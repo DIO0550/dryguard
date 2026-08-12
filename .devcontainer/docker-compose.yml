@@ -1,0 +1,25 @@
+version: "3.8"
+services:
+  rust:
+    build:
+      context: .
+      dockerfile: ./rust/Dockerfile
+    image: rust-dev-environment
+    container_name: rust-dev-container
+    ports:
+      - "5300:5300"
+    volumes:
+      - ..:/workspace:cached
+    restart: always
+    stdin_open: true
+    tty: true
+    user: vscode
+    working_dir: /workspace
+    command: /bin/bash
+    networks:
+      - mcp-network
+
+networks:
+  mcp-network:
+    driver: bridge
+    name: mcp-network
