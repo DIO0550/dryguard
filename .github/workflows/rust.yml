@@ -1,0 +1,40 @@
+name: Rust
+
+# 強制力の序列で層 1（無条件に効く）。git hooks（層 2）と Claude Code hooks（層 3）は
+# 実行環境によっては同時に抜けるため、ここが唯一の無条件のゲートになる
+# （harness/githooks/README.md「配線の穴と、それを誰が塞ぐか」）。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 1 つずつ独立したステップにする。&& で連ねると途中の出力が流れて
+      # 末尾しか見えず、どの検査で落ちたのかを読み違える。
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
