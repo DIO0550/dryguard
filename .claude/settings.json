@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build)",
+      "Bash(cargo build *)",
+      "Bash(cargo check)",
+      "Bash(cargo check *)",
+      "Bash(cargo test)",
+      "Bash(cargo test *)",
+      "Bash(cargo fmt)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo clippy)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo run *)"
+    ]
+  },
+  "enabledPlugins": {
+    "rust-rules-plugin@d-market-rust": true
+  },
+  "extraKnownMarketplaces": {
+    "d-market-rust": {
+      "source": {
+        "source": "github",
+        "repo": "DIO0550/d-market-rust"
+      },
+      "autoUpdate": true
+    }
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wire-githooks.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
