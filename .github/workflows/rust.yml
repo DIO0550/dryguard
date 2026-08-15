@@ -12,6 +12,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -20,13 +23,27 @@ jobs:
     name: fmt / clippy / test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # 使うアクションは GitHub 公式（actions/*）のみ。commit hash で固定する。
+      #
+      # Why: タグは動かせるので、`@v5` のままだと同じ設定でも別のコードが走りうる。
+      # ここは無条件のゲートなので、何が走るかを固定できないと検査そのものが信用できない。
+      # 更新するときは hash とコメントの版を両方直す。
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # Why not（dtolnay/rust-toolchain）: 公式ではないため。
+      # ランナーには rustup が入っているので、直接呼べば足りる。
+      - name: Rust ツールチェーン
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
 
-      - uses: Swatinem/rust-cache@v2
+      # Why not（キャッシュ）: 依存が clap 1 つで、ビルドからテストまで 20 秒ほどしかかからない。
+      # `actions/cache` を足しても縮む時間より、キー設計と復元漏れの面倒のほうが大きい。
+      # 遅くなってから入れる。
 
       # 1 つずつ独立したステップにする。&& で連ねると途中の出力が流れて
       # 末尾しか見えず、どの検査で落ちたのかを読み違える。
