@@ -1,0 +1,73 @@
+# 命名規約
+
+`snake_case` / `CamelCase` などの綴りの流儀は **rustfmt と clippy が見る**ので、ここには書かない
+（ツールが強制するものを規約に二重に書かない）。ここに書くのは、ツールが見られない部分だけ。
+
+## 名前と実体を一致させる
+
+**名前が約束することと、実際にやること・返すものを一致させる。**
+名前を読んで想像した挙動と実装がずれていたら、名前が間違っている。
+
+- **戻り値を名前に出す。** エラーの一覧を返すだけの関数を `validate_*` と名付けない
+  （「検証して成否を返す」と読める）。集めて返すなら `collect_*_errors`
+- 探索していない関数に `find_*` を使わない
+- **1 つのモジュール内で語彙を混在させない。** 内部だけ直して公開 API に古い名前を残さない
+
+| NG | OK | 理由 |
+|---|---|---|
+| `validate_chunk(chunk)` | `collect_chunk_errors(chunk)` | エラー一覧を返すだけで、成否は返さない |
+| `find_domain(path)` | `domain_of(path)` | 何も探していない。パスから導いている |
+
+## `And` を含む名前を作らない
+
+`do_a_and_b` は、その関数が 2 つの振る舞いを持っている証拠。
+**名前を工夫して押し込めるのではなく、処理を分ける。**
+分けられないなら、2 つをまとめて表す 1 つの概念名を見つける。
+
+## 条件を組んだ式に名前を付ける
+
+`&&` / `||` で 2 つ以上の条件を組んだ式を `if` にそのまま置かない。
+**何を判定しているのかを表す名前の変数に入れてから使う。**
+
+```rust
+// NG
+if similarity > threshold && !domains_overlap && caller_domains.len() > 1 { ... }
+
+// OK
+let structurally_similar = similarity > threshold;
+let domains_differ = !domains_overlap && caller_domains.len() > 1;
+if structurally_similar && domains_differ { ... }
+```
+
+条件が 2 つ以上要る理由がコードから読み取れないなら、変数のそばに Why を残す。
+単独の条件（`chunks.is_empty()` など）はそのまま置いてよい。
+
+## 内容を表さない汎用語を使わない
+
+`Info` / `Data` / `Detail` / `Manager` / `Helper` / `Util` は、何を指すのかを伝えない。
+
+**名前が思いつかないのは、その型が 2 つの役割を抱き合わせているサイン**であることが多い。
+改名で解決しようとする前に、役割を分けられないか確認する（分けた結果その型自体が不要になることもある）。
+
+## このツールの語彙を固定する
+
+**同じものをステージごとに違う名前で呼ばない。** `docs/dryguard-plan.md` が使っている語を出発点にする。
+
+| 語 | 指すもの |
+|---|---|
+| `chunk` | 比較の単位。関数・メソッド・impl ブロック |
+| `pair` | 比較する 2 つの chunk |
+| `signal` | 判定の材料。構造類似度・型シグネチャ・呼び出し先 / 呼び出し元・モジュール距離 |
+| `verdict` | 判定の結果（`EXTRACT-CANDIDATE` / `DO-NOT-EXTRACT` / `REVIEW`） |
+| `domain` | ドメイン。ディレクトリ構造からの推定と `dryguard.toml` の宣言で決まる |
+
+`snippet` / `fragment` / `candidate`（chunk の意味で）/ `label`（verdict の意味で）は使わない。
+
+**語を増やすときは、既にある語で言えないかを先に確かめる。**
+新しい語を足したら、この表にも足す。
+
+## `create` / `new` / `from_*` の使い分け
+
+- **`new`**: 引数がその値の材料であるとき（`Location::new(path, line)`）
+- **`from_*`**: 別の表現から作り直すとき。変換元を名前に出す（`Chunk::from_node`）
+- 判定は `is_*` / `has_*`、変換は `to_*` / `into_*`（Rust の慣習に従う）、収集は `collect_*`
