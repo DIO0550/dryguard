@@ -1,0 +1,57 @@
+name: Rust
+
+# 強制力の序列で層 1（無条件に効く）。git hooks（層 2）と Claude Code hooks（層 3）は
+# 実行環境によっては同時に抜けるため、ここが唯一の無条件のゲートになる
+# （harness/githooks/README.md「配線の穴と、それを誰が塞ぐか」）。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      # 使うアクションは GitHub 公式（actions/*）のみ。commit hash で固定する。
+      #
+      # Why: タグは動かせるので、`@v5` のままだと同じ設定でも別のコードが走りうる。
+      # ここは無条件のゲートなので、何が走るかを固定できないと検査そのものが信用できない。
+      # 更新するときは hash とコメントの版を両方直す。
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # Why not（dtolnay/rust-toolchain）: 公式ではないため。
+      # ランナーには rustup が入っているので、直接呼べば足りる。
+      - name: Rust ツールチェーン
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
+
+      # Why not（キャッシュ）: 依存が clap 1 つで、ビルドからテストまで 20 秒ほどしかかからない。
+      # `actions/cache` を足しても縮む時間より、キー設計と復元漏れの面倒のほうが大きい。
+      # 遅くなってから入れる。
+
+      # 1 つずつ独立したステップにする。&& で連ねると途中の出力が流れて
+      # 末尾しか見えず、どの検査で落ちたのかを読み違える。
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test

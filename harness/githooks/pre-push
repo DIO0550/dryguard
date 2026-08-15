@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+#
+# push 前の検査（git ネイティブのフック）。Claude Code の配線に依存しない最終網。
+#
+# 違いは発火条件だけで、こちらは CLI・IDE・素の git のどれから push しても必ず走る
+# （AGENTS.md「強制力の序列」）。
+#
+# 配線: git config core.hooksPath harness/githooks
+set -e
+
+cd "$(git rev-parse --show-toplevel)"
+
+# 1 つずつ独立に実行する。&& で連ねると途中の出力が流れて末尾しか見えず、
+# どの検査で落ちたのかを読み違える。
+#
+# cargo が無い環境では黙って通す。検査できないことを理由に push を止めても、
+# 検査の質は上がらない。無条件のゲートは CI（層 1）にある。
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "pre-push: cargo が無いため検査を飛ばします"
+  exit 0
+fi
+
+echo "pre-push: fmt"
+cargo fmt --check
+
+echo "pre-push: clippy"
+cargo clippy --all-targets -- -D warnings
+
+echo "pre-push: test"
+cargo test

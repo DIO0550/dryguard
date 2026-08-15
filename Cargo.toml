@@ -1,0 +1,18 @@
+[package]
+name = "dryguard"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "構造の似たコードが偶発的な重複かどうかを、型・依存・参照の意味情報から理由付きで判定する CLI"
+repository = "https://github.com/DIO0550/dryguard"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+
+# 本番コードでの unwrap / expect の禁止は、規約の文ではなくツールで落とす。
+# テストコード内は clippy.toml の allow-unwrap-in-tests / allow-expect-in-tests で許可する
+# (rules/coding.md「エラーと不在の表現」/ rules/testing.md「テスト内の unwrap / expect」)。
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

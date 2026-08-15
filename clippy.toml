@@ -1,0 +1,5 @@
+# Cargo.toml が deny している unwrap / expect を、テストコード内でだけ許可する。
+# 禁止の対象は本番コードのみで、テストは失敗理由が分かるほうが優先される
+# (rules/testing.md「テスト内の unwrap / expect」)。
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
