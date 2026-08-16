@@ -299,6 +299,12 @@ export function applyDiscount(price: number): number {
 }
 "#;
 
+    const CLOSING_BRACE_IN_A_TEMPLATE_LITERAL: &str = r#"function render(name: string): string {
+  const close = `}`;
+  return name + close;
+}
+"#;
+
     const CLOSING_BRACE_IN_A_CONTINUED_STRING: &str = r#"function render(name: string): string {
   const close = "a\
 }";
@@ -411,6 +417,15 @@ export const rate = 0.1;
     #[test]
     fn test_chunk_with_a_closing_brace_in_a_string_does_not_end_at_that_line() {
         let chunk = chunk_at(CLOSING_BRACE_IN_A_STRING, "a.ts:3").expect("切り出せる");
+
+        assert_eq!(chunk.lines(), range(1, 4));
+    }
+
+    #[test]
+    fn test_chunk_with_a_closing_brace_in_a_template_literal_does_not_end_at_that_line() {
+        // 引用符はシングル・ダブル・バッククォートの 3 つ。バッククォートが抜けると
+        // テンプレートリテラルの中の `}` を本体の終わりと数える
+        let chunk = chunk_at(CLOSING_BRACE_IN_A_TEMPLATE_LITERAL, "a.ts:3").expect("切り出せる");
 
         assert_eq!(chunk.lines(), range(1, 4));
     }
