@@ -51,11 +51,7 @@ impl fmt::Display for LineRange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::num::NonZeroUsize;
-
-    fn line(number: usize) -> NonZeroUsize {
-        NonZeroUsize::new(number).expect("テストが渡す行番号は 1 以上")
-    }
+    use crate::test_support::line;
 
     #[test]
     fn test_line_range_with_start_before_end_is_created() {

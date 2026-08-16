@@ -15,3 +15,6 @@ pub mod cli;
 pub mod location;
 pub mod stage1;
 pub mod threshold;
+
+#[cfg(test)]
+mod test_support;

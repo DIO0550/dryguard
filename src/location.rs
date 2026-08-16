@@ -105,10 +105,7 @@ impl Error for LocationParseError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn line(number: usize) -> NonZeroUsize {
-        NonZeroUsize::new(number).expect("テストが渡す行番号は 1 以上")
-    }
+    use crate::test_support::line;
 
     #[test]
     fn test_location_with_path_and_line_parses_both() {
