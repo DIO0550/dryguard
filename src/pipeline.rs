@@ -1,6 +1,6 @@
 //! ステージを呼ぶ順序。
 //!
-//! ファイルの読み込みはここが持つ。`stage1` は I/O を持たないので、その外側で
+//! ファイルの読み込みはここが持つ。`syntax` は I/O を持たないので、その外側で
 //! 読んで渡す（rules/coding.md 禁止事項 / rules/architecture.md「3 ステージのパイプライン」）。
 
 use std::error::Error;
@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 
 use crate::location::Location;
-use crate::stage1::chunk::{Chunk, ChunkingError, find_enclosing_chunk};
+use crate::syntax::chunk::{Chunk, ChunkingError, find_enclosing_chunk};
 
 /// 比較する 2 箇所から、それぞれのチャンクを取り出す。
 ///

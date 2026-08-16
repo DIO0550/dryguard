@@ -13,7 +13,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use crate::location::Location;
-use crate::stage1::line_range::LineRange;
+use crate::syntax::line_range::LineRange;
 
 /// 比較の単位。関数・メソッド 1 つ分のソースと、それがどこにあったか。
 #[derive(Debug, Clone, PartialEq, Eq)]

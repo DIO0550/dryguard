@@ -11,7 +11,7 @@ use clap::Parser;
 use dryguard::cli::{Cli, Command, CommonOptions};
 use dryguard::location::Location;
 use dryguard::pipeline::collect_chunks;
-use dryguard::stage1::chunk::Chunk;
+use dryguard::syntax::chunk::Chunk;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
