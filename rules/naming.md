@@ -9,13 +9,13 @@
 名前を読んで想像した挙動と実装がずれていたら、名前が間違っている。
 
 - **戻り値を名前に出す。** エラーの一覧を返すだけの関数を `validate_*` と名付けない
-  （「検証して成否を返す」と読める）。集めて返すなら `collect_*_errors`
+  （「検証して成否を返す」と読める）。返すものを名前に出して `chunk_errors_of`
 - 探索していない関数に `find_*` を使わない
 - **1 つのモジュール内で語彙を混在させない。** 内部だけ直して公開 API に古い名前を残さない
 
 | NG | OK | 理由 |
 |---|---|---|
-| `validate_chunk(chunk)` | `collect_chunk_errors(chunk)` | エラー一覧を返すだけで、成否は返さない |
+| `validate_chunk(chunk)` | `chunk_errors_of(chunk)` | エラー一覧を返すだけで、成否は返さない |
 | `find_domain(path)` | `domain_of(path)` | 何も探していない。パスから導いている |
 
 ## `And` を含む名前を作らない
@@ -70,4 +70,18 @@ if structurally_similar && domains_differ { ... }
 
 - **`new`**: 引数がその値の材料であるとき（`Location::new(path, line)`）
 - **`from_*`**: 別の表現から作り直すとき。変換元を名前に出す（`Chunk::from_node`）
-- 判定は `is_*` / `has_*`、変換は `to_*` / `into_*`（Rust の慣習に従う）、収集は `collect_*`
+- 判定は `is_*` / `has_*`、変換は `to_*` / `into_*`（Rust の慣習に従う）
+- **複数をまとめて返すものは `<返すもの>_of`**（`chunk_errors_of` / `tokens_of`）
+
+## `collect` を名前に使わない
+
+**自前の関数・型の名前に `collect` / `Collection` を入れない。** 代わりに
+`<返すもの>_of` で、**返すものを名前に出す**（`Iterator::collect` の呼び出しは対象外）。
+
+**Why**: Rust では `collect` が `Iterator::collect`（イテレータを別のコレクションへ集約する）と
+強く結びついている。自前の関数に付けると、読む側が標準のそれと同じ操作を想像する。
+
+**Why not（「集める」関数には使ってよい、としない）**: 「集めている」かどうかは
+**呼ぶ側から見えない実装の手順**で、名前が伝えるべき「何が返るか」を押しのける。
+実際 `collect_chunks` は 2 箇所から集めていたが、呼ぶ側が知りたいのは
+**チャンクの組が返ること**だった。
