@@ -2,26 +2,27 @@
 
 use std::error::Error;
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use crate::line_number::{LineNumber, LineNumberParseError};
+
 /// ソース上の位置。
 ///
-/// 行番号を [`NonZeroUsize`] で持つのは、0 行目という位置が存在しないため。ここで弾いておくと、
+/// 行番号を [`LineNumber`] で持つので、0 行目という位置は組み立てられない。
 /// 後段が「0 かもしれない」を考えなくて済む
 /// (rules/coding.md「生成時に検証し、不正な値を存在させない」)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
     path: PathBuf,
-    line: NonZeroUsize,
+    line: LineNumber,
 }
 
 impl Location {
     /// 位置を組み立てる。
     ///
-    /// `path` は対象ファイルのパス、`line` は 1 始まりの行番号。
-    pub fn new(path: PathBuf, line: NonZeroUsize) -> Self {
+    /// `path` は対象ファイルのパス、`line` はその行番号。
+    pub fn new(path: PathBuf, line: LineNumber) -> Self {
         Self { path, line }
     }
 
@@ -30,8 +31,8 @@ impl Location {
         &self.path
     }
 
-    /// 1 始まりの行番号。
-    pub fn line(&self) -> NonZeroUsize {
+    /// 行番号。
+    pub fn line(&self) -> LineNumber {
         self.line
     }
 }
@@ -49,7 +50,7 @@ impl FromStr for Location {
     ///
     /// # Errors
     ///
-    /// `:` が無い / パスが空 / 行番号が数値でない / 行番号が 0 のとき。
+    /// `:` が無い / パスが空 / `:` の右を行番号として読めないとき。
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         // 右から分割する。左からだと Windows のドライブレター (`C:\a.rs:12`) を
         // 区切りと取り違える。
@@ -61,28 +62,24 @@ impl FromStr for Location {
             return Err(LocationParseError::EmptyPath);
         }
 
-        let number: usize = line
-            .parse()
-            .map_err(|_| LocationParseError::NotANumber(line.to_owned()))?;
-        let line = NonZeroUsize::new(number).ok_or(LocationParseError::ZeroLine)?;
+        let line = line.parse().map_err(LocationParseError::Line)?;
 
         Ok(Self::new(PathBuf::from(path), line))
     }
 }
 
 /// [`Location`] の解釈が失敗した理由。
-///
-/// 「数値でない」と「0 行目」を分けているのは、利用者が直す先が違うため。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocationParseError {
     /// `file:line` の `:` が無い。
     MissingSeparator,
     /// `:` の左が空。
     EmptyPath,
-    /// `:` の右が数値として読めない。保持しているのは読めなかった文字列。
-    NotANumber(String),
-    /// 行番号が 0。行は 1 始まり。
-    ZeroLine,
+    /// `:` の右を行番号として読めない。
+    ///
+    /// 理由の内訳を自前で持たず [`LineNumberParseError`] をそのまま抱えるのは、
+    /// 同じ分類を 2 箇所に置くと片方だけ古くなるため。
+    Line(LineNumberParseError),
 }
 
 impl fmt::Display for LocationParseError {
@@ -92,15 +89,19 @@ impl fmt::Display for LocationParseError {
                 write!(formatter, "位置は file:line の形で指定してください")
             }
             Self::EmptyPath => write!(formatter, "ファイルパスが空です"),
-            Self::NotANumber(text) => {
-                write!(formatter, "行番号が数値ではありません: {text}")
-            }
-            Self::ZeroLine => write!(formatter, "行番号は 1 以上を指定してください"),
+            Self::Line(cause) => write!(formatter, "{cause}"),
         }
     }
 }
 
-impl Error for LocationParseError {}
+impl Error for LocationParseError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MissingSeparator | Self::EmptyPath => None,
+            Self::Line(cause) => Some(cause),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -144,15 +145,20 @@ mod tests {
 
         assert_eq!(
             result,
-            Err(LocationParseError::NotANumber("abc".to_owned()))
+            Err(LocationParseError::Line(LineNumberParseError::NotANumber(
+                "abc".to_owned()
+            )))
         );
     }
 
     #[test]
-    fn test_location_with_zero_line_returns_zero_line() {
+    fn test_location_with_zero_line_returns_zero() {
         let result = "src/a.ts:0".parse::<Location>();
 
-        assert_eq!(result, Err(LocationParseError::ZeroLine));
+        assert_eq!(
+            result,
+            Err(LocationParseError::Line(LineNumberParseError::Zero))
+        );
     }
 
     #[test]

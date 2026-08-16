@@ -1,7 +1,7 @@
 //! ソース上の行範囲。
 
+use crate::line_number::LineNumber;
 use std::fmt;
-use std::num::NonZeroUsize;
 
 /// 1 始まりの行範囲。両端を含む。
 ///
@@ -10,8 +10,8 @@ use std::num::NonZeroUsize;
 /// (rules/coding.md「不正な状態を型で表現できなくする」)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineRange {
-    start: NonZeroUsize,
-    end: NonZeroUsize,
+    start: LineNumber,
+    end: LineNumber,
 }
 
 impl LineRange {
@@ -19,7 +19,7 @@ impl LineRange {
     ///
     /// `end` が `start` より手前のときは作れないので `None` を返す。
     /// 1 行だけの範囲は `start` と `end` が同じ値になる。
-    pub fn new(start: NonZeroUsize, end: NonZeroUsize) -> Option<Self> {
+    pub fn new(start: LineNumber, end: LineNumber) -> Option<Self> {
         if end < start {
             return None;
         }
@@ -33,25 +33,25 @@ impl LineRange {
     /// 前後が入れ替わりようがないので、[`LineRange::new`] と違って失敗しない。
     /// 「開始位置と長さ」の形で範囲が決まる呼び出し側が `Option` を開く必要をなくす
     /// （起こりえない `None` の分岐は、読む側にありうる失敗だと誤解させる）。
-    pub fn starting_at(start: NonZeroUsize, additional_lines: usize) -> Self {
+    pub fn starting_at(start: LineNumber, additional_lines: usize) -> Self {
         Self {
             start,
-            end: start.saturating_add(additional_lines),
+            end: LineNumber::from_index(start.to_index() + additional_lines),
         }
     }
 
     /// 開始行。
-    pub fn start(self) -> NonZeroUsize {
+    pub fn start(self) -> LineNumber {
         self.start
     }
 
     /// 終了行。
-    pub fn end(self) -> NonZeroUsize {
+    pub fn end(self) -> LineNumber {
         self.end
     }
 
     /// その行が範囲に入っているか。両端は含む。
-    pub fn contains(self, line: NonZeroUsize) -> bool {
+    pub fn contains(self, line: LineNumber) -> bool {
         (self.start..=self.end).contains(&line)
     }
 }

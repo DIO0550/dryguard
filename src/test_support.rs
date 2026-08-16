@@ -6,13 +6,13 @@
 //!
 //! 汎用の操作（値を別の表現へ直すなど）は実装側の責務なので、ここに書かない。
 
-use std::num::NonZeroUsize;
+use crate::line_number::LineNumber;
 
 /// 1 始まりの行番号。
 ///
 /// # Panics
 ///
 /// `number` が 0 のとき。テストが 0 行目を渡すのは、テスト自体の書き間違い。
-pub(crate) fn line(number: usize) -> NonZeroUsize {
-    NonZeroUsize::new(number).expect("テストが渡す行番号は 1 以上")
+pub(crate) fn line(number: usize) -> LineNumber {
+    LineNumber::new(number).expect("テストが渡す行番号は 1 以上")
 }

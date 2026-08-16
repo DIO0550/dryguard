@@ -9,9 +9,9 @@
 
 use std::error::Error;
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
+use crate::line_number::LineNumber;
 use crate::location::Location;
 use crate::syntax::line_range::LineRange;
 
@@ -35,15 +35,14 @@ impl Chunk {
     /// 関数の始まりは見つかったが閉じるブレースが無いとき。
     pub fn find_enclosing(location: &Location, source: &str) -> Result<Self, ChunkingError> {
         let lines: Vec<&str> = source.lines().collect();
-        let target_line = location.line().get();
 
-        if target_line > lines.len() {
+        if location.line().get() > lines.len() {
             return Err(ChunkingError::LineBeyondSource {
                 total_lines: lines.len(),
             });
         }
 
-        let target_index = target_line - 1;
+        let target_index = location.line().to_index();
 
         // 上に向かって関数の始まりを探す。最初に当たった始まりの範囲が指定行を含まない
         // ことがある（内側の関数が指定行より手前で閉じている場合）ので、含むまで遡り続ける。
@@ -55,7 +54,7 @@ impl Chunk {
             let Some(closing_index) = find_closing_index(&lines, header_index) else {
                 // 内側が閉じていないなら、それを囲む関数も閉じていない
                 return Err(ChunkingError::UnterminatedFunction {
-                    start: line_number(header_index),
+                    start: LineNumber::from_index(header_index),
                 });
             };
 
@@ -65,7 +64,10 @@ impl Chunk {
 
             return Ok(Self::new(
                 location.path().to_path_buf(),
-                LineRange::starting_at(line_number(header_index), closing_index - header_index),
+                LineRange::starting_at(
+                    LineNumber::from_index(header_index),
+                    closing_index - header_index,
+                ),
                 lines[header_index..=closing_index].join("\n"),
             ));
         }
@@ -115,7 +117,7 @@ pub enum ChunkingError {
     /// 指定行を含む関数が見つからない。
     NoEnclosingFunction,
     /// 関数の始まりは見つかったが、閉じるブレースが無い。保持しているのは始まりの行。
-    UnterminatedFunction { start: NonZeroUsize },
+    UnterminatedFunction { start: LineNumber },
 }
 
 impl fmt::Display for ChunkingError {
@@ -138,11 +140,6 @@ impl Error for ChunkingError {}
 
 /// 行頭に置かれると関数の始まりに見えてしまう制御構文のキーワード。
 const CONTROL_KEYWORDS: [&str; 8] = ["if", "for", "while", "switch", "catch", "do", "try", "else"];
-
-/// 0 始まりの行インデックスを 1 始まりの行番号に直す。
-fn line_number(index: usize) -> NonZeroUsize {
-    NonZeroUsize::MIN.saturating_add(index)
-}
 
 /// その行が関数・メソッドの始まりに見えるか。
 ///
