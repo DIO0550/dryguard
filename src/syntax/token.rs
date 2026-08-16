@@ -251,16 +251,30 @@ fn end_of_text(characters: &[char], start: usize) -> usize {
 
 /// 数値リテラルの次の位置。
 ///
-/// 英数字と `.` `_` を続けて読む。`0x1f` `1e5` `1_000` `0.1` をまとめて 1 つの
-/// リテラルとして扱うため（値は捨てるので、切り方の細かさは類似度に効かない）。
+/// 英数字と `_` を続けて読む。`0x1f` `1e5` `1_000` をまとめて 1 つのリテラルとして
+/// 扱うため（値は捨てるので、切り方の細かさは類似度に効かない）。
+///
+/// `.` は**数字が続くときだけ**数値の一部にする。`1.0.toFixed(2)` の `.toFixed` まで
+/// 飲み込むと、メンバーアクセスがトークン列から消えて構造が違って見える。
 fn end_of_number(characters: &[char], start: usize) -> usize {
-    let is_part =
-        |character: char| character.is_ascii_alphanumeric() || matches!(character, '.' | '_');
+    let mut position = start;
 
-    characters[start..]
-        .iter()
-        .position(|&character| !is_part(character))
-        .map_or(characters.len(), |offset| start + offset)
+    while let Some(&current) = characters.get(position) {
+        let continues_the_number = if current == '.' {
+            characters
+                .get(position + 1)
+                .is_some_and(char::is_ascii_digit)
+        } else {
+            current.is_ascii_alphanumeric() || current == '_'
+        };
+
+        if !continues_the_number {
+            return position;
+        }
+        position += 1;
+    }
+
+    characters.len()
 }
 
 /// 識別子・予約語の次の位置。
@@ -310,6 +324,22 @@ mod tests {
     #[test]
     fn test_tokens_of_a_number_literal_drop_its_value() {
         assert_eq!(Token::collect_from("0.1"), vec![Token::Number]);
+    }
+
+    #[test]
+    fn test_tokens_of_a_property_access_on_a_number_keep_the_property_name() {
+        // 数字が続かない `.` まで数値に飲み込むと、メンバーアクセスの構造が消える
+        assert_eq!(
+            Token::collect_from("1.0.toFixed(2)"),
+            vec![
+                Token::Number,
+                Token::Symbol('.'),
+                Token::Identifier,
+                Token::Symbol('('),
+                Token::Number,
+                Token::Symbol(')')
+            ]
+        );
     }
 
     #[test]
