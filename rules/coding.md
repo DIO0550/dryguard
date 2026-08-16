@@ -169,4 +169,16 @@ let (path, line) = text.rsplit_once(':')...
 - **lint 抑制を足さない**（`#[allow(..)]` / `#[expect(..)]`）。
   抑制したくなったら**設計のほうを変える**（`dead_code` が出たので lib + bin に分けた、が実例）
 - `unsafe`
-- `syntax` / `classification` での I/O（ファイル読み込み・プロセス起動）。I/O は `lsp` と入口の層のみ
+- `syntax` / `classification` での I/O（ファイル読み込み・プロセス起動）
+
+## I/O を持ってよい場所
+
+`lsp`・入口の層・`location`（**自分が指すファイルを読むところまで**）に限る。
+
+**Why（`location` を例外にする）**: 「その位置のファイルを読む」は位置自身の振る舞いで、
+呼び出し側に `fs::read_to_string(location.path())` を組み立てさせる理由が無い。
+
+**Why not（`syntax` まで広げる）**: 読んだ結果を渡す先が純粋でなくなると、
+`Chunk::find_enclosing` のテストが実ファイルを要求し始める。
+`location` を例外にしても**渡す先は純粋なまま**なので、「LSP 無しでも動く」
+（`rules/architecture.md`）と「モックが要らない」（`rules/testing.md`）は壊れない。
