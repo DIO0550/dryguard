@@ -57,10 +57,33 @@ impl Threshold {
 }
 ```
 
-- **標準の型で表現できるならそれを使う。** 行番号は「0 が存在しない」ので
-  `NonZeroUsize`（自前のラッパを作る前に標準を探す）
+- **自前のラッパを作る前に標準を探す。** 「0 が存在しない」だけなら `NonZeroUsize`、
+  「範囲が決まっている」だけなら既存の型で足りることが多い
+- **標準の型が「その値の意味」まで言えないなら newtype にする。** 判断軸は
+  **その型に置き場所が要る操作があるか**
 - **型が構造で狭まっているかを確かめる。** `type Score = f64;` のような別名は
   素の `f64` がそのまま代入できるので、**何も防いでいない**
+
+行番号がこの 2 つ目の例。`NonZeroUsize` で持っていたときは「0 でない」しか言えず、
+**0 始まりのインデックスと 1 始まりの行番号の変換**に置き場所が無かった。
+結果、要る場所ごとに同じ private ヘルパーが生えかけた（`syntax` に 1 つ、
+tree-sitter が行を 0 始まりで返すのでこの先さらに増える）。
+
+```rust
+// NG: 「0 でない」しか言えない。変換の置き場所が決まらない
+fn line_number(index: usize) -> NonZeroUsize {
+    NonZeroUsize::MIN.saturating_add(index)
+}
+
+// OK: 変換と文字列からの解釈が 1 箇所に集まる
+impl LineNumber {
+    pub fn from_index(index: usize) -> Self
+    pub fn to_index(self) -> usize
+}
+```
+
+**Why not（`NonZeroUsize` のまま通す）**: 変換が散ると、0 始まりと 1 始まりの
+取り違えがコンパイルを通ってしまう。**どちらも `usize` なので型では止まらない。**
 
 ## 値の語彙を型で閉じる
 
@@ -146,4 +169,16 @@ let (path, line) = text.rsplit_once(':')...
 - **lint 抑制を足さない**（`#[allow(..)]` / `#[expect(..)]`）。
   抑制したくなったら**設計のほうを変える**（`dead_code` が出たので lib + bin に分けた、が実例）
 - `unsafe`
-- `stage1` / `stage3` での I/O（ファイル読み込み・プロセス起動）。I/O は `lsp` と入口の層のみ
+- `syntax` / `classification` での I/O（ファイル読み込み・プロセス起動）
+
+## I/O を持ってよい場所
+
+`lsp`・入口の層・`location`（**自分が指すファイルを読むところまで**）に限る。
+
+**Why（`location` を例外にする）**: 「その位置のファイルを読む」は位置自身の振る舞いで、
+呼び出し側に `fs::read_to_string(location.path())` を組み立てさせる理由が無い。
+
+**Why not（`syntax` まで広げる）**: 読んだ結果を渡す先が純粋でなくなると、
+`Chunk::find_enclosing` のテストが実ファイルを要求し始める。
+`location` を例外にしても**渡す先は純粋なまま**なので、「LSP 無しでも動く」
+（`rules/architecture.md`）と「モックが要らない」（`rules/testing.md`）は壊れない。

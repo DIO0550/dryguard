@@ -3,14 +3,20 @@
 //! 3 ステージのパイプラインで構成する
 //! (`docs/dryguard-plan.md`「アーキテクチャ」/ `rules/architecture.md`)。
 //!
-//! | ステージ | 責務 |
-//! |---|---|
-//! | Stage 1 | 候補抽出（チャンク化・正規化・類似度・import 収集） |
-//! | Stage 2 | 意味情報収集（LSP への問い合わせと結果の正規化） |
-//! | Stage 3 | 分類（シグナルの統合と判定・理由の組み立て） |
+//! | モジュール | 責務 | 計画での呼び名 |
+//! |---|---|---|
+//! | `syntax` | 候補抽出（チャンク化・正規化・類似度・import 収集） | Stage 1 |
+//! | `semantics` | 意味情報収集（LSP への問い合わせと結果の正規化） | Stage 2 |
+//! | `classification` | 分類（シグナルの統合と判定・理由の組み立て） | Stage 3 |
 //!
-//! 現在は Phase 0 の骨格として、CLI の受け口と、そこで扱う値の型だけがある。
+//! 現在は Phase 0 の途中で、CLI の受け口と `syntax` のチャンク化までがある。
 
 pub mod cli;
+pub mod line_number;
 pub mod location;
+pub mod pipeline;
+pub mod syntax;
 pub mod threshold;
+
+#[cfg(test)]
+mod test_support;

@@ -33,6 +33,7 @@ AI コーディングエージェントは、テキスト的に似たコード�
 
 ```
 [Stage 1: 候補抽出]      [Stage 2: 意味情報収集]   [Stage 3: 分類]
+ syntax                   semantics                classification
  tree-sitter              LSP                      ルールエンジン
   ├ 関数/メソッド単位で    ├ hover (型シグネチャ)     ├ シグナル統合
   │ チャンク化            ├ callHierarchy           ├ ドメイン距離判定
