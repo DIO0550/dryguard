@@ -1,4 +1,4 @@
-//! ソースを正規化したトークンの列にする。
+//! 正規化したトークンと、その集合の重なり。
 //!
 //! Phase 0 の素朴実装。tree-sitter は使わず、文字を前から見てトークンに切る
 //! （`docs/dryguard-plan.md`「Phase 0: 貫通させる (LSPなし)」）。AST 正規化は Phase 1。
@@ -6,6 +6,10 @@
 //! テンプレートリテラルの `${}` の中と正規表現リテラルは、この切り方では読めない。
 //! どちらも 1 つの [`Token::Text`] / 記号の並びとして潰れる。ここを詰めるより
 //! tree-sitter へ移すほうが確実なので、Phase 0 では踏み込まない。
+
+use std::collections::HashSet;
+
+use crate::similarity::Similarity;
 
 /// 正規化したトークン。
 ///
@@ -159,6 +163,38 @@ const RESERVED_WORDS: &[&str] = &[
     "yield",
 ];
 
+/// チャンク 1 つ分の、正規化トークンの集合。
+///
+/// 空では作れない。トークンが 1 つも取れなかったことを空の集合として通すと、
+/// 後段が「共通するトークンが無い」と「見ていない」を区別できなくなる
+/// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenSet(HashSet<Token>);
+
+impl TokenSet {
+    /// ソースを正規化トークンの集合にする。
+    ///
+    /// トークンが 1 つも取れなかったときは作れないので `None` を返す。
+    pub fn from_source(source: &str) -> Option<Self> {
+        let tokens: HashSet<Token> = Token::collect_from(source).into_iter().collect();
+        if tokens.is_empty() {
+            return None;
+        }
+        Some(Self(tokens))
+    }
+
+    /// 2 つのトークン集合の Jaccard 係数（共通しているトークンが、合わせたうちの何割か）。
+    ///
+    /// これが Phase 0 の構造類似度。出現回数は見ないので、同じトークンが何度出ても
+    /// 1 つとして数える。
+    pub fn jaccard(&self, other: &Self) -> Similarity {
+        let shared = self.0.intersection(&other.0).count();
+        let combined = self.0.union(&other.0).count();
+
+        Similarity::from_shared_count(shared, combined)
+    }
+}
+
 /// 引用符として文字列・テンプレートリテラルを開く文字か。
 fn is_quote(character: char) -> bool {
     matches!(character, '\'' | '"' | '`')
@@ -245,6 +281,10 @@ mod tests {
         Keyword::new(word).expect("テストが渡すのは予約語")
     }
 
+    fn token_set(source: &str) -> TokenSet {
+        TokenSet::from_source(source).expect("テストが渡すソースにはトークンがある")
+    }
+
     #[test]
     fn test_tokens_of_an_identifier_drop_its_name() {
         assert_eq!(Token::collect_from("invoice"), vec![Token::Identifier]);
@@ -328,5 +368,69 @@ mod tests {
     #[test]
     fn test_keyword_of_an_ordinary_word_cannot_be_created() {
         assert_eq!(Keyword::new("invoice"), None);
+    }
+
+    #[test]
+    fn test_token_set_of_a_source_without_tokens_cannot_be_created() {
+        // 「トークンが取れなかった」を空の集合として通すと、後段が
+        // 「似ていない」と「見ていない」を区別できない
+        assert_eq!(TokenSet::from_source("  \n // 何も無い\n"), None);
+    }
+
+    #[test]
+    fn test_jaccard_of_the_same_source_is_one() {
+        let source = "return Math.max(shortage, 0);";
+
+        assert_eq!(token_set(source).jaccard(&token_set(source)).value(), 1.0);
+    }
+
+    #[test]
+    fn test_jaccard_of_sources_that_differ_only_in_names_is_one() {
+        let discount = "const discounted = invoice.amount * (1 - RATE);";
+        let reorder = "const shortage = stock.quantity * (1 - LIMIT);";
+
+        assert_eq!(
+            token_set(discount).jaccard(&token_set(reorder)).value(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn test_jaccard_of_sources_without_a_common_token_is_zero() {
+        // 識別子だけの集合と数値だけの集合には共通のトークンが無い
+        assert_eq!(token_set("invoice").jaccard(&token_set("42")).value(), 0.0);
+    }
+
+    #[test]
+    fn test_jaccard_of_partially_overlapping_sources_is_the_shared_ratio() {
+        // {Identifier, Number} と {Number, Symbol('+')} で、共通は Number の 1 つ、
+        // 合わせて 3 つ
+        let ratio = token_set("invoice 1").jaccard(&token_set("1 +")).value();
+
+        assert!(
+            (ratio - 1.0 / 3.0).abs() < f64::EPSILON,
+            "共通 1 / 合併 3 になる: {ratio}"
+        );
+    }
+
+    #[test]
+    fn test_jaccard_of_structurally_different_sources_is_below_one() {
+        // 名前を潰した結果すべてが似て見えるなら、このシグナルは何も言っていない
+        let assignment = token_set("const discounted = invoice.amount;");
+        let loop_over_items = token_set("for (const item of items) { total = total + 1; }");
+
+        assert!(
+            assignment.jaccard(&loop_over_items).value() < 1.0,
+            "構造が違うペアは完全一致にならない"
+        );
+    }
+
+    #[test]
+    fn test_jaccard_does_not_count_how_many_times_a_token_appears() {
+        // 集合で見るので出現回数は落ちる。Phase 0 の割り切り
+        let once = token_set("invoice;");
+        let three_times = token_set("invoice; invoice; invoice;");
+
+        assert_eq!(once.jaccard(&three_times).value(), 1.0);
     }
 }

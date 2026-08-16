@@ -26,6 +26,21 @@ impl Similarity {
         Some(Self(value))
     }
 
+    /// 全体 `combined` 個のうち `shared` 個が共通しているときの類似度。
+    ///
+    /// `shared` は `combined` の一部なので、比は必ず 0.0-1.0 に収まる。
+    /// [`Similarity::new`] と違って失敗しないのは、**起こりえない `None` の分岐を
+    /// 呼び出し側に開かせない**ため（ありうる失敗だと誤解させる）。
+    ///
+    /// `combined` が 0 のときは 1.0。どちらにも要素が無いなら違いも無い
+    /// （Jaccard 係数の慣習に合わせる）。
+    pub(crate) fn from_shared_count(shared: usize, combined: usize) -> Self {
+        if combined == 0 {
+            return Self(1.0);
+        }
+        Self(shared as f64 / combined as f64)
+    }
+
     /// 類似度そのもの。丸めない値が要るときに使う。
     pub fn value(self) -> f64 {
         self.0
@@ -76,6 +91,21 @@ mod tests {
     #[test]
     fn test_similarity_of_nan_cannot_be_created() {
         assert_eq!(Similarity::new(f64::NAN), None);
+    }
+
+    #[test]
+    fn test_similarity_from_a_part_of_the_whole_is_the_ratio() {
+        let similarity = Similarity::from_shared_count(1, 4);
+
+        assert_eq!(similarity.value(), 0.25);
+    }
+
+    #[test]
+    fn test_similarity_from_nothing_shared_of_nothing_is_one() {
+        // どちらにも要素が無いなら違いも無い（Jaccard 係数の慣習）
+        let similarity = Similarity::from_shared_count(0, 0);
+
+        assert_eq!(similarity.value(), 1.0);
     }
 
     #[test]
