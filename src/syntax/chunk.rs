@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use crate::line_number::LineNumber;
 use crate::location::Location;
 use crate::syntax::line_range::LineRange;
+use crate::syntax::source_character::{is_quote, is_word_part};
 
 /// 比較の単位。関数・メソッド 1 つ分のソースと、それがどこにあったか。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,9 +171,7 @@ fn is_function_header(line: &str) -> bool {
 /// 行頭から続く、識別子として読める部分。
 fn leading_word(trimmed: &str) -> &str {
     let end = trimmed
-        .find(|character: char| {
-            !character.is_alphanumeric() && character != '_' && character != '$'
-        })
+        .find(|character: char| !is_word_part(character))
         .unwrap_or(trimmed.len());
     &trimmed[..end]
 }
@@ -213,7 +212,9 @@ fn find_closing_index(lines: &[&str], start: usize) -> Option<usize> {
                         position += 2;
                         continue;
                     }
-                    ('\'' | '"' | '`', _) => state = ScanState::Text(current),
+                    // マッチガードにしているのは、パターンでは is_quote を呼べないため。
+                    // 上 2 つの 2 文字先読みをパターンのまま残せる位置に置く
+                    (quote, _) if is_quote(quote) => state = ScanState::Text(quote),
                     ('{', _) => {
                         depth += 1;
                         opened = true;
