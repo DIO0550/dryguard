@@ -13,6 +13,7 @@
 
 pub mod cli;
 pub mod location;
+pub mod pipeline;
 pub mod stage1;
 pub mod threshold;
 
