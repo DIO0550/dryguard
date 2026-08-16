@@ -9,8 +9,9 @@
 //! | Stage 2 | 意味情報収集（LSP への問い合わせと結果の正規化） |
 //! | Stage 3 | 分類（シグナルの統合と判定・理由の組み立て） |
 //!
-//! 現在は Phase 0 の骨格として、CLI の受け口と、そこで扱う値の型だけがある。
+//! 現在は Phase 0 の途中で、CLI の受け口と Stage 1 のチャンク化までがある。
 
 pub mod cli;
 pub mod location;
+pub mod stage1;
 pub mod threshold;
