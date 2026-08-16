@@ -12,4 +12,5 @@
 
 pub mod chunk;
 pub mod line_range;
+pub(crate) mod source_character;
 pub mod token;

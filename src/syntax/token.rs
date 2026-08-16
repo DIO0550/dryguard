@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 
 use crate::similarity::Similarity;
+use crate::syntax::source_character::{is_quote, is_word_part, is_word_start};
 
 /// 正規化したトークン。
 ///
@@ -193,16 +194,6 @@ impl TokenSet {
     }
 }
 
-/// 引用符として文字列・テンプレートリテラルを開く文字か。
-fn is_quote(character: char) -> bool {
-    matches!(character, '\'' | '"' | '`')
-}
-
-/// 識別子の 1 文字目になれる文字か。
-fn is_word_start(character: char) -> bool {
-    character.is_alphabetic() || character == '_' || character == '$'
-}
-
 /// 行コメントの次の位置。改行そのものは空白として落ちる。
 fn end_of_line_comment(characters: &[char], start: usize) -> usize {
     characters[start..]
@@ -277,11 +268,9 @@ fn end_of_number(characters: &[char], start: usize) -> usize {
 
 /// 識別子・予約語の次の位置。
 fn end_of_word(characters: &[char], start: usize) -> usize {
-    let is_part = |character: char| character.is_alphanumeric() || matches!(character, '_' | '$');
-
     characters[start..]
         .iter()
-        .position(|&character| !is_part(character))
+        .position(|&character| !is_word_part(character))
         .map_or(characters.len(), |offset| start + offset)
 }
 
