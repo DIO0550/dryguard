@@ -7,7 +7,10 @@
 //! **このツールの主張（構文が似ていることと意味が同じことは別物）が、
 //! そのままモジュールの分かれ目になっている。**
 //!
-//! Phase 0 では、指定位置を含む関数をソースから切り出すところまでがある。
+//! Phase 0 では、指定位置を含む関数を切り出し、正規化トークン集合の
+//! Jaccard 係数で構造類似度を出すところまでがある。
 
 pub mod chunk;
 pub mod line_range;
+pub(crate) mod source_character;
+pub mod token;
