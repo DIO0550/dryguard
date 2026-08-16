@@ -146,4 +146,4 @@ let (path, line) = text.rsplit_once(':')...
 - **lint 抑制を足さない**（`#[allow(..)]` / `#[expect(..)]`）。
   抑制したくなったら**設計のほうを変える**（`dead_code` が出たので lib + bin に分けた、が実例）
 - `unsafe`
-- `stage1` / `stage3` での I/O（ファイル読み込み・プロセス起動）。I/O は `lsp` と入口の層のみ
+- `syntax` / `classification` での I/O（ファイル読み込み・プロセス起動）。I/O は `lsp` と入口の層のみ
