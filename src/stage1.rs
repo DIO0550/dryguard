@@ -5,4 +5,5 @@
 //!
 //! Phase 0 では、指定位置を含む関数をソースから切り出すところまでがある。
 
+pub mod chunk;
 pub mod line_range;
