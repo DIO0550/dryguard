@@ -12,6 +12,7 @@
 //! 現在は Phase 0 の途中で、CLI の受け口と `syntax` のチャンク化までがある。
 
 pub mod cli;
+pub mod line_number;
 pub mod location;
 pub mod pipeline;
 pub mod syntax;
