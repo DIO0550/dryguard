@@ -15,6 +15,7 @@ pub mod cli;
 pub mod line_number;
 pub mod location;
 pub mod pipeline;
+pub mod similarity;
 pub mod syntax;
 pub mod threshold;
 
