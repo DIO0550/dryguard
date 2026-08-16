@@ -24,10 +24,59 @@ pub struct Chunk {
 }
 
 impl Chunk {
+    /// 指定位置を含む関数を、ソースから切り出す。
+    ///
+    /// `location` は切り出したい位置、`source` はそのファイルの中身。
+    /// 入れ子になっている場合は、指定位置を含む**もっとも内側**の関数を返す。
+    ///
+    /// # Errors
+    ///
+    /// 指定行がソースの行数を超えている / 指定行を含む関数が無い /
+    /// 関数の始まりは見つかったが閉じるブレースが無いとき。
+    pub fn find_enclosing(location: &Location, source: &str) -> Result<Self, ChunkingError> {
+        let lines: Vec<&str> = source.lines().collect();
+        let target_line = location.line().get();
+
+        if target_line > lines.len() {
+            return Err(ChunkingError::LineBeyondSource {
+                total_lines: lines.len(),
+            });
+        }
+
+        let target_index = target_line - 1;
+
+        // 上に向かって関数の始まりを探す。最初に当たった始まりの範囲が指定行を含まない
+        // ことがある（内側の関数が指定行より手前で閉じている場合）ので、含むまで遡り続ける。
+        for header_index in (0..=target_index).rev() {
+            if !is_function_header(lines[header_index]) {
+                continue;
+            }
+
+            let Some(closing_index) = find_closing_index(&lines, header_index) else {
+                // 内側が閉じていないなら、それを囲む関数も閉じていない
+                return Err(ChunkingError::UnterminatedFunction {
+                    start: line_number(header_index),
+                });
+            };
+
+            if closing_index < target_index {
+                continue;
+            }
+
+            return Ok(Self::new(
+                location.path().to_path_buf(),
+                LineRange::starting_at(line_number(header_index), closing_index - header_index),
+                lines[header_index..=closing_index].join("\n"),
+            ));
+        }
+
+        Err(ChunkingError::NoEnclosingFunction)
+    }
+
     /// 切り出した結果を組み立てる。
     ///
     /// モジュールの外から呼べないのは、`lines` と `source` が食い違ったチャンクを
-    /// 作れないようにするため。組み立てるのは [`find_enclosing_chunk`] だけで、
+    /// 作れないようにするため。組み立てるのは [`Chunk::find_enclosing`] だけで、
     /// そこでは `source` を `lines` の範囲から切り出している
     /// (rules/coding.md「不正な状態を型で表現できなくする」)。
     fn new(path: PathBuf, lines: LineRange, source: String) -> Self {
@@ -89,55 +138,6 @@ impl Error for ChunkingError {}
 
 /// 行頭に置かれると関数の始まりに見えてしまう制御構文のキーワード。
 const CONTROL_KEYWORDS: [&str; 8] = ["if", "for", "while", "switch", "catch", "do", "try", "else"];
-
-/// 指定位置を含む関数を、ソースから切り出す。
-///
-/// `location` は切り出したい位置、`source` はそのファイルの中身。
-/// 入れ子になっている場合は、指定位置を含む**もっとも内側**の関数を返す。
-///
-/// # Errors
-///
-/// 指定行がソースの行数を超えている / 指定行を含む関数が無い /
-/// 関数の始まりは見つかったが閉じるブレースが無いとき。
-pub fn find_enclosing_chunk(location: &Location, source: &str) -> Result<Chunk, ChunkingError> {
-    let lines: Vec<&str> = source.lines().collect();
-    let target_line = location.line().get();
-
-    if target_line > lines.len() {
-        return Err(ChunkingError::LineBeyondSource {
-            total_lines: lines.len(),
-        });
-    }
-
-    let target_index = target_line - 1;
-
-    // 上に向かって関数の始まりを探す。最初に当たった始まりの範囲が指定行を含まない
-    // ことがある（内側の関数が指定行より手前で閉じている場合）ので、含むまで遡り続ける。
-    for header_index in (0..=target_index).rev() {
-        if !is_function_header(lines[header_index]) {
-            continue;
-        }
-
-        let Some(closing_index) = find_closing_index(&lines, header_index) else {
-            // 内側が閉じていないなら、それを囲む関数も閉じていない
-            return Err(ChunkingError::UnterminatedFunction {
-                start: line_number(header_index),
-            });
-        };
-
-        if closing_index < target_index {
-            continue;
-        }
-
-        return Ok(Chunk::new(
-            location.path().to_path_buf(),
-            LineRange::starting_at(line_number(header_index), closing_index - header_index),
-            lines[header_index..=closing_index].join("\n"),
-        ));
-    }
-
-    Err(ChunkingError::NoEnclosingFunction)
-}
 
 /// 0 始まりの行インデックスを 1 始まりの行番号に直す。
 fn line_number(index: usize) -> NonZeroUsize {
@@ -277,7 +277,7 @@ mod tests {
 
     fn chunk_at(source: &str, location: &str) -> Result<Chunk, ChunkingError> {
         let location: Location = location.parse().expect("テストが渡す位置は解釈できる");
-        find_enclosing_chunk(&location, source)
+        Chunk::find_enclosing(&location, source)
     }
 
     const FUNCTION_AFTER_A_CONSTANT: &str = r#"const rate = 0.1;

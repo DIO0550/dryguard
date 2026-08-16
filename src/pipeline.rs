@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 
 use crate::location::Location;
-use crate::syntax::chunk::{Chunk, ChunkingError, find_enclosing_chunk};
+use crate::syntax::chunk::{Chunk, ChunkingError};
 
 /// 比較する 2 箇所から、それぞれのチャンクを取り出す。
 ///
@@ -33,7 +33,7 @@ fn chunk_at(location: &Location) -> Result<Chunk, ChunkCollectionError> {
         }
     })?;
 
-    find_enclosing_chunk(location, &source).map_err(|cause| ChunkCollectionError::ChunkingFailed {
+    Chunk::find_enclosing(location, &source).map_err(|cause| ChunkCollectionError::ChunkingFailed {
         location: location.clone(),
         cause,
     })
