@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use crate::line_number::LineNumber;
 use crate::location::Location;
 use crate::syntax::line_range::LineRange;
-use crate::syntax::source_character::{is_quote, is_word_part};
+use crate::syntax::source_character::{is_multiline_quote, is_quote, is_word_part};
 
 /// 比較の単位。関数・メソッド 1 つ分のソースと、それがどこにあったか。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,8 +253,8 @@ fn find_closing_index(lines: &[&str], start: usize) -> Option<usize> {
 
         // 行をまたぐ文字列は、テンプレートリテラルと行継続（行末の `\`）の 2 つだけ。
         // それ以外の閉じ忘れをまたがせると、そこから先のブレースを丸ごと読み飛ばす
-        let text_crosses_the_line_end =
-            matches!(state, ScanState::Text('`')) || text_continues_by_backslash;
+        let text_crosses_the_line_end = matches!(state, ScanState::Text(quote) if is_multiline_quote(quote))
+            || text_continues_by_backslash;
         if matches!(state, ScanState::Text(_)) && !text_crosses_the_line_end {
             state = ScanState::Code;
         }
