@@ -30,58 +30,59 @@ pub enum Token {
     Symbol(char),
 }
 
-impl Token {
-    /// ソースを正規化トークンの列にする。空白とコメントは落とす。
-    pub fn collect_from(source: &str) -> Vec<Self> {
-        let characters: Vec<char> = source.chars().collect();
-        let mut tokens = Vec::new();
-        let mut position = 0;
+/// ソースを正規化トークンの列にする。空白とコメントは落とす。
+///
+/// `collect_*` と呼ばないのは、集めているのではなく**ソースを別の表現へ直している**ため
+/// (rules/naming.md「名前と実体を一致させる」の `domain_of` と同じ形)。
+pub fn tokens_of(source: &str) -> Vec<Token> {
+    let characters: Vec<char> = source.chars().collect();
+    let mut tokens = Vec::new();
+    let mut position = 0;
 
-        while position < characters.len() {
-            let current = characters[position];
-            let next = characters.get(position + 1).copied();
+    while position < characters.len() {
+        let current = characters[position];
+        let next = characters.get(position + 1).copied();
 
-            if current.is_whitespace() {
-                position += 1;
-                continue;
-            }
-            if current == '/' && next == Some('/') {
-                position = end_of_line_comment(&characters, position);
-                continue;
-            }
-            if current == '/' && next == Some('*') {
-                position = end_of_block_comment(&characters, position);
-                continue;
-            }
-            if is_quote(current) {
-                position = end_of_text(&characters, position);
-                tokens.push(Self::Text);
-                continue;
-            }
-            if current.is_ascii_digit() {
-                position = end_of_number(&characters, position);
-                tokens.push(Self::Number);
-                continue;
-            }
-            if is_word_start(current) {
-                let end = end_of_word(&characters, position);
-                let word: String = characters[position..end].iter().collect();
-                position = end;
-                tokens.push(Self::from_word(&word));
-                continue;
-            }
-
-            tokens.push(Self::Symbol(current));
+        if current.is_whitespace() {
             position += 1;
+            continue;
+        }
+        if current == '/' && next == Some('/') {
+            position = end_of_line_comment(&characters, position);
+            continue;
+        }
+        if current == '/' && next == Some('*') {
+            position = end_of_block_comment(&characters, position);
+            continue;
+        }
+        if is_quote(current) {
+            position = end_of_text(&characters, position);
+            tokens.push(Token::Text);
+            continue;
+        }
+        if current.is_ascii_digit() {
+            position = end_of_number(&characters, position);
+            tokens.push(Token::Number);
+            continue;
+        }
+        if is_word_start(current) {
+            let end = end_of_word(&characters, position);
+            let word: String = characters[position..end].iter().collect();
+            position = end;
+            tokens.push(token_of_word(&word));
+            continue;
         }
 
-        tokens
+        tokens.push(Token::Symbol(current));
+        position += 1;
     }
 
-    /// 語 1 つ分をトークンにする。予約語でなければ識別子。
-    fn from_word(word: &str) -> Self {
-        Keyword::new(word).map_or(Self::Identifier, Self::Keyword)
-    }
+    tokens
+}
+
+/// 語 1 つ分をトークンにする。予約語でなければ識別子。
+fn token_of_word(word: &str) -> Token {
+    Keyword::new(word).map_or(Token::Identifier, Token::Keyword)
 }
 
 /// TypeScript の予約語。
@@ -176,7 +177,7 @@ impl TokenSet {
     ///
     /// トークンが 1 つも取れなかったときは作れないので `None` を返す。
     pub fn from_source(source: &str) -> Option<Self> {
-        let tokens: HashSet<Token> = Token::collect_from(source).into_iter().collect();
+        let tokens: HashSet<Token> = tokens_of(source).into_iter().collect();
         if tokens.is_empty() {
             return None;
         }
@@ -301,36 +302,33 @@ mod tests {
 
     #[test]
     fn test_tokens_of_an_identifier_drop_its_name() {
-        assert_eq!(Token::collect_from("invoice"), vec![Token::Identifier]);
+        assert_eq!(tokens_of("invoice"), vec![Token::Identifier]);
     }
 
     #[test]
     fn test_tokens_of_sources_that_differ_only_in_names_are_the_same() {
         // 名前の違いで類似度が落ちないようにするのが正規化の目的
         assert_eq!(
-            Token::collect_from("const discounted = invoice.amount;"),
-            Token::collect_from("const shortage = stock.quantity;")
+            tokens_of("const discounted = invoice.amount;"),
+            tokens_of("const shortage = stock.quantity;")
         );
     }
 
     #[test]
     fn test_tokens_of_a_reserved_word_keep_the_word() {
-        assert_eq!(
-            Token::collect_from("return"),
-            vec![Token::Keyword(keyword("return"))]
-        );
+        assert_eq!(tokens_of("return"), vec![Token::Keyword(keyword("return"))]);
     }
 
     #[test]
     fn test_tokens_of_a_number_literal_drop_its_value() {
-        assert_eq!(Token::collect_from("0.1"), vec![Token::Number]);
+        assert_eq!(tokens_of("0.1"), vec![Token::Number]);
     }
 
     #[test]
     fn test_tokens_of_a_property_access_on_a_number_keep_the_property_name() {
         // 数字が続かない `.` まで数値に飲み込むと、メンバーアクセスの構造が消える
         assert_eq!(
-            Token::collect_from("1.0.toFixed(2)"),
+            tokens_of("1.0.toFixed(2)"),
             vec![
                 Token::Number,
                 Token::Symbol('.'),
@@ -345,49 +343,43 @@ mod tests {
     #[test]
     fn test_tokens_of_a_string_literal_drop_its_content() {
         // 中の語をトークンにすると、文字列を書き換えただけで構造が違って見える
-        assert_eq!(Token::collect_from("\"const invoice\""), vec![Token::Text]);
+        assert_eq!(tokens_of("\"const invoice\""), vec![Token::Text]);
     }
 
     #[test]
     fn test_tokens_of_a_string_literal_with_an_escaped_quote_end_at_the_real_quote() {
         assert_eq!(
-            Token::collect_from("\"a\\\"b\" + 1"),
+            tokens_of("\"a\\\"b\" + 1"),
             vec![Token::Text, Token::Symbol('+'), Token::Number]
         );
     }
 
     #[test]
     fn test_tokens_of_a_template_literal_drop_its_content() {
-        assert_eq!(Token::collect_from("`a ${b} c`"), vec![Token::Text]);
+        assert_eq!(tokens_of("`a ${b} c`"), vec![Token::Text]);
     }
 
     #[test]
     fn test_tokens_skip_a_line_comment_but_keep_the_next_line() {
-        assert_eq!(
-            Token::collect_from("// const invoice\n1"),
-            vec![Token::Number]
-        );
+        assert_eq!(tokens_of("// const invoice\n1"), vec![Token::Number]);
     }
 
     #[test]
     fn test_tokens_skip_a_block_comment_but_keep_what_follows() {
-        assert_eq!(
-            Token::collect_from("/* const invoice */ 1"),
-            vec![Token::Number]
-        );
+        assert_eq!(tokens_of("/* const invoice */ 1"), vec![Token::Number]);
     }
 
     #[test]
     fn test_tokens_of_an_operator_are_one_symbol_per_character() {
         assert_eq!(
-            Token::collect_from("==="),
+            tokens_of("==="),
             vec![Token::Symbol('='), Token::Symbol('='), Token::Symbol('=')]
         );
     }
 
     #[test]
     fn test_tokens_of_a_source_with_only_whitespace_and_comments_are_none() {
-        assert_eq!(Token::collect_from("  \n // 何も無い\n"), vec![]);
+        assert_eq!(tokens_of("  \n // 何も無い\n"), vec![]);
     }
 
     #[test]
