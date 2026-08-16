@@ -306,6 +306,13 @@ export function applyDiscount(price: number): number {
 }
 "#;
 
+    const CLOSING_BRACE_IN_A_MULTILINE_TEMPLATE_LITERAL: &str = r#"function render(name: string): string {
+  const template = `
+}`;
+  return name + template;
+}
+"#;
+
     const CLOSING_BRACE_IN_A_CONTINUED_STRING: &str = r#"function render(name: string): string {
   const close = "a\
 }";
@@ -429,6 +436,16 @@ export const rate = 0.1;
         let chunk = chunk_at(CLOSING_BRACE_IN_A_TEMPLATE_LITERAL, "a.ts:3").expect("切り出せる");
 
         assert_eq!(chunk.lines(), range(1, 4));
+    }
+
+    #[test]
+    fn test_chunk_with_a_closing_brace_in_a_multiline_template_literal_does_not_end_at_that_line() {
+        // 行をまたげる引用符はバッククォートだけ。行末で文字列を打ち切ると
+        // 次の行の `}` を本体の終わりと数える
+        let chunk =
+            chunk_at(CLOSING_BRACE_IN_A_MULTILINE_TEMPLATE_LITERAL, "a.ts:4").expect("切り出せる");
+
+        assert_eq!(chunk.lines(), range(1, 5));
     }
 
     #[test]
