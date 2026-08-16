@@ -31,9 +31,6 @@ pub enum Token {
 }
 
 /// ソースを正規化トークンの列にする。空白とコメントは落とす。
-///
-/// `collect_*` と呼ばないのは、集めているのではなく**ソースを別の表現へ直している**ため
-/// (rules/naming.md「名前と実体を一致させる」の `domain_of` と同じ形)。
 pub fn tokens_of(source: &str) -> Vec<Token> {
     let characters: Vec<char> = source.chars().collect();
     let mut tokens = Vec::new();

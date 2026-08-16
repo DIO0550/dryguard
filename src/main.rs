@@ -10,7 +10,7 @@ use clap::Parser;
 
 use dryguard::cli::{Cli, Command, CommonOptions};
 use dryguard::location::Location;
-use dryguard::pipeline::collect_chunks;
+use dryguard::pipeline::chunk_pair_of;
 use dryguard::syntax::chunk::Chunk;
 use dryguard::syntax::token::TokenSet;
 
@@ -37,7 +37,7 @@ fn report_compare(
 ) -> ExitCode {
     report_options(location_a, location_b, options);
 
-    let chunks = collect_chunks(location_a, location_b);
+    let chunks = chunk_pair_of(location_a, location_b);
     let (chunk_a, chunk_b) = match chunks {
         Ok(chunks) => chunks,
         Err(error) => {
