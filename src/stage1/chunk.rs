@@ -202,6 +202,7 @@ fn find_closing_index(lines: &[&str], start: usize) -> Option<usize> {
     for (index, line) in lines.iter().enumerate().skip(start) {
         let characters: Vec<char> = line.chars().collect();
         let mut position = 0;
+        let mut text_continues_by_backslash = false;
 
         while position < characters.len() {
             let current = characters[position];
@@ -237,6 +238,9 @@ fn find_closing_index(lines: &[&str], start: usize) -> Option<usize> {
                 }
                 ScanState::Text(quote) => {
                     if current == '\\' {
+                        // 行末の `\` は行継続で、文字列は次の行へ続く。
+                        // `\\` で終わる行は継続しないので、次の文字の有無で見分ける
+                        text_continues_by_backslash = next.is_none();
                         position += 2;
                         continue;
                     }
@@ -249,9 +253,11 @@ fn find_closing_index(lines: &[&str], start: usize) -> Option<usize> {
             position += 1;
         }
 
-        // 行をまたげるのはテンプレートリテラルとブロックコメントだけ。`'` と `"` の
-        // 閉じ忘れをまたがせると、そこから先のブレースを丸ごと読み飛ばす
-        if matches!(state, ScanState::Text(quote) if quote != '`') {
+        // 行をまたぐ文字列は、テンプレートリテラルと行継続（行末の `\`）の 2 つだけ。
+        // それ以外の閉じ忘れをまたがせると、そこから先のブレースを丸ごと読み飛ばす
+        let text_crosses_the_line_end =
+            matches!(state, ScanState::Text('`')) || text_continues_by_backslash;
+        if matches!(state, ScanState::Text(_)) && !text_crosses_the_line_end {
             state = ScanState::Code;
         }
     }
@@ -292,6 +298,13 @@ export function applyDiscount(price: number): number {
 
     const CLOSING_BRACE_IN_A_STRING: &str = r#"function render(name: string): string {
   const close = "}";
+  return name + close;
+}
+"#;
+
+    const CLOSING_BRACE_IN_A_CONTINUED_STRING: &str = r#"function render(name: string): string {
+  const close = "a\
+}";
   return name + close;
 }
 "#;
@@ -403,6 +416,15 @@ export const rate = 0.1;
         let chunk = chunk_at(CLOSING_BRACE_IN_A_STRING, "a.ts:3").expect("切り出せる");
 
         assert_eq!(chunk.lines(), range(1, 4));
+    }
+
+    #[test]
+    fn test_chunk_with_a_closing_brace_in_a_continued_string_does_not_end_at_that_line() {
+        // 行末の `\` は行継続で、文字列は次の行へ続く。そこで文字列を打ち切ると
+        // 次の行の `}` を本体の終わりと数えてしまう
+        let chunk = chunk_at(CLOSING_BRACE_IN_A_CONTINUED_STRING, "a.ts:4").expect("切り出せる");
+
+        assert_eq!(chunk.lines(), range(1, 5));
     }
 
     #[test]
