@@ -12,6 +12,7 @@ use dryguard::cli::{Cli, Command, CommonOptions};
 use dryguard::location::Location;
 use dryguard::pipeline::collect_chunks;
 use dryguard::syntax::chunk::Chunk;
+use dryguard::syntax::token::TokenSet;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -50,6 +51,9 @@ fn report_compare(
     report_chunk(&chunk_b);
 
     println!();
+    report_structural_similarity(&chunk_a, &chunk_b);
+
+    println!();
     println!("判定は未実装です (Stage 3 が入ってから)。");
 
     ExitCode::SUCCESS
@@ -76,6 +80,23 @@ fn report_options(location_a: &Location, location_b: &Location, options: &Common
         Some(fail_on) => println!("  fail-on: {fail_on:?}"),
         None => println!("  fail-on: なし"),
     }
+}
+
+/// 2 つのチャンクの構造類似度を表示する。
+///
+/// トークンが 1 つも取れなかったときは、値の代わりに取れなかったことを出す。
+/// 0.00 で埋めると、読む側が「似ていない」と「見ていない」を区別できない
+/// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
+fn report_structural_similarity(chunk_a: &Chunk, chunk_b: &Chunk) {
+    let (Some(tokens_a), Some(tokens_b)) = (
+        TokenSet::from_source(chunk_a.source()),
+        TokenSet::from_source(chunk_b.source()),
+    ) else {
+        println!("  構造類似度: 取れません (トークンが 1 つも無い)");
+        return;
+    };
+
+    println!("  構造類似度: {}", tokens_a.jaccard(&tokens_b));
 }
 
 /// 切り出したチャンクを 1 行で表示する。

@@ -8,6 +8,8 @@ use std::path::Path;
 
 use dryguard::location::Location;
 use dryguard::pipeline::{ChunkCollectionError, collect_chunks};
+use dryguard::similarity::Similarity;
+use dryguard::syntax::token::TokenSet;
 
 /// `tests/fixtures/` 配下の位置。
 ///
@@ -27,6 +29,22 @@ fn fixture(relative_path: &str, line: usize) -> Location {
         panic!("テストが組み立てる位置は解釈できる: {text}");
     };
     location
+}
+
+/// 2 箇所を実ファイルから切り出して、構造類似度を出すところまで。
+fn structural_similarity(location_a: &Location, location_b: &Location) -> Similarity {
+    let Ok((chunk_a, chunk_b)) = collect_chunks(location_a, location_b) else {
+        panic!("テストが渡す位置はどちらも関数の中を指している");
+    };
+
+    let (Some(tokens_a), Some(tokens_b)) = (
+        TokenSet::from_source(chunk_a.source()),
+        TokenSet::from_source(chunk_b.source()),
+    ) else {
+        panic!("テストが渡すチャンクにはトークンがある");
+    };
+
+    tokens_a.jaccard(&tokens_b)
 }
 
 #[test]
@@ -88,4 +106,36 @@ fn test_compare_with_a_line_outside_every_function_reports_the_location_that_fai
         panic!("関数の外を指した位置は ChunkingFailed になる");
     };
     assert_eq!(location.path(), Path::new(outside.path()));
+}
+
+#[test]
+fn test_compare_of_two_functions_that_differ_only_in_names_reports_a_high_similarity() {
+    let similarity = structural_similarity(
+        &fixture("billing/discount.ts", 6),
+        &fixture("inventory/reorder.ts", 6),
+    );
+
+    assert!(
+        similarity.value() >= 0.9,
+        "名前と定数だけが違う 2 つの関数は構造がほぼ同じ: {similarity}"
+    );
+}
+
+#[test]
+fn test_compare_of_two_functions_with_different_shapes_reports_a_lower_similarity() {
+    // 対照を 1 件置く。名前を潰した結果すべてが 0.9 を超えるなら、
+    // このシグナルは閾値で分けられず何も言っていない
+    let same_shape = structural_similarity(
+        &fixture("billing/discount.ts", 6),
+        &fixture("inventory/reorder.ts", 6),
+    );
+    let different_shape = structural_similarity(
+        &fixture("billing/discount.ts", 6),
+        &fixture("report/summary.ts", 6),
+    );
+
+    assert!(
+        different_shape.value() < same_shape.value(),
+        "ループと配列を持つ関数のほうが構造が遠い: {different_shape} < {same_shape}"
+    );
 }
