@@ -1,11 +1,11 @@
 //! ステージを呼ぶ順序。
 //!
-//! ファイルの読み込みはここが持つ。`syntax` は I/O を持たないので、その外側で
-//! 読んで渡す（rules/coding.md 禁止事項 / rules/architecture.md「3 ステージのパイプライン」）。
+//! ここが持つのは順序だけで、読み込みは `Location`、切り出しは `Chunk` にある。
+//! `syntax` は I/O を持たないので、読んだ結果を渡す形になる
+//! （rules/coding.md 禁止事項 / rules/architecture.md「3 ステージのパイプライン」）。
 
 use std::error::Error;
 use std::fmt;
-use std::fs;
 use std::io;
 
 use crate::location::Location;
@@ -26,12 +26,13 @@ pub fn collect_chunks(
 
 /// その位置のファイルを読んで、指定行を含む関数を切り出す。
 fn chunk_at(location: &Location) -> Result<Chunk, ChunkCollectionError> {
-    let source = fs::read_to_string(location.path()).map_err(|cause| {
-        ChunkCollectionError::SourceUnreadable {
-            location: location.clone(),
-            cause,
-        }
-    })?;
+    let source =
+        location
+            .read_source()
+            .map_err(|cause| ChunkCollectionError::SourceUnreadable {
+                location: location.clone(),
+                cause,
+            })?;
 
     Chunk::find_enclosing(location, &source).map_err(|cause| ChunkCollectionError::ChunkingFailed {
         location: location.clone(),

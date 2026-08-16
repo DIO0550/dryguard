@@ -2,6 +2,8 @@
 
 use std::error::Error;
 use std::fmt;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -34,6 +36,21 @@ impl Location {
     /// 行番号。
     pub fn line(&self) -> LineNumber {
         self.line
+    }
+
+    /// この位置が指すファイルを丸ごと読む。
+    ///
+    /// 指した行だけでなく全体を返すのは、チャンクの切り出しに前後の行が要るため。
+    ///
+    /// **`syntax` に I/O を持たせないための入口がここ。** 位置が自分の指すファイルを
+    /// 読むところまでを持ち、読んだ結果を受け取る側は純粋なまま保つ
+    /// (rules/coding.md「禁止事項」の `location` の例外)。
+    ///
+    /// # Errors
+    ///
+    /// ファイルが開けない / 読めない / UTF-8 として解釈できないとき。
+    pub fn read_source(&self) -> io::Result<String> {
+        fs::read_to_string(&self.path)
     }
 }
 
@@ -159,6 +176,38 @@ mod tests {
             result,
             Err(LocationParseError::Line(LineNumberParseError::Zero))
         );
+    }
+
+    /// `tests/fixtures/` 配下の位置。
+    ///
+    /// カレントディレクトリではなくマニフェストの位置から組み立てる
+    /// （テストの実行位置に依存させない）。
+    fn fixture(relative_path: &str) -> Location {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(relative_path);
+
+        Location::new(path, line(6))
+    }
+
+    #[test]
+    fn test_location_reads_the_whole_source_of_its_file() {
+        let location = fixture("billing/discount.ts");
+
+        let source = location.read_source().expect("フィクスチャは読める");
+
+        assert!(
+            source.contains("export function applyDiscount("),
+            "指した行だけでなくファイル全体が返る: {source}"
+        );
+    }
+
+    #[test]
+    fn test_location_of_a_missing_file_cannot_read_the_source() {
+        // 同じディレクトリに読めるファイルがあるので、「そもそも読めない環境」では通らない
+        let location = fixture("billing/missing.ts");
+
+        assert!(location.read_source().is_err());
     }
 
     #[test]
