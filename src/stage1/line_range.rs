@@ -26,6 +26,20 @@ impl LineRange {
         Some(Self { start, end })
     }
 
+    /// 開始行と、そこから続く行数で範囲を作る。
+    ///
+    /// `additional_lines` は開始行の**次の行から**数える。0 なら 1 行だけの範囲。
+    ///
+    /// 前後が入れ替わりようがないので、[`LineRange::new`] と違って失敗しない。
+    /// 「開始位置と長さ」の形で範囲が決まる呼び出し側が `Option` を開く必要をなくす
+    /// （起こりえない `None` の分岐は、読む側にありうる失敗だと誤解させる）。
+    pub fn starting_at(start: NonZeroUsize, additional_lines: usize) -> Self {
+        Self {
+            start,
+            end: start.saturating_add(additional_lines),
+        }
+    }
+
     /// 開始行。
     pub fn start(self) -> NonZeroUsize {
         self.start
@@ -72,6 +86,21 @@ mod tests {
     #[test]
     fn test_line_range_with_end_before_start_cannot_be_created() {
         assert_eq!(LineRange::new(line(20), line(10)), None);
+    }
+
+    #[test]
+    fn test_line_range_starting_at_a_line_without_more_lines_ends_at_the_same_line() {
+        let range = LineRange::starting_at(line(7), 0);
+
+        assert_eq!(range.start(), line(7));
+        assert_eq!(range.end(), line(7), "続く行が 0 なら 1 行だけの範囲");
+    }
+
+    #[test]
+    fn test_line_range_starting_at_a_line_counts_the_rest_from_the_next_line() {
+        let range = LineRange::starting_at(line(3), 3);
+
+        assert_eq!(range.end(), line(6));
     }
 
     #[test]
