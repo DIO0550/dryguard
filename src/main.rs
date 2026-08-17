@@ -52,6 +52,7 @@ fn report_compare(
 
     println!();
     report_structural_similarity(&chunk_a, &chunk_b);
+    report_import_overlap(&chunk_a, &chunk_b);
 
     println!();
     println!("判定は未実装です (Stage 3 が入ってから)。");
@@ -97,6 +98,21 @@ fn report_structural_similarity(chunk_a: &Chunk, chunk_b: &Chunk) {
     };
 
     println!("  構造類似度: {}", tokens_a.jaccard(&tokens_b));
+}
+
+/// 2 つのチャンクが属するファイルの、依存先の重なりを表示する。
+///
+/// **どちらか一方でも import が無ければ、値を出さない。** 片側が空なら重なりは
+/// 必ず 0.00 になるが、それは依存先が食い違っている証拠ではなく片側に材料が
+/// 無いだけで、0.00 を出すと読む側が両者を区別できない
+/// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
+fn report_import_overlap(chunk_a: &Chunk, chunk_b: &Chunk) {
+    let (Some(imports_a), Some(imports_b)) = (chunk_a.imports(), chunk_b.imports()) else {
+        println!("  依存モジュールの重なり: 取れません (import が無いファイルがある)");
+        return;
+    };
+
+    println!("  依存モジュールの重なり: {}", imports_a.jaccard(imports_b));
 }
 
 /// 切り出したチャンクを 1 行で表示する。
