@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use crate::line_number::LineNumber;
 use crate::location::Location;
 use crate::syntax::line_range::LineRange;
+use crate::syntax::source_character::{is_multiline_quote, is_quote, is_word_part};
 
 /// 比較の単位。関数・メソッド 1 つ分のソースと、それがどこにあったか。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,9 +171,7 @@ fn is_function_header(line: &str) -> bool {
 /// 行頭から続く、識別子として読める部分。
 fn leading_word(trimmed: &str) -> &str {
     let end = trimmed
-        .find(|character: char| {
-            !character.is_alphanumeric() && character != '_' && character != '$'
-        })
+        .find(|character: char| !is_word_part(character))
         .unwrap_or(trimmed.len());
     &trimmed[..end]
 }
@@ -213,7 +212,9 @@ fn find_closing_index(lines: &[&str], start: usize) -> Option<usize> {
                         position += 2;
                         continue;
                     }
-                    ('\'' | '"' | '`', _) => state = ScanState::Text(current),
+                    // マッチガードにしているのは、パターンでは is_quote を呼べないため。
+                    // 上 2 つの 2 文字先読みをパターンのまま残せる位置に置く
+                    (quote, _) if is_quote(quote) => state = ScanState::Text(quote),
                     ('{', _) => {
                         depth += 1;
                         opened = true;
@@ -252,8 +253,8 @@ fn find_closing_index(lines: &[&str], start: usize) -> Option<usize> {
 
         // 行をまたぐ文字列は、テンプレートリテラルと行継続（行末の `\`）の 2 つだけ。
         // それ以外の閉じ忘れをまたがせると、そこから先のブレースを丸ごと読み飛ばす
-        let text_crosses_the_line_end =
-            matches!(state, ScanState::Text('`')) || text_continues_by_backslash;
+        let text_crosses_the_line_end = matches!(state, ScanState::Text(quote) if is_multiline_quote(quote))
+            || text_continues_by_backslash;
         if matches!(state, ScanState::Text(_)) && !text_crosses_the_line_end {
             state = ScanState::Code;
         }
@@ -296,6 +297,19 @@ export function applyDiscount(price: number): number {
     const CLOSING_BRACE_IN_A_STRING: &str = r#"function render(name: string): string {
   const close = "}";
   return name + close;
+}
+"#;
+
+    const CLOSING_BRACE_IN_A_TEMPLATE_LITERAL: &str = r#"function render(name: string): string {
+  const close = `}`;
+  return name + close;
+}
+"#;
+
+    const CLOSING_BRACE_IN_A_MULTILINE_TEMPLATE_LITERAL: &str = r#"function render(name: string): string {
+  const template = `
+}`;
+  return name + template;
 }
 "#;
 
@@ -413,6 +427,25 @@ export const rate = 0.1;
         let chunk = chunk_at(CLOSING_BRACE_IN_A_STRING, "a.ts:3").expect("切り出せる");
 
         assert_eq!(chunk.lines(), range(1, 4));
+    }
+
+    #[test]
+    fn test_chunk_with_a_closing_brace_in_a_template_literal_does_not_end_at_that_line() {
+        // 引用符はシングル・ダブル・バッククォートの 3 つ。バッククォートが抜けると
+        // テンプレートリテラルの中の `}` を本体の終わりと数える
+        let chunk = chunk_at(CLOSING_BRACE_IN_A_TEMPLATE_LITERAL, "a.ts:3").expect("切り出せる");
+
+        assert_eq!(chunk.lines(), range(1, 4));
+    }
+
+    #[test]
+    fn test_chunk_with_a_closing_brace_in_a_multiline_template_literal_does_not_end_at_that_line() {
+        // 行をまたげる引用符はバッククォートだけ。行末で文字列を打ち切ると
+        // 次の行の `}` を本体の終わりと数える
+        let chunk =
+            chunk_at(CLOSING_BRACE_IN_A_MULTILINE_TEMPLATE_LITERAL, "a.ts:4").expect("切り出せる");
+
+        assert_eq!(chunk.lines(), range(1, 5));
     }
 
     #[test]
