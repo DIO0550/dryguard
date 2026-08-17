@@ -11,6 +11,7 @@
 //! Jaccard 係数で構造類似度を出すところまでがある。
 
 pub mod chunk;
+pub mod import;
 pub mod line_range;
 pub(crate) mod source_character;
 pub mod token;
