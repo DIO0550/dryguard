@@ -47,6 +47,50 @@ fn structural_similarity(location_a: &Location, location_b: &Location) -> Simila
     tokens_a.jaccard(&tokens_b)
 }
 
+/// 2 箇所を実ファイルから切り出して、依存先の重なりを出すところまで。
+///
+/// どちらかに import が無ければ `None`。
+fn import_overlap(location_a: &Location, location_b: &Location) -> Option<Similarity> {
+    let Ok((chunk_a, chunk_b)) = chunk_pair_of(location_a, location_b) else {
+        panic!("テストが渡す位置はどちらも関数の中を指している");
+    };
+
+    let (imports_a, imports_b) = (chunk_a.imports()?, chunk_b.imports()?);
+    Some(imports_a.jaccard(imports_b))
+}
+
+#[test]
+fn test_compare_of_two_functions_in_different_domains_reports_no_shared_dependency() {
+    // 対照として、依存先が一致する組を下のテストに置いてある
+    let overlap = import_overlap(
+        &fixture("billing/discount.ts", 6),
+        &fixture("inventory/reorder.ts", 6),
+    );
+
+    assert_eq!(
+        overlap.map(Similarity::value),
+        Some(0.0),
+        "billing は ./invoice、inventory は ./stock にしか依存していない"
+    );
+}
+
+#[test]
+fn test_compare_of_two_functions_sharing_a_utility_reports_a_total_overlap() {
+    // 綴りの違う相対指定（./pad と ../utils/pad）が同じファイルを指す組。
+    // 指定子を文字列のまま比べると 0.0 になり、共有しているのに
+    // 「依存先ドメインが不一致」と出る
+    let overlap = import_overlap(
+        &fixture("utils/formatDate.ts", 4),
+        &fixture("report/dateHelper.ts", 4),
+    );
+
+    assert_eq!(
+        overlap.map(Similarity::value),
+        Some(1.0),
+        "どちらも tests/fixtures/utils/pad に依存している"
+    );
+}
+
 #[test]
 fn test_compare_of_two_locations_yields_a_chunk_for_each() {
     let (chunk_a, chunk_b) = chunk_pair_of(
