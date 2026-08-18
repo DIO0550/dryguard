@@ -6,12 +6,12 @@
 
 use std::path::Path;
 
+use dryguard::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
 use dryguard::classification::verdict::Verdict;
 use dryguard::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
 use dryguard::location::Location;
 use dryguard::pipeline::{ChunkPairError, chunk_pair_of, signals_of};
 use dryguard::similarity::Similarity;
-use dryguard::syntax::token::TokenSet;
 
 /// `tests/fixtures/` 配下の位置。
 ///
@@ -33,41 +33,35 @@ fn fixture(relative_path: &str, line: usize) -> Location {
     location
 }
 
-/// 2 箇所を実ファイルから切り出して、構造類似度を出すところまで。
-fn structural_similarity(location_a: &Location, location_b: &Location) -> Similarity {
+/// 2 箇所を実ファイルから切り出して、シグナルを測るところまで。
+fn signals(location_a: &Location, location_b: &Location) -> Signals {
     let Ok((chunk_a, chunk_b)) = chunk_pair_of(location_a, location_b) else {
         panic!("テストが渡す位置はどちらも関数の中を指している");
     };
 
-    let (Some(tokens_a), Some(tokens_b)) = (
-        TokenSet::from_source(chunk_a.source()),
-        TokenSet::from_source(chunk_b.source()),
-    ) else {
+    signals_of(&chunk_a, &chunk_b)
+}
+
+/// 測れた構造類似度。
+fn structural_similarity(location_a: &Location, location_b: &Location) -> Similarity {
+    let StructuralSimilarity::Measured(similarity) =
+        signals(location_a, location_b).structural_similarity()
+    else {
         panic!("テストが渡すチャンクにはトークンがある");
     };
 
-    tokens_a.jaccard(&tokens_b)
+    similarity
 }
 
-/// 2 箇所を実ファイルから切り出して、依存先の重なりを出すところまで。
-///
-/// どちらかに import が無ければ `None`。
-fn import_overlap(location_a: &Location, location_b: &Location) -> Option<Similarity> {
-    let Ok((chunk_a, chunk_b)) = chunk_pair_of(location_a, location_b) else {
-        panic!("テストが渡す位置はどちらも関数の中を指している");
-    };
-
-    let (imports_a, imports_b) = (chunk_a.imports()?, chunk_b.imports()?);
-    Some(imports_a.jaccard(imports_b))
+/// 依存先の重なり。測れなかったこと自体を見るテストがあるので、そのまま返す。
+fn import_overlap(location_a: &Location, location_b: &Location) -> ImportOverlap {
+    signals(location_a, location_b).import_overlap()
 }
 
 /// 2 箇所を実ファイルから切り出して、既定の閾値で判定するところまで。
 fn verdict(location_a: &Location, location_b: &Location) -> Verdict {
-    let Ok((chunk_a, chunk_b)) = chunk_pair_of(location_a, location_b) else {
-        panic!("テストが渡す位置はどちらも関数の中を指している");
-    };
+    let signals = signals(location_a, location_b);
 
-    let signals = signals_of(&chunk_a, &chunk_b);
     classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD).verdict()
 }
 
@@ -116,8 +110,8 @@ fn test_compare_of_two_functions_in_different_domains_reports_no_shared_dependen
     );
 
     assert_eq!(
-        overlap.map(Similarity::value),
-        Some(0.0),
+        overlap,
+        ImportOverlap::Measured(Similarity::new(0.0).expect("0.0 は範囲に含む")),
         "billing は ./invoice、inventory は ./stock にしか依存していない"
     );
 }
@@ -133,8 +127,8 @@ fn test_compare_of_two_functions_sharing_a_utility_reports_a_total_overlap() {
     );
 
     assert_eq!(
-        overlap.map(Similarity::value),
-        Some(1.0),
+        overlap,
+        ImportOverlap::Measured(Similarity::new(1.0).expect("1.0 は範囲に含む")),
         "どちらも tests/fixtures/utils/pad に依存している"
     );
 }
