@@ -1,13 +1,15 @@
-//! `compare` が受け取った 2 箇所を、実際のファイルからチャンクにするところまで。
+//! `compare` が受け取った 2 箇所を、実際のファイルから判定まで通すところ。
 //!
 //! ステージをつないだ結果はここで見る（rules/testing.md「ステージをまたぐテストと
-//! 単体のテストを分ける」）。切り出しそのものの振る舞いは `syntax::chunk` の
-//! モジュール内テストにある。
+//! 単体のテストを分ける」）。切り出しそのものの振る舞いは `syntax::chunk`、
+//! 決定木は `classification` のモジュール内テストにある。
 
 use std::path::Path;
 
+use dryguard::classification::verdict::Verdict;
+use dryguard::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
 use dryguard::location::Location;
-use dryguard::pipeline::{ChunkPairError, chunk_pair_of};
+use dryguard::pipeline::{ChunkPairError, chunk_pair_of, signals_of};
 use dryguard::similarity::Similarity;
 use dryguard::syntax::token::TokenSet;
 
@@ -57,6 +59,52 @@ fn import_overlap(location_a: &Location, location_b: &Location) -> Option<Simila
 
     let (imports_a, imports_b) = (chunk_a.imports()?, chunk_b.imports()?);
     Some(imports_a.jaccard(imports_b))
+}
+
+/// 2 箇所を実ファイルから切り出して、既定の閾値で判定するところまで。
+fn verdict(location_a: &Location, location_b: &Location) -> Verdict {
+    let Ok((chunk_a, chunk_b)) = chunk_pair_of(location_a, location_b) else {
+        panic!("テストが渡す位置はどちらも関数の中を指している");
+    };
+
+    let signals = signals_of(&chunk_a, &chunk_b);
+    classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD).verdict()
+}
+
+#[test]
+fn test_compare_of_similar_functions_in_separate_domains_is_do_not_extract() {
+    // Phase 0 の仮説そのもの。構造は似ている（0.94）が、依存先が食い違っていて
+    // ディレクトリも分かれている
+    let verdict = verdict(
+        &fixture("billing/discount.ts", 6),
+        &fixture("inventory/reorder.ts", 6),
+    );
+
+    assert_eq!(verdict, Verdict::DoNotExtract);
+}
+
+#[test]
+fn test_compare_of_similar_functions_sharing_a_utility_is_extract_candidate() {
+    // 同じ tests/fixtures/utils/pad に依存している。ディレクトリは分かれているが、
+    // 依存先を共有しているので偶発的な重複ではない
+    let verdict = verdict(
+        &fixture("utils/formatDate.ts", 4),
+        &fixture("report/dateHelper.ts", 4),
+    );
+
+    assert_eq!(verdict, Verdict::ExtractCandidate);
+}
+
+#[test]
+fn test_compare_of_functions_with_different_shapes_is_review() {
+    // 依存先もディレクトリも上の DO-NOT-EXTRACT の組と同じ条件で、構造だけが
+    // 似ていない（0.59）。似ていないことが DO-NOT-EXTRACT に倒れないことを見る
+    let verdict = verdict(
+        &fixture("billing/discount.ts", 6),
+        &fixture("report/summary.ts", 6),
+    );
+
+    assert_eq!(verdict, Verdict::Review);
 }
 
 #[test]
