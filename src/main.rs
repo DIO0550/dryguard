@@ -1,19 +1,19 @@
 //! `dryguard` のエントリポイント。
 //!
-//! Phase 0 の骨格。引数を解釈して、この実行で使う設定と切り出せたチャンクを
-//! 表示するところまでを担う。判定そのものは Stage 3 が入ってから
-//! (`docs/dryguard-plan.md`「Phase 0: 貫通させる (LSPなし)」)。
+//! Phase 0 の骨格。引数を解釈して、切り出したチャンク・測ったシグナル・
+//! 判定ラベルを表示する。理由と提案まで含めた出力は次
+//! (`docs/dryguard-plan.md`「CLI仕様 (案)」の出力イメージ)。
 
 use std::process::ExitCode;
 
 use clap::Parser;
 
+use dryguard::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
+use dryguard::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
 use dryguard::cli::{Cli, Command, CommonOptions};
 use dryguard::location::Location;
-use dryguard::pipeline::chunk_pair_of;
+use dryguard::pipeline::{chunk_pair_of, signals_of};
 use dryguard::syntax::chunk::Chunk;
-use dryguard::syntax::module_distance::ModuleDistance;
-use dryguard::syntax::token::TokenSet;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -51,13 +51,17 @@ fn report_compare(
     report_chunk(&chunk_a);
     report_chunk(&chunk_b);
 
+    let signals = signals_of(&chunk_a, &chunk_b);
     println!();
-    report_structural_similarity(&chunk_a, &chunk_b);
-    report_import_overlap(&chunk_a, &chunk_b);
-    report_module_distance(&chunk_a, &chunk_b);
+    report_signals(&signals);
+
+    let threshold = options
+        .threshold
+        .unwrap_or(DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+    let classification = classification_of(&signals, threshold);
 
     println!();
-    println!("判定は未実装です (Stage 3 が入ってから)。");
+    println!("判定: {}", classification.verdict());
 
     ExitCode::SUCCESS
 }
@@ -72,9 +76,11 @@ fn report_options(location_a: &Location, location_b: &Location, options: &Common
     println!("  lang: {:?}", options.lang);
     println!("  format: {:?}", options.format);
 
+    // 既定値のときも数値を出す。「既定値」とだけ書くと、指定が無かったことは
+    // 分かっても、この実行がどの値で判定したのかが読めない
     match options.threshold {
         Some(threshold) => println!("  threshold: {threshold}"),
-        None => println!("  threshold: 既定値"),
+        None => println!("  threshold: {DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD} (既定値)"),
     }
 
     println!("  explain: {}", options.explain);
@@ -85,47 +91,33 @@ fn report_options(location_a: &Location, location_b: &Location, options: &Common
     }
 }
 
-/// 2 つのチャンクの構造類似度を表示する。
+/// 判定の材料として測ったシグナルを表示する。
 ///
-/// トークンが 1 つも取れなかったときは、値の代わりに取れなかったことを出す。
-/// 0.00 で埋めると、読む側が「似ていない」と「見ていない」を区別できない
+/// 測れなかったシグナルは、値の代わりに測れなかったことを出す。0.00 で埋めると、
+/// 読む側が「そういう値だった」と「見ていない」を区別できない
 /// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
-fn report_structural_similarity(chunk_a: &Chunk, chunk_b: &Chunk) {
-    let (Some(tokens_a), Some(tokens_b)) = (
-        TokenSet::from_source(chunk_a.source()),
-        TokenSet::from_source(chunk_b.source()),
-    ) else {
-        println!("  構造類似度: 取れません (トークンが 1 つも無い)");
-        return;
-    };
-
-    println!("  構造類似度: {}", tokens_a.jaccard(&tokens_b));
-}
-
-/// 2 つのチャンクが属するファイルの、依存先の重なりを表示する。
 ///
-/// **どちらか一方でも import が無ければ、値を出さない。** 片側が空なら重なりは
-/// 必ず 0.00 になるが、それは依存先が食い違っている証拠ではなく片側に材料が
-/// 無いだけで、0.00 を出すと読む側が両者を区別できない
-/// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
-fn report_import_overlap(chunk_a: &Chunk, chunk_b: &Chunk) {
-    let (Some(imports_a), Some(imports_b)) = (chunk_a.imports(), chunk_b.imports()) else {
-        println!("  依存モジュールの重なり: 取れません (import が無いファイルがある)");
-        return;
-    };
-
-    println!("  依存モジュールの重なり: {}", imports_a.jaccard(imports_b));
-}
-
-/// 2 つのチャンクを隔てているディレクトリの段数を表示する。
-///
-/// 「近い / 遠い」ではなく段数をそのまま出す。何段を遠いとみなすかは判定なので、
-/// classification が入るまでここでは言わない
+/// モジュール距離は「近い / 遠い」ではなく段数をそのまま出す。何段を遠いと
+/// みなすかは判定なので、ここでは言わない
 /// (rules/architecture.md「判定は 1 箇所にだけ置く」)。
-fn report_module_distance(chunk_a: &Chunk, chunk_b: &Chunk) {
-    let distance = ModuleDistance::between(chunk_a.path(), chunk_b.path());
+fn report_signals(signals: &Signals) {
+    match signals.structural_similarity() {
+        StructuralSimilarity::Measured(similarity) => {
+            println!("  構造類似度: {similarity}")
+        }
+        StructuralSimilarity::NoTokens => {
+            println!("  構造類似度: 取れません (トークンが 1 つも無い)")
+        }
+    }
 
-    println!("  モジュール距離: {} 段", distance.steps());
+    match signals.import_overlap() {
+        ImportOverlap::Measured(overlap) => println!("  依存モジュールの重なり: {overlap}"),
+        ImportOverlap::NoImports => {
+            println!("  依存モジュールの重なり: 取れません (import が無いファイルがある)")
+        }
+    }
+
+    println!("  モジュール距離: {} 段", signals.module_distance().steps());
 }
 
 /// 切り出したチャンクを 1 行で表示する。
