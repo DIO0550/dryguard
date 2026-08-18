@@ -13,15 +13,20 @@ use std::path::{Path, PathBuf};
 
 use crate::line_number::LineNumber;
 use crate::location::Location;
+use crate::syntax::import::ImportSet;
 use crate::syntax::line_range::LineRange;
 use crate::syntax::source_character::{is_multiline_quote, is_quote, is_word_part};
 
 /// 比較の単位。関数・メソッド 1 つ分のソースと、それがどこにあったか。
+///
+/// 依存先の集合だけはチャンクの範囲ではなく**ファイル全体**から採る。
+/// import は関数の外に書かれるので、範囲を関数に合わせると必ず空になる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     path: PathBuf,
     lines: LineRange,
     source: String,
+    imports: Option<ImportSet>,
 }
 
 impl Chunk {
@@ -70,6 +75,7 @@ impl Chunk {
                     closing_index - header_index,
                 ),
                 lines[header_index..=closing_index].join("\n"),
+                ImportSet::from_source(source, location.path()),
             ));
         }
 
@@ -82,11 +88,12 @@ impl Chunk {
     /// 作れないようにするため。組み立てるのは [`Chunk::find_enclosing`] だけで、
     /// そこでは `source` を `lines` の範囲から切り出している
     /// (rules/coding.md「不正な状態を型で表現できなくする」)。
-    fn new(path: PathBuf, lines: LineRange, source: String) -> Self {
+    fn new(path: PathBuf, lines: LineRange, source: String, imports: Option<ImportSet>) -> Self {
         Self {
             path,
             lines,
             source,
+            imports,
         }
     }
 
@@ -103,6 +110,15 @@ impl Chunk {
     /// 切り出したソース。行の区切りは改行 1 文字。
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// このチャンクがあるファイルの、依存先の集合。
+    ///
+    /// import が 1 つも無いファイルでは `None`。空の集合を返さないのは、
+    /// 後段が「依存先が食い違っている」と「材料が無い」を区別できるようにするため
+    /// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
+    pub fn imports(&self) -> Option<&ImportSet> {
+        self.imports.as_ref()
     }
 }
 

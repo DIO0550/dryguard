@@ -12,6 +12,7 @@ use dryguard::cli::{Cli, Command, CommonOptions};
 use dryguard::location::Location;
 use dryguard::pipeline::chunk_pair_of;
 use dryguard::syntax::chunk::Chunk;
+use dryguard::syntax::module_distance::ModuleDistance;
 use dryguard::syntax::token::TokenSet;
 
 fn main() -> ExitCode {
@@ -52,6 +53,8 @@ fn report_compare(
 
     println!();
     report_structural_similarity(&chunk_a, &chunk_b);
+    report_import_overlap(&chunk_a, &chunk_b);
+    report_module_distance(&chunk_a, &chunk_b);
 
     println!();
     println!("判定は未実装です (Stage 3 が入ってから)。");
@@ -97,6 +100,32 @@ fn report_structural_similarity(chunk_a: &Chunk, chunk_b: &Chunk) {
     };
 
     println!("  構造類似度: {}", tokens_a.jaccard(&tokens_b));
+}
+
+/// 2 つのチャンクが属するファイルの、依存先の重なりを表示する。
+///
+/// **どちらか一方でも import が無ければ、値を出さない。** 片側が空なら重なりは
+/// 必ず 0.00 になるが、それは依存先が食い違っている証拠ではなく片側に材料が
+/// 無いだけで、0.00 を出すと読む側が両者を区別できない
+/// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
+fn report_import_overlap(chunk_a: &Chunk, chunk_b: &Chunk) {
+    let (Some(imports_a), Some(imports_b)) = (chunk_a.imports(), chunk_b.imports()) else {
+        println!("  依存モジュールの重なり: 取れません (import が無いファイルがある)");
+        return;
+    };
+
+    println!("  依存モジュールの重なり: {}", imports_a.jaccard(imports_b));
+}
+
+/// 2 つのチャンクを隔てているディレクトリの段数を表示する。
+///
+/// 「近い / 遠い」ではなく段数をそのまま出す。何段を遠いとみなすかは判定なので、
+/// classification が入るまでここでは言わない
+/// (rules/architecture.md「判定は 1 箇所にだけ置く」)。
+fn report_module_distance(chunk_a: &Chunk, chunk_b: &Chunk) {
+    let distance = ModuleDistance::between(chunk_a.path(), chunk_b.path());
+
+    println!("  モジュール距離: {} 段", distance.steps());
 }
 
 /// 切り出したチャンクを 1 行で表示する。

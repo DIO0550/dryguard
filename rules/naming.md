@@ -60,8 +60,17 @@ if structurally_similar && domains_differ { ... }
 | `signal` | 判定の材料。構造類似度・型シグネチャ・呼び出し先 / 呼び出し元・モジュール距離 |
 | `verdict` | 判定の結果（`EXTRACT-CANDIDATE` / `DO-NOT-EXTRACT` / `REVIEW`） |
 | `domain` | ドメイン。ディレクトリ構造からの推定と `dryguard.toml` の宣言で決まる |
+| `import` | 依存の宣言。ソースに書かれた `import` / `export ... from` そのもの |
+| `specifier` | `from` の後ろに書かれた文字列（`"./pad"`）。**解決前** |
+| `module path` | 指定子を importer の位置から解決した依存先（`src/utils/pad`）。**解決後** |
+| `module distance` | 2 つのファイルを隔てているディレクトリの段数 |
 
 `snippet` / `fragment` / `candidate`（chunk の意味で）/ `label`（verdict の意味で）は使わない。
+
+**`specifier` と `module path` を混ぜない。** どちらも文字列だが、解決前は
+書いた人の位置に依存し、解決後は依存しない。同じ依存先が別の綴りで書かれるので、
+**解決前のまま比べると共有している依存を「別物」と数える**（`ModulePath` を
+newtype にしているのはこのため）。
 
 **語を増やすときは、既にある語で言えないかを先に確かめる。**
 新しい語を足したら、この表にも足す。
