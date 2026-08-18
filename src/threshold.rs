@@ -24,6 +24,22 @@ impl Threshold {
         Some(Self(value))
     }
 
+    /// コード中の定数から閾値を作る。
+    ///
+    /// [`Threshold::new`] と違って `Option` を返さない。判定の既定値のように
+    /// **書いた値がその場に見えている**ときは、呼び出し側に「作れなかった」の
+    /// 分岐を開かせても埋めようがない（`const` の初期化では扱えない）。
+    ///
+    /// # Panics
+    ///
+    /// `value` が 0.0-1.0 の範囲外・NaN のとき。`const` の文脈で評価されるので、
+    /// 範囲外の定数はコンパイルが通らない形で落ちる。
+    pub const fn from_literal(value: f64) -> Self {
+        assert!(value >= 0.0, "閾値は 0.0 以上");
+        assert!(value <= 1.0, "閾値は 1.0 以下");
+        Self(value)
+    }
+
     /// 閾値そのもの。
     pub fn value(self) -> f64 {
         self.0
@@ -108,6 +124,14 @@ mod tests {
     fn test_threshold_of_nan_cannot_be_created() {
         // NaN はどの比較でも false になるので、範囲の比較だけでは通り抜ける
         assert_eq!(Threshold::new(f64::NAN), None);
+    }
+
+    #[test]
+    fn test_threshold_from_a_literal_keeps_the_value() {
+        // 範囲外は const の評価で落ちるので、ここで確かめられるのは範囲内だけ
+        const THRESHOLD: Threshold = Threshold::from_literal(0.85);
+
+        assert_eq!(THRESHOLD.value(), 0.85);
     }
 
     #[test]
