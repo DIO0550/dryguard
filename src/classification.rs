@@ -6,4 +6,5 @@
 //! I/O も LSP の呼び出しも持たない。意味情報はシグナルとして受け取るので、
 //! LSP が使えない環境でも判定できる（`rules/architecture.md`「依存方向のルール」）。
 
+pub mod signal;
 pub mod verdict;
