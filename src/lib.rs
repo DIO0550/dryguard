@@ -11,6 +11,7 @@
 //!
 //! 現在は Phase 0 の途中で、CLI の受け口と `syntax` のチャンク化・構造類似度までがある。
 
+pub mod classification;
 pub mod cli;
 pub mod line_number;
 pub mod location;
