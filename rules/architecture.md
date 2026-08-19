@@ -7,8 +7,8 @@
 
 ```
 cli → pipeline → classification(分類) → semantics(意味情報収集) → syntax(候補抽出)
-                                              ↓
-                                             lsp(外部プロセスとの境界)
+        ↓                                       ↓
+       report(text 化)                         lsp(外部プロセスとの境界)
 ```
 
 | モジュール | 責務 | 持たないもの | 計画での呼び名 |
@@ -18,6 +18,7 @@ cli → pipeline → classification(分類) → semantics(意味情報収集) �
 | `syntax` | チャンク化・AST 正規化・類似度・import 収集 | 判定 | Stage 1 |
 | `semantics` | LSP への問い合わせと応答の正規化 | 判定 | Stage 2 |
 | `classification` | シグナルの統合と判定・理由の組み立て | I/O・LSP の呼び出し | Stage 3 |
+| `report` | 判定と根拠を人が読む text にする | 判定・シグナルの再計算 | — |
 | `lsp` | 子プロセスの起動と JSON-RPC | 複数ステージにまたがる手順 | — |
 
 **モジュールは段の番号ではなく責務で呼ぶ。** `stage1` は「パイプラインのどこにいるか」しか

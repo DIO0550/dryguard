@@ -10,14 +10,15 @@
 //! | `classification` | 分類（シグナルの統合と判定・理由の組み立て） | Stage 3 |
 //!
 //! 現在は Phase 0 の途中。CLI の受け口、`syntax` のチャンク化・構造類似度・import 収集、
-//! `classification` のハードコードした閾値による 3 ラベルの判定までがある。
-//! `semantics` と `lsp` はまだ無い。
+//! `classification` のハードコードした閾値による 3 ラベルの判定、`report` の理由付き
+//! text 出力までがある。`semantics` と `lsp` はまだ無い。
 
 pub mod classification;
 pub mod cli;
 pub mod line_number;
 pub mod location;
 pub mod pipeline;
+pub mod report;
 pub mod similarity;
 pub mod syntax;
 pub mod threshold;
