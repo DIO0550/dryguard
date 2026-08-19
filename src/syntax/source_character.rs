@@ -12,14 +12,6 @@ pub(crate) fn is_quote(character: char) -> bool {
     matches!(character, '\'' | '"' | '`')
 }
 
-/// その引用符で開いた文字列が、改行をそのまま含められるか。
-///
-/// テンプレートリテラルだけが行をまたげる。シングル・ダブルクォートの文字列は
-/// 行末で閉じ忘れても次の行へは続かない（続けると、そこから先のブレースを丸ごと読み飛ばす）。
-pub(crate) fn is_multiline_quote(character: char) -> bool {
-    character == '`'
-}
-
 /// 識別子の 1 文字目になれる文字か。
 pub(crate) fn is_word_start(character: char) -> bool {
     character.is_alphabetic() || matches!(character, '_' | '$')

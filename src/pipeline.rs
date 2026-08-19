@@ -13,6 +13,7 @@ use crate::location::Location;
 use crate::syntax::chunk::{Chunk, ChunkingError};
 use crate::syntax::module_distance::ModuleDistance;
 use crate::syntax::token::TokenSet;
+use crate::syntax::tree::{ParseError, SyntaxTree};
 
 /// 比較する 2 箇所から、チャンクの組を取り出す。
 ///
@@ -28,6 +29,9 @@ pub fn chunk_pair_of(
 }
 
 /// その位置のファイルを読んで、指定行を含む関数を切り出す。
+///
+/// パースはファイルにつき 1 回にする。チャンクの範囲も import の集合も同じ木から
+/// 採るので、ソースを渡す形のままだと 1 箇所につき 2 回パースすることになる。
 fn chunk_at(location: &Location) -> Result<Chunk, ChunkPairError> {
     let source = location
         .read_source()
@@ -36,7 +40,13 @@ fn chunk_at(location: &Location) -> Result<Chunk, ChunkPairError> {
             cause,
         })?;
 
-    Chunk::find_enclosing(location, &source).map_err(|cause| ChunkPairError::ChunkingFailed {
+    let tree =
+        SyntaxTree::from_typescript(&source).map_err(|cause| ChunkPairError::SourceUnparsable {
+            location: location.clone(),
+            cause,
+        })?;
+
+    Chunk::find_enclosing(location, &tree).map_err(|cause| ChunkPairError::ChunkingFailed {
         location: location.clone(),
         cause,
     })
@@ -87,7 +97,12 @@ pub enum ChunkPairError {
         location: Location,
         cause: io::Error,
     },
-    /// ファイルは読めたが、チャンクを切り出せなかった。
+    /// ファイルは読めたが、構文木にできなかった。
+    SourceUnparsable {
+        location: Location,
+        cause: ParseError,
+    },
+    /// 構文木にはできたが、チャンクを切り出せなかった。
     ChunkingFailed {
         location: Location,
         cause: ChunkingError,
@@ -100,6 +115,9 @@ impl fmt::Display for ChunkPairError {
             Self::SourceUnreadable { location, cause } => {
                 write!(formatter, "{location} のファイルを読めません: {cause}")
             }
+            Self::SourceUnparsable { location, cause } => {
+                write!(formatter, "{location} のファイルを読み解けません: {cause}")
+            }
             Self::ChunkingFailed { location, cause } => {
                 write!(formatter, "{location} から切り出せません: {cause}")
             }
@@ -111,6 +129,7 @@ impl Error for ChunkPairError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::SourceUnreadable { cause, .. } => Some(cause),
+            Self::SourceUnparsable { cause, .. } => Some(cause),
             Self::ChunkingFailed { cause, .. } => Some(cause),
         }
     }
@@ -130,13 +149,14 @@ mod tests {
 
     /// ファイルを読まずにチャンクを作る。
     ///
-    /// `Chunk::find_enclosing` はソースを引数で受けるので、実ファイルが要るのは
+    /// `Chunk::find_enclosing` は構文木を引数で受けるので、実ファイルが要るのは
     /// 読み込みまで。ここで見たいのは読み込みの後ろにあるシグナルの測り方なので、
     /// パスは位置の材料としてだけ渡す。
     fn chunk_of(path: &str, number: usize, source: &str) -> Chunk {
         let location = Location::new(PathBuf::from(path), line(number));
+        let tree = SyntaxTree::from_typescript(source).expect("テストが渡すソースは木にできる");
 
-        Chunk::find_enclosing(&location, source).expect("テストが渡す位置は関数の中を指している")
+        Chunk::find_enclosing(&location, &tree).expect("テストが渡す位置は関数の中を指している")
     }
 
     const WITH_IMPORT: &str = "import { pad } from \"./pad\";\n\

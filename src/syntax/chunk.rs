@@ -1,7 +1,8 @@
 //! 比較の単位（チャンク）と、ソースからの切り出し。
 //!
-//! Phase 0 の素朴実装。tree-sitter は使わず、関数の始まりに見える行とブレースの対応で
-//! 範囲を決める（`docs/dryguard-plan.md`「Phase 0: 貫通させる (LSPなし)」）。
+//! 範囲は tree-sitter の構文木から採る（`docs/dryguard-plan.md`「Stage 1: 候補抽出」）。
+//! **どのノードがチャンクかという語彙をここが持つ**。木を歩く手順そのものは
+//! `syntax::tree` にある。
 //!
 //! 切り出しを `extract_*` と呼ばないのは、このツールの語彙では `extract` が
 //! `EXTRACT-CANDIDATE`（共通化してよい）の意味で埋まっているため
@@ -11,11 +12,13 @@ use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use tree_sitter::Node;
+
 use crate::line_number::LineNumber;
 use crate::location::Location;
 use crate::syntax::import::ImportSet;
 use crate::syntax::line_range::LineRange;
-use crate::syntax::source_character::{is_multiline_quote, is_quote, is_word_part};
+use crate::syntax::tree::SyntaxTree;
 
 /// 比較の単位。関数・メソッド 1 つ分のソースと、それがどこにあったか。
 ///
@@ -30,56 +33,42 @@ pub struct Chunk {
 }
 
 impl Chunk {
-    /// 指定位置を含む関数を、ソースから切り出す。
+    /// 指定位置を含む関数を、構文木から切り出す。
     ///
-    /// `location` は切り出したい位置、`source` はそのファイルの中身。
+    /// `location` は切り出したい位置、`tree` はそのファイルの構文木。
     /// 入れ子になっている場合は、指定位置を含む**もっとも内側**の関数を返す。
     ///
     /// # Errors
     ///
     /// 指定行がソースの行数を超えている / 指定行を含む関数が無い /
-    /// 関数の始まりは見つかったが閉じるブレースが無いとき。
-    pub fn find_enclosing(location: &Location, source: &str) -> Result<Self, ChunkingError> {
-        let lines: Vec<&str> = source.lines().collect();
+    /// 指定行を含む関数に構文エラーがあるとき。
+    pub fn find_enclosing(
+        location: &Location,
+        tree: &SyntaxTree<'_>,
+    ) -> Result<Self, ChunkingError> {
+        let total_lines = tree.source().lines().count();
+        if location.line().get() > total_lines {
+            return Err(ChunkingError::LineBeyondSource { total_lines });
+        }
 
-        if location.line().get() > lines.len() {
-            return Err(ChunkingError::LineBeyondSource {
-                total_lines: lines.len(),
+        let enclosing = innermost_chunk_node(tree, location.line())
+            .ok_or(ChunkingError::NoEnclosingFunction)?;
+        let lines = line_range_of(enclosing);
+
+        // 木全体ではなくこのノードの部分木だけを見る。関係のない場所の構文エラーで
+        // 切り出しを止めると、壊れている 1 関数がファイル全体を巻き込む
+        if enclosing.has_error() {
+            return Err(ChunkingError::UnparsableFunction {
+                start: lines.start(),
             });
         }
 
-        let target_index = location.line().to_index();
-
-        // 上に向かって関数の始まりを探す。最初に当たった始まりの範囲が指定行を含まない
-        // ことがある（内側の関数が指定行より手前で閉じている場合）ので、含むまで遡り続ける。
-        for header_index in (0..=target_index).rev() {
-            if !is_function_header(lines[header_index]) {
-                continue;
-            }
-
-            let Some(closing_index) = find_closing_index(&lines, header_index) else {
-                // 内側が閉じていないなら、それを囲む関数も閉じていない
-                return Err(ChunkingError::UnterminatedFunction {
-                    start: LineNumber::from_index(header_index),
-                });
-            };
-
-            if closing_index < target_index {
-                continue;
-            }
-
-            return Ok(Self::new(
-                location.path().to_path_buf(),
-                LineRange::starting_at(
-                    LineNumber::from_index(header_index),
-                    closing_index - header_index,
-                ),
-                lines[header_index..=closing_index].join("\n"),
-                ImportSet::from_source(source, location.path()),
-            ));
-        }
-
-        Err(ChunkingError::NoEnclosingFunction)
+        Ok(Self::new(
+            location.path().to_path_buf(),
+            lines,
+            source_of_lines(tree.source(), lines),
+            ImportSet::from_source(tree.source(), location.path()),
+        ))
     }
 
     /// 切り出した結果を組み立てる。
@@ -133,8 +122,11 @@ pub enum ChunkingError {
     LineBeyondSource { total_lines: usize },
     /// 指定行を含む関数が見つからない。
     NoEnclosingFunction,
-    /// 関数の始まりは見つかったが、閉じるブレースが無い。保持しているのは始まりの行。
-    UnterminatedFunction { start: LineNumber },
+    /// 指定行を含む関数に構文エラーがある。保持しているのは始まりの行。
+    ///
+    /// 「閉じるブレースが無い」に限らないのは、構文木から見えるのが
+    /// **その関数が構文として壊れていること**までのため。閉じ忘れはその一例。
+    UnparsableFunction { start: LineNumber },
 }
 
 impl fmt::Display for ChunkingError {
@@ -146,8 +138,11 @@ impl fmt::Display for ChunkingError {
             Self::NoEnclosingFunction => {
                 write!(formatter, "指定行を含む関数が見つかりません")
             }
-            Self::UnterminatedFunction { start } => {
-                write!(formatter, "{start} 行目から始まる関数が閉じていません")
+            Self::UnparsableFunction { start } => {
+                write!(
+                    formatter,
+                    "{start} 行目から始まる関数に構文エラーがあります"
+                )
             }
         }
     }
@@ -155,128 +150,64 @@ impl fmt::Display for ChunkingError {
 
 impl Error for ChunkingError {}
 
-/// 行頭に置かれると関数の始まりに見えてしまう制御構文のキーワード。
-const CONTROL_KEYWORDS: [&str; 8] = ["if", "for", "while", "switch", "catch", "do", "try", "else"];
-
-/// その行が関数・メソッドの始まりに見えるか。
+/// チャンクとして拾うノードの種別。
 ///
-/// `{` で終わり、丸カッコの対を持ち、制御構文で始まらない行を関数の始まりとみなす。
-/// `class Foo {` はカッコが無いので外れ、`if (x) {` は行頭の語で外れる。
+/// 「関数・メソッド 1 つ分」を tree-sitter の語彙に写したもの
+/// (rules/naming.md「このツールの語彙を固定する」の `chunk`)。
+/// クラスのメソッドとオブジェクトのメソッドは、grammar が同じ `method_definition` で表す。
 ///
-/// 複数行にまたがるシグネチャ（`): void {` だけの行）は拾えない。ここを詰めるより
-/// tree-sitter へ移すほうが確実なので、Phase 0 では切り出せなかったこととして扱う。
-fn is_function_header(line: &str) -> bool {
-    let trimmed = line.trim();
+/// `class_declaration` を入れないのは、比較の単位が関数だから。impl ブロックは
+/// Phase 4 の Rust 対応で grammar ごと足す。
+const CHUNK_KINDS: [&str; 6] = [
+    "function_declaration",
+    "generator_function_declaration",
+    "function_expression",
+    "generator_function",
+    "arrow_function",
+    "method_definition",
+];
 
-    // `} else if (x) {` のように、閉じてから続く行を関数の始まりと取らない
-    if trimmed.starts_with('}') || !trimmed.ends_with('{') {
-        return false;
-    }
-
-    let has_parameter_list = match (trimmed.find('('), trimmed.rfind(')')) {
-        (Some(open), Some(close)) => open < close,
-        _ => false,
-    };
-    if !has_parameter_list {
-        return false;
-    }
-
-    !CONTROL_KEYWORDS.contains(&leading_word(trimmed))
+/// 指定行を含むチャンクノードのうち、もっとも内側のもの。1 つも無ければ `None`。
+///
+/// 内側かどうかはバイト範囲の短さで決める。入れ子になったノードは必ず外側の範囲に
+/// 収まるので、短いほうが内側になる。
+fn innermost_chunk_node<'tree>(
+    tree: &'tree SyntaxTree<'_>,
+    line: LineNumber,
+) -> Option<Node<'tree>> {
+    tree.named_descendants()
+        .into_iter()
+        .filter(|node| CHUNK_KINDS.contains(&node.kind()))
+        .filter(|node| line_range_of(*node).contains(line))
+        .min_by_key(|node| node.byte_range().len())
 }
 
-/// 行頭から続く、識別子として読める部分。
-fn leading_word(trimmed: &str) -> &str {
-    let end = trimmed
-        .find(|character: char| !is_word_part(character))
-        .unwrap_or(trimmed.len());
-    &trimmed[..end]
+/// そのノードが覆っている行範囲。
+fn line_range_of(node: Node<'_>) -> LineRange {
+    let start_index = node.start_position().row;
+    let end_index = node.end_position().row;
+
+    LineRange::starting_at(
+        LineNumber::from_index(start_index),
+        end_index.saturating_sub(start_index),
+    )
 }
 
-/// 走査中に今どこにいるか。ブレースを数えてよいのは [`ScanState::Code`] のときだけ。
-#[derive(Debug, Clone, Copy)]
-enum ScanState {
-    Code,
-    BlockComment,
-    /// 文字列・テンプレートリテラルの中。保持しているのは閉じる引用符。
-    Text(char),
-}
-
-/// `start` の行から始まる本体が閉じる行のインデックス。閉じないまま末尾に達したら `None`。
+/// その行範囲のソース。行の区切りは改行 1 文字。
 ///
-/// 文字列リテラルとコメントの中は数えない。`const close = "}";` の 1 行で深さがずれると、
-/// 範囲が**黙って**別の場所で切れる。切り出せなかったことは構造に出せるが、
-/// 間違った範囲で成功したことは後段からも読者からも見えない。
-fn find_closing_index(lines: &[&str], start: usize) -> Option<usize> {
-    let mut state = ScanState::Code;
-    let mut depth: usize = 0;
-    let mut opened = false;
+/// ノードが覆っているテキストではなく**行ごと**採る。ノードは行の途中から始まることが
+/// あり（`export function f() {}` の `function` は `export ` の後ろ）、そこだけを持つと
+/// `lines` が指す範囲と `source` の中身がずれる。
+fn source_of_lines(source: &str, lines: LineRange) -> String {
+    let start_index = lines.start().to_index();
+    let line_count = lines.end().to_index() - start_index + 1;
 
-    for (index, line) in lines.iter().enumerate().skip(start) {
-        let characters: Vec<char> = line.chars().collect();
-        let mut position = 0;
-        let mut text_continues_by_backslash = false;
-
-        while position < characters.len() {
-            let current = characters[position];
-            let next = characters.get(position + 1).copied();
-
-            match state {
-                ScanState::Code => match (current, next) {
-                    ('/', Some('/')) => break,
-                    ('/', Some('*')) => {
-                        state = ScanState::BlockComment;
-                        position += 2;
-                        continue;
-                    }
-                    // マッチガードにしているのは、パターンでは is_quote を呼べないため。
-                    // 上 2 つの 2 文字先読みをパターンのまま残せる位置に置く
-                    (quote, _) if is_quote(quote) => state = ScanState::Text(quote),
-                    ('{', _) => {
-                        depth += 1;
-                        opened = true;
-                    }
-                    ('}', _) => {
-                        depth = depth.saturating_sub(1);
-                        if opened && depth == 0 {
-                            return Some(index);
-                        }
-                    }
-                    _ => {}
-                },
-                ScanState::BlockComment => {
-                    if current == '*' && next == Some('/') {
-                        state = ScanState::Code;
-                        position += 2;
-                        continue;
-                    }
-                }
-                ScanState::Text(quote) => {
-                    if current == '\\' {
-                        // 行末の `\` は行継続で、文字列は次の行へ続く。
-                        // `\\` で終わる行は継続しないので、次の文字の有無で見分ける
-                        text_continues_by_backslash = next.is_none();
-                        position += 2;
-                        continue;
-                    }
-                    if current == quote {
-                        state = ScanState::Code;
-                    }
-                }
-            }
-
-            position += 1;
-        }
-
-        // 行をまたぐ文字列は、テンプレートリテラルと行継続（行末の `\`）の 2 つだけ。
-        // それ以外の閉じ忘れをまたがせると、そこから先のブレースを丸ごと読み飛ばす
-        let text_crosses_the_line_end = matches!(state, ScanState::Text(quote) if is_multiline_quote(quote))
-            || text_continues_by_backslash;
-        if matches!(state, ScanState::Text(_)) && !text_crosses_the_line_end {
-            state = ScanState::Code;
-        }
-    }
-
-    None
+    source
+        .lines()
+        .skip(start_index)
+        .take(line_count)
+        .collect::<Vec<&str>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -291,7 +222,9 @@ mod tests {
 
     fn chunk_at(source: &str, location: &str) -> Result<Chunk, ChunkingError> {
         let location: Location = location.parse().expect("テストが渡す位置は解釈できる");
-        Chunk::find_enclosing(&location, source)
+        let tree = SyntaxTree::from_typescript(source).expect("テストが渡すソースは木にできる");
+
+        Chunk::find_enclosing(&location, &tree)
     }
 
     const FUNCTION_AFTER_A_CONSTANT: &str = r#"const rate = 0.1;
@@ -529,12 +462,121 @@ export const rate = 0.1;
     }
 
     #[test]
-    fn test_chunk_of_a_function_that_never_closes_returns_unterminated_function() {
+    fn test_chunk_of_a_function_that_never_closes_returns_unparsable_function() {
         let result = chunk_at(UNTERMINATED_FUNCTION, "a.ts:2");
 
         assert_eq!(
             result,
-            Err(ChunkingError::UnterminatedFunction { start: line(1) })
+            Err(ChunkingError::UnparsableFunction { start: line(1) })
         );
+    }
+
+    #[test]
+    fn test_chunk_of_a_function_next_to_a_broken_one_is_still_taken() {
+        // 対照は上のテスト。壊れているのが別の関数なら切り出しは止まらない。
+        // 木全体のエラーを見ていると、ここで NoEnclosingFunction に落ちる
+        let broken_then_sound = r#"function broken(: {
+}
+
+export function sound(value: number): number {
+  return value;
+}
+"#;
+
+        let chunk = chunk_at(broken_then_sound, "a.ts:5").expect("壊れていない側は切り出せる");
+
+        assert_eq!(chunk.lines(), range(4, 6));
+    }
+
+    #[test]
+    fn test_chunk_of_a_function_with_a_multiline_signature_covers_the_whole_function() {
+        // 行を 1 本ずつ見る切り出しでは、`): number {` だけの行を関数の始まりと
+        // 読めず、この形を丸ごと取り逃がしていた
+        let multiline_signature = r#"export function applyDiscount(
+  price: number,
+  rate: number,
+): number {
+  return price * (1 - rate);
+}
+"#;
+
+        let chunk = chunk_at(multiline_signature, "a.ts:5").expect("切り出せる");
+
+        assert_eq!(chunk.lines(), range(1, 6));
+    }
+
+    #[test]
+    fn test_chunk_of_a_line_inside_an_object_method_covers_the_method() {
+        let object_with_a_method = r#"export const handlers = {
+  run(value: number): number {
+    return value;
+  },
+};
+"#;
+
+        let chunk = chunk_at(object_with_a_method, "a.ts:3").expect("切り出せる");
+
+        assert_eq!(chunk.lines(), range(2, 4));
+    }
+
+    #[test]
+    fn test_chunk_of_a_line_inside_a_function_expression_covers_that_function() {
+        let function_expression = r#"export const applyDiscount = function (price: number): number {
+  return price * 0.9;
+};
+"#;
+
+        let chunk = chunk_at(function_expression, "a.ts:2").expect("切り出せる");
+
+        assert_eq!(chunk.lines(), range(1, 3));
+    }
+
+    #[test]
+    fn test_chunk_of_an_arrow_function_without_a_body_block_covers_that_function() {
+        // ブレースで終わらない行なので、行の見た目で判断する切り出しでは拾えなかった
+        let expression_bodied_arrow = r#"export const double = (value: number): number => value * 2;
+"#;
+
+        let chunk = chunk_at(expression_bodied_arrow, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(chunk.lines(), range(1, 1));
+    }
+
+    #[test]
+    fn test_chunk_of_a_line_inside_a_generator_function_covers_that_function() {
+        let generator = r#"export async function* pages(total: number): AsyncGenerator<number> {
+  yield total;
+}
+"#;
+
+        let chunk = chunk_at(generator, "a.ts:2").expect("切り出せる");
+
+        assert_eq!(chunk.lines(), range(1, 3));
+    }
+
+    #[test]
+    fn test_chunk_of_a_line_inside_a_generator_function_expression_covers_that_function() {
+        // 名前の付いたジェネレータとは別のノード種別になる（宣言と式で分かれている）
+        let generator_expression = r#"export const pages = function* (total: number) {
+  yield total;
+};
+"#;
+
+        let chunk = chunk_at(generator_expression, "a.ts:2").expect("切り出せる");
+
+        assert_eq!(chunk.lines(), range(1, 3));
+    }
+
+    #[test]
+    fn test_chunk_of_a_line_inside_an_arrow_nested_in_a_function_covers_the_arrow() {
+        // 外側の関数も指定行を含む。内側を選べていないと 1-3 行目が返る
+        let arrow_inside_a_function = r#"export function makeAdder(a: number) {
+  return (b: number) => a + b;
+}
+"#;
+
+        let chunk = chunk_at(arrow_inside_a_function, "a.ts:2").expect("切り出せる");
+
+        assert_eq!(chunk.lines(), range(2, 2));
     }
 }
