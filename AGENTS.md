@@ -9,7 +9,7 @@
   理由付きで判定する CLI**（`docs/dryguard-plan.md`）
 - 言語: Rust（edition 2024）
 - 構成: `src/lib.rs` が本体、`src/main.rs` は引数を受けて呼ぶだけ
-- 外部依存: `clap`。以降 `tree-sitter` / `lsp-types` / `rayon` / `serde` を足す
+- 外部依存: `clap` / `tree-sitter` / `tree-sitter-typescript`。以降 `lsp-types` / `rayon` / `serde` を足す
 - LSP サーバ: TS は typescript-language-server、Rust は rust-analyzer（子プロセスで起動）
 
 ## 規約一覧
