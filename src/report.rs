@@ -142,9 +142,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
-    use crate::classification::{
-        Classification, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of,
-    };
+    use crate::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
     use crate::location::Location;
     use crate::similarity::Similarity;
     use crate::syntax::module_distance::ModuleDistance;
@@ -167,39 +165,41 @@ mod tests {
         )
     }
 
-    fn classification(
+    /// 別のディレクトリにある 2 箇所を、渡した閾値で判定した text。
+    ///
+    /// 距離を固定して、構造の似かたと依存先の重なりだけを動かす。判定に渡す閾値と
+    /// 表示に渡す閾値を揃えているのは、`compare` が同じ値を両方へ渡すため。
+    fn text_of_separate_directories(
         structural_similarity: StructuralSimilarity,
         import_overlap: ImportOverlap,
-    ) -> Classification {
+        threshold: Threshold,
+    ) -> String {
         let signals = Signals::new(
             structural_similarity,
             import_overlap,
             separate_directories(),
         );
 
-        classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD)
-    }
-
-    /// 構造が似ていて依存先を共有していない組（`DO-NOT-EXTRACT` になる）。
-    fn accidental_duplication() -> Classification {
-        classification(
-            StructuralSimilarity::Measured(measured(0.94)),
-            ImportOverlap::Measured(measured(0.0)),
-        )
-    }
-
-    fn text(classification: &Classification) -> String {
         text_of(
             &location("src/billing/discount.ts", 42),
             &location("src/inventory/reorder.ts", 18),
-            classification,
+            &classification_of(&signals, threshold),
+            threshold,
+        )
+    }
+
+    /// 構造が似ていて依存先を共有していない組（`DO-NOT-EXTRACT` になる）の text。
+    fn text_of_accidental_duplication() -> String {
+        text_of_separate_directories(
+            StructuralSimilarity::Measured(measured(0.94)),
+            ImportOverlap::Measured(measured(0.0)),
             DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
         )
     }
 
     #[test]
     fn test_text_of_starts_with_the_verdict_and_both_locations() {
-        let text = text(&accidental_duplication());
+        let text = text_of_accidental_duplication();
 
         assert_eq!(
             text.lines().next(),
@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_text_of_reports_the_structural_similarity_with_the_threshold_it_was_compared_against() {
-        let text = text(&accidental_duplication());
+        let text = text_of_accidental_duplication();
 
         assert!(
             text.contains("構造類似度: 0.94 (閾値 0.85) → 共通化する側"),
@@ -221,10 +221,9 @@ mod tests {
     fn test_text_of_reports_the_threshold_it_was_given_instead_of_the_default() {
         // 既定（0.85）と違う値を渡す。既定と同じ値では、渡した閾値が使われたのか
         // 既定が使われたのかが分からない
-        let text = text_of(
-            &location("src/billing/discount.ts", 42),
-            &location("src/inventory/reorder.ts", 18),
-            &accidental_duplication(),
+        let text = text_of_separate_directories(
+            StructuralSimilarity::Measured(measured(0.94)),
+            ImportOverlap::Measured(measured(0.0)),
             Threshold::from_literal(0.5),
         );
 
@@ -236,7 +235,7 @@ mod tests {
 
     #[test]
     fn test_text_of_reports_every_signal_with_the_direction_it_leaned() {
-        let text = text(&accidental_duplication());
+        let text = text_of_accidental_duplication();
 
         assert!(
             text.contains("  理由: 依存先の重なり 0.00 → 共通化しない側\n")
@@ -250,10 +249,11 @@ mod tests {
         // 依存先を共有しているので EXTRACT-CANDIDATE になるが、ディレクトリは
         // 分かれている。判定と逆へ傾いた根拠を落とすと、読者が「なぜこの判定か」を
         // 追えなくなる
-        let text = text(&classification(
+        let text = text_of_separate_directories(
             StructuralSimilarity::Measured(measured(0.94)),
             ImportOverlap::Measured(measured(1.0)),
-        ));
+            DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+        );
 
         assert!(
             text.contains("モジュール距離 2 段 → 共通化しない側"),
@@ -265,10 +265,11 @@ mod tests {
     fn test_text_of_without_imports_reports_that_the_signal_could_not_be_measured() {
         // 対照として構造類似度は測れている。測れた値と測れなかったことが
         // 同じ出方をすると、読者が両者を区別できない
-        let text = text(&classification(
+        let text = text_of_separate_directories(
             StructuralSimilarity::Measured(measured(0.94)),
             ImportOverlap::NoImports,
-        ));
+            DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+        );
 
         assert!(
             text.contains(
@@ -285,10 +286,11 @@ mod tests {
     #[test]
     fn test_text_of_without_structural_similarity_omits_the_threshold() {
         // 測れていない値に閾値を並べると、比べた結果として読めてしまう
-        let text = text(&classification(
+        let text = text_of_separate_directories(
             StructuralSimilarity::NoTokens,
             ImportOverlap::Measured(measured(0.0)),
-        ));
+            DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+        );
 
         assert!(
             text.contains("構造類似度: 測れない (トークンが 1 つも無い) → どちらでもない"),
@@ -299,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_text_of_do_not_extract_suggests_keeping_the_code_separate() {
-        let text = text(&accidental_duplication());
+        let text = text_of_accidental_duplication();
 
         assert!(
             text.contains("  提案: 偶発的な重複の可能性が高い。共通化せず分離を維持する。"),
@@ -309,10 +311,11 @@ mod tests {
 
     #[test]
     fn test_text_of_extract_candidate_suggests_extracting() {
-        let text = text(&classification(
+        let text = text_of_separate_directories(
             StructuralSimilarity::Measured(measured(0.94)),
             ImportOverlap::Measured(measured(1.0)),
-        ));
+            DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+        );
 
         assert!(
             text.contains("  提案: 共通化してよい。1 つにまとめる先を検討する。"),
@@ -322,10 +325,11 @@ mod tests {
 
     #[test]
     fn test_text_of_review_suggests_a_human_decision() {
-        let text = text(&classification(
+        let text = text_of_separate_directories(
             StructuralSimilarity::Measured(measured(0.5)),
             ImportOverlap::Measured(measured(0.0)),
-        ));
+            DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+        );
 
         assert!(
             text.contains("  提案: 判断材料が足りない。人が見て決める。"),
