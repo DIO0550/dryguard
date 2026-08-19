@@ -16,3 +16,4 @@ pub mod line_range;
 pub mod module_distance;
 pub(crate) mod source_character;
 pub mod token;
+pub mod tree;

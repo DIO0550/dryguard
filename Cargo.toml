@@ -9,6 +9,10 @@ license = "MIT"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+tree-sitter = "0.26"
+# grammar は言語ごとに別クレート。Phase 4 で Rust を足すときは
+# tree-sitter-rust を並べるだけで済む（`docs/dryguard-plan.md`「技術スタック」）。
+tree-sitter-typescript = "0.23"
 
 # 本番コードでの unwrap / expect の禁止は、規約の文ではなくツールで落とす。
 # テストコード内は clippy.toml の allow-unwrap-in-tests / allow-expect-in-tests で許可する
