@@ -9,8 +9,11 @@
 //! | `semantics` | 意味情報収集（LSP への問い合わせと結果の正規化） | Stage 2 |
 //! | `classification` | 分類（シグナルの統合と判定・理由の組み立て） | Stage 3 |
 //!
-//! 現在は Phase 0 の途中で、CLI の受け口と `syntax` のチャンク化・構造類似度までがある。
+//! 現在は Phase 0 の途中。CLI の受け口、`syntax` のチャンク化・構造類似度・import 収集、
+//! `classification` のハードコードした閾値による 3 ラベルの判定までがある。
+//! `semantics` と `lsp` はまだ無い。
 
+pub mod classification;
 pub mod cli;
 pub mod line_number;
 pub mod location;

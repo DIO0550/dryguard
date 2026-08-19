@@ -59,6 +59,8 @@ if structurally_similar && domains_differ { ... }
 | `pair` | 比較する 2 つの chunk |
 | `signal` | 判定の材料。構造類似度・型シグネチャ・呼び出し先 / 呼び出し元・モジュール距離 |
 | `verdict` | 判定の結果（`EXTRACT-CANDIDATE` / `DO-NOT-EXTRACT` / `REVIEW`） |
+| `reason` | 判定を傾けた根拠 1 件。シグナルの値と、それが傾けた向きの組 |
+| `lean` | シグナルが判定を傾けた向き（共通化する側 / しない側 / どちらでもない） |
 | `domain` | ドメイン。ディレクトリ構造からの推定と `dryguard.toml` の宣言で決まる |
 | `import` | 依存の宣言。ソースに書かれた `import` / `export ... from` そのもの |
 | `specifier` | `from` の後ろに書かれた文字列（`"./pad"`）。**解決前** |
@@ -66,6 +68,11 @@ if structurally_similar && domains_differ { ... }
 | `module distance` | 2 つのファイルを隔てているディレクトリの段数 |
 
 `snippet` / `fragment` / `candidate`（chunk の意味で）/ `label`（verdict の意味で）は使わない。
+
+**`reason` は文ではなく構造。** 「依存先ドメイン不一致」のような人が読む文は
+`reason` を出力側が組み立てた結果で、`reason` そのものではない。文にしてから持つと、
+**判定に効いた値と向きが文字列に埋もれて後段が読めない**（`--explain` が
+シグナルごとの効き方を出せなくなる）。
 
 **`specifier` と `module path` を混ぜない。** どちらも文字列だが、解決前は
 書いた人の位置に依存し、解決後は依存しない。同じ依存先が別の綴りで書かれるので、

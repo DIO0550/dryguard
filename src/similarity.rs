@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::threshold::Threshold;
+
 /// 0.0 以上 1.0 以下の類似度。1.0 が完全一致。
 ///
 /// [`crate::threshold::Threshold`] と同じ範囲だが別の型にする。**測った値**と
@@ -44,6 +46,15 @@ impl Similarity {
     /// 類似度そのもの。丸めない値が要るときに使う。
     pub fn value(self) -> f64 {
         self.0
+    }
+
+    /// 閾値に届いているか（閾値と同じ値なら届いている）。
+    ///
+    /// 比較をここに置くのは、**測った値と基準を突き合わせる操作の置き場所**が
+    /// 他に無いため。呼び出し側で `similarity.value() >= threshold.value()` と
+    /// 書かせると、素の `f64` に戻った時点で 2 つを型で分けた意味が消える。
+    pub fn is_at_least(self, threshold: Threshold) -> bool {
+        self.0 >= threshold.value()
     }
 }
 
@@ -106,6 +117,31 @@ mod tests {
         let similarity = Similarity::from_shared_count(0, 0);
 
         assert_eq!(similarity.value(), 1.0);
+    }
+
+    #[test]
+    fn test_similarity_above_the_threshold_reaches_it() {
+        let similarity = Similarity::new(0.9).expect("作れる");
+        let threshold = Threshold::new(0.85).expect("作れる");
+
+        assert!(similarity.is_at_least(threshold));
+    }
+
+    #[test]
+    fn test_similarity_below_the_threshold_does_not_reach_it() {
+        let similarity = Similarity::new(0.84).expect("作れる");
+        let threshold = Threshold::new(0.85).expect("作れる");
+
+        assert!(!similarity.is_at_least(threshold));
+    }
+
+    #[test]
+    fn test_similarity_equal_to_the_threshold_reaches_it() {
+        // 境界。閾値ちょうどを弾くと、閾値に指定した値そのものが判定に出てこない
+        let similarity = Similarity::new(0.85).expect("作れる");
+        let threshold = Threshold::new(0.85).expect("作れる");
+
+        assert!(similarity.is_at_least(threshold));
     }
 
     #[test]

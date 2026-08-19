@@ -1,15 +1,17 @@
-//! `compare` が受け取った 2 箇所を、実際のファイルからチャンクにするところまで。
+//! `compare` が受け取った 2 箇所を、実際のファイルから判定まで通すところ。
 //!
 //! ステージをつないだ結果はここで見る（rules/testing.md「ステージをまたぐテストと
-//! 単体のテストを分ける」）。切り出しそのものの振る舞いは `syntax::chunk` の
-//! モジュール内テストにある。
+//! 単体のテストを分ける」）。切り出しそのものの振る舞いは `syntax::chunk`、
+//! 決定木は `classification` のモジュール内テストにある。
 
 use std::path::Path;
 
+use dryguard::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
+use dryguard::classification::verdict::Verdict;
+use dryguard::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
 use dryguard::location::Location;
-use dryguard::pipeline::{ChunkPairError, chunk_pair_of};
+use dryguard::pipeline::{ChunkPairError, chunk_pair_of, signals_of};
 use dryguard::similarity::Similarity;
-use dryguard::syntax::token::TokenSet;
 
 /// `tests/fixtures/` 配下の位置。
 ///
@@ -31,32 +33,72 @@ fn fixture(relative_path: &str, line: usize) -> Location {
     location
 }
 
-/// 2 箇所を実ファイルから切り出して、構造類似度を出すところまで。
-fn structural_similarity(location_a: &Location, location_b: &Location) -> Similarity {
+/// 2 箇所を実ファイルから切り出して、シグナルを測るところまで。
+fn signals(location_a: &Location, location_b: &Location) -> Signals {
     let Ok((chunk_a, chunk_b)) = chunk_pair_of(location_a, location_b) else {
         panic!("テストが渡す位置はどちらも関数の中を指している");
     };
 
-    let (Some(tokens_a), Some(tokens_b)) = (
-        TokenSet::from_source(chunk_a.source()),
-        TokenSet::from_source(chunk_b.source()),
-    ) else {
+    signals_of(&chunk_a, &chunk_b)
+}
+
+/// 測れた構造類似度。
+fn structural_similarity(location_a: &Location, location_b: &Location) -> Similarity {
+    let StructuralSimilarity::Measured(similarity) =
+        signals(location_a, location_b).structural_similarity()
+    else {
         panic!("テストが渡すチャンクにはトークンがある");
     };
 
-    tokens_a.jaccard(&tokens_b)
+    similarity
 }
 
-/// 2 箇所を実ファイルから切り出して、依存先の重なりを出すところまで。
-///
-/// どちらかに import が無ければ `None`。
-fn import_overlap(location_a: &Location, location_b: &Location) -> Option<Similarity> {
-    let Ok((chunk_a, chunk_b)) = chunk_pair_of(location_a, location_b) else {
-        panic!("テストが渡す位置はどちらも関数の中を指している");
-    };
+/// 依存先の重なり。測れなかったこと自体を見るテストがあるので、そのまま返す。
+fn import_overlap(location_a: &Location, location_b: &Location) -> ImportOverlap {
+    signals(location_a, location_b).import_overlap()
+}
 
-    let (imports_a, imports_b) = (chunk_a.imports()?, chunk_b.imports()?);
-    Some(imports_a.jaccard(imports_b))
+/// 2 箇所を実ファイルから切り出して、既定の閾値で判定するところまで。
+fn verdict(location_a: &Location, location_b: &Location) -> Verdict {
+    let signals = signals(location_a, location_b);
+
+    classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD).verdict()
+}
+
+#[test]
+fn test_compare_of_similar_functions_in_separate_domains_is_do_not_extract() {
+    // Phase 0 の仮説そのもの。構造は似ている（0.94）が、依存先が食い違っていて
+    // ディレクトリも分かれている
+    let verdict = verdict(
+        &fixture("billing/discount.ts", 6),
+        &fixture("inventory/reorder.ts", 6),
+    );
+
+    assert_eq!(verdict, Verdict::DoNotExtract);
+}
+
+#[test]
+fn test_compare_of_similar_functions_sharing_a_utility_is_extract_candidate() {
+    // 同じ tests/fixtures/utils/pad に依存している。ディレクトリは分かれているが、
+    // 依存先を共有しているので偶発的な重複ではない
+    let verdict = verdict(
+        &fixture("utils/formatDate.ts", 4),
+        &fixture("report/dateHelper.ts", 4),
+    );
+
+    assert_eq!(verdict, Verdict::ExtractCandidate);
+}
+
+#[test]
+fn test_compare_of_functions_with_different_shapes_is_review() {
+    // 依存先もディレクトリも上の DO-NOT-EXTRACT の組と同じ条件で、構造だけが
+    // 似ていない（0.59）。似ていないことが DO-NOT-EXTRACT に倒れないことを見る
+    let verdict = verdict(
+        &fixture("billing/discount.ts", 6),
+        &fixture("report/summary.ts", 6),
+    );
+
+    assert_eq!(verdict, Verdict::Review);
 }
 
 #[test]
@@ -68,8 +110,8 @@ fn test_compare_of_two_functions_in_different_domains_reports_no_shared_dependen
     );
 
     assert_eq!(
-        overlap.map(Similarity::value),
-        Some(0.0),
+        overlap,
+        ImportOverlap::Measured(Similarity::new(0.0).expect("0.0 は範囲に含む")),
         "billing は ./invoice、inventory は ./stock にしか依存していない"
     );
 }
@@ -85,8 +127,8 @@ fn test_compare_of_two_functions_sharing_a_utility_reports_a_total_overlap() {
     );
 
     assert_eq!(
-        overlap.map(Similarity::value),
-        Some(1.0),
+        overlap,
+        ImportOverlap::Measured(Similarity::new(1.0).expect("1.0 は範囲に含む")),
         "どちらも tests/fixtures/utils/pad に依存している"
     );
 }
