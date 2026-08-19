@@ -8,8 +8,10 @@
 use std::collections::HashSet;
 use std::path::{Component, Path};
 
+use tree_sitter::Node;
+
 use crate::similarity::Similarity;
-use crate::syntax::source_character::{is_quote, is_word_part};
+use crate::syntax::tree::SyntaxTree;
 
 /// 解決済みの依存先。相対指定は importer の位置から畳んである。
 ///
@@ -52,12 +54,12 @@ impl ModulePath {
 pub struct ImportSet(HashSet<ModulePath>);
 
 impl ImportSet {
-    /// ソースの import を集めて、解決済みの依存先の集合にする。
+    /// 構文木の import を集めて、解決済みの依存先の集合にする。
     ///
-    /// `source` は importer の中身、`importer` はそのファイルの位置。
+    /// `tree` は importer の構文木、`importer` はそのファイルの位置。
     /// import が 1 つも無かったときは作れないので `None` を返す。
-    pub fn from_source(source: &str, importer: &Path) -> Option<Self> {
-        let paths: HashSet<ModulePath> = specifiers_of(source)
+    pub fn from_tree(tree: &SyntaxTree<'_>, importer: &Path) -> Option<Self> {
+        let paths: HashSet<ModulePath> = specifiers_of(tree)
             .iter()
             .map(|specifier| ModulePath::from_specifier(specifier, importer))
             .collect();
@@ -80,120 +82,72 @@ impl ImportSet {
     }
 }
 
-/// 依存を宣言している語。この語の直後に来た文字列だけを指定子として拾う。
+/// 依存先を宣言する文の種別。どちらも `source` フィールドに指定子の文字列を持つ。
 ///
-/// `require` を入れないのは、Phase 0 の対象が TS の ES モジュールだけのため。
-const DEPENDENCY_KEYWORDS: [&str; 2] = ["import", "from"];
+/// `export_statement` を入れるのは `export { pad } from "./pad"` と
+/// `export * from "./pad"` のため。`from` を持たない `export` は
+/// `source` フィールドを持たないので、同じ規則のまま外れる。
+const DEPENDENCY_STATEMENT_KINDS: [&str; 2] = ["import_statement", "export_statement"];
 
 /// ソースに書かれた import 指定子。書かれた順に返す。
 ///
-/// 文字列を無条件に拾わず、**直前の語が依存の宣言だったものだけ**を採る。
+/// 文字列を無条件に拾わず、**依存を宣言する文が指定子として持っているものだけ**を採る。
 /// `const path = "./pad";` を拾うと、依存していないファイルが依存しているように見える。
+fn specifiers_of<'source>(tree: &SyntaxTree<'source>) -> Vec<&'source str> {
+    tree.named_descendants()
+        .into_iter()
+        .filter_map(specifier_literal_of)
+        .filter_map(|literal| unquoted_text_of(tree, literal))
+        .collect()
+}
+
+/// その文が依存先として指している文字列リテラルのノード。依存を宣言していなければ `None`。
+fn specifier_literal_of(node: Node<'_>) -> Option<Node<'_>> {
+    if DEPENDENCY_STATEMENT_KINDS.contains(&node.kind()) {
+        return node.child_by_field_name("source");
+    }
+    if is_dynamic_import(node) {
+        return first_string_argument_of(node);
+    }
+    None
+}
+
+/// その呼び出しが `import("./pad")` か。
 ///
-/// 直前の語を見る形にしているので、`import ... from "x"` が複数行に分かれていても
-/// `export { a } from "x"` でも同じ規則で拾える。
-fn specifiers_of(source: &str) -> Vec<String> {
-    let characters: Vec<char> = source.chars().collect();
-    let mut specifiers = Vec::new();
-    let mut preceding_word = String::new();
-    let mut position = 0;
+/// 動的 import も依存の宣言なので拾う。`require` は拾わない
+/// （対象は TS の ES モジュール）。
+fn is_dynamic_import(node: Node<'_>) -> bool {
+    let is_call = node.kind() == "call_expression";
+    let calls_import = node
+        .child_by_field_name("function")
+        .is_some_and(|called| called.kind() == "import");
 
-    while position < characters.len() {
-        let current = characters[position];
-        let next = characters.get(position + 1).copied();
-
-        if current == '/' && next == Some('/') {
-            position = end_of_line_comment(&characters, position);
-            preceding_word.clear();
-            continue;
-        }
-        if current == '/' && next == Some('*') {
-            position = end_of_block_comment(&characters, position);
-            preceding_word.clear();
-            continue;
-        }
-        if is_quote(current) {
-            let (text, after) = text_from(&characters, position);
-            if DEPENDENCY_KEYWORDS.contains(&preceding_word.as_str()) {
-                specifiers.push(text);
-            }
-            preceding_word.clear();
-            position = after;
-            continue;
-        }
-        if is_word_part(current) {
-            let (word, after) = word_from(&characters, position);
-            preceding_word = word;
-            position = after;
-            continue;
-        }
-
-        // 空白と記号では直前の語を捨てない。`{ a } from "x"` のように、
-        // 語と文字列の間に記号が挟まる形がある
-        position += 1;
-    }
-
-    specifiers
+    is_call && calls_import
 }
 
-/// 語 1 つ分と、その次の位置。
+/// その呼び出しの最初の引数が文字列リテラルなら、そのノード。
 ///
-/// 1 文字ずつ足すのではなく語ごと読むのは、`const path` のように語が続いたときに
-/// 2 つを繋げた 1 語として持たないため。
-fn word_from(characters: &[char], start: usize) -> (String, usize) {
-    let mut word = String::new();
-    let mut position = start;
+/// テンプレートリテラル（`` import(`./${name}`) ``）は書いた時点で先が決まらないので採らない。
+fn first_string_argument_of(node: Node<'_>) -> Option<Node<'_>> {
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
 
-    while position < characters.len() && is_word_part(characters[position]) {
-        word.push(characters[position]);
-        position += 1;
-    }
-
-    (word, position)
+    arguments
+        .named_children(&mut cursor)
+        .find(|argument| argument.kind() == "string")
 }
 
-/// 引用符から始まる文字列の中身と、閉じた次の位置。
-///
-/// 閉じないまま末尾に達したら、そこまでを中身として返す。
-fn text_from(characters: &[char], start: usize) -> (String, usize) {
-    let quote = characters[start];
-    let mut text = String::new();
-    let mut position = start + 1;
+/// 引用符の中身。空文字列（`import("")`）のときは中身のノードが無いので `None`。
+fn unquoted_text_of<'source>(
+    tree: &SyntaxTree<'source>,
+    literal: Node<'_>,
+) -> Option<&'source str> {
+    let mut cursor = literal.walk();
+    let fragment = literal
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "string_fragment")?;
 
-    while position < characters.len() {
-        let current = characters[position];
-        if current == '\\' {
-            position += 2;
-            continue;
-        }
-        if current == quote {
-            return (text, position + 1);
-        }
-        text.push(current);
-        position += 1;
-    }
-
-    (text, characters.len())
-}
-
-/// 行コメントの次の位置。
-fn end_of_line_comment(characters: &[char], start: usize) -> usize {
-    characters[start..]
-        .iter()
-        .position(|character| *character == '\n')
-        .map_or(characters.len(), |offset| start + offset)
-}
-
-/// ブロックコメントの次の位置。閉じないまま末尾に達したら末尾。
-fn end_of_block_comment(characters: &[char], start: usize) -> usize {
-    let mut position = start + 2;
-    while position + 1 < characters.len() {
-        if characters[position] == '*' && characters[position + 1] == '/' {
-            return position + 2;
-        }
-        position += 1;
-    }
-    characters.len()
+    tree.text_of(fragment)
 }
 
 /// その指定子が importer の位置から解決するものか。
@@ -284,8 +238,12 @@ mod tests {
         assert_eq!(resolved("react", "src/utils/formatDate.ts"), "react");
     }
 
+    fn tree_of(source: &str) -> SyntaxTree<'_> {
+        SyntaxTree::from_typescript(source).expect("テストが渡すソースは木にできる")
+    }
+
     fn import_set(source: &str, importer: &str) -> ImportSet {
-        ImportSet::from_source(source, Path::new(importer))
+        ImportSet::from_tree(&tree_of(source), Path::new(importer))
             .expect("テストが渡すソースには import がある")
     }
 
@@ -402,13 +360,71 @@ const path = "./stock";
     }
 
     #[test]
+    fn test_import_set_of_a_dynamic_import_reaches_the_same_module() {
+        // import(".../pad") も依存の宣言。import 文だけを見ると、遅延読み込みしている
+        // ファイルの依存先が丸ごと消える
+        let dynamic = r#"export async function load(): Promise<unknown> {
+  return import("./pad");
+}
+"#;
+
+        assert_eq!(
+            overlap(
+                dynamic,
+                "src/utils/a.ts",
+                IMPORTS_PAD_FROM_SIBLING,
+                "src/utils/b.ts",
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn test_import_set_ignores_a_require_call() {
+        // 拾ってよい import を 1 件、拾ってはいけない呼び出しを 1 件、同じソースに置く。
+        // 呼び出しなら何でも拾う実装だと集合に "./stock" が入り、重なりが 0.5 に落ちる
+        let real_import_and_a_require = r#"import { pad } from "./pad";
+const stock = require("./stock");
+"#;
+
+        assert_eq!(
+            overlap(
+                real_import_and_a_require,
+                "src/utils/a.ts",
+                IMPORTS_PAD_FROM_SIBLING,
+                "src/utils/b.ts",
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn test_import_set_ignores_an_export_that_has_no_source() {
+        // 対照に `from` 付きの export を 1 件置く。export の中の文字列を無条件に拾う
+        // 実装だと集合に "./stock" が入り、重なりが 0.5 に落ちる
+        let re_export_and_a_decoy = r#"export { pad } from "./pad";
+export const fallback = "./stock";
+"#;
+
+        assert_eq!(
+            overlap(
+                re_export_and_a_decoy,
+                "src/utils/a.ts",
+                IMPORTS_PAD_FROM_SIBLING,
+                "src/utils/b.ts",
+            ),
+            1.0
+        );
+    }
+
+    #[test]
     fn test_import_set_ignores_an_import_written_inside_a_comment() {
         let commented_out = r#"// import { pad } from "./pad";
 const value = 1;
 "#;
 
         assert_eq!(
-            ImportSet::from_source(commented_out, Path::new("src/utils/a.ts")),
+            ImportSet::from_tree(&tree_of(commented_out), Path::new("src/utils/a.ts")),
             None
         );
     }
@@ -423,7 +439,7 @@ const value = 1;
 "#;
 
         assert_eq!(
-            ImportSet::from_source(no_imports, Path::new("src/utils/pad.ts")),
+            ImportSet::from_tree(&tree_of(no_imports), Path::new("src/utils/pad.ts")),
             None
         );
     }

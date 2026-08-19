@@ -67,7 +67,7 @@ impl Chunk {
             location.path().to_path_buf(),
             lines,
             source_of_lines(tree.source(), lines),
-            ImportSet::from_source(tree.source(), location.path()),
+            ImportSet::from_tree(tree, location.path()),
         ))
     }
 
