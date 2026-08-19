@@ -11,6 +11,7 @@ use dryguard::classification::verdict::Verdict;
 use dryguard::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
 use dryguard::location::Location;
 use dryguard::pipeline::{ChunkPairError, chunk_pair_of, signals_of};
+use dryguard::report::text_of;
 use dryguard::similarity::Similarity;
 
 /// `tests/fixtures/` 配下の位置。
@@ -204,6 +205,39 @@ fn test_compare_of_two_functions_that_differ_only_in_names_reports_a_high_simila
     assert!(
         similarity.value() >= 0.9,
         "名前と定数だけが違う 2 つの関数は構造がほぼ同じ: {similarity}"
+    );
+}
+
+#[test]
+fn test_compare_of_similar_functions_in_separate_domains_reports_the_verdict_and_a_reason_that_leans_that_way()
+ {
+    // ステージをつなげて出力までいけることを見るテスト。個々のシグナルの傾きは
+    // report のモジュール内テストで見る。ここでは実データから 3 種の情報
+    // （ラベル・シグナル値・傾き）が揃って出るところまで
+    let location_a = fixture("billing/discount.ts", 6);
+    let location_b = fixture("inventory/reorder.ts", 6);
+    let signals = signals(&location_a, &location_b);
+    let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+    let text = text_of(
+        &location_a,
+        &location_b,
+        &classification,
+        DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+    );
+
+    let first_line = text.lines().next().unwrap_or_default();
+    assert!(
+        first_line.starts_with("[DO-NOT-EXTRACT] "),
+        "1 行目がラベルと 2 つの位置: {first_line}"
+    );
+    assert!(
+        text.contains("依存先の重なり 0.00 → 共通化しない側"),
+        "測った値と傾きの組が並ぶ: {text}"
+    );
+    assert!(
+        text.contains("提案: 偶発的な重複の可能性が高い。共通化せず分離を維持する。"),
+        "ラベルに対する提案が出る: {text}"
     );
 }
 
