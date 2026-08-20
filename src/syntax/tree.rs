@@ -185,6 +185,9 @@ mod tests {
         let unterminated = "function broken() {\n  return 1;\n";
         let tree = tree_of(unterminated);
 
+        // 探すのが `function_declaration` ではないのは、閉じブレースが欠けると
+        // tree-sitter が宣言として復元できず、式文の中の関数式として組み直すため。
+        // `function broken()` と書いてあっても、木に宣言のノードは現れない
         let broken = tree
             .named_descendants()
             .into_iter()
