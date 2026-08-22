@@ -13,6 +13,10 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Phase 0 の検証ハーネスの出力
+# 対象リポジトリごとに変わる調査結果なので、残すのは Issue のコメント側
+harness/phase0/out/
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
