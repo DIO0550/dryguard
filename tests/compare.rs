@@ -68,7 +68,7 @@ fn verdict(location_a: &Location, location_b: &Location) -> Verdict {
 
 #[test]
 fn test_compare_of_similar_functions_in_separate_domains_is_do_not_extract() {
-    // Phase 0 の仮説そのもの。構造は似ている（0.94）が、依存先が食い違っていて
+    // Phase 0 の仮説そのもの。構造は同じ（1.00）だが、依存先が食い違っていて
     // ディレクトリも分かれている
     let verdict = verdict(
         &fixture("billing/discount.ts", 6),
@@ -93,7 +93,7 @@ fn test_compare_of_similar_functions_sharing_a_utility_is_extract_candidate() {
 #[test]
 fn test_compare_of_functions_with_different_shapes_is_review() {
     // 依存先もディレクトリも上の DO-NOT-EXTRACT の組と同じ条件で、構造だけが
-    // 似ていない（0.59）。似ていないことが DO-NOT-EXTRACT に倒れないことを見る
+    // 似ていない（0.23）。似ていないことが DO-NOT-EXTRACT に倒れないことを見る
     let verdict = verdict(
         &fixture("billing/discount.ts", 6),
         &fixture("report/summary.ts", 6),
@@ -204,7 +204,7 @@ fn test_compare_of_two_functions_that_differ_only_in_names_reports_a_high_simila
 
     assert!(
         similarity.value() >= 0.9,
-        "名前と定数だけが違う 2 つの関数は構造がほぼ同じ: {similarity}"
+        "名前と定数だけが違う 2 つの関数は構造が同じ: {similarity}"
     );
 }
 

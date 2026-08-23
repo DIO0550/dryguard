@@ -18,9 +18,14 @@ use crate::line_number::LineNumber;
 use crate::location::Location;
 use crate::syntax::import::ImportSet;
 use crate::syntax::line_range::LineRange;
+use crate::syntax::token::TokenSequence;
 use crate::syntax::tree::SyntaxTree;
 
 /// 比較の単位。関数・メソッド 1 つ分のソースと、それがどこにあったか。
+///
+/// 正規化トークン列は切り出しと同じ構文木から採る。**チャンクのソース文字列を
+/// 読み直す形にはできない**（`total(): number { .. }` のようなメソッドは、
+/// 単体ではトップレベルの構文にならない）。
 ///
 /// 依存先の集合だけはチャンクの範囲ではなく**ファイル全体**から採る。
 /// import は関数の外に書かれるので、範囲を関数に合わせると必ず空になる。
@@ -29,6 +34,7 @@ pub struct Chunk {
     path: PathBuf,
     lines: LineRange,
     source: String,
+    tokens: Option<TokenSequence>,
     imports: Option<ImportSet>,
 }
 
@@ -67,21 +73,29 @@ impl Chunk {
             location.path().to_path_buf(),
             lines,
             source_of_lines(tree.source(), lines),
+            TokenSequence::from_node(enclosing),
             ImportSet::from_tree(tree, location.path()),
         ))
     }
 
     /// 切り出した結果を組み立てる。
     ///
-    /// モジュールの外から呼べないのは、`lines` と `source` が食い違ったチャンクを
-    /// 作れないようにするため。組み立てるのは [`Chunk::find_enclosing`] だけで、
-    /// そこでは `source` を `lines` の範囲から切り出している
+    /// モジュールの外から呼べないのは、`lines` と `source` と `tokens` が食い違った
+    /// チャンクを作れないようにするため。組み立てるのは [`Chunk::find_enclosing`] だけで、
+    /// そこでは 3 つとも同じノードから採っている
     /// (rules/coding.md「不正な状態を型で表現できなくする」)。
-    fn new(path: PathBuf, lines: LineRange, source: String, imports: Option<ImportSet>) -> Self {
+    fn new(
+        path: PathBuf,
+        lines: LineRange,
+        source: String,
+        tokens: Option<TokenSequence>,
+        imports: Option<ImportSet>,
+    ) -> Self {
         Self {
             path,
             lines,
             source,
+            tokens,
             imports,
         }
     }
@@ -99,6 +113,15 @@ impl Chunk {
     /// 切り出したソース。行の区切りは改行 1 文字。
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// このチャンクを正規化したトークン列。
+    ///
+    /// トークンが 1 つも取れなかったときは `None`。空の列を返さないのは、後段が
+    /// 「並びが食い違っている」と「材料が無い」を区別できるようにするため
+    /// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
+    pub fn tokens(&self) -> Option<&TokenSequence> {
+        self.tokens.as_ref()
     }
 
     /// このチャンクがあるファイルの、依存先の集合。
