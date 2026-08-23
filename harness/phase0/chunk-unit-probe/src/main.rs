@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use dryguard::classification::DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
-use dryguard::syntax::token::TokenSet;
+use dryguard::syntax::token::{TokenSequence, tokens_of};
 use dryguard::syntax::tree::SyntaxTree;
 use tree_sitter::Node;
 
@@ -55,7 +55,7 @@ struct Unit {
     start_line: usize,
     end_line: usize,
     token_count: usize,
-    tokens: TokenSet,
+    tokens: TokenSequence,
     /// このブロックが属する関数の添字。関数自身の場合は自分の添字。
     owner: usize,
 }
@@ -184,7 +184,7 @@ fn collect_units(
 
     let offset = functions.len();
     for (index, node) in function_nodes.iter().enumerate() {
-        if let Some(unit) = unit_of(path, source, *node, offset + index) {
+        if let Some(unit) = unit_of(path, *node, offset + index) {
             functions.push(unit);
         }
     }
@@ -196,7 +196,7 @@ fn collect_units(
         let Some(owner) = innermost_owner_of(&function_nodes, node) else {
             continue;
         };
-        if let Some(unit) = unit_of(path, source, node, offset + owner) {
+        if let Some(unit) = unit_of(path, node, offset + owner) {
             blocks.push(unit);
         }
     }
@@ -219,33 +219,20 @@ fn innermost_owner_of(function_nodes: &[Node<'_>], node: Node<'_>) -> Option<usi
 
 /// ノード 1 つ分の比較単位。トークンが 1 つも無いときは `None`。
 ///
-/// ノードが覆っているテキストではなく**行ごと**採る。`src/syntax/chunk.rs` の
-/// `source_of_lines` に合わせるためで、合わせないと `export function f() {` の
-/// `export` が入らず、**同じペアでも `compare` と違う類似度が出る**。
-fn unit_of(path: &Path, source: &str, node: Node<'_>, owner: usize) -> Option<Unit> {
-    let start_line = node.start_position().row + 1;
-    let end_line = node.end_position().row + 1;
-    let text = source_of_lines(source, start_line, end_line);
-    let tokens = TokenSet::from_source(&text)?;
+/// トークンはノードから直に採る。`src/syntax/chunk.rs` も同じノードから採るので、
+/// **同じペアなら `compare` と同じ類似度が出る**（テキストを切り直していた頃は、
+/// `export function f() {` の `export` を入れるかどうかで食い違った）。
+fn unit_of(path: &Path, node: Node<'_>, owner: usize) -> Option<Unit> {
+    let tokens = TokenSequence::from_node(node)?;
 
     Some(Unit {
         path: path.to_path_buf(),
-        start_line,
-        end_line,
-        token_count: dryguard::syntax::token::tokens_of(&text).len(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+        token_count: tokens_of(node).len(),
         tokens,
         owner,
     })
-}
-
-/// 1 始まりの行範囲のソース。行の区切りは改行 1 文字。
-fn source_of_lines(source: &str, start_line: usize, end_line: usize) -> String {
-    source
-        .lines()
-        .skip(start_line - 1)
-        .take(end_line + 1 - start_line)
-        .collect::<Vec<&str>>()
-        .join("\n")
 }
 
 fn pair_count(count: usize) -> usize {
@@ -257,7 +244,7 @@ fn similar_pair_count_of(functions: &[Unit], threshold: dryguard::threshold::Thr
     let mut count = 0;
     for (index, left) in functions.iter().enumerate() {
         for right in &functions[index + 1..] {
-            if left.tokens.jaccard(&right.tokens).is_at_least(threshold) {
+            if left.tokens.similarity_with(&right.tokens).is_at_least(threshold) {
                 count += 1;
             }
         }
@@ -276,7 +263,7 @@ fn similar_block_pairs_of(
             if left.owner == right.owner {
                 continue;
             }
-            if left.tokens.jaccard(&right.tokens).is_at_least(threshold) {
+            if left.tokens.similarity_with(&right.tokens).is_at_least(threshold) {
                 pairs.push((left, right));
             }
         }
@@ -297,7 +284,7 @@ fn missed_pairs_of<'unit>(
 
     for (index, left) in functions.iter().enumerate() {
         for (offset, right) in functions[index + 1..].iter().enumerate() {
-            let function_similarity = left.tokens.jaccard(&right.tokens);
+            let function_similarity = left.tokens.similarity_with(&right.tokens);
             if function_similarity.is_at_least(threshold) {
                 continue;
             }
@@ -314,7 +301,7 @@ fn missed_pairs_of<'unit>(
                             (
                                 left_block,
                                 right_block,
-                                left_block.tokens.jaccard(&right_block.tokens),
+                                left_block.tokens.similarity_with(&right_block.tokens),
                             )
                         })
                 })

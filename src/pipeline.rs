@@ -12,7 +12,6 @@ use crate::classification::signal::{ImportOverlap, Signals, StructuralSimilarity
 use crate::location::Location;
 use crate::syntax::chunk::{Chunk, ChunkingError};
 use crate::syntax::module_distance::ModuleDistance;
-use crate::syntax::token::TokenSet;
 use crate::syntax::tree::{ParseError, SyntaxTree};
 
 /// 比較する 2 箇所から、チャンクの組を取り出す。
@@ -65,16 +64,13 @@ pub fn signals_of(chunk_a: &Chunk, chunk_b: &Chunk) -> Signals {
     )
 }
 
-/// 正規化トークン集合の Jaccard 係数。どちらかにトークンが無ければ測れない。
+/// 正規化トークン列の似かた。どちらかにトークンが無ければ測れない。
 fn structural_similarity_of(chunk_a: &Chunk, chunk_b: &Chunk) -> StructuralSimilarity {
-    let (Some(tokens_a), Some(tokens_b)) = (
-        TokenSet::from_source(chunk_a.source()),
-        TokenSet::from_source(chunk_b.source()),
-    ) else {
+    let (Some(tokens_a), Some(tokens_b)) = (chunk_a.tokens(), chunk_b.tokens()) else {
         return StructuralSimilarity::NoTokens;
     };
 
-    StructuralSimilarity::Measured(tokens_a.jaccard(&tokens_b))
+    StructuralSimilarity::Measured(tokens_a.similarity_with(tokens_b))
 }
 
 /// 依存先集合の Jaccard 係数。どちらかのファイルに import が無ければ測れない。

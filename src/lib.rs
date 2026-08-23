@@ -13,8 +13,8 @@
 //! `classification` のハードコードした閾値による 3 ラベルの判定、`report` の理由付き
 //! text 出力までがある。`semantics` と `lsp` はまだ無い。
 //!
-//! `syntax` のうち、チャンク化と import 収集は tree-sitter の構文木から採る。
-//! AST 正規化と類似度の測り方は Phase 0 のまま（正規化トークン集合の Jaccard 係数）。
+//! `syntax` はチャンク化・AST 正規化・import 収集のすべてを tree-sitter の構文木から採る。
+//! 構造類似度は、正規化トークン列に現れる並びの重なりで測る。
 
 pub mod classification;
 pub mod cli;

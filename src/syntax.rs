@@ -11,13 +11,12 @@
 //! **どのノードがチャンク / import かという語彙は `chunk` と `import` が持ち**、
 //! 木を歩く手順だけを `tree` に置く。
 //!
-//! 構造類似度は Phase 0 のまま、文字を前から見て切った正規化トークン集合の
-//! Jaccard 係数で出している（`token`）。
+//! 構造類似度は構文木を正規化したトークン列の重なりで出す（`token`）。
+//! 正規化の粒度もそこが持つ。
 
 pub mod chunk;
 pub mod import;
 pub mod line_range;
 pub mod module_distance;
-pub(crate) mod source_character;
 pub mod token;
 pub mod tree;
