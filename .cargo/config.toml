@@ -1,0 +1,22 @@
+# 公開から日が浅いバージョンを解決に使わない（cooldown）。
+#
+# Why: 悪意あるバージョンは build script と proc macro が `cargo build` の時点で
+# ローカル実行されるため、掴んでから気付いても遅い。発見・yank されるまでの時間を稼ぐ。
+#
+# **stable では無言で無効になる。** `[unstable]` テーブルは仕様として黙って無視され、
+# `registry.global-min-publish-age` も警告を出さない（`resolver.incompatible-publish-age`
+# だけが unused config key として出る）。設定してあるのに守られていない状態を避けるため、
+# 依存の解決は `harness/deps/resolve.sh` を通す。あちらは nightly が無ければ落ちる。
+
+[unstable]
+min-publish-age = true
+
+[registry]
+# 14 日。2026-08 の arrayref の事案は 86 分で検知・削除されており、日数の意味は
+# 「検知ラグを覆えるか」に尽きる。長くするほど緊急のセキュリティ修正が遅れる。
+global-min-publish-age = "14 days"
+
+[resolver]
+# 期間内のバージョンは、lock に既にある場合を除いて無視する。
+# 緊急時は `allow` + `cargo update --precise` で意図的に抜ける（RFC 3923 が想定する逃げ道）。
+incompatible-publish-age = "deny"

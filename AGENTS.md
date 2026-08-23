@@ -147,3 +147,32 @@ bash harness/githooks/pre-push              # push 前の検査をまとめて�
   固定できないと検査そのものが信用できない**
 - 可読性のため hash の隣に `# v5.1.0` の形で版をコメントする。
   更新するときは hash とコメントの両方を直す
+
+## 依存の更新は cooldown を通す
+
+**`cargo update` / `cargo add` を素で叩かない。`harness/deps/resolve.sh` を通す**
+（詳細は `harness/deps/README.md`）。
+
+```bash
+bash harness/deps/resolve.sh update
+bash harness/deps/resolve.sh add serde
+```
+
+**Why**: 悪意あるバージョンは build script と proc macro が `cargo build` の時点で
+ローカル実行される。**掴んだ時点で実行済み**なので、後段の層では止められない。
+`.cargo/config.toml` の `global-min-publish-age` が、公開から日が浅いバージョンを
+解決に使わないようにする。
+
+**この件だけは強制力の序列が逆転する。** 序列は「検査が確実に走るか」で並んでいるが、
+ここで要るのは「**コードが実行される前か**」なので、上位の層ほど手遅れになる。
+
+| 層 | この用途 |
+|---|---|
+| 解決時（`min-publish-age`） | **ここだけが本当のブロック** |
+| git hooks（層 2） | ビルド済み = 手遅れ |
+| CI（層 1） | push 後 = 手遅れ。バイパスの事後検知にしかならない |
+
+**stable では無言で無効になる**（`[unstable]` テーブルも `global-min-publish-age` も
+警告を出さない）ため、`resolve.sh` は nightly が無ければ落ちる。
+「設定してあるのに守られていない」を作らないのがスクリプトを挟む理由で、
+**素の `cargo update` はそれを迂回する**。
