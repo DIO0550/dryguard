@@ -3,6 +3,11 @@
 //! ステージをつないだ結果はここで見る（rules/testing.md「ステージをまたぐテストと
 //! 単体のテストを分ける」）。切り出しそのものの振る舞いは `syntax::chunk`、
 //! 決定木は `classification` のモジュール内テストにある。
+//!
+//! 入力は 2 種類ある。`tests/fixtures/` は**期待するラベルを先に決めて書いた**もので、
+//! `tests/corpus/` は**業務アプリとして先に書いて判定を後から見た**もの
+//! （`tests/corpus/README.md`）。前者は出力の形を、後者は**実データに当てたときの
+//! 判定そのもの**を固定する。
 
 use std::path::Path;
 
@@ -25,6 +30,21 @@ use dryguard::similarity::Similarity;
 fn fixture(relative_path: &str, line: usize) -> Location {
     let text = format!(
         "{}/tests/fixtures/{relative_path}:{line}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let Ok(location) = text.parse() else {
+        panic!("テストが組み立てる位置は解釈できる: {text}");
+    };
+    location
+}
+
+/// `tests/corpus/src/` 配下の位置。
+///
+/// 組み立て方は [`fixture`] と同じで、根だけが違う。
+fn corpus(relative_path: &str, line: usize) -> Location {
+    let text = format!(
+        "{}/tests/corpus/src/{relative_path}:{line}",
         env!("CARGO_MANIFEST_DIR")
     );
 
@@ -239,6 +259,34 @@ fn test_compare_of_similar_functions_in_separate_domains_reports_the_verdict_and
         text.contains("提案: 偶発的な重複の可能性が高い。共通化せず分離を維持する。"),
         "ラベルに対する提案が出る: {text}"
     );
+}
+
+#[test]
+fn test_compare_of_two_filter_loops_over_unrelated_types_is_do_not_extract() {
+    // Phase 0 の検証で出た真陽性そのもの（Issue #17）。`overdueInvoices` と
+    // `itemsInWarehouse` は「配列を回して条件で絞り、別の配列へ push する」形が同じで、
+    // 依存先は 1 つも重ならない。**このツールが検出したかったケース**なので、
+    // 構造類似度の測り方や既定の閾値を触ったときに黙って落ちないよう固定する。
+    let verdict = verdict(
+        &corpus("billing/dunning.ts", 10),
+        &corpus("inventory/warehouse.ts", 18),
+    );
+
+    assert_eq!(verdict, Verdict::DoNotExtract);
+}
+
+#[test]
+fn test_compare_of_two_short_functions_without_a_shared_shape_is_review() {
+    // 対照は上の真陽性。`allocate`（数値のクランプ）と `renderInvoiceEmail`
+    // （文字列の組み立て）は、どちらも 3 行で `const` と `return` しか共有していない。
+    // Phase 0 の集合 Jaccard はこれを 0.93 と測って DO-NOT-EXTRACT に倒していた
+    // （Issue #17 が「弱点 1」と呼んだ偽陽性）。
+    let verdict = verdict(
+        &corpus("inventory/warehouse.ts", 13),
+        &corpus("notification/email.ts", 6),
+    );
+
+    assert_eq!(verdict, Verdict::Review);
 }
 
 #[test]

@@ -212,23 +212,23 @@ mod tests {
         let text = text_of_accidental_duplication();
 
         assert!(
-            text.contains("構造類似度: 0.94 (閾値 0.85) → 共通化する側"),
+            text.contains("構造類似度: 0.94 (閾値 0.5) → 共通化する側"),
             "測った値・比べた閾値・傾きが 1 行で読める: {text}"
         );
     }
 
     #[test]
     fn test_text_of_reports_the_threshold_it_was_given_instead_of_the_default() {
-        // 既定（0.85）と違う値を渡す。既定と同じ値では、渡した閾値が使われたのか
+        // 既定と違う値を渡す。既定と同じ値では、渡した閾値が使われたのか
         // 既定が使われたのかが分からない
         let text = text_of_separate_directories(
             StructuralSimilarity::Measured(measured(0.94)),
             ImportOverlap::Measured(measured(0.0)),
-            Threshold::from_literal(0.5),
+            Threshold::from_literal(0.8),
         );
 
         assert!(
-            text.contains("(閾値 0.5)"),
+            text.contains("(閾値 0.8)"),
             "指定された閾値がそのまま出る: {text}"
         );
     }
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn test_text_of_review_suggests_a_human_decision() {
         let text = text_of_separate_directories(
-            StructuralSimilarity::Measured(measured(0.5)),
+            StructuralSimilarity::Measured(measured(0.2)),
             ImportOverlap::Measured(measured(0.0)),
             DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
         );

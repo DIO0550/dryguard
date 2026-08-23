@@ -18,9 +18,20 @@ use crate::threshold::Threshold;
 
 /// 構造が似ていると見なす類似度の下限。`--threshold` が無いときに使う。
 ///
+/// **この値は構造類似度の測り方とセットでしか意味を持たない。** 測り方を変えたら、
+/// ここも測り直して決める（`tests/corpus/` の全ペアで旧実装と突き合わせる）。
+///
+/// Why（0.50）: 正規化トークン列の 3-gram で測ると、`tests/corpus/` の 1081 ペアの
+/// うち 65 ペアがこの値を超える。**素朴な集合 Jaccard で 0.85 を超えていたのと同じ本数**で、
+/// 測り方を差し替えても候補に上げる網の細かさが変わらない。
+///
+/// Why not（0.85 のまま）: 集合 Jaccard は順序も出現回数も落としていたので上位が
+/// 1.00 付近に潰れており、0.85 はその分布に対して選んだ値だった。並びを見る測り方では
+/// 同じ 0.85 が 4 倍近く厳しくなり、Phase 0 で検出できていた真陽性が消える。
+///
 /// Phase 3 まで設定ファイルへ出さない。**先回りで外に出すと、まだ意味の分かっていない
 /// つまみが増える**（`docs/dryguard-plan.md`「Phase 3: Stage 3 を厚くする」）。
-pub const DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD: Threshold = Threshold::from_literal(0.85);
+pub const DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD: Threshold = Threshold::from_literal(0.50);
 
 /// 依存先を共有していると見なす重なりの下限。
 ///
@@ -281,7 +292,7 @@ mod tests {
         // ドメインは不一致にしてある。構造が似ていないだけで DO-NOT-EXTRACT に
         // 倒れないことを見る（似ていないペアは、そもそも共通化の候補ではない）
         let signals = Signals::new(
-            StructuralSimilarity::Measured(measured(0.5)),
+            StructuralSimilarity::Measured(measured(0.2)),
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         );
@@ -295,7 +306,9 @@ mod tests {
     fn test_classification_at_the_threshold_is_extract_candidate() {
         // 境界。閾値ちょうどを候補から外すと、指定した閾値そのものが判定に出てこない
         let signals = Signals::new(
-            StructuralSimilarity::Measured(measured(0.85)),
+            StructuralSimilarity::Measured(measured(
+                DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD.value(),
+            )),
             ImportOverlap::Measured(measured(1.0)),
             separate_directories(),
         );
@@ -307,15 +320,15 @@ mod tests {
 
     #[test]
     fn test_classification_with_a_lowered_threshold_reaches_a_verdict_the_default_would_not() {
-        // 既定（0.85）では届かない類似度を選ぶ。既定と同じ答えになる入力では、
+        // 既定では届かない類似度を選ぶ。既定と同じ答えになる入力では、
         // 渡した閾値が使われたのか既定が使われたのかが分からない
         let signals = Signals::new(
-            StructuralSimilarity::Measured(measured(0.6)),
+            StructuralSimilarity::Measured(measured(0.3)),
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         );
 
-        let classification = classification_of(&signals, Threshold::from_literal(0.5));
+        let classification = classification_of(&signals, Threshold::from_literal(0.2));
 
         assert_eq!(classification.verdict(), Verdict::DoNotExtract);
     }
@@ -413,7 +426,7 @@ mod tests {
         // 似ていないことは「共通化するな」ではない。TowardDoNotExtract に倒すと、
         // --explain が「偶発的重複だから共通化しない」と読める根拠を出してしまう
         let signals = Signals::new(
-            StructuralSimilarity::Measured(measured(0.5)),
+            StructuralSimilarity::Measured(measured(0.2)),
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         );
@@ -424,7 +437,7 @@ mod tests {
             leans(
                 &classification,
                 &Reason::StructuralSimilarity {
-                    signal: StructuralSimilarity::Measured(measured(0.5)),
+                    signal: StructuralSimilarity::Measured(measured(0.2)),
                     lean: Lean::Neither,
                 }
             ),

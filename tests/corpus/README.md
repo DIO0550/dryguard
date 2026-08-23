@@ -4,6 +4,21 @@
 TypeScript で、5 ドメイン（`billing` / `inventory` / `shipping` / `notification` / `analytics`）と
 共有ユーティリティ（`shared`）に 19 ファイル・47 関数を置いてある。
 
+## CI が見ている関数がある
+
+`tests/compare.rs` が、ここの 4 関数を名指しで判定の回帰テストに使っている。
+
+| ファイル | 関数 | 固定している判定 |
+|---|---|---|
+| `billing/dunning.ts` | `overdueInvoices` | この 2 つで `DO-NOT-EXTRACT`（Phase 0 の真陽性） |
+| `inventory/warehouse.ts` | `itemsInWarehouse` | 〃 |
+| `inventory/warehouse.ts` | `allocate` | この 2 つで `REVIEW`（Phase 0 の偽陽性が再現しないことの対照） |
+| `notification/email.ts` | `renderInvoiceEmail` | 〃 |
+
+**この 4 つの本体と行位置を動かすと CI が落ちる。** 足すのは自由だが、この 4 つは
+「判定を後から見た入力」であることに価値があるので、テストを通すために書き換えない
+（書き換えた時点で `tests/fixtures` と同じ「答えが先にある」入力になる）。
+
 ## `tests/fixtures` と何が違うか
 
 **書いた順番が違う。**
