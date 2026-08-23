@@ -1,0 +1,12 @@
+# Phase 0 の調査用。プロダクトのクレートとは別に持つ（README「なぜ別クレートか」）。
+[package]
+name = "chunk-unit-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# 類似度の測り方をプロダクトと同じにするために依存する。ここを別実装にすると、
+# 出た差が「単位の違い」なのか「測り方の違い」なのか読めなくなる。
+dryguard = { path = "../../.." }
+tree-sitter = "0.26"
