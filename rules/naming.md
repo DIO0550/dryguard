@@ -57,6 +57,7 @@ if structurally_similar && domains_differ { ... }
 |---|---|
 | `chunk` | 比較の単位。関数・メソッド・impl ブロック |
 | `pair` | 比較する 2 つの chunk |
+| `gram` | 構造類似度を測るときに突き合わせる、正規化トークンの並び 1 つ分 |
 | `signal` | 判定の材料。構造類似度・型シグネチャ・呼び出し先 / 呼び出し元・モジュール距離 |
 | `verdict` | 判定の結果（`EXTRACT-CANDIDATE` / `DO-NOT-EXTRACT` / `REVIEW`） |
 | `reason` | 判定を傾けた根拠 1 件。シグナルの値と、それが傾けた向きの組 |
