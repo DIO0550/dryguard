@@ -18,6 +18,7 @@
 
 pub mod classification;
 pub mod cli;
+pub mod codebase;
 pub mod line_number;
 pub mod location;
 pub mod pipeline;
