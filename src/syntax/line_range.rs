@@ -54,6 +54,14 @@ impl LineRange {
     pub fn contains(self, line: LineNumber) -> bool {
         (self.start..=self.end).contains(&line)
     }
+
+    /// 2 つの範囲が 1 行でも共有しているか。
+    ///
+    /// 片方がもう片方を丸ごと覆っている形も重なりに数える。**入れ子になった関数を
+    /// 見分けるのがこの操作の用途**で、そこでは覆う形のほうが普通。
+    pub fn overlaps(self, other: Self) -> bool {
+        self.start <= other.end && other.start <= self.end
+    }
 }
 
 impl fmt::Display for LineRange {
@@ -124,6 +132,33 @@ mod tests {
 
         assert!(!range.contains(line(9)));
         assert!(!range.contains(line(21)));
+    }
+
+    #[test]
+    fn test_line_range_overlaps_a_range_it_encloses() {
+        let outer = LineRange::new(line(10), line(20)).expect("作れる");
+        let inner = LineRange::new(line(12), line(14)).expect("作れる");
+
+        assert!(outer.overlaps(inner));
+        assert!(inner.overlaps(outer), "どちら側から見ても重なっている");
+    }
+
+    #[test]
+    fn test_line_range_overlaps_a_range_that_shares_only_one_line() {
+        // 1 行だけ共有する形。両端を含む範囲なので、ここは重なりに数える
+        let earlier = LineRange::new(line(10), line(20)).expect("作れる");
+        let later = LineRange::new(line(20), line(30)).expect("作れる");
+
+        assert!(earlier.overlaps(later));
+    }
+
+    #[test]
+    fn test_line_range_does_not_overlap_a_range_that_starts_after_it_ends() {
+        let earlier = LineRange::new(line(10), line(20)).expect("作れる");
+        let later = LineRange::new(line(21), line(30)).expect("作れる");
+
+        assert!(!earlier.overlaps(later));
+        assert!(!later.overlaps(earlier));
     }
 
     #[test]
