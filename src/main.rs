@@ -3,6 +3,7 @@
 //! Phase 0 の骨格。引数を解釈して、判定ラベル・位置・構造類似度・理由・提案を
 //! text で表示する（`docs/dryguard-plan.md`「CLI仕様 (案)」の出力イメージ）。
 
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -10,8 +11,9 @@ use clap::Parser;
 use dryguard::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
 use dryguard::cli::{Cli, Command, CommonOptions};
 use dryguard::location::Location;
-use dryguard::pipeline::{chunk_pair_of, signals_of};
-use dryguard::report::text_of;
+use dryguard::pipeline::{chunk_pair_of, scan_of, signals_of};
+use dryguard::report::{scan_text_of, text_of};
+use dryguard::threshold::Threshold;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -21,6 +23,7 @@ fn main() -> ExitCode {
             location_a,
             location_b,
         } => report_compare(location_a, location_b, &cli.options),
+        Command::Scan { path } => report_scan(path, &cli.options),
     }
 }
 
@@ -46,9 +49,7 @@ fn report_compare(
     };
 
     let signals = signals_of(&chunk_a, &chunk_b);
-    let threshold = options
-        .threshold
-        .unwrap_or(DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+    let threshold = threshold_of(options);
     let classification = classification_of(&signals, threshold);
 
     println!(
@@ -57,4 +58,32 @@ fn report_compare(
     );
 
     ExitCode::SUCCESS
+}
+
+/// `scan` の対象ディレクトリを走査して、候補ペアを理由付きで表示する。
+///
+/// 走査そのものが始められなかったときだけ終了コードを 1 にする。読めなかった
+/// 1 ファイルで全体を失敗にすると、出せていた候補ペアまで捨てることになる
+/// （飛ばしたものは出力に残る）。
+fn report_scan(root: &Path, options: &CommonOptions) -> ExitCode {
+    let threshold = threshold_of(options);
+
+    let scan = match scan_of(root, threshold) {
+        Ok(scan) => scan,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("{}", scan_text_of(&scan, threshold));
+
+    ExitCode::SUCCESS
+}
+
+/// 判定に使う閾値。`--threshold` が無ければ既定値。
+fn threshold_of(options: &CommonOptions) -> Threshold {
+    options
+        .threshold
+        .unwrap_or(DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD)
 }
