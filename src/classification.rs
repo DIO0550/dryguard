@@ -144,7 +144,11 @@ fn domain_of(signals: &Signals) -> Domain {
 }
 
 /// 構造類似度が閾値に届いているか。測れていなければ届いていない扱いにする。
-fn is_structurally_similar(signal: StructuralSimilarity, threshold: Threshold) -> bool {
+///
+/// `scan` が候補ペアを絞るのにも使う。**同じ条件を呼ぶ側に書き直させない**ため公開する。
+/// 書き直すと、`classification` の決定木が「似ている」と見なす範囲と、候補として
+/// 拾われる範囲が黙ってずれる（`rules/architecture.md`「判定は 1 箇所にだけ置く」）。
+pub fn is_structurally_similar(signal: StructuralSimilarity, threshold: Threshold) -> bool {
     match signal {
         StructuralSimilarity::Measured(similarity) => similarity.is_at_least(threshold),
         StructuralSimilarity::NoTokens => false,
