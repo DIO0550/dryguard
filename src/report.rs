@@ -12,6 +12,7 @@ use crate::classification::reason::{Lean, Reason};
 use crate::classification::signal::{ImportOverlap, StructuralSimilarity};
 use crate::classification::verdict::Verdict;
 use crate::location::Location;
+use crate::pipeline::{Scan, SkippedFile};
 use crate::syntax::module_distance::ModuleDistance;
 use crate::threshold::Threshold;
 
@@ -72,6 +73,69 @@ pub fn text_of(
     ));
 
     lines.join("\n")
+}
+
+/// 走査の結果を、候補ペアごとの text と走査した量にする。
+///
+/// `structural_similarity_threshold` は候補を絞るのと判定に使った閾値で、
+/// ペアごとの行に併記する。
+///
+/// 候補ペアは [`text_of`] と同じ形で並べる。**`compare` と `scan` で同じペアの
+/// 見え方が変わると、片方で見た結果をもう片方で確かめられない。**
+///
+/// 飛ばしたファイルと切り出せなかった関数は、あるときだけ節ごと出す。
+/// 空の見出しを残すと、読む側は「何かを飛ばした」と読む。
+///
+/// 末尾に改行は付けない（呼ぶ側が `println!` で出す）。
+pub fn scan_text_of(scan: &Scan, structural_similarity_threshold: Threshold) -> String {
+    let mut blocks: Vec<String> = scan
+        .candidate_pairs()
+        .iter()
+        .map(|pair| {
+            text_of(
+                pair.location_a(),
+                pair.location_b(),
+                pair.classification(),
+                structural_similarity_threshold,
+            )
+        })
+        .collect();
+
+    blocks.extend(listed_block_of(
+        "読めなかったファイル:",
+        scan.skipped_files().iter().map(SkippedFile::to_string),
+    ));
+    blocks.extend(listed_block_of(
+        "構文エラーで切り出せなかった関数:",
+        scan.unchunkable().iter().map(Location::to_string),
+    ));
+    blocks.push(walked_text_of(scan));
+
+    blocks.join("\n\n")
+}
+
+/// 見出しと、字下げした項目の並び。項目が 1 つも無ければ節ごと作らない。
+fn listed_block_of(heading: &str, items: impl Iterator<Item = String>) -> Option<String> {
+    let lines: Vec<String> = std::iter::once(heading.to_owned())
+        .chain(items.map(|item| format!("{INDENT}{item}")))
+        .collect();
+
+    let only_the_heading = lines.len() == 1;
+    if only_the_heading {
+        return None;
+    }
+    Some(lines.join("\n"))
+}
+
+/// 走査した量。**候補の数だけでは「見ていないもの」が分からない。**
+fn walked_text_of(scan: &Scan) -> String {
+    format!(
+        "対象 {} ファイル / チャンク {} 件 / 比較 {} ペア / 候補 {} ペア",
+        scan.file_count(),
+        scan.chunk_count(),
+        scan.compared_pair_count(),
+        scan.candidate_pairs().len()
+    )
 }
 
 /// 根拠の行。見出し `理由:` は最初の 1 件にだけ付け、続きは同じ桁から始める。
@@ -144,6 +208,7 @@ mod tests {
     use crate::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
     use crate::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
     use crate::location::Location;
+    use crate::pipeline::{Scan, scan_of};
     use crate::similarity::Similarity;
     use crate::syntax::module_distance::ModuleDistance;
     use crate::test_support::line;
@@ -320,6 +385,109 @@ mod tests {
         assert!(
             text.contains("  提案: 共通化してよい。1 つにまとめる先を検討する。"),
             "候補側の提案が出る: {text}"
+        );
+    }
+
+    /// `tests/fixtures/` 配下のディレクトリを走査した結果。
+    ///
+    /// カレントディレクトリではなくマニフェストの位置から組み立てる
+    /// （テストの実行位置に依存させない）。
+    fn scan_of_fixture(relative_path: &str, threshold: Threshold) -> Scan {
+        let root = PathBuf::from(format!(
+            "{}/tests/fixtures/{relative_path}",
+            env!("CARGO_MANIFEST_DIR")
+        ));
+
+        scan_of(&root, threshold).expect("フィクスチャのディレクトリは走査できる")
+    }
+
+    /// 候補ペアが 1 組だけ出るフィクスチャの text。
+    fn scan_text_of_fixture() -> String {
+        let threshold = DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
+
+        scan_text_of(&scan_of_fixture("scan", threshold), threshold)
+    }
+
+    #[test]
+    fn test_scan_text_of_reports_a_candidate_pair_with_its_verdict_and_both_locations() {
+        let text = scan_text_of_fixture();
+
+        let verdict_line = text
+            .lines()
+            .find(|line| line.starts_with("[DO-NOT-EXTRACT] "))
+            .unwrap_or_default();
+        assert!(
+            verdict_line.contains("billing/discount.ts:3")
+                && verdict_line.contains("inventory/reorder.ts:3"),
+            "候補ペアが compare と同じ 1 行目の形で出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_scan_text_of_separates_the_pairs_it_lists_with_a_blank_line() {
+        // 閾値を 0.0 まで下げて、比べたペアをすべて候補にする。1 組しか出ない
+        // 入力では「並べた形」になっているかを確かめられない
+        let threshold = Threshold::from_literal(0.0);
+        let scan = scan_of_fixture("scan", threshold);
+
+        let text = scan_text_of(&scan, threshold);
+
+        let verdict_lines = text.lines().filter(|line| line.starts_with('[')).count();
+        assert_eq!(verdict_lines, 5, "比べた 5 ペアが並ぶ: {text}");
+        assert!(text.contains("\n\n["), "ペアとペアの間に空行が入る: {text}");
+    }
+
+    #[test]
+    fn test_scan_text_of_reports_how_much_of_the_codebase_it_walked() {
+        let text = scan_text_of_fixture();
+
+        assert!(
+            text.contains("対象 5 ファイル / チャンク 4 件 / 比較 5 ペア / 候補 1 ペア"),
+            "走査した量が読める: {text}"
+        );
+    }
+
+    #[test]
+    fn test_scan_text_of_reports_a_file_it_could_not_read() {
+        let threshold = DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
+
+        let text = scan_text_of(&scan_of_fixture("scan-skipped", threshold), threshold);
+
+        assert!(
+            text.contains("読めなかったファイル:"),
+            "飛ばしたファイルの見出しが出る: {text}"
+        );
+        assert!(
+            text.contains("not-utf8.ts"),
+            "どのファイルを飛ばしたかが出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_scan_text_of_reports_a_function_it_could_not_chunk() {
+        let threshold = DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
+
+        let text = scan_text_of(&scan_of_fixture("scan-skipped", threshold), threshold);
+
+        assert!(
+            text.contains("構文エラーで切り出せなかった関数:"),
+            "切り出せなかった関数の見出しが出る: {text}"
+        );
+        assert!(
+            text.contains("unterminated.ts:1"),
+            "どの関数を飛ばしたかが位置で出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_scan_text_of_without_anything_skipped_omits_those_sections() {
+        // 対照は上の 2 つ。飛ばしたものが無い走査で見出しだけが残ると、
+        // 読む側は「何かを飛ばした」と読む
+        let text = scan_text_of_fixture();
+
+        assert!(
+            !text.contains("読めなかったファイル:") && !text.contains("構文エラーで"),
+            "飛ばしたものが無ければ見出しごと出さない: {text}"
         );
     }
 
