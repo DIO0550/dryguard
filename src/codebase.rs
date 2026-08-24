@@ -33,6 +33,9 @@ const TYPESCRIPT_EXTENSION: &str = "ts";
 /// シンボリックリンクは辿らない。**辿ると循環したツリーで走査が終わらない**うえ、
 /// 同じファイルを別のパスで 2 回数えることになる。
 ///
+/// Why not（`path.is_dir()` で判定する）: リンクを辿った先の型を返すので、
+/// リンクのディレクトリが `true` になる。`entry.file_type()` はリンク自身の型を返す。
+///
 /// # Errors
 ///
 /// `root` がディレクトリでない / 途中のディレクトリを読めないとき。
@@ -214,6 +217,28 @@ mod tests {
         assert!(
             relative.iter().any(|path| path.starts_with("src/")),
             "除外の対象でないディレクトリは残る: {relative:?}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_paths_of_a_directory_does_not_walk_into_a_symlinked_directory() {
+        // 対照はリンク先の実体（src/billing）。実体のファイルは出るが、リンク経由の
+        // パスでは出ない。`entry.file_type()` はリンク自身の型を返すのでこうなるが、
+        // `path.is_dir()` に書き換えるとリンクを辿り、循環したツリーで走査が終わらなくなる
+        let root = fixture("scan");
+
+        let paths = typescript_paths_of(&root).expect("フィクスチャのディレクトリはある");
+
+        let relative = relative_paths_of(&root, &paths);
+        assert!(
+            !relative
+                .iter()
+                .any(|path| path.starts_with("src/linked-billing/")),
+            "リンク経由のパスで同じファイルを 2 回数えている: {relative:?}"
+        );
+        assert!(
+            relative.contains(&"src/billing/discount.ts".to_owned()),
+            "リンク先の実体は走査に出る: {relative:?}"
         );
     }
 
