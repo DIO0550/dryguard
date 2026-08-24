@@ -9,9 +9,10 @@
 //! | `semantics` | 意味情報収集（LSP への問い合わせと結果の正規化） | Stage 2 |
 //! | `classification` | 分類（シグナルの統合と判定・理由の組み立て） | Stage 3 |
 //!
-//! 現在は Phase 1 の途中。CLI の受け口、`syntax` のチャンク化・構造類似度・import 収集、
-//! `classification` のハードコードした閾値による 3 ラベルの判定、`report` の理由付き
-//! text 出力までがある。`semantics` と `lsp` はまだ無い。
+//! 現在は Phase 1 の途中。CLI の受け口（`compare` と `scan`）、`codebase` の対象ファイル
+//! 収集、`syntax` のチャンク化・構造類似度・import 収集、`classification` の
+//! ハードコードした閾値による 3 ラベルの判定、`report` の理由付き text 出力までがある。
+//! `semantics` と `lsp` はまだ無い。
 //!
 //! `syntax` はチャンク化・AST 正規化・import 収集のすべてを tree-sitter の構文木から採る。
 //! 構造類似度は、正規化トークン列に現れる並びの重なりで測る。

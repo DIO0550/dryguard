@@ -7,14 +7,16 @@
 
 ```
 cli → pipeline → classification(分類) → semantics(意味情報収集) → syntax(候補抽出)
-        ↓                                       ↓
-       report(text 化)                         lsp(外部プロセスとの境界)
+        ↓  ↓                                    ↓
+        │ codebase(走査対象の収集)              lsp(外部プロセスとの境界)
+       report(text 化)
 ```
 
 | モジュール | 責務 | 持たないもの | 計画での呼び名 |
 |---|---|---|---|
 | `cli` | 引数の受け口と値の解釈 | 判定・I/O の手順 | — |
 | `pipeline` | ステージを呼ぶ順序 | 判定・チャンク化 | — |
+| `codebase` | 走査対象のファイルを集めて読む | 判定・チャンク化・順序 | — |
 | `syntax` | チャンク化・AST 正規化・類似度・import 収集 | 判定 | Stage 1 |
 | `semantics` | LSP への問い合わせと応答の正規化 | 判定 | Stage 2 |
 | `classification` | シグナルの統合と判定・理由の組み立て | I/O・LSP の呼び出し | Stage 3 |

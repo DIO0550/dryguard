@@ -173,10 +173,19 @@ let (path, line) = text.rsplit_once(':')...
 
 ## I/O を持ってよい場所
 
-`lsp`・入口の層・`location`（**自分が指すファイルを読むところまで**）に限る。
+`lsp`・入口の層・`location`（**自分が指すファイルを読むところまで**）・
+`codebase`（**対象ファイルを集めて読むところまで**）に限る。
 
 **Why（`location` を例外にする）**: 「その位置のファイルを読む」は位置自身の振る舞いで、
 呼び出し側に `fs::read_to_string(location.path())` を組み立てさせる理由が無い。
+
+**Why（`codebase` を例外にする）**: `scan` は位置ではなくディレクトリから始まるので、
+`location` では受けられない。`location` と同じ形で「集めて読む」までに閉じ、
+渡す先（`syntax`）は純粋なまま保つ。
+
+**Why not（`pipeline` に直接 `fs` を置く）**: `pipeline` の責務は
+ステージを呼ぶ順序で、I/O の手順は持たない（`rules/architecture.md` の表）。
+2 モジュールに閉じておくと、`fs::` を grep するだけで I/O の入口を数え切れる。
 
 **Why not（`syntax` まで広げる）**: 読んだ結果を渡す先が純粋でなくなると、
 `Chunk::find_enclosing` のテストが実ファイルを要求し始める。
