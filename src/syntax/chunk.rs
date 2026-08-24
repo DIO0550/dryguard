@@ -146,6 +146,45 @@ pub struct FileChunks {
 }
 
 impl FileChunks {
+    /// そのファイルにある関数・メソッドを、構文木からすべて切り出す。
+    ///
+    /// `tree` はそのファイルの構文木、`path` は切り出したチャンクに持たせる位置。
+    /// 入れ子になった関数は外側と内側の両方が返る。**別のファイルに同じ形の内側が
+    /// あれば見つけたい**ので、外側に含まれることを理由に落とさない。
+    ///
+    /// 構文エラーのある関数はチャンクにせず、始まりの行だけを残す
+    /// ([`Chunk::find_enclosing`] が [`ChunkingError::UnparsableFunction`] で断るのと同じ扱い)。
+    pub fn from_tree(tree: &SyntaxTree<'_>, path: &Path) -> Self {
+        let imports = ImportSet::from_tree(tree, path);
+        let mut chunks = Vec::new();
+        let mut unparsable_starts = Vec::new();
+
+        for node in tree.named_descendants() {
+            if !CHUNK_KINDS.contains(&node.kind()) {
+                continue;
+            }
+
+            let lines = line_range_of(node);
+            if node.has_error() {
+                unparsable_starts.push(lines.start());
+                continue;
+            }
+
+            chunks.push(Chunk::new(
+                path.to_path_buf(),
+                lines,
+                source_of_lines(tree.source(), lines),
+                TokenSequence::from_node(node),
+                imports.clone(),
+            ));
+        }
+
+        Self {
+            chunks,
+            unparsable_starts,
+        }
+    }
+
     /// 切り出せたチャンク。ソースに書かれた順に並ぶ。
     pub fn chunks(&self) -> &[Chunk] {
         &self.chunks
@@ -154,45 +193,6 @@ impl FileChunks {
     /// 構文エラーで切り出せなかった関数の、始まりの行。
     pub fn unparsable_starts(&self) -> &[LineNumber] {
         &self.unparsable_starts
-    }
-}
-
-/// そのファイルにある関数・メソッドをすべて切り出す。
-///
-/// `path` は切り出したチャンクに持たせる位置、`tree` はそのファイルの構文木。
-/// 入れ子になった関数は外側と内側の両方が返る。**別のファイルに同じ形の内側が
-/// あれば見つけたい**ので、外側に含まれることを理由に落とさない。
-///
-/// 構文エラーのある関数はチャンクにせず、始まりの行だけを残す
-/// ([`Chunk::find_enclosing`] が [`ChunkingError::UnparsableFunction`] で断るのと同じ扱い)。
-pub fn chunks_of(path: &Path, tree: &SyntaxTree<'_>) -> FileChunks {
-    let imports = ImportSet::from_tree(tree, path);
-    let mut chunks = Vec::new();
-    let mut unparsable_starts = Vec::new();
-
-    for node in tree.named_descendants() {
-        if !CHUNK_KINDS.contains(&node.kind()) {
-            continue;
-        }
-
-        let lines = line_range_of(node);
-        if node.has_error() {
-            unparsable_starts.push(lines.start());
-            continue;
-        }
-
-        chunks.push(Chunk::new(
-            path.to_path_buf(),
-            lines,
-            source_of_lines(tree.source(), lines),
-            TokenSequence::from_node(node),
-            imports.clone(),
-        ));
-    }
-
-    FileChunks {
-        chunks,
-        unparsable_starts,
     }
 }
 
@@ -668,11 +668,11 @@ export function sound(value: number): number {
     fn chunks_at(source: &str, path: &str) -> FileChunks {
         let tree = SyntaxTree::from_typescript(source).expect("テストが渡すソースは木にできる");
 
-        chunks_of(Path::new(path), &tree)
+        FileChunks::from_tree(&tree, Path::new(path))
     }
 
     #[test]
-    fn test_chunks_of_a_file_with_two_functions_returns_both_in_source_order() {
+    fn test_file_chunks_from_a_file_with_two_functions_keeps_both_in_source_order() {
         let two_functions = r#"export function first(value: number): number {
   return value;
 }
@@ -689,7 +689,7 @@ export function second(value: number): number {
     }
 
     #[test]
-    fn test_chunks_of_a_file_with_a_nested_function_returns_the_outer_and_the_inner() {
+    fn test_file_chunks_from_a_file_with_a_nested_function_keeps_the_outer_and_the_inner() {
         // 別のファイルに同じ形のアロー関数があれば見つけたいので、入れ子の内側も
         // 1 つのチャンクとして返す
         let file_chunks = chunks_at(NESTED_FUNCTIONS, "src/a.ts");
@@ -699,7 +699,7 @@ export function second(value: number): number {
     }
 
     #[test]
-    fn test_chunks_of_a_file_without_any_function_returns_nothing() {
+    fn test_file_chunks_from_a_file_without_any_function_keeps_nothing() {
         let only_a_constant = "export const rate = 0.1;\n";
 
         let file_chunks = chunks_at(only_a_constant, "src/a.ts");
@@ -708,7 +708,7 @@ export function second(value: number): number {
     }
 
     #[test]
-    fn test_chunks_of_a_file_gives_every_chunk_the_path_it_was_asked_for() {
+    fn test_file_chunks_from_a_file_gives_every_chunk_the_path_it_was_asked_for() {
         let file_chunks = chunks_at(FUNCTION_AFTER_A_CONSTANT, "src/billing/discount.ts");
 
         let paths: Vec<&Path> = file_chunks.chunks().iter().map(Chunk::path).collect();
@@ -716,7 +716,7 @@ export function second(value: number): number {
     }
 
     #[test]
-    fn test_chunks_of_a_file_with_an_import_gives_every_chunk_that_dependency() {
+    fn test_file_chunks_from_a_file_with_an_import_gives_every_chunk_that_dependency() {
         let file_chunks = chunks_at(CONSTANT_OUTSIDE_A_FUNCTION, "src/billing/invoice.ts");
 
         let dependencies: Vec<Option<&ImportSet>> =
@@ -728,7 +728,7 @@ export function second(value: number): number {
     }
 
     #[test]
-    fn test_chunks_of_a_file_reports_the_start_of_a_function_it_could_not_parse() {
+    fn test_file_chunks_from_a_file_reports_the_start_of_a_function_it_could_not_parse() {
         // 対照として壊れていない関数を同じソースに置く。壊れた側だけが
         // チャンクから外れて、始まりの行として残る
         let sound_then_broken = r#"export function sound(value: number): number {

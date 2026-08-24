@@ -13,7 +13,7 @@ use crate::classification::signal::{ImportOverlap, Signals, StructuralSimilarity
 use crate::classification::{Classification, classification_of, is_structurally_similar};
 use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
 use crate::location::Location;
-use crate::syntax::chunk::{Chunk, ChunkingError, chunks_of};
+use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks};
 use crate::syntax::module_distance::ModuleDistance;
 use crate::syntax::tree::{ParseError, SyntaxTree};
 use crate::threshold::Threshold;
@@ -125,7 +125,7 @@ pub fn scan_of(
             }
         };
 
-        let file_chunks = chunks_of(&path, &tree);
+        let file_chunks = FileChunks::from_tree(&tree, &path);
         unchunkable.extend(
             file_chunks
                 .unparsable_starts()
