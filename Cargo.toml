@@ -9,6 +9,9 @@ license = "MIT"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+# scan の並列化に使う（`docs/dryguard-plan.md`「技術スタック」）。総当たりの仕事量は
+# 先頭のチャンクほど大きい三角形なので、等分ではなく作業盗みのある実装に任せる。
+rayon = "1.12"
 tree-sitter = "0.26"
 # grammar は言語ごとに別クレート。Phase 4 で Rust を足すときは
 # tree-sitter-rust を並べるだけで済む（`docs/dryguard-plan.md`「技術スタック」）。

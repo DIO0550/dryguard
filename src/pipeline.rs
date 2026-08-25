@@ -9,6 +9,8 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use crate::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
 use crate::classification::{Classification, classification_of, is_structurally_similar};
 use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
@@ -110,33 +112,25 @@ pub fn scan_of(
     let paths = typescript_paths_of(root)?;
     let file_count = paths.len();
 
+    // ファイルごとの読み込み・パース・切り出しは互いに独立なので並列に回す。
+    // 結果は `paths` と同じ並びで返るので、まとめ直しを順に行えば出力の並びは
+    // 逐次で回したときと変わらない
+    let chunked_files: Vec<Result<FileChunks, SkippedFile>> =
+        paths.par_iter().map(|path| file_chunks_of(path)).collect();
+
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut skipped_files = Vec::new();
     let mut unchunkable = Vec::new();
 
-    for path in paths {
-        let Some(grammar) = Grammar::of_path(&path) else {
-            skipped_files.push(SkippedFile::UnreadableExtension { path });
-            continue;
-        };
-
-        let source = match source_of(&path) {
-            Ok(source) => source,
-            Err(cause) => {
-                skipped_files.push(SkippedFile::SourceUnreadable { path, cause });
+    for (path, chunked_file) in paths.iter().zip(chunked_files) {
+        let file_chunks = match chunked_file {
+            Ok(file_chunks) => file_chunks,
+            Err(skipped) => {
+                skipped_files.push(skipped);
                 continue;
             }
         };
 
-        let tree = match SyntaxTree::from_source(&source, grammar) {
-            Ok(tree) => tree,
-            Err(cause) => {
-                skipped_files.push(SkippedFile::SourceUnparsable { path, cause });
-                continue;
-            }
-        };
-
-        let file_chunks = FileChunks::from_tree(&tree, &path);
         unchunkable.extend(
             file_chunks
                 .unparsable_starts()
@@ -157,6 +151,34 @@ pub fn scan_of(
     ))
 }
 
+/// そのファイルを読んで、中にある関数・メソッドをすべて切り出す。
+///
+/// `path` は [`typescript_paths_of`] が集めたファイル。
+///
+/// # Errors
+///
+/// 拡張子から grammar を選べない / ファイルを読めない / 構文木にできないとき。
+/// **飛ばす理由をそのまま返す**ので、呼び出し側は 1 ファイルのために走査を止めずに済む。
+fn file_chunks_of(path: &Path) -> Result<FileChunks, SkippedFile> {
+    let grammar = Grammar::of_path(path).ok_or_else(|| SkippedFile::UnreadableExtension {
+        path: path.to_path_buf(),
+    })?;
+
+    let source = source_of(path).map_err(|cause| SkippedFile::SourceUnreadable {
+        path: path.to_path_buf(),
+        cause,
+    })?;
+
+    let tree = SyntaxTree::from_source(&source, grammar).map_err(|cause| {
+        SkippedFile::SourceUnparsable {
+            path: path.to_path_buf(),
+            cause,
+        }
+    })?;
+
+    Ok(FileChunks::from_tree(&tree, path))
+}
+
 /// 走査で集めた、チャンク以外の材料。
 ///
 /// [`scan_of_chunks`] の引数をまとめるためだけの型なので公開しない。
@@ -168,39 +190,31 @@ struct ScanInputs {
 
 /// 集めたチャンクを総当たりで比べ、候補ペアだけを判定する。
 ///
-/// 候補かどうかは [`is_structurally_similar`] に聞く。**同じ条件をここに書き直すと、
-/// 判定が「似ている」と見なす範囲と候補に拾う範囲が黙ってずれる**
-/// (`rules/architecture.md`「判定は 1 箇所にだけ置く」)。
+/// チャンク 1 つ分（自分より後ろの全チャンクとの比較）を単位に並列で回す。
+/// **先頭のチャンクほど比べる相手が多い**ので、区間を等分せず rayon の作業盗みに任せる。
+///
+/// 結果はチャンクの並び順で返るので、候補ペアの並びは逐次で回したときと変わらない。
 fn scan_of_chunks(
     chunks: &[Chunk],
     structural_similarity_threshold: Threshold,
     inputs: ScanInputs,
 ) -> Scan {
-    let mut candidate_pairs = Vec::new();
-    let mut compared_pair_count = 0;
+    let compared: Vec<ComparedPairs> = chunks
+        .par_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            ComparedPairs::from_chunk(chunk, &chunks[index + 1..], structural_similarity_threshold)
+        })
+        .collect();
 
-    for (index, chunk_a) in chunks.iter().enumerate() {
-        for chunk_b in &chunks[index + 1..] {
-            if is_nested(chunk_a, chunk_b) {
-                continue;
-            }
-            compared_pair_count += 1;
-
-            let signals = signals_of(chunk_a, chunk_b);
-            if !is_structurally_similar(
-                signals.structural_similarity(),
-                structural_similarity_threshold,
-            ) {
-                continue;
-            }
-
-            candidate_pairs.push(CandidatePair {
-                location_a: start_of(chunk_a),
-                location_b: start_of(chunk_b),
-                classification: classification_of(&signals, structural_similarity_threshold),
-            });
-        }
-    }
+    let compared_pair_count = compared
+        .iter()
+        .map(|compared| compared.compared_pair_count)
+        .sum();
+    let candidate_pairs = compared
+        .into_iter()
+        .flat_map(|compared| compared.candidate_pairs)
+        .collect();
 
     Scan {
         candidate_pairs,
@@ -209,6 +223,57 @@ fn scan_of_chunks(
         compared_pair_count,
         skipped_files: inputs.skipped_files,
         unchunkable: inputs.unchunkable,
+    }
+}
+
+/// 1 つのチャンクを、それより後ろのチャンクすべてと比べた結果。
+///
+/// 候補ペアと比べた数を一緒に持つ。**比べた数は候補ペアの一覧から数え直せない**
+/// （閾値に届かなかった組も、入れ子で比べなかった組も一覧には出ない）。
+struct ComparedPairs {
+    candidate_pairs: Vec<CandidatePair>,
+    compared_pair_count: usize,
+}
+
+impl ComparedPairs {
+    /// `chunk` を `following`（並びの中でそれより後ろにあるチャンク）すべてと比べる。
+    ///
+    /// 候補かどうかは [`is_structurally_similar`] に聞く。**同じ条件をここに書き直すと、
+    /// 判定が「似ている」と見なす範囲と候補に拾う範囲が黙ってずれる**
+    /// (`rules/architecture.md`「判定は 1 箇所にだけ置く」)。
+    fn from_chunk(
+        chunk: &Chunk,
+        following: &[Chunk],
+        structural_similarity_threshold: Threshold,
+    ) -> Self {
+        let mut candidate_pairs = Vec::new();
+        let mut compared_pair_count = 0;
+
+        for other in following {
+            if is_nested(chunk, other) {
+                continue;
+            }
+            compared_pair_count += 1;
+
+            let signals = signals_of(chunk, other);
+            if !is_structurally_similar(
+                signals.structural_similarity(),
+                structural_similarity_threshold,
+            ) {
+                continue;
+            }
+
+            candidate_pairs.push(CandidatePair {
+                location_a: start_of(chunk),
+                location_b: start_of(other),
+                classification: classification_of(&signals, structural_similarity_threshold),
+            });
+        }
+
+        Self {
+            candidate_pairs,
+            compared_pair_count,
+        }
     }
 }
 

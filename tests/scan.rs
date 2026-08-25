@@ -42,6 +42,16 @@ fn is_pair_of(pair: &CandidatePair, one: &str, other: &str) -> bool {
     ends_with_both(one, other) || ends_with_both(other, one)
 }
 
+/// そのペアが列挙された位置。`(先に列挙したチャンク, 後に列挙したチャンク)` の順で比べられる形。
+fn enumeration_key_of(pair: &CandidatePair) -> (PathBuf, usize, PathBuf, usize) {
+    (
+        pair.location_a().path().to_path_buf(),
+        pair.location_a().line().get(),
+        pair.location_b().path().to_path_buf(),
+        pair.location_b().line().get(),
+    )
+}
+
 /// そのペアの判定。候補に出ていなければ `None`。
 fn verdict_of(scan: &Scan, one: &str, other: &str) -> Option<Verdict> {
     scan.candidate_pairs()
@@ -93,6 +103,25 @@ fn test_scan_of_the_corpus_compares_every_pair_of_chunks_it_found() {
 
     assert_eq!(scan.chunk_count(), 47, "コーパスの関数の数");
     assert_eq!(scan.compared_pair_count(), 1081, "総当たりのペアの数");
+}
+
+#[test]
+fn test_scan_of_the_corpus_lists_its_candidate_pairs_in_enumeration_order() {
+    // ファイルはパス順、ファイルの中のチャンクはソース順に列挙されるので、
+    // 総当たりで出た候補ペアは (先のチャンク, 後のチャンク) の昇順に並ぶ。
+    // `Scan::candidate_pairs` が doc で約束している「列挙した順」がこれ
+    let scan = scan_of_corpus();
+
+    let keys: Vec<(PathBuf, usize, PathBuf, usize)> = scan
+        .candidate_pairs()
+        .iter()
+        .map(enumeration_key_of)
+        .collect();
+    assert!(
+        keys.len() > 1,
+        "並びを見るには 2 件以上の候補が要る: {keys:?}"
+    );
+    assert!(keys.is_sorted(), "候補ペアは列挙した順に並ぶ: {keys:?}");
 }
 
 #[test]
