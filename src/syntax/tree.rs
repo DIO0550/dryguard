@@ -9,8 +9,44 @@
 
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 
 use tree_sitter::{Node, Parser};
+
+/// ソースを読むのに使う grammar。
+///
+/// TypeScript と TSX は tree-sitter では別の grammar で、**片方で兼ねられない**。
+/// JSX は TypeScript の grammar では構文エラーになり、型アサーション `<T>value` は
+/// TSX の grammar では JSX の開始タグとして読まれる。どちらで読むかは拡張子で決まる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grammar {
+    /// `.ts`
+    TypeScript,
+    /// `.tsx`
+    Tsx,
+}
+
+impl Grammar {
+    /// そのファイルを読むための grammar。読める拡張子でなければ `None`。
+    ///
+    /// **読める拡張子の一覧をここ 1 箇所に置く。** 走査の対象を決める側（`codebase`）が
+    /// 別の一覧を持つと、拡張子を足したときに片方だけが古くなる。
+    pub fn of_path(path: &Path) -> Option<Self> {
+        match path.extension()?.to_str()? {
+            "ts" => Some(Self::TypeScript),
+            "tsx" => Some(Self::Tsx),
+            _ => None,
+        }
+    }
+
+    /// tree-sitter に渡す言語。
+    fn language(self) -> tree_sitter::Language {
+        match self {
+            Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        }
+    }
+}
 
 /// パース済みの構文木と、その元になったソース。
 ///
@@ -25,7 +61,9 @@ pub struct SyntaxTree<'source> {
 }
 
 impl<'source> SyntaxTree<'source> {
-    /// TypeScript のソースを構文木にする。
+    /// ソースを、指定した grammar で構文木にする。
+    ///
+    /// `grammar` は [`Grammar::of_path`] が拡張子から決めたもの。
     ///
     /// 構文エラーのあるソースでも木は返る（tree-sitter は壊れた場所を木の中に印として
     /// 残す）。**壊れているかを決めるのは呼び出し側**で、ここでは木を作れたかどうかだけを返す。
@@ -33,10 +71,10 @@ impl<'source> SyntaxTree<'source> {
     /// # Errors
     ///
     /// grammar を実行時が受け付けなかった / パーサが木を返さなかったとき。
-    pub fn from_typescript(source: &'source str) -> Result<Self, ParseError> {
+    pub fn from_source(source: &'source str, grammar: Grammar) -> Result<Self, ParseError> {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .set_language(&grammar.language())
             .map_err(|_| ParseError::GrammarRejected)?;
 
         let tree = parser.parse(source, None).ok_or(ParseError::NoTree)?;
@@ -110,14 +148,83 @@ impl Error for ParseError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     const A_FUNCTION: &str = r#"export function applyDiscount(price: number): number {
   return price * 0.9;
 }
 "#;
 
+    /// JSX を返す関数。TypeScript の grammar では読めない。
+    const A_FUNCTION_RETURNING_JSX: &str = r#"export function Badge(label: string) {
+  return <span className="badge">{label}</span>;
+}
+"#;
+
+    /// 型アサーション。TSX の grammar では JSX の開始タグとして読まれる。
+    const A_FUNCTION_WITH_A_TYPE_ASSERTION: &str = r#"export function widen(value: unknown) {
+  return <string>value;
+}
+"#;
+
     fn tree_of(source: &str) -> SyntaxTree<'_> {
-        SyntaxTree::from_typescript(source).expect("テストが渡すソースは木にできる")
+        SyntaxTree::from_source(source, Grammar::TypeScript)
+            .expect("テストが渡すソースは木にできる")
+    }
+
+    fn has_error(source: &str, grammar: Grammar) -> bool {
+        let tree =
+            SyntaxTree::from_source(source, grammar).expect("テストが渡すソースは木にできる");
+
+        tree.named_descendants()
+            .into_iter()
+            .any(|node| node.has_error())
+    }
+
+    #[test]
+    fn test_grammar_of_a_typescript_path_reads_it_as_typescript() {
+        assert_eq!(
+            Grammar::of_path(Path::new("src/billing/discount.ts")),
+            Some(Grammar::TypeScript)
+        );
+    }
+
+    #[test]
+    fn test_grammar_of_a_tsx_path_reads_it_as_tsx() {
+        // 既定と違う値を選ぶ。`.ts` と同じ grammar になっていたら区別が付かない
+        assert_eq!(
+            Grammar::of_path(Path::new("src/report/Badge.tsx")),
+            Some(Grammar::Tsx)
+        );
+    }
+
+    #[test]
+    fn test_grammar_of_a_path_with_another_extension_is_not_readable() {
+        // 対照は上の 2 つ。読める拡張子と同じディレクトリにあっても選べない
+        assert_eq!(Grammar::of_path(Path::new("src/report/notes.md")), None);
+        assert_eq!(Grammar::of_path(Path::new("src/report/Badge")), None);
+    }
+
+    #[test]
+    fn test_syntax_tree_of_jsx_read_as_tsx_has_no_error() {
+        assert!(!has_error(A_FUNCTION_RETURNING_JSX, Grammar::Tsx));
+    }
+
+    #[test]
+    fn test_syntax_tree_of_jsx_read_as_typescript_marks_an_error() {
+        // 対照は上のテスト。**拡張子だけ増やして grammar を選ばないと、
+        // `.tsx` の関数が丸ごと「構文エラーで切り出せない」に落ちる**
+        assert!(has_error(A_FUNCTION_RETURNING_JSX, Grammar::TypeScript));
+    }
+
+    #[test]
+    fn test_syntax_tree_of_a_type_assertion_read_as_tsx_marks_an_error() {
+        // 逆向きの非対称。TSX で両方を兼ねられないので、拡張子で選ぶ必要がある
+        assert!(has_error(A_FUNCTION_WITH_A_TYPE_ASSERTION, Grammar::Tsx));
+        assert!(!has_error(
+            A_FUNCTION_WITH_A_TYPE_ASSERTION,
+            Grammar::TypeScript
+        ));
     }
 
     #[test]
@@ -174,7 +281,7 @@ mod tests {
         // 「どこが壊れているか」を後段が見られなくなる
         let unterminated = "function broken() {\n  return 1;\n";
 
-        let tree = SyntaxTree::from_typescript(unterminated);
+        let tree = SyntaxTree::from_source(unterminated, Grammar::TypeScript);
 
         assert!(tree.is_ok(), "構文エラーがあっても木は返る");
     }

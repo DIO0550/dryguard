@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use dryguard::classification::DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
 use dryguard::syntax::token::{TokenSequence, tokens_of};
-use dryguard::syntax::tree::SyntaxTree;
+use dryguard::syntax::tree::{Grammar, SyntaxTree};
 use tree_sitter::Node;
 
 /// 関数として拾うノードの種別。`src/syntax/chunk.rs` の `CHUNK_KINDS` に合わせてある。
@@ -173,7 +173,7 @@ fn collect_units(
     functions: &mut Vec<Unit>,
     blocks: &mut Vec<Unit>,
 ) -> Result<(), Box<dyn Error>> {
-    let tree = SyntaxTree::from_typescript(source)?;
+    let tree = SyntaxTree::from_source(source, Grammar::of_path(path).unwrap_or(Grammar::TypeScript))?;
     let nodes = tree.named_descendants();
 
     let function_nodes: Vec<Node<'_>> = nodes

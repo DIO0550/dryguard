@@ -1,5 +1,7 @@
 //! コマンドラインの受け口。
 
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::location::Location;
@@ -22,7 +24,7 @@ pub struct Cli {
 
 /// サブコマンド。
 ///
-/// `scan` / `check --diff` は Phase 1 / Phase 5 で足す。**受け取るだけで何もしない
+/// `check --diff` は Phase 5 で足す。**受け取るだけで何もしない
 /// サブコマンドを先に生やさない** — 実行できるのに結果が出ないコマンドは、
 /// 使う側が「壊れている」と「未実装」を区別できない。
 #[derive(Debug, Subcommand)]
@@ -34,7 +36,19 @@ pub enum Command {
         /// 比較先の位置（file:line）
         location_b: Location,
     },
+    /// コードベース全体をスキャンする
+    Scan {
+        /// 走査を始めるディレクトリ
+        #[arg(default_value = DEFAULT_SCAN_ROOT)]
+        path: PathBuf,
+    },
 }
+
+/// `scan` の対象を省いたときに走査する場所。
+///
+/// 計画の `dryguard scan [path]` に合わせて省略できる形にする
+/// （`docs/dryguard-plan.md`「CLI仕様 (案)」）。
+const DEFAULT_SCAN_ROOT: &str = ".";
 
 /// サブコマンドをまたいで使うオプション。
 ///
@@ -110,9 +124,41 @@ mod tests {
         let Command::Compare {
             location_a,
             location_b,
-        } = &cli.command;
+        } = &cli.command
+        else {
+            panic!("compare を渡したので Compare になる");
+        };
         assert_eq!(location_a.path(), Path::new("a.ts"));
         assert_eq!(location_b.path(), Path::new("b.ts"));
+    }
+
+    #[test]
+    fn test_scan_with_a_path_walks_that_directory() {
+        // 既定は "." なので、既定と違う値を渡さないと指定が効いたか分からない
+        let cli = parse(&["dryguard", "scan", "src/billing"]);
+
+        let Command::Scan { path } = &cli.command else {
+            panic!("scan を渡したので Scan になる");
+        };
+        assert_eq!(path, Path::new("src/billing"));
+    }
+
+    #[test]
+    fn test_scan_without_a_path_walks_the_current_directory() {
+        let cli = parse(&["dryguard", "scan"]);
+
+        let Command::Scan { path } = &cli.command else {
+            panic!("scan を渡したので Scan になる");
+        };
+        assert_eq!(path, Path::new("."));
+    }
+
+    #[test]
+    fn test_scan_with_a_threshold_option_keeps_the_value() {
+        // オプションは global なのでサブコマンドの後ろに書ける
+        let cli = parse(&["dryguard", "scan", "src", "--threshold", "0.75"]);
+
+        assert_eq!(cli.options.threshold.map(Threshold::value), Some(0.75));
     }
 
     #[test]

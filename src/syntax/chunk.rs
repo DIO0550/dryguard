@@ -134,6 +134,68 @@ impl Chunk {
     }
 }
 
+/// 1 ファイルから切り出したチャンクと、構文エラーで切り出せなかった関数。
+///
+/// 切り出せなかった関数を捨てずに残すのは、スキャンの結果を読む側が
+/// 「比べた上で似ていなかった」と「そもそも比べていない」を区別できるようにするため
+/// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChunks {
+    chunks: Vec<Chunk>,
+    unparsable_starts: Vec<LineNumber>,
+}
+
+impl FileChunks {
+    /// そのファイルにある関数・メソッドを、構文木からすべて切り出す。
+    ///
+    /// `tree` はそのファイルの構文木、`path` は切り出したチャンクに持たせる位置。
+    /// 入れ子になった関数は外側と内側の両方が返る。**別のファイルに同じ形の内側が
+    /// あれば見つけたい**ので、外側に含まれることを理由に落とさない。
+    ///
+    /// 構文エラーのある関数はチャンクにせず、始まりの行だけを残す
+    /// ([`Chunk::find_enclosing`] が [`ChunkingError::UnparsableFunction`] で断るのと同じ扱い)。
+    pub fn from_tree(tree: &SyntaxTree<'_>, path: &Path) -> Self {
+        let imports = ImportSet::from_tree(tree, path);
+        let mut chunks = Vec::new();
+        let mut unparsable_starts = Vec::new();
+
+        for node in tree.named_descendants() {
+            if !CHUNK_KINDS.contains(&node.kind()) {
+                continue;
+            }
+
+            let lines = line_range_of(node);
+            if node.has_error() {
+                unparsable_starts.push(lines.start());
+                continue;
+            }
+
+            chunks.push(Chunk::new(
+                path.to_path_buf(),
+                lines,
+                source_of_lines(tree.source(), lines),
+                TokenSequence::from_node(node),
+                imports.clone(),
+            ));
+        }
+
+        Self {
+            chunks,
+            unparsable_starts,
+        }
+    }
+
+    /// 切り出せたチャンク。ソースに書かれた順に並ぶ。
+    pub fn chunks(&self) -> &[Chunk] {
+        &self.chunks
+    }
+
+    /// 構文エラーで切り出せなかった関数の、始まりの行。
+    pub fn unparsable_starts(&self) -> &[LineNumber] {
+        &self.unparsable_starts
+    }
+}
+
 /// チャンクを切り出せなかった理由。
 ///
 /// 「切り出せなかった」を既定値で埋めずに構造へ出す
@@ -236,6 +298,7 @@ fn source_of_lines(source: &str, lines: LineRange) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::syntax::tree::Grammar;
     use crate::test_support::line;
     use std::path::Path;
 
@@ -245,7 +308,8 @@ mod tests {
 
     fn chunk_at(source: &str, location: &str) -> Result<Chunk, ChunkingError> {
         let location: Location = location.parse().expect("テストが渡す位置は解釈できる");
-        let tree = SyntaxTree::from_typescript(source).expect("テストが渡すソースは木にできる");
+        let tree = SyntaxTree::from_source(source, Grammar::TypeScript)
+            .expect("テストが渡すソースは木にできる");
 
         Chunk::find_enclosing(&location, &tree)
     }
@@ -601,5 +665,91 @@ export function sound(value: number): number {
         let chunk = chunk_at(arrow_inside_a_function, "a.ts:2").expect("切り出せる");
 
         assert_eq!(chunk.lines(), range(2, 2));
+    }
+
+    fn chunks_at(source: &str, path: &str) -> FileChunks {
+        let tree = SyntaxTree::from_source(source, Grammar::TypeScript)
+            .expect("テストが渡すソースは木にできる");
+
+        FileChunks::from_tree(&tree, Path::new(path))
+    }
+
+    #[test]
+    fn test_file_chunks_from_a_file_with_two_functions_keeps_both_in_source_order() {
+        let two_functions = r#"export function first(value: number): number {
+  return value;
+}
+
+export function second(value: number): number {
+  return value + 1;
+}
+"#;
+
+        let file_chunks = chunks_at(two_functions, "src/a.ts");
+
+        let ranges: Vec<LineRange> = file_chunks.chunks().iter().map(Chunk::lines).collect();
+        assert_eq!(ranges, vec![range(1, 3), range(5, 7)]);
+    }
+
+    #[test]
+    fn test_file_chunks_from_a_file_with_a_nested_function_keeps_the_outer_and_the_inner() {
+        // 別のファイルに同じ形のアロー関数があれば見つけたいので、入れ子の内側も
+        // 1 つのチャンクとして返す
+        let file_chunks = chunks_at(NESTED_FUNCTIONS, "src/a.ts");
+
+        let ranges: Vec<LineRange> = file_chunks.chunks().iter().map(Chunk::lines).collect();
+        assert_eq!(ranges, vec![range(1, 6), range(2, 4)]);
+    }
+
+    #[test]
+    fn test_file_chunks_from_a_file_without_any_function_keeps_nothing() {
+        let only_a_constant = "export const rate = 0.1;\n";
+
+        let file_chunks = chunks_at(only_a_constant, "src/a.ts");
+
+        assert!(file_chunks.chunks().is_empty());
+    }
+
+    #[test]
+    fn test_file_chunks_from_a_file_gives_every_chunk_the_path_it_was_asked_for() {
+        let file_chunks = chunks_at(FUNCTION_AFTER_A_CONSTANT, "src/billing/discount.ts");
+
+        let paths: Vec<&Path> = file_chunks.chunks().iter().map(Chunk::path).collect();
+        assert_eq!(paths, vec![Path::new("src/billing/discount.ts")]);
+    }
+
+    #[test]
+    fn test_file_chunks_from_a_file_with_an_import_gives_every_chunk_that_dependency() {
+        let file_chunks = chunks_at(CONSTANT_OUTSIDE_A_FUNCTION, "src/billing/invoice.ts");
+
+        let dependencies: Vec<Option<&ImportSet>> =
+            file_chunks.chunks().iter().map(Chunk::imports).collect();
+        assert!(
+            dependencies.iter().all(Option::is_some),
+            "import はファイル全体から採るので、そのファイルのチャンクすべてが持つ"
+        );
+    }
+
+    #[test]
+    fn test_file_chunks_from_a_file_reports_the_start_of_a_function_it_could_not_parse() {
+        // 対照として壊れていない関数を同じソースに置く。壊れた側だけが
+        // チャンクから外れて、始まりの行として残る
+        let sound_then_broken = r#"export function sound(value: number): number {
+  return value;
+}
+
+function broken() {
+  return 1;
+"#;
+
+        let file_chunks = chunks_at(sound_then_broken, "src/a.ts");
+
+        let ranges: Vec<LineRange> = file_chunks.chunks().iter().map(Chunk::lines).collect();
+        assert_eq!(ranges, vec![range(1, 3)], "壊れた関数はチャンクにしない");
+        assert_eq!(
+            file_chunks.unparsable_starts(),
+            [line(5)],
+            "飛ばしたことが始まりの行として残る"
+        );
     }
 }

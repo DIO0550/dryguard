@@ -55,8 +55,11 @@ if structurally_similar && domains_differ { ... }
 
 | 語 | 指すもの |
 |---|---|
+| `codebase` | スキャンの対象になるディレクトリツリー。`scan` が受け取る根の下 |
+| `grammar` | ソースを読むのに使う tree-sitter の文法。拡張子で決まる（`.ts` / `.tsx`） |
 | `chunk` | 比較の単位。関数・メソッド・impl ブロック |
 | `pair` | 比較する 2 つの chunk |
+| `candidate pair` | 構造類似度が閾値に届いた pair。`scan` が判定して出すのはこれだけ |
 | `gram` | 構造類似度を測るときに突き合わせる、正規化トークンの並び 1 つ分 |
 | `signal` | 判定の材料。構造類似度・型シグネチャ・呼び出し先 / 呼び出し元・モジュール距離 |
 | `verdict` | 判定の結果（`EXTRACT-CANDIDATE` / `DO-NOT-EXTRACT` / `REVIEW`） |
@@ -69,6 +72,7 @@ if structurally_similar && domains_differ { ... }
 | `module distance` | 2 つのファイルを隔てているディレクトリの段数 |
 
 `snippet` / `fragment` / `candidate`（chunk の意味で）/ `label`（verdict の意味で）は使わない。
+**`candidate` が指すのはペアであって chunk ではない。**
 
 **`reason` は文ではなく構造。** 「依存先ドメイン不一致」のような人が読む文は
 `reason` を出力側が組み立てた結果で、`reason` そのものではない。文にしてから持つと、

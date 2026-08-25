@@ -29,7 +29,8 @@ AI コーディングエージェントは、テキスト的に似たコード�
 意味情報の収集（Stage 2）と、理由・提案まで含めた出力は未実装。
 
 Stage 1 のうち**チャンクの切り出しと import の収集は tree-sitter** に載っている。
-AST 正規化・`scan` コマンド・並列化はこれから。
+`scan` はコードベース全体を総当たりで比べる。事前フィルタと並列化はこれから
+（規模が問題になってから入れる）。
 
 進め方は**縦切り（walking skeleton）**で、各ステージを順に完成させるのではなく
 全ステージを雑に貫通させてから厚くする。計画は [`docs/dryguard-plan.md`](docs/dryguard-plan.md)、
@@ -51,6 +52,7 @@ AST 正規化・`scan` コマンド・並列化はこれから。
 
 ```bash
 cargo run -- compare <locA> <locB>   # 特定の 2 関数を比較 (file:line)
+cargo run -- scan [path]             # コードベース全体をスキャン (既定は .)
 
 オプション:
   --lang ts|auto
@@ -60,7 +62,13 @@ cargo run -- compare <locA> <locB>   # 特定の 2 関数を比較 (file:line)
   --fail-on do-not-extract           # 非推奨ペアがあれば exit 1
 ```
 
-`scan` / `check --diff` と `--format json` は後のフェーズで足す。
+`scan` が見るのは `.ts` と `.tsx` で、`node_modules` / `dist` / `build` / `target` / `.git` は
+降りない。**読むときの grammar は拡張子で選ぶ**（JSX は TypeScript の grammar では読めず、
+型アサーション `<T>value` は TSX の grammar では JSX に見えるので、片方で兼ねられない）。
+読めなかったファイルと構文エラーで切り出せなかった関数は、
+**候補ペアの後ろに一覧で出す**（黙って飛ばすと、対象だったのか除外されたのかが分からない）。
+
+`check --diff` と `--format json` は後のフェーズで足す。
 **まだ動かないコマンド・選択肢はヘルプに並べない**方針のため、現時点では出ない。
 
 ## 開発
