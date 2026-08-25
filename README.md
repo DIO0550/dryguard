@@ -62,8 +62,10 @@ cargo run -- scan [path]             # コードベース全体をスキャン (
   --fail-on do-not-extract           # 非推奨ペアがあれば exit 1
 ```
 
-`scan` が見るのは `.ts` だけで、`node_modules` / `dist` / `build` / `target` / `.git` は
-降りない。読めなかったファイルと構文エラーで切り出せなかった関数は、
+`scan` が見るのは `.ts` と `.tsx` で、`node_modules` / `dist` / `build` / `target` / `.git` は
+降りない。**読むときの grammar は拡張子で選ぶ**（JSX は TypeScript の grammar では読めず、
+型アサーション `<T>value` は TSX の grammar では JSX に見えるので、片方で兼ねられない）。
+読めなかったファイルと構文エラーで切り出せなかった関数は、
 **候補ペアの後ろに一覧で出す**（黙って飛ばすと、対象だったのか除外されたのかが分からない）。
 
 `check --diff` と `--format json` は後のフェーズで足す。

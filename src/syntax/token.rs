@@ -228,7 +228,7 @@ fn gram_counts_of(tokens: &[Token]) -> HashMap<&[Token], usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::syntax::tree::SyntaxTree;
+    use crate::syntax::tree::{Grammar, SyntaxTree};
 
     fn syntax(kind: &'static str) -> Token {
         Token::Syntax(SyntaxKind(kind))
@@ -238,14 +238,16 @@ mod tests {
     ///
     /// `named_descendants` は根から前順に返すので、先頭が根になる。
     fn tokens(source: &str) -> Vec<Token> {
-        let tree = SyntaxTree::from_typescript(source).expect("テストが渡すソースは木にできる");
+        let tree = SyntaxTree::from_source(source, Grammar::TypeScript)
+            .expect("テストが渡すソースは木にできる");
         let root = *tree.named_descendants().first().expect("木には根がある");
 
         tokens_of(root)
     }
 
     fn sequence(source: &str) -> TokenSequence {
-        let tree = SyntaxTree::from_typescript(source).expect("テストが渡すソースは木にできる");
+        let tree = SyntaxTree::from_source(source, Grammar::TypeScript)
+            .expect("テストが渡すソースは木にできる");
         let root = *tree.named_descendants().first().expect("木には根がある");
 
         TokenSequence::from_node(root).expect("テストが渡すソースにはトークンがある")
@@ -253,7 +255,8 @@ mod tests {
 
     /// ソースの中の、その種別のノードだけを覆うトークン列。
     fn sequence_of_kind(source: &str, kind: &str) -> TokenSequence {
-        let tree = SyntaxTree::from_typescript(source).expect("テストが渡すソースは木にできる");
+        let tree = SyntaxTree::from_source(source, Grammar::TypeScript)
+            .expect("テストが渡すソースは木にできる");
         let node = tree
             .named_descendants()
             .into_iter()
@@ -365,7 +368,7 @@ mod tests {
         // 「トークンが取れなかった」を空の列として通すと、後段が
         // 「似ていない」と「見ていない」を区別できない
         let source = "// 何も無い";
-        let tree = SyntaxTree::from_typescript(source).expect("木にできる");
+        let tree = SyntaxTree::from_source(source, Grammar::TypeScript).expect("木にできる");
         let comment = tree
             .named_descendants()
             .into_iter()

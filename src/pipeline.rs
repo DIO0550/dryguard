@@ -15,7 +15,7 @@ use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
 use crate::location::Location;
 use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks};
 use crate::syntax::module_distance::ModuleDistance;
-use crate::syntax::tree::{ParseError, SyntaxTree};
+use crate::syntax::tree::{Grammar, ParseError, SyntaxTree};
 use crate::threshold::Threshold;
 
 /// 比較する 2 箇所から、チャンクの組を取り出す。
@@ -36,6 +36,11 @@ pub fn chunk_pair_of(
 /// パースはファイルにつき 1 回にする。チャンクの範囲も import の集合も同じ木から
 /// 採るので、ソースを渡す形のままだと 1 箇所につき 2 回パースすることになる。
 fn chunk_at(location: &Location) -> Result<Chunk, ChunkPairError> {
+    let grammar =
+        Grammar::of_path(location.path()).ok_or_else(|| ChunkPairError::UnreadableExtension {
+            location: location.clone(),
+        })?;
+
     let source = location
         .read_source()
         .map_err(|cause| ChunkPairError::SourceUnreadable {
@@ -43,11 +48,12 @@ fn chunk_at(location: &Location) -> Result<Chunk, ChunkPairError> {
             cause,
         })?;
 
-    let tree =
-        SyntaxTree::from_typescript(&source).map_err(|cause| ChunkPairError::SourceUnparsable {
+    let tree = SyntaxTree::from_source(&source, grammar).map_err(|cause| {
+        ChunkPairError::SourceUnparsable {
             location: location.clone(),
             cause,
-        })?;
+        }
+    })?;
 
     Chunk::find_enclosing(location, &tree).map_err(|cause| ChunkPairError::ChunkingFailed {
         location: location.clone(),
@@ -109,6 +115,11 @@ pub fn scan_of(
     let mut unchunkable = Vec::new();
 
     for path in paths {
+        let Some(grammar) = Grammar::of_path(&path) else {
+            skipped_files.push(SkippedFile::UnreadableExtension { path });
+            continue;
+        };
+
         let source = match source_of(&path) {
             Ok(source) => source,
             Err(cause) => {
@@ -117,7 +128,7 @@ pub fn scan_of(
             }
         };
 
-        let tree = match SyntaxTree::from_typescript(&source) {
+        let tree = match SyntaxTree::from_source(&source, grammar) {
             Ok(tree) => tree,
             Err(cause) => {
                 skipped_files.push(SkippedFile::SourceUnparsable { path, cause });
@@ -294,6 +305,8 @@ impl CandidatePair {
 /// 除外されたのか**を読む側が区別できないため。
 #[derive(Debug)]
 pub enum SkippedFile {
+    /// 拡張子から grammar を選べなかった。
+    UnreadableExtension { path: PathBuf },
     /// ファイルを読めなかった。
     SourceUnreadable { path: PathBuf, cause: io::Error },
     /// ファイルは読めたが、構文木にできなかった。
@@ -303,6 +316,9 @@ pub enum SkippedFile {
 impl fmt::Display for SkippedFile {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnreadableExtension { path } => {
+                write!(formatter, "{}: 読める拡張子ではありません", path.display())
+            }
             Self::SourceUnreadable { path, cause } => {
                 write!(formatter, "{}: 読めません: {cause}", path.display())
             }
@@ -316,6 +332,7 @@ impl fmt::Display for SkippedFile {
 impl Error for SkippedFile {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::UnreadableExtension { .. } => None,
             Self::SourceUnreadable { cause, .. } => Some(cause),
             Self::SourceUnparsable { cause, .. } => Some(cause),
         }
@@ -328,6 +345,12 @@ impl Error for SkippedFile {
 /// 位置が分からないと利用者はどちらを直せばよいか分からない。
 #[derive(Debug)]
 pub enum ChunkPairError {
+    /// 拡張子から grammar を選べなかった。
+    ///
+    /// 読める拡張子でないファイルは、読めたふりをせずここで断る。TypeScript の
+    /// grammar で当てても**読めた範囲だけが構造として出る**ので、判定が
+    /// 「似ていない」なのか「読めていない」なのか区別できなくなる。
+    UnreadableExtension { location: Location },
     /// ファイルを読めなかった。
     SourceUnreadable {
         location: Location,
@@ -348,6 +371,9 @@ pub enum ChunkPairError {
 impl fmt::Display for ChunkPairError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnreadableExtension { location } => {
+                write!(formatter, "{location} は読める拡張子ではありません")
+            }
             Self::SourceUnreadable { location, cause } => {
                 write!(formatter, "{location} のファイルを読めません: {cause}")
             }
@@ -364,6 +390,7 @@ impl fmt::Display for ChunkPairError {
 impl Error for ChunkPairError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::UnreadableExtension { .. } => None,
             Self::SourceUnreadable { cause, .. } => Some(cause),
             Self::SourceUnparsable { cause, .. } => Some(cause),
             Self::ChunkingFailed { cause, .. } => Some(cause),
@@ -392,7 +419,8 @@ mod tests {
     /// パスは位置の材料としてだけ渡す。
     fn chunk_of(path: &str, number: usize, source: &str) -> Chunk {
         let location = Location::new(PathBuf::from(path), line(number));
-        let tree = SyntaxTree::from_typescript(source).expect("テストが渡すソースは木にできる");
+        let tree = SyntaxTree::from_source(source, Grammar::TypeScript)
+            .expect("テストが渡すソースは木にできる");
 
         Chunk::find_enclosing(&location, &tree).expect("テストが渡す位置は関数の中を指している")
     }
@@ -509,15 +537,28 @@ mod tests {
 
     #[test]
     fn test_scan_of_a_codebase_does_not_compare_a_function_with_the_one_nested_in_it() {
-        // フィクスチャのチャンクは 4 つ（discount / reorder / makeAdder とその中のアロー）。
-        // 総当たりなら 6 ペアだが、入れ子の 1 ペアは比較しないので 5 ペアになる
+        // フィクスチャのチャンクは 5 つ（discount / reorder / Badge / makeAdder と
+        // その中のアロー）。総当たりなら 10 ペアだが、入れ子の 1 ペアは比較しない
         let scan = scan_of_fixture("scan");
 
-        assert_eq!(scan.chunk_count(), 4, "切り出せたチャンクの数");
+        assert_eq!(scan.chunk_count(), 5, "切り出せたチャンクの数");
         assert_eq!(
             scan.compared_pair_count(),
-            5,
+            9,
             "入れ子の組（makeAdder とその中のアロー）は比べない"
+        );
+    }
+
+    #[test]
+    fn test_scan_of_a_codebase_reads_a_tsx_file_without_losing_its_function() {
+        // フィクスチャの src/report/Badge.tsx は JSX を返す。TypeScript の grammar で
+        // 読むと関数ごと構文エラーになり、チャンクにならず unchunkable に落ちる
+        let scan = scan_of_fixture("scan");
+
+        let unchunkable: Vec<String> = scan.unchunkable().iter().map(Location::to_string).collect();
+        assert!(
+            unchunkable.is_empty(),
+            "JSX を構文エラーとして飛ばしている: {unchunkable:?}"
         );
     }
 
@@ -527,7 +568,7 @@ mod tests {
 
         assert_eq!(
             scan.file_count(),
-            5,
+            6,
             "除外したディレクトリと TypeScript でないファイルは数えない"
         );
     }

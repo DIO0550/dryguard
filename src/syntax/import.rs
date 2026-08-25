@@ -192,6 +192,7 @@ fn climb(segments: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::syntax::tree::Grammar;
     use std::path::Path;
 
     fn resolved(specifier: &str, importer: &str) -> String {
@@ -239,7 +240,8 @@ mod tests {
     }
 
     fn tree_of(source: &str) -> SyntaxTree<'_> {
-        SyntaxTree::from_typescript(source).expect("テストが渡すソースは木にできる")
+        SyntaxTree::from_source(source, Grammar::TypeScript)
+            .expect("テストが渡すソースは木にできる")
     }
 
     fn import_set(source: &str, importer: &str) -> ImportSet {

@@ -298,6 +298,7 @@ fn source_of_lines(source: &str, lines: LineRange) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::syntax::tree::Grammar;
     use crate::test_support::line;
     use std::path::Path;
 
@@ -307,7 +308,8 @@ mod tests {
 
     fn chunk_at(source: &str, location: &str) -> Result<Chunk, ChunkingError> {
         let location: Location = location.parse().expect("テストが渡す位置は解釈できる");
-        let tree = SyntaxTree::from_typescript(source).expect("テストが渡すソースは木にできる");
+        let tree = SyntaxTree::from_source(source, Grammar::TypeScript)
+            .expect("テストが渡すソースは木にできる");
 
         Chunk::find_enclosing(&location, &tree)
     }
@@ -666,7 +668,8 @@ export function sound(value: number): number {
     }
 
     fn chunks_at(source: &str, path: &str) -> FileChunks {
-        let tree = SyntaxTree::from_typescript(source).expect("テストが渡すソースは木にできる");
+        let tree = SyntaxTree::from_source(source, Grammar::TypeScript)
+            .expect("テストが渡すソースは木にできる");
 
         FileChunks::from_tree(&tree, Path::new(path))
     }

@@ -56,6 +56,7 @@ if structurally_similar && domains_differ { ... }
 | 語 | 指すもの |
 |---|---|
 | `codebase` | スキャンの対象になるディレクトリツリー。`scan` が受け取る根の下 |
+| `grammar` | ソースを読むのに使う tree-sitter の文法。拡張子で決まる（`.ts` / `.tsx`） |
 | `chunk` | 比較の単位。関数・メソッド・impl ブロック |
 | `pair` | 比較する 2 つの chunk |
 | `candidate pair` | 構造類似度が閾値に届いた pair。`scan` が判定して出すのはこれだけ |

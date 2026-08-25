@@ -12,23 +12,21 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::syntax::tree::Grammar;
+
 /// 走査から外すディレクトリの名前。
 ///
 /// Phase 1 ではハードコードにする。`dryguard.toml` への外出しは Phase 3 で、
 /// 実際に調整したくなった項目だけを切り出す（閾値と同じ方針）。
 const EXCLUDED_DIRECTORY_NAMES: [&str; 5] = ["node_modules", "dist", "build", "target", ".git"];
 
-/// 走査の対象にする拡張子。
-///
-/// Why not（`tsx` を入れる）: JSX は TypeScript の grammar では読めず、
-/// `tree_sitter_typescript::LANGUAGE_TSX` の選択が要る。拡張子だけ足すと
-/// **中身が丸ごと構文エラーの関数として飛ばされる**ので、grammar の選択と一緒に足す。
-const TYPESCRIPT_EXTENSION: &str = "ts";
-
-/// そのディレクトリ以下の TypeScript ファイルを、パス順に集める。
+/// そのディレクトリ以下の TypeScript ファイル（`.ts` / `.tsx`）を、パス順に集める。
 ///
 /// `root` は走査を始めるディレクトリ。`node_modules` などの生成物・依存の置き場
 /// （`EXCLUDED_DIRECTORY_NAMES`）は中へ降りない。
+///
+/// 対象かどうかは [`Grammar::of_path`] が読める拡張子かで決める。**拡張子の一覧を
+/// ここに持たない**（持つと、読める拡張子を増やしたときに片方だけが古くなる）。
 ///
 /// シンボリックリンクは辿らない。**辿ると循環したツリーで走査が終わらない**うえ、
 /// 同じファイルを別のパスで 2 回数えることになる。
@@ -70,7 +68,8 @@ pub fn typescript_paths_of(root: &Path) -> Result<Vec<PathBuf>, CodebaseError> {
                 continue;
             }
 
-            if file_type.is_file() && path.extension() == Some(TYPESCRIPT_EXTENSION.as_ref()) {
+            let is_readable_source = file_type.is_file() && Grammar::of_path(&path).is_some();
+            if is_readable_source {
                 paths.insert(path);
             }
         }
@@ -194,6 +193,7 @@ mod tests {
                 "src/billing/invoice.ts",
                 "src/inventory/reorder.ts",
                 "src/inventory/stock.ts",
+                "src/report/Badge.tsx",
                 "src/shared/adder.ts",
             ]
         );
@@ -243,17 +243,31 @@ mod tests {
     }
 
     #[test]
-    fn test_typescript_paths_of_a_directory_leaves_out_files_with_another_extension() {
-        // フィクスチャには src/notes.md がある。拡張子で絞れていないと混ざる
+    fn test_typescript_paths_of_a_directory_returns_tsx_as_well_as_ts() {
+        // `.tsx` を落とすと、JSX を書くリポジトリでは対象が丸ごと抜ける
         let root = fixture("scan");
 
         let paths = typescript_paths_of(&root).expect("フィクスチャのディレクトリはある");
 
+        let relative = relative_paths_of(&root, &paths);
         assert!(
-            paths
-                .iter()
-                .all(|path| path.extension() == Some("ts".as_ref())),
-            "TypeScript 以外が混ざっている: {paths:?}"
+            relative.contains(&"src/report/Badge.tsx".to_owned()),
+            "`.tsx` が対象に入っていない: {relative:?}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_paths_of_a_directory_leaves_out_files_with_another_extension() {
+        // 対照は上の 2 つ。フィクスチャの src/notes.md は同じディレクトリにあるが、
+        // 読める拡張子ではないので対象にならない
+        let root = fixture("scan");
+
+        let paths = typescript_paths_of(&root).expect("フィクスチャのディレクトリはある");
+
+        let relative = relative_paths_of(&root, &paths);
+        assert!(
+            !relative.iter().any(|path| path.ends_with(".md")),
+            "読めない拡張子が混ざっている: {relative:?}"
         );
     }
 

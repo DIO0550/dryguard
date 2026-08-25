@@ -433,7 +433,7 @@ mod tests {
         let text = scan_text_of(&scan, threshold);
 
         let verdict_lines = text.lines().filter(|line| line.starts_with('[')).count();
-        assert_eq!(verdict_lines, 5, "比べた 5 ペアが並ぶ: {text}");
+        assert_eq!(verdict_lines, 9, "比べた 9 ペアが並ぶ: {text}");
         assert!(text.contains("\n\n["), "ペアとペアの間に空行が入る: {text}");
     }
 
@@ -442,7 +442,7 @@ mod tests {
         let text = scan_text_of_fixture();
 
         assert!(
-            text.contains("対象 5 ファイル / チャンク 4 件 / 比較 5 ペア / 候補 1 ペア"),
+            text.contains("対象 6 ファイル / チャンク 5 件 / 比較 9 ペア / 候補 1 ペア"),
             "走査した量が読める: {text}"
         );
     }
