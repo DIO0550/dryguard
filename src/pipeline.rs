@@ -9,6 +9,8 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use crate::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
 use crate::classification::{Classification, classification_of, is_structurally_similar};
 use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
@@ -110,33 +112,25 @@ pub fn scan_of(
     let paths = typescript_paths_of(root)?;
     let file_count = paths.len();
 
+    // ファイルごとの読み込み・パース・切り出しは互いに独立なので並列に回す。
+    // 結果は `paths` と同じ並びで返るので、まとめ直しを順に行えば出力の並びは
+    // 逐次で回したときと変わらない
+    let chunked_files: Vec<Result<FileChunks, SkippedFile>> =
+        paths.par_iter().map(|path| file_chunks_of(path)).collect();
+
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut skipped_files = Vec::new();
     let mut unchunkable = Vec::new();
 
-    for path in paths {
-        let Some(grammar) = Grammar::of_path(&path) else {
-            skipped_files.push(SkippedFile::UnreadableExtension { path });
-            continue;
-        };
-
-        let source = match source_of(&path) {
-            Ok(source) => source,
-            Err(cause) => {
-                skipped_files.push(SkippedFile::SourceUnreadable { path, cause });
+    for (path, chunked_file) in paths.iter().zip(chunked_files) {
+        let file_chunks = match chunked_file {
+            Ok(file_chunks) => file_chunks,
+            Err(skipped) => {
+                skipped_files.push(skipped);
                 continue;
             }
         };
 
-        let tree = match SyntaxTree::from_source(&source, grammar) {
-            Ok(tree) => tree,
-            Err(cause) => {
-                skipped_files.push(SkippedFile::SourceUnparsable { path, cause });
-                continue;
-            }
-        };
-
-        let file_chunks = FileChunks::from_tree(&tree, &path);
         unchunkable.extend(
             file_chunks
                 .unparsable_starts()
@@ -155,6 +149,34 @@ pub fn scan_of(
             unchunkable,
         },
     ))
+}
+
+/// そのファイルを読んで、中にある関数・メソッドをすべて切り出す。
+///
+/// `path` は [`typescript_paths_of`] が集めたファイル。
+///
+/// # Errors
+///
+/// 拡張子から grammar を選べない / ファイルを読めない / 構文木にできないとき。
+/// **飛ばす理由をそのまま返す**ので、呼び出し側は 1 ファイルのために走査を止めずに済む。
+fn file_chunks_of(path: &Path) -> Result<FileChunks, SkippedFile> {
+    let grammar = Grammar::of_path(path).ok_or_else(|| SkippedFile::UnreadableExtension {
+        path: path.to_path_buf(),
+    })?;
+
+    let source = source_of(path).map_err(|cause| SkippedFile::SourceUnreadable {
+        path: path.to_path_buf(),
+        cause,
+    })?;
+
+    let tree = SyntaxTree::from_source(&source, grammar).map_err(|cause| {
+        SkippedFile::SourceUnparsable {
+            path: path.to_path_buf(),
+            cause,
+        }
+    })?;
+
+    Ok(FileChunks::from_tree(&tree, path))
 }
 
 /// 走査で集めた、チャンク以外の材料。
