@@ -190,39 +190,31 @@ struct ScanInputs {
 
 /// 集めたチャンクを総当たりで比べ、候補ペアだけを判定する。
 ///
-/// 候補かどうかは [`is_structurally_similar`] に聞く。**同じ条件をここに書き直すと、
-/// 判定が「似ている」と見なす範囲と候補に拾う範囲が黙ってずれる**
-/// (`rules/architecture.md`「判定は 1 箇所にだけ置く」)。
+/// チャンク 1 つ分（自分より後ろの全チャンクとの比較）を単位に並列で回す。
+/// **先頭のチャンクほど比べる相手が多い**ので、区間を等分せず rayon の作業盗みに任せる。
+///
+/// 結果はチャンクの並び順で返るので、候補ペアの並びは逐次で回したときと変わらない。
 fn scan_of_chunks(
     chunks: &[Chunk],
     structural_similarity_threshold: Threshold,
     inputs: ScanInputs,
 ) -> Scan {
-    let mut candidate_pairs = Vec::new();
-    let mut compared_pair_count = 0;
+    let compared: Vec<ComparedPairs> = chunks
+        .par_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            ComparedPairs::from_chunk(chunk, &chunks[index + 1..], structural_similarity_threshold)
+        })
+        .collect();
 
-    for (index, chunk_a) in chunks.iter().enumerate() {
-        for chunk_b in &chunks[index + 1..] {
-            if is_nested(chunk_a, chunk_b) {
-                continue;
-            }
-            compared_pair_count += 1;
-
-            let signals = signals_of(chunk_a, chunk_b);
-            if !is_structurally_similar(
-                signals.structural_similarity(),
-                structural_similarity_threshold,
-            ) {
-                continue;
-            }
-
-            candidate_pairs.push(CandidatePair {
-                location_a: start_of(chunk_a),
-                location_b: start_of(chunk_b),
-                classification: classification_of(&signals, structural_similarity_threshold),
-            });
-        }
-    }
+    let compared_pair_count = compared
+        .iter()
+        .map(|compared| compared.compared_pair_count)
+        .sum();
+    let candidate_pairs = compared
+        .into_iter()
+        .flat_map(|compared| compared.candidate_pairs)
+        .collect();
 
     Scan {
         candidate_pairs,
@@ -231,6 +223,57 @@ fn scan_of_chunks(
         compared_pair_count,
         skipped_files: inputs.skipped_files,
         unchunkable: inputs.unchunkable,
+    }
+}
+
+/// 1 つのチャンクを、それより後ろのチャンクすべてと比べた結果。
+///
+/// 候補ペアと比べた数を一緒に持つ。**比べた数は候補ペアの一覧から数え直せない**
+/// （閾値に届かなかった組も、入れ子で比べなかった組も一覧には出ない）。
+struct ComparedPairs {
+    candidate_pairs: Vec<CandidatePair>,
+    compared_pair_count: usize,
+}
+
+impl ComparedPairs {
+    /// `chunk` を `following`（並びの中でそれより後ろにあるチャンク）すべてと比べる。
+    ///
+    /// 候補かどうかは [`is_structurally_similar`] に聞く。**同じ条件をここに書き直すと、
+    /// 判定が「似ている」と見なす範囲と候補に拾う範囲が黙ってずれる**
+    /// (`rules/architecture.md`「判定は 1 箇所にだけ置く」)。
+    fn from_chunk(
+        chunk: &Chunk,
+        following: &[Chunk],
+        structural_similarity_threshold: Threshold,
+    ) -> Self {
+        let mut candidate_pairs = Vec::new();
+        let mut compared_pair_count = 0;
+
+        for other in following {
+            if is_nested(chunk, other) {
+                continue;
+            }
+            compared_pair_count += 1;
+
+            let signals = signals_of(chunk, other);
+            if !is_structurally_similar(
+                signals.structural_similarity(),
+                structural_similarity_threshold,
+            ) {
+                continue;
+            }
+
+            candidate_pairs.push(CandidatePair {
+                location_a: start_of(chunk),
+                location_b: start_of(other),
+                classification: classification_of(&signals, structural_similarity_threshold),
+            });
+        }
+
+        Self {
+            candidate_pairs,
+            compared_pair_count,
+        }
     }
 }
 
