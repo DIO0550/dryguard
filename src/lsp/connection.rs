@@ -91,6 +91,11 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     ///
     /// 送受信が失敗したとき、サーバが error を返したとき。
     pub fn shutdown(&mut self) -> Result<(), ConnectionError> {
+        // 応答の result は見ない。仕様上 null で、中身を持たないため。
+        //
+        // Why not（null であることを検証する）: 非 null を返すサーバを落とすと、
+        // `exit` を送る前に抜けてしまう。**終わらせるはずの手順が、終わらせずに帰る。**
+        // `handshake` が result を読むのは、そちらの中身が要るからで、ここには無い。
         self.request(Shutdown::METHOD, None)?;
         self.notify(Exit::METHOD, None)
     }
