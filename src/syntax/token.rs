@@ -204,6 +204,34 @@ impl TokenSequence {
 
         Similarity::from_shared_count(shared, combined)
     }
+
+    /// 突き合わせる前に分かる、似かたの上限。実際の似かたがこれを超えることはない。
+    ///
+    /// gram の**総数だけ**から出るので、[`TokenSequence::similarity_with`] のように
+    /// gram を数え上げなくてよい。上限が閾値に届かないペアは突き合わせても届かないので、
+    /// 候補を 1 組も落とさずに比較を飛ばせる。
+    ///
+    /// 導出は総数を `|A|` `|B|` として次の 2 つ。どちらも
+    /// [`TokenSequence::similarity_with`] の数え方から直に出る。
+    ///
+    /// - 共通分は少ないほうを超えない: `shared ≤ min(|A|, |B|)`
+    /// - 合わせた分は多いほうを下回らない: `combined ≥ max(|A|, |B|)`
+    pub fn similarity_ceiling_with(&self, other: &Self) -> Similarity {
+        let mine = self.gram_count();
+        let theirs = other.gram_count();
+
+        // 少ないほう / 多いほう。比が 1.0 を超えないことは
+        // `Similarity::from_shared_count` が要求する形と同じなので、そのまま渡せる
+        Similarity::from_shared_count(mine.min(theirs), mine.max(theirs))
+    }
+
+    /// この列から切り出せる gram の数。
+    ///
+    /// [`gram_counts_of`] が数える回数の合計と同じ値を、数え上げずに長さから出す。
+    /// 列が [`GRAM_LENGTH`] に満たないときは列全体で 1 つ（あちらと同じ扱い）。
+    fn gram_count(&self) -> usize {
+        self.0.len().saturating_sub(GRAM_LENGTH - 1).max(1)
+    }
 }
 
 /// トークン列に現れる gram と、その出現回数。
@@ -460,5 +488,80 @@ mod tests {
         let number = sequence_of_kind("42", "number");
 
         assert_eq!(identifier.similarity_with(&number).value(), 0.0);
+    }
+
+    /// 上限を測るペアの材料。長さの比が両極端になる組を選んである。
+    const ONE_LINER: &str = "function f() { return 0; }";
+
+    const TEN_LINER: &str = "function g(invoice: Invoice): number {\n  \
+                             const base = invoice.amount;\n  \
+                             const discounted = base * (1 - RATE);\n  \
+                             const rounded = Math.round(discounted);\n  \
+                             const capped = Math.min(rounded, LIMIT);\n  \
+                             const floored = Math.max(capped, 0);\n  \
+                             const withTax = floored * (1 + TAX);\n  \
+                             const total = Math.round(withTax);\n  \
+                             return total;\n}";
+
+    fn similarity_ceiling(source_a: &str, source_b: &str) -> f64 {
+        sequence(source_a)
+            .similarity_ceiling_with(&sequence(source_b))
+            .value()
+    }
+
+    #[test]
+    fn test_similarity_ceiling_is_never_below_the_measured_similarity() {
+        // 枝刈りの前提。上限が実測を下回った瞬間、届いていた候補が消える
+        let sources = [
+            ONE_LINER,
+            TEN_LINER,
+            "function f() { return Math.max(shortage, 0); }",
+            "function f() { for (const item of items) { total = total + 1; } }",
+            "class C {}",
+            "invoice",
+        ];
+
+        for source_a in sources {
+            for source_b in sources {
+                let measured = similarity(source_a, source_b);
+                let ceiling = similarity_ceiling(source_a, source_b);
+
+                assert!(
+                    ceiling >= measured,
+                    "上限 {ceiling} が実測 {measured} を下回った: {source_a:?} <-> {source_b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_similarity_ceiling_of_the_same_source_rules_out_nothing() {
+        // 完全一致するペアの上限が 1.00 未満だと、閾値をいくつにしても本物が落ちる
+        assert_eq!(similarity_ceiling(TEN_LINER, TEN_LINER), 1.0);
+    }
+
+    #[test]
+    fn test_similarity_ceiling_of_sources_differing_only_in_names_rules_out_nothing() {
+        // 名前だけが違うペアは実測 1.00（上のテスト群）。長さも同じなので上限も 1.00
+        let discount = "function applyDiscount(invoice: Invoice): number {\n  \
+                        const discounted = invoice.amount * (1 - RATE);\n  \
+                        return Math.max(discounted, 0);\n}";
+        let reorder = "function reorderAmount(stock: Stock): number {\n  \
+                       const shortage = stock.quantity * (1 - LIMIT);\n  \
+                       return Math.max(shortage, 0);\n}";
+
+        assert_eq!(similarity_ceiling(discount, reorder), 1.0);
+    }
+
+    #[test]
+    fn test_similarity_ceiling_of_a_much_longer_source_falls_below_half() {
+        // 上限が何も絞らない（常に 1.00）なら枝刈りは 1 ペアも飛ばせない。
+        // 長さが 2 倍以上離れた組で、実際に 0.5 を切ることを見る
+        let ceiling = similarity_ceiling(ONE_LINER, TEN_LINER);
+
+        assert!(
+            ceiling < 0.5,
+            "長さが 2 倍以上離れた組の上限は 0.5 を切る: {ceiling}"
+        );
     }
 }
