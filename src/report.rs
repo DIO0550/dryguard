@@ -128,12 +128,16 @@ fn listed_block_of(heading: &str, items: impl Iterator<Item = String>) -> Option
 }
 
 /// 走査した量。**候補の数だけでは「見ていないもの」が分からない。**
+///
+/// 比べたペアの内訳（長さの上限だけで確定した数）も出す。省いた数が読めないと、
+/// 同じ「比較 N ペア」がどれだけの突き合わせを指すのかが回ごとに変わって見える。
 fn walked_text_of(scan: &Scan) -> String {
     format!(
-        "対象 {} ファイル / チャンク {} 件 / 比較 {} ペア / 候補 {} ペア",
+        "対象 {} ファイル / チャンク {} 件 / 比較 {} ペア（うち長さで確定 {} ペア）/ 候補 {} ペア",
         scan.file_count(),
         scan.chunk_count(),
         scan.compared_pair_count(),
+        scan.pruned_pair_count(),
         scan.candidate_pairs().len()
     )
 }
@@ -442,8 +446,10 @@ mod tests {
         let text = scan_text_of_fixture();
 
         assert!(
-            text.contains("対象 6 ファイル / チャンク 5 件 / 比較 9 ペア / 候補 1 ペア"),
-            "走査した量が読める: {text}"
+            text.contains(
+                "対象 6 ファイル / チャンク 5 件 / 比較 9 ペア（うち長さで確定 3 ペア）/ 候補 1 ペア"
+            ),
+            "走査した量と、突き合わせを省いた内訳が読める: {text}"
         );
     }
 
