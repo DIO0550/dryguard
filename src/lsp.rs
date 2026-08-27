@@ -242,6 +242,7 @@ impl Error for ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lsp_types::HoverProviderCapability;
 
     #[test]
     fn test_client_start_with_a_missing_program_reports_the_server_not_found() {
@@ -272,9 +273,16 @@ mod tests {
 
         let capabilities = client.handshake().expect("握手できる");
 
-        // hover は Stage 2 で最初に使う問い合わせ。返らないサーバでは意味情報が採れない
+        // hover は Stage 2 で最初に使う問い合わせ。返らないサーバでは意味情報が採れない。
+        // 有無ではなく中身を見る。無効を表す `Simple(false)` も「ある」なので、
+        // is_some() では hover を切ったサーバでも通ってしまう
+        let provides_hover = matches!(
+            capabilities.hover_provider,
+            Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
+        );
+
         assert!(
-            capabilities.hover_provider.is_some(),
+            provides_hover,
             "typescript-language-server は hover を提供する"
         );
 
