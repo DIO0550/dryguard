@@ -4,3 +4,4 @@
 //! (rules/architecture.md「依存方向のルール」)。
 
 pub mod framing;
+pub mod message;
