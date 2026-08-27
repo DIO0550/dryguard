@@ -106,6 +106,15 @@ fn test_scan_of_the_corpus_compares_every_pair_of_chunks_it_found() {
 }
 
 #[test]
+fn test_scan_of_the_corpus_keeps_every_candidate_pair_it_can_reach() {
+    // 突き合わせを省く仕組み（長さの上限による枝刈り）は、候補ペアを 1 組も
+    // 落としてはならない。落ちればこの数が減る
+    let scan = scan_of_corpus();
+
+    assert_eq!(scan.candidate_pairs().len(), 65, "閾値に届いたペアの数");
+}
+
+#[test]
 fn test_scan_of_the_corpus_lists_its_candidate_pairs_in_enumeration_order() {
     // ファイルはパス順、ファイルの中のチャンクはソース順に列挙されるので、
     // 総当たりで出た候補ペアは (先のチャンク, 後のチャンク) の昇順に並ぶ。
