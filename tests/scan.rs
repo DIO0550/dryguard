@@ -106,6 +106,15 @@ fn test_scan_of_the_corpus_compares_every_pair_of_chunks_it_found() {
 }
 
 #[test]
+fn test_scan_of_the_corpus_keeps_every_candidate_pair_it_can_reach() {
+    // 突き合わせを省く仕組み（長さの上限による枝刈り）は、候補ペアを 1 組も
+    // 落としてはならない。落ちればこの数が減る
+    let scan = scan_of_corpus();
+
+    assert_eq!(scan.candidate_pairs().len(), 65, "閾値に届いたペアの数");
+}
+
+#[test]
 fn test_scan_of_the_corpus_lists_its_candidate_pairs_in_enumeration_order() {
     // ファイルはパス順、ファイルの中のチャンクはソース順に列挙されるので、
     // 総当たりで出た候補ペアは (先のチャンク, 後のチャンク) の昇順に並ぶ。
@@ -165,4 +174,22 @@ fn test_scan_of_a_directory_without_typescript_finds_nothing_to_compare() {
     assert_eq!(scan.file_count(), 0);
     assert_eq!(scan.compared_pair_count(), 0);
     assert!(scan.candidate_pairs().is_empty());
+}
+
+#[test]
+fn test_scan_of_the_corpus_rules_out_pairs_whose_lengths_are_too_far_apart() {
+    // 上限だけで確定できるペアが 1 組も無いなら、枝刈りは何も飛ばしていない。
+    // 対照は上のテスト（候補 65 組）。飛ばしすぎればあちらが落ちる
+    let scan = scan_of_corpus();
+
+    assert!(
+        scan.pruned_pair_count() > 0,
+        "長さが 2 倍以上離れたペアは突き合わせずに確定する"
+    );
+    assert!(
+        scan.pruned_pair_count() < scan.compared_pair_count(),
+        "突き合わせたペアも残る: {} / {}",
+        scan.pruned_pair_count(),
+        scan.compared_pair_count()
+    );
 }
