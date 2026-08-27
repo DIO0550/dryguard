@@ -17,7 +17,7 @@ pub mod message;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, BufReader};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
 use lsp_types::ServerCapabilities;
 
@@ -122,13 +122,23 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// 往復が失敗したとき、終了を待てなかったとき。失敗した場合は `Drop` が kill する。
+    /// 往復が失敗したとき、終了を待てなかったとき、サーバが異常終了したとき。
+    /// 往復の失敗で抜けた場合は `Drop` が kill する。
     pub fn shutdown(mut self) -> Result<(), ClientError> {
         self.connection
             .shutdown()
             .map_err(ClientError::Conversation)?;
-        self.child.wait().map_err(ClientError::Wait)?;
+        let status = self.child.wait().map_err(ClientError::Wait)?;
+
+        // 待ち終えた時点で子プロセスは残っていない。ここより後で失敗しても kill は要らない。
         self.terminated = true;
+
+        // `wait` は終了できたことしか言わない。**異常終了も `Ok` で返る**ので、
+        // 状態を見ずに握りつぶすと「終了しました」と報告してしまう
+        // (rules/coding.md「失敗を握りつぶして既定値へフォールバックしない」)。
+        if !status.success() {
+            return Err(ClientError::AbnormalExit { status });
+        }
 
         Ok(())
     }
@@ -187,6 +197,11 @@ pub enum ClientError {
     Conversation(ConnectionError),
     /// 子プロセスの終了を待てなかった。
     Wait(io::Error),
+    /// 終了手順は通ったが、サーバが異常終了した。
+    AbnormalExit {
+        /// サーバの終了状態。
+        status: ExitStatus,
+    },
 }
 
 impl fmt::Display for ClientError {
@@ -206,6 +221,9 @@ impl fmt::Display for ClientError {
             Self::Wait(cause) => {
                 write!(formatter, "LSP サーバの終了を待てませんでした: {cause}")
             }
+            Self::AbnormalExit { status } => {
+                write!(formatter, "LSP サーバが異常終了しました ({status})")
+            }
         }
     }
 }
@@ -213,7 +231,7 @@ impl fmt::Display for ClientError {
 impl Error for ClientError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ServerNotFound { .. } | Self::PipesNotWired => None,
+            Self::ServerNotFound { .. } | Self::PipesNotWired | Self::AbnormalExit { .. } => None,
             Self::Spawn { cause, .. } => Some(cause),
             Self::Conversation(cause) => Some(cause),
             Self::Wait(cause) => Some(cause),
