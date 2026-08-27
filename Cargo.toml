@@ -9,9 +9,15 @@ license = "MIT"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+# LSP の要求・応答の型だけを借りる（`docs/dryguard-plan.md`「技術スタック」）。
+# JSON-RPC のフレーミングと往復は自前で持つ。サーバごとの癖に手が届かなくなるため。
+lsp-types = "0.97.0"
 # scan の並列化に使う（`docs/dryguard-plan.md`「技術スタック」）。総当たりの仕事量は
 # 先頭のチャンクほど大きい三角形なので、等分ではなく作業盗みのある実装に任せる。
 rayon = "1.12"
+# 受け取った payload の解釈に使う。serde 本体は入れない — こちらで derive するものが無く、
+# lsp-types の型は向こうが Serialize / Deserialize を持っている。
+serde_json = "1.0.151"
 tree-sitter = "0.26"
 # grammar は言語ごとに別クレート。Phase 4 で Rust を足すときは
 # tree-sitter-rust を並べるだけで済む（`docs/dryguard-plan.md`「技術スタック」）。
