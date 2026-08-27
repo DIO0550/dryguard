@@ -55,3 +55,22 @@ jobs:
 
       - name: cargo test
         run: cargo test
+
+      # LSP サーバを要するテストは #[ignore] を付けてあり、開発機では飛ばされる。
+      # **無条件に走らせる場所はここしか無い**（AGENTS.md「強制力の序列」の層 1 /
+      # rules/testing.md「LSP を要するテストは、飛ばしたことが分かる形にする」）。
+      #
+      # Why（typescript を明示して入れる）: typescript-language-server は tsserver を
+      # 包むだけで、TypeScript 本体を同梱しない。TypeScript 7 は tsserver.js を
+      # 配らなくなったため、版を指定しないと解決した TypeScript 次第で
+      # initialize が失敗する。
+      #
+      # Why not（actions/setup-node）: ランナーに node と npm が入っているので、
+      # 直接呼べば足りる（AGENTS.md「CI で使うアクション」）。
+      - name: LSP サーバ
+        run: |
+          npm install -g typescript-language-server@6.0.0 typescript@5.9.3
+          typescript-language-server --version
+
+      - name: cargo test (LSP)
+        run: cargo test -- --ignored
