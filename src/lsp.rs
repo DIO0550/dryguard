@@ -3,5 +3,6 @@
 //! 複数のステージを組み合わせる手順はここには置かない
 //! (rules/architecture.md「依存方向のルール」)。
 
+pub mod connection;
 pub mod framing;
 pub mod message;
