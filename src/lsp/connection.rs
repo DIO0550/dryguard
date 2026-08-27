@@ -26,6 +26,7 @@ const CLIENT_NAME: &str = "dryguard";
 /// LSP サーバとの往復。
 ///
 /// 1 本のストリームを要求と応答が行き来するので、id の発番と対応付けをここが持つ。
+#[derive(Debug)]
 pub struct Connection<R: BufRead, W: Write> {
     reader: R,
     writer: W,
