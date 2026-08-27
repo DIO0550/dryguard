@@ -10,6 +10,9 @@ use serde_json::{Value, json};
 /// JSON-RPC のバージョン。2.0 以外は送らないし、受け取っても見ない。
 const JSON_RPC_VERSION: &str = "2.0";
 
+/// 支えていないメソッドを要求されたときに返すコード（JSON-RPC の Method not found）。
+const METHOD_NOT_FOUND: i64 = -32601;
+
 /// こちらが発番する要求の id。
 ///
 /// 応答を要求へ対応付けるためだけに使う。**数で持つのはこちらが数しか発番しないため**で、
@@ -39,6 +42,41 @@ impl RequestId {
 impl fmt::Display for RequestId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}", self.0)
+    }
+}
+
+/// サーバが発番した要求の id。
+///
+/// **こちらの [`RequestId`] と別の型にする。** 仕様上サーバは文字列の id も使えるうえ、
+/// この id は突き合わせるためではなく**そのまま返すため**に持つ。
+/// 1 つの型にまとめると、対応付けに使えない値が対応付けの側へ流れ込む。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerRequestId {
+    /// 数の id。
+    Number(i64),
+    /// 文字列の id。
+    Text(String),
+}
+
+impl ServerRequestId {
+    /// JSON の id から作る。数でも文字列でもなければ `None`。
+    fn from_json(id: &Value) -> Option<Self> {
+        if let Some(number) = id.as_i64() {
+            return Some(Self::Number(number));
+        }
+
+        id.as_str().map(|text| Self::Text(text.to_owned()))
+    }
+
+    /// 応答に載せる形に戻す。
+    ///
+    /// 受け取ったときの種類（数 / 文字列）を保つ。数で来た id を文字列で返すと、
+    /// サーバは自分の要求と結び付けられない。
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Number(number) => json!(number),
+            Self::Text(text) => json!(text),
+        }
     }
 }
 
@@ -83,6 +121,23 @@ pub fn notification_payload_of(method: &str, params: Option<Value>) -> String {
     message.to_string()
 }
 
+/// サーバからの要求に「そのメソッドは支えていない」と返す payload。
+///
+/// **支えていないからこそ返す。** 黙って捨てると、応答を待つサーバはそこで止まり、
+/// こちらは次のフレームを待つので、双方が待ち合う。
+pub fn method_not_found_payload_of(id: &ServerRequestId, method: &str) -> String {
+    let message = json!({
+        "jsonrpc": JSON_RPC_VERSION,
+        "id": id.to_json(),
+        "error": {
+            "code": METHOD_NOT_FOUND,
+            "message": format!("dryguard は {method} を支えていません"),
+        },
+    });
+
+    message.to_string()
+}
+
 /// サーバから届いた 1 通。
 ///
 /// 「id を持つのは応答とサーバからの要求だけ」「method を持つのは要求と通知だけ」を
@@ -99,6 +154,8 @@ pub enum ServerMessage {
     },
     /// サーバからこちらへの要求。
     Request {
+        /// 返すときに載せ直す id。
+        id: ServerRequestId,
         /// 要求されたメソッド名。
         method: String,
     },
@@ -115,7 +172,8 @@ impl ServerMessage {
     /// # Errors
     ///
     /// JSON として読めないとき、id も method も持たないとき、応答の id が数でないとき、
-    /// 応答が result も error も持たないとき、error に code / message が揃っていないとき。
+    /// 要求の id が数でも文字列でもないとき、応答が result も error も持たないとき、
+    /// error に code / message が揃っていないとき。
     pub fn from_json(payload: &str) -> Result<Self, MessageError> {
         let message: Value = serde_json::from_str(payload).map_err(MessageError::NotJson)?;
         let method = message.get("method").and_then(Value::as_str);
@@ -125,7 +183,8 @@ impl ServerMessage {
                 id: request_id_of(id)?,
                 outcome: outcome_of(&message)?,
             }),
-            (Some(_), Some(method)) => Ok(Self::Request {
+            (Some(id), Some(method)) => Ok(Self::Request {
+                id: server_request_id_of(id)?,
                 method: method.to_owned(),
             }),
             (None, Some(method)) => Ok(Self::Notification {
@@ -169,6 +228,12 @@ fn request_id_of(id: &Value) -> Result<RequestId, MessageError> {
         .ok_or_else(|| MessageError::ResponseIdNotANumber { id: id.to_string() })
 }
 
+/// サーバからの要求の id を [`ServerRequestId`] にする。
+fn server_request_id_of(id: &Value) -> Result<ServerRequestId, MessageError> {
+    ServerRequestId::from_json(id)
+        .ok_or_else(|| MessageError::RequestIdNotSupported { id: id.to_string() })
+}
+
 /// 応答の result / error を [`ResponseOutcome`] にする。
 fn outcome_of(message: &Value) -> Result<ResponseOutcome, MessageError> {
     if let Some(failure) = message.get("error") {
@@ -209,6 +274,11 @@ pub enum MessageError {
         /// 数として読めなかった id。
         id: String,
     },
+    /// サーバからの要求の id が数でも文字列でもない。そのまま返せない。
+    RequestIdNotSupported {
+        /// 返せなかった id。
+        id: String,
+    },
     /// 応答が result も error も持たない。
     ResponseWithoutOutcome,
     /// 応答の error に code / message が揃っていない。
@@ -228,6 +298,10 @@ impl fmt::Display for MessageError {
             Self::ResponseIdNotANumber { id } => {
                 write!(formatter, "LSP サーバの応答の id が数ではありません: {id}")
             }
+            Self::RequestIdNotSupported { id } => write!(
+                formatter,
+                "LSP サーバの要求の id が数でも文字列でもありません: {id}"
+            ),
             Self::ResponseWithoutOutcome => {
                 write!(formatter, "LSP サーバの応答に result も error もありません")
             }
@@ -244,6 +318,7 @@ impl Error for MessageError {
         match self {
             Self::Unrecognized
             | Self::ResponseIdNotANumber { .. }
+            | Self::RequestIdNotSupported { .. }
             | Self::ResponseWithoutOutcome
             | Self::MalformedResponseFailure => None,
             Self::NotJson(cause) => Some(cause),
@@ -367,9 +442,54 @@ mod tests {
         assert_eq!(
             message,
             ServerMessage::Request {
+                id: ServerRequestId::Number(7),
                 method: "client/registerCapability".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn test_server_message_from_a_request_with_a_string_id_keeps_it_as_text() {
+        // サーバは文字列の id も使える。数に寄せると、そのまま返せなくなる
+        let payload = r#"{"jsonrpc":"2.0","id":"req-1","method":"window/showMessageRequest"}"#;
+
+        let message = ServerMessage::from_json(payload).expect("解釈できる");
+
+        assert_eq!(
+            message,
+            ServerMessage::Request {
+                id: ServerRequestId::Text("req-1".to_owned()),
+                method: "window/showMessageRequest".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_server_message_from_a_request_with_an_id_that_cannot_be_echoed_reports_it() {
+        let payload = r#"{"jsonrpc":"2.0","id":[1],"method":"window/showMessageRequest"}"#;
+
+        let error = ServerMessage::from_json(payload).expect_err("解釈できない");
+
+        assert!(matches!(error, MessageError::RequestIdNotSupported { .. }));
+    }
+
+    #[test]
+    fn test_method_not_found_payload_of_answers_with_the_id_it_was_given() {
+        // 数で来た id を文字列で返すと、サーバは自分の要求と結び付けられない
+        let payload =
+            method_not_found_payload_of(&ServerRequestId::Number(7), "window/showMessageRequest");
+
+        let answer = parsed(&payload);
+        assert_eq!(answer["id"], json!(7));
+        assert_eq!(answer["error"]["code"], json!(-32601));
+    }
+
+    #[test]
+    fn test_method_not_found_payload_of_keeps_a_string_id_as_a_string() {
+        let payload =
+            method_not_found_payload_of(&ServerRequestId::Text("req-1".to_owned()), "any/method");
+
+        assert_eq!(parsed(&payload)["id"], json!("req-1"));
     }
 
     #[test]

@@ -60,7 +60,8 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         let params = InitializeParams {
             process_id: Some(std::process::id()),
             // 何も宣言しない。宣言した機能に応じてサーバはこちらへ要求を投げてくるので、
-            // 応答を返せないうちは受け取る条件を作らない。
+            // 支えていない機能の要求を呼び込まない。ただし `window/showMessageRequest` の
+            // ように宣言に依らず届く要求はあり、それは `response_of` が返す。
             capabilities: ClientCapabilities::default(),
             client_info: Some(ClientInfo {
                 name: CLIENT_NAME.to_owned(),
@@ -133,9 +134,14 @@ impl<R: BufRead, W: Write> Connection<R, W> {
 
             let (responded, outcome) = match message {
                 // 応答の前後にサーバの通知（window/logMessage・$/progress）が挟まる。
-                // サーバからの要求は、こちらが機能を何も宣言していないので来る条件が無い。
-                // どちらも待っている応答ではないので、次のフレームへ進む。
-                ServerMessage::Notification { .. } | ServerMessage::Request { .. } => continue,
+                // 通知に応答は要らないので、次のフレームへ進むだけでよい。
+                ServerMessage::Notification { .. } => continue,
+                // 要求には返す。黙って捨てると、応答を待つサーバはそこで止まり、
+                // こちらは次のフレームを待つので、双方が待ち合う。
+                ServerMessage::Request { id, method } => {
+                    self.send(&message::method_not_found_payload_of(&id, &method))?;
+                    continue;
+                }
                 ServerMessage::Response { id, outcome } => (id, outcome),
             };
 
@@ -275,35 +281,32 @@ mod tests {
             .collect()
     }
 
-    /// 書き出されたフレームから method 名を順に取り出す。
-    fn sent_methods(written: &[u8]) -> Vec<String> {
+    /// 書き出されたフレームを順に解いたもの。
+    fn sent_payloads(written: &[u8]) -> Vec<Value> {
         let mut reader = written;
-        let mut methods = Vec::new();
+        let mut payloads = Vec::new();
 
         while let Ok(payload) = framing::payload_of(&mut reader) {
-            let message: Value = serde_json::from_str(&payload).expect("送った payload は JSON");
-            let method = message["method"]
-                .as_str()
-                .expect("送った payload は method を持つ");
-            methods.push(method.to_owned());
+            payloads.push(serde_json::from_str(&payload).expect("送った payload は JSON"));
         }
 
-        methods
+        payloads
+    }
+
+    /// 書き出されたフレームから method 名を順に取り出す。応答は method を持たないので飛ばす。
+    fn sent_methods(written: &[u8]) -> Vec<String> {
+        sent_payloads(written)
+            .iter()
+            .filter_map(|payload| payload["method"].as_str().map(str::to_owned))
+            .collect()
     }
 
     /// 書き出されたフレームから id を順に取り出す。通知は id を持たないので飛ばす。
     fn sent_ids(written: &[u8]) -> Vec<u64> {
-        let mut reader = written;
-        let mut ids = Vec::new();
-
-        while let Ok(payload) = framing::payload_of(&mut reader) {
-            let message: Value = serde_json::from_str(&payload).expect("送った payload は JSON");
-            if let Some(id) = message["id"].as_u64() {
-                ids.push(id);
-            }
-        }
-
-        ids
+        sent_payloads(written)
+            .iter()
+            .filter_map(|payload| payload["id"].as_u64())
+            .collect()
     }
 
     fn connection_over(server_output: &[u8]) -> Connection<&[u8], Vec<u8>> {
@@ -352,6 +355,25 @@ mod tests {
             .expect("応答を受け取れる");
 
         assert_eq!(result, json!({"a": 1}));
+    }
+
+    #[test]
+    fn test_request_answers_a_server_request_before_taking_its_own_response() {
+        // 返さないと、応答を待つサーバはそこで止まり、こちらは次のフレームを待つ
+        let server_output = frames_of(&[
+            r#"{"jsonrpc":"2.0","id":9,"method":"window/showMessageRequest","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"a":1}}"#,
+        ]);
+        let mut connection = connection_over(&server_output);
+
+        connection
+            .request("initialize", None)
+            .expect("応答を受け取れる");
+
+        let sent = sent_payloads(&connection.writer);
+        assert_eq!(sent.len(), 2, "要求 1 通と、サーバの要求への応答 1 通");
+        assert_eq!(sent[1]["id"], json!(9), "サーバの id をそのまま返す");
+        assert_eq!(sent[1]["error"]["code"], json!(-32601));
     }
 
     #[test]
