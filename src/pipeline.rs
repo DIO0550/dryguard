@@ -211,6 +211,10 @@ fn scan_of_chunks(
         .iter()
         .map(|compared| compared.compared_pair_count)
         .sum();
+    let pruned_pair_count = compared
+        .iter()
+        .map(|compared| compared.pruned_pair_count)
+        .sum();
     let candidate_pairs = compared
         .into_iter()
         .flat_map(|compared| compared.candidate_pairs)
@@ -221,6 +225,7 @@ fn scan_of_chunks(
         file_count: inputs.file_count,
         chunk_count: chunks.len(),
         compared_pair_count,
+        pruned_pair_count,
         skipped_files: inputs.skipped_files,
         unchunkable: inputs.unchunkable,
     }
@@ -233,6 +238,7 @@ fn scan_of_chunks(
 struct ComparedPairs {
     candidate_pairs: Vec<CandidatePair>,
     compared_pair_count: usize,
+    pruned_pair_count: usize,
 }
 
 impl ComparedPairs {
@@ -248,12 +254,18 @@ impl ComparedPairs {
     ) -> Self {
         let mut candidate_pairs = Vec::new();
         let mut compared_pair_count = 0;
+        let mut pruned_pair_count = 0;
 
         for other in following {
             if is_nested(chunk, other) {
                 continue;
             }
             compared_pair_count += 1;
+
+            if is_ruled_out_by_ceiling(chunk, other, structural_similarity_threshold) {
+                pruned_pair_count += 1;
+                continue;
+            }
 
             let signals = signals_of(chunk, other);
             if !is_structurally_similar(
@@ -273,8 +285,31 @@ impl ComparedPairs {
         Self {
             candidate_pairs,
             compared_pair_count,
+            pruned_pair_count,
         }
     }
+}
+
+/// 突き合わせるまでもなく、構造類似度が閾値に届かないと分かるペアか。
+///
+/// トークン列の長さから出る上限を [`is_structurally_similar`] に渡して聞く。
+/// **同じ条件をここに書き直さない**のは [`ComparedPairs::from_chunk`] と同じ理由で、
+/// 判定が「似ている」と見なす範囲と飛ばす範囲が黙ってずれるため。
+///
+/// **これは判定の先取りではない。** 上限は実際の類似度を下回らないので
+/// (`TokenSequence::similarity_ceiling_with`)、飛ばしたペアが候補になることはない。
+/// 飛ばす / 飛ばさないで候補ペアが変わらないことが、この関数を置ける条件そのもの。
+///
+/// どちらかにトークンが無いときは飛ばさない。**それは長さで確定したのではなく
+/// 測れないケース**で、`NoTokens` として `signals_of` が構造に出す。
+fn is_ruled_out_by_ceiling(chunk_a: &Chunk, chunk_b: &Chunk, threshold: Threshold) -> bool {
+    let (Some(tokens_a), Some(tokens_b)) = (chunk_a.tokens(), chunk_b.tokens()) else {
+        return false;
+    };
+
+    let ceiling = StructuralSimilarity::Measured(tokens_a.similarity_ceiling_with(tokens_b));
+
+    !is_structurally_similar(ceiling, threshold)
 }
 
 /// 同じファイルにあって範囲が重なる 2 つのチャンクか（外側の関数とその中の関数）。
@@ -303,6 +338,7 @@ pub struct Scan {
     file_count: usize,
     chunk_count: usize,
     compared_pair_count: usize,
+    pruned_pair_count: usize,
     skipped_files: Vec<SkippedFile>,
     unchunkable: Vec<Location>,
 }
@@ -324,8 +360,20 @@ impl Scan {
     }
 
     /// 実際に比べたペアの数。入れ子の組は含まない。
+    ///
+    /// **長さの上限だけで確定したペアもここに数える**（[`Scan::pruned_pair_count`]）。
+    /// 飛ばしたのではなく安く比べただけなので、比べた数からは外さない。
     pub fn compared_pair_count(&self) -> usize {
         self.compared_pair_count
+    }
+
+    /// 比べたペアのうち、トークン列の長さから出る上限だけで確定した数。
+    ///
+    /// [`Scan::compared_pair_count`] の内訳で、残りが gram を突き合わせたペア。
+    /// **黙って飛ばさない**のは、どれだけ省いたかが読めないと
+    /// 「比べた」の意味が回ごとに変わって見えるため。
+    pub fn pruned_pair_count(&self) -> usize {
+        self.pruned_pair_count
     }
 
     /// 読めなかった・構文木にできなかったファイル。

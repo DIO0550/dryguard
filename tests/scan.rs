@@ -175,3 +175,21 @@ fn test_scan_of_a_directory_without_typescript_finds_nothing_to_compare() {
     assert_eq!(scan.compared_pair_count(), 0);
     assert!(scan.candidate_pairs().is_empty());
 }
+
+#[test]
+fn test_scan_of_the_corpus_rules_out_pairs_whose_lengths_are_too_far_apart() {
+    // 上限だけで確定できるペアが 1 組も無いなら、枝刈りは何も飛ばしていない。
+    // 対照は上のテスト（候補 65 組）。飛ばしすぎればあちらが落ちる
+    let scan = scan_of_corpus();
+
+    assert!(
+        scan.pruned_pair_count() > 0,
+        "長さが 2 倍以上離れたペアは突き合わせずに確定する"
+    );
+    assert!(
+        scan.pruned_pair_count() < scan.compared_pair_count(),
+        "突き合わせたペアも残る: {} / {}",
+        scan.pruned_pair_count(),
+        scan.compared_pair_count()
+    );
+}
