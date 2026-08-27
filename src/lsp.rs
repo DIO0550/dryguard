@@ -5,14 +5,18 @@
 //!
 //! | モジュール | 持つもの |
 //! |---|---|
-//! | [`framing`] | `Content-Length` による区切り |
-//! | [`message`] | JSON-RPC の payload の組み立てと解釈 |
-//! | [`connection`] | 要求と応答の対応付け・ライフサイクル |
+//! | `framing` | `Content-Length` による区切り |
+//! | `message` | JSON-RPC の payload の組み立てと解釈 |
+//! | `connection` | 要求と応答の対応付け・ライフサイクル |
 //! | ここ | サーバの起動・パイプの配線・終了 |
+//!
+//! **外へ出すのは [`Client`] / [`ServerCommand`] と、失敗を読むための型だけ。**
+//! 区切りや payload の組み立て方は、いつ変えても外に影響しない位置に置く
+//! (rules/architecture.md「モジュールの公開 API」)。
 
-pub mod connection;
-pub mod framing;
-pub mod message;
+pub(crate) mod connection;
+pub(crate) mod framing;
+pub(crate) mod message;
 
 use std::error::Error;
 use std::fmt;
@@ -21,7 +25,13 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
 use lsp_types::ServerCapabilities;
 
-use connection::{Connection, ConnectionError};
+use connection::Connection;
+
+// 失敗を読むための型だけを外へ出す。[`ClientError`] が抱えている以上、
+// 外から名前を呼べないと `source()` をたどっても中身を見分けられない。
+pub use connection::ConnectionError;
+pub use framing::FramingError;
+pub use message::{MessageError, RequestId, ResponseFailure};
 
 /// TypeScript の LSP サーバの実行ファイル名。
 const TYPESCRIPT_SERVER: &str = "typescript-language-server";
@@ -76,7 +86,7 @@ impl Client {
     /// サーバを起動し、stdin / stdout を配線する。
     ///
     /// stderr は捨てる。サーバのログをこちらの出力に混ぜないため。起動そのものの失敗は
-    /// フレームの切れ目の EOF（[`framing::FramingError::ServerClosed`]）として表に出る。
+    /// フレームの切れ目の EOF（[`FramingError::ServerClosed`]）として表に出る。
     ///
     /// # Errors
     ///
