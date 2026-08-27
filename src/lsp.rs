@@ -10,7 +10,7 @@
 //! | `connection` | 要求と応答の対応付け・ライフサイクル |
 //! | ここ | サーバの起動・パイプの配線・終了 |
 //!
-//! **外へ出すのは [`Client`] / [`ServerCommand`] と、失敗を読むための型だけ。**
+//! **外へ出すのは [`ServerCommand`] / [`Client`] / [`Session`] と、失敗を読むための型だけ。**
 //! 区切りや payload の組み立て方は、いつ変えても外に影響しない位置に置く
 //! (rules/architecture.md「モジュールの公開 API」)。
 
@@ -71,9 +71,14 @@ impl ServerCommand {
     }
 }
 
-/// 動いている LSP サーバと、そこへの往復。
+/// 起動しただけの LSP サーバ。まだ握手していない。
 ///
-/// 子プロセスを抱えるので、[`Self::shutdown`] を通らずに落ちた経路では
+/// **握手の前と後を別の型にしてある。** LSP は `initialize` を 1 回しか受け付けず、
+/// その前に他の要求を送ることも許さない。1 つの型に両方の状態を持たせると、
+/// 2 回目の握手も、握手前の終了も、書けてしまう
+/// (rules/coding.md「不正な状態を型で表現できなくする」)。
+///
+/// 子プロセスを抱えるので、[`Session::shutdown`] を通らずに落ちた経路では
 /// `Drop` が kill する。
 #[derive(Debug)]
 pub struct Client {
@@ -114,20 +119,46 @@ impl Client {
         })
     }
 
-    /// サーバと握手し、サーバができることを受け取る。
+    /// サーバと握手し、問い合わせを送れる状態にする。
+    ///
+    /// 値を取るのは、握手を 2 回できないようにするため。`initialize` を 2 度送られた
+    /// サーバは 2 通目を拒む。
     ///
     /// # Errors
     ///
-    /// 往復が失敗したとき。
-    pub fn handshake(&mut self) -> Result<ServerCapabilities, ClientError> {
-        self.connection
+    /// 往復が失敗したとき。抜けた [`Client`] は `Drop` が kill する。
+    pub fn handshake(mut self) -> Result<Session, ClientError> {
+        let capabilities = self
+            .connection
             .handshake()
-            .map_err(ClientError::Conversation)
+            .map_err(ClientError::Conversation)?;
+
+        Ok(Session {
+            client: self,
+            capabilities,
+        })
+    }
+}
+
+/// 握手を終えた LSP サーバ。問い合わせを送れる。
+///
+/// 握手で受け取った capabilities を抱えるのは、**サーバができることを知らずに
+/// 問い合わせを組み立てる形を作らない**ため。
+#[derive(Debug)]
+pub struct Session {
+    client: Client,
+    capabilities: ServerCapabilities,
+}
+
+impl Session {
+    /// サーバができること。
+    pub fn capabilities(&self) -> &ServerCapabilities {
+        &self.capabilities
     }
 
     /// サーバを終わらせ、子プロセスの終了を待つ。
     ///
-    /// 値を取るのは、終わらせた後の [`Client`] を残さないため
+    /// 値を取るのは、終わらせた後の [`Session`] を残さないため
     /// (rules/coding.md「不正な状態を型で表現できなくする」)。
     ///
     /// # Errors
@@ -135,13 +166,14 @@ impl Client {
     /// 往復が失敗したとき、終了を待てなかったとき、サーバが異常終了したとき。
     /// 往復の失敗で抜けた場合は `Drop` が kill する。
     pub fn shutdown(mut self) -> Result<(), ClientError> {
-        self.connection
+        self.client
+            .connection
             .shutdown()
             .map_err(ClientError::Conversation)?;
-        let status = self.child.wait().map_err(ClientError::Wait)?;
+        let status = self.client.child.wait().map_err(ClientError::Wait)?;
 
         // 待ち終えた時点で子プロセスは残っていない。ここより後で失敗しても kill は要らない。
-        self.terminated = true;
+        self.client.terminated = true;
 
         // `wait` は終了できたことしか言わない。**異常終了も `Ok` で返る**ので、
         // 状態を見ずに握りつぶすと「終了しました」と報告してしまう
@@ -279,15 +311,15 @@ mod tests {
     #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
     fn test_client_handshake_with_typescript_language_server_returns_its_capabilities() {
         let command = ServerCommand::typescript();
-        let mut client = Client::start(&command).expect("サーバを起動できる");
+        let client = Client::start(&command).expect("サーバを起動できる");
 
-        let capabilities = client.handshake().expect("握手できる");
+        let session = client.handshake().expect("握手できる");
 
         // hover は Stage 2 で最初に使う問い合わせ。返らないサーバでは意味情報が採れない。
         // 有無ではなく中身を見る。無効を表す `Simple(false)` も「ある」なので、
         // is_some() では hover を切ったサーバでも通ってしまう
         let provides_hover = matches!(
-            capabilities.hover_provider,
+            session.capabilities().hover_provider,
             Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
         );
 
@@ -296,6 +328,6 @@ mod tests {
             "typescript-language-server は hover を提供する"
         );
 
-        client.shutdown().expect("終了できる");
+        session.shutdown().expect("終了できる");
     }
 }

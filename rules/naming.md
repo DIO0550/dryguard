@@ -73,6 +73,7 @@ if structurally_similar && domains_differ { ... }
 | `frame` | LSP のストリーム上の 1 通分。`Content-Length` ヘッダと、それが数えた本文 |
 | `payload` | frame の本文。JSON-RPC のメッセージ 1 通そのもの |
 | `handshake` | `initialize` 要求 → 応答 → `initialized` 通知。ここまでで 1 つ |
+| `session` | handshake を終えた接続。問い合わせを送れる状態。握手前は `client` |
 
 `snippet` / `fragment` / `candidate`（chunk の意味で）/ `label`（verdict の意味で）は使わない。
 **`candidate` が指すのはペアであって chunk ではない。**
