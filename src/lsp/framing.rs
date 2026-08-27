@@ -119,6 +119,13 @@ fn content_length_of<R: BufRead>(reader: &mut R) -> Result<usize, FramingError> 
         header_started = true;
 
         if let Some(value) = content_length_value_of(line) {
+            // 2 つ目で上書きしない。**どちらが本当の長さか決められない**まま読み進めると、
+            // 次のフレームの頭を食うか、来ないバイトを待つかで、区切りがずれたまま続く。
+            // 値が同じ場合も分けない。1 つのフレームに 2 つ載っている時点で壊れている。
+            if length.is_some() {
+                return Err(FramingError::DuplicateContentLength);
+            }
+
             length = Some(
                 value
                     .parse()
@@ -164,6 +171,8 @@ pub enum FramingError {
         /// サーバが申告した長さ。
         length: usize,
     },
+    /// 1 つのフレームに `Content-Length` が 2 つ以上ある。
+    DuplicateContentLength,
     /// ヘッダ部が上限を超えても空行に届かない。
     HeaderTooLong,
     /// payload を UTF-8 として解釈できない。
@@ -189,6 +198,10 @@ impl fmt::Display for FramingError {
                 formatter,
                 "LSP サーバの応答が大きすぎます ({length} バイト / 上限 {MAX_PAYLOAD_BYTES} バイト)"
             ),
+            Self::DuplicateContentLength => write!(
+                formatter,
+                "LSP サーバの応答に Content-Length が 2 つ以上あります"
+            ),
             Self::HeaderTooLong => write!(
                 formatter,
                 "LSP サーバの応答のヘッダが {MAX_HEADER_BYTES} バイトを超えても終わりません"
@@ -207,6 +220,7 @@ impl Error for FramingError {
             | Self::MissingContentLength
             | Self::MalformedContentLength { .. }
             | Self::PayloadTooLarge { .. }
+            | Self::DuplicateContentLength
             | Self::HeaderTooLong
             | Self::NotUtf8 => None,
             Self::Read(cause) => Some(cause),
@@ -308,6 +322,26 @@ mod tests {
             error,
             FramingError::MalformedContentLength { value } if value == "seven"
         ));
+    }
+
+    #[test]
+    fn test_payload_of_with_two_conflicting_content_lengths_reports_it() {
+        // 後勝ちで読むと 7 バイトのつもりで 4 バイトを取り、次のフレームの頭を食う
+        let framed = "Content-Length: 7\r\nContent-Length: 4\r\n\r\n{\"a\":1}";
+
+        let error = read_payload(framed).expect_err("読めない");
+
+        assert!(matches!(error, FramingError::DuplicateContentLength));
+    }
+
+    #[test]
+    fn test_payload_of_with_two_identical_content_lengths_reports_it() {
+        // 値が同じでも通さない。1 つのフレームに 2 つ載っている時点で壊れている
+        let framed = "Content-Length: 7\r\nContent-Length: 7\r\n\r\n{\"a\":1}";
+
+        let error = read_payload(framed).expect_err("読めない");
+
+        assert!(matches!(error, FramingError::DuplicateContentLength));
     }
 
     #[test]
