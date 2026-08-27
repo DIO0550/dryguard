@@ -9,7 +9,9 @@
 
 use std::error::Error;
 use std::fmt;
-use std::io::{self, BufRead};
+// `Read` は `take` を `&mut R` の側で解決させるために要る。入れないと型引数の側
+// （`R: BufRead` の supertrait）で解決し、借りているはずの読み口ごと動かそうとする。
+use std::io::{self, BufRead, Read};
 
 /// 長さを載せるヘッダの名前。比較は ASCII 大文字小文字を無視して行う。
 const CONTENT_LENGTH: &str = "content-length";
@@ -20,6 +22,16 @@ const CONTENT_LENGTH: &str = "content-length";
 /// 壊れたサーバが桁を間違えるだけで、確保の失敗としてプロセスごと落ちる。
 /// 問い合わせるのは hover や references で、応答がこの桁に届くことはない。
 const MAX_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+
+/// 1 フレームのヘッダ部として読む上限（1 KiB）。
+///
+/// **payload の上限だけでは足りない。** 長さを知るのはヘッダを読み切った後なので、
+/// 改行を送ってこないサーバや、空行に辿り着かないサーバは、[`MAX_PAYLOAD_BYTES`] に
+/// 触れないまま読み続けさせられる。行の長さではなく**ヘッダ部の合計**を数えるのは、
+/// 短い行を延々と送る形も同じ 1 つの上限で止まるため。
+///
+/// 実際のヘッダは `Content-Length` と `Content-Type` で 100 バイトに満たない。
+const MAX_HEADER_BYTES: usize = 1024;
 
 /// payload を 1 フレームのバイト列にする。
 ///
@@ -64,14 +76,22 @@ pub fn payload_of<R: BufRead>(reader: &mut R) -> Result<String, FramingError> {
 /// # Errors
 ///
 /// ヘッダが 1 行も無いまま入力が尽きたとき（サーバの終了）、空行に届く前に尽きたとき、
-/// `Content-Length` が無い / 数として読めないとき。
+/// ヘッダ部が上限を超えたとき、`Content-Length` が無い / 数として読めないとき。
 fn content_length_of<R: BufRead>(reader: &mut R) -> Result<usize, FramingError> {
     let mut length = None;
     let mut header_started = false;
+    let mut remaining = MAX_HEADER_BYTES;
 
     loop {
+        if remaining == 0 {
+            return Err(FramingError::HeaderTooLong);
+        }
+
+        // 読める量を残りで縛る。`read_line` は改行が来るまで伸ばし続けるので、
+        // 縛らないと 1 行だけで payload の上限を素通りできる。
         let mut line = String::new();
-        let read = reader.read_line(&mut line).map_err(FramingError::Read)?;
+        let mut limited = (&mut *reader).take(remaining as u64);
+        let read = limited.read_line(&mut line).map_err(FramingError::Read)?;
 
         if read == 0 {
             // フレームの切れ目での EOF とフレーム途中での EOF を分ける。前者はサーバが
@@ -80,6 +100,16 @@ fn content_length_of<R: BufRead>(reader: &mut R) -> Result<usize, FramingError> 
                 return Err(FramingError::TruncatedFrame);
             }
             return Err(FramingError::ServerClosed);
+        }
+
+        remaining -= read;
+
+        if !line.ends_with('\n') {
+            // 改行が来ないまま止まった。残りが尽きたなら上限、そうでなければ入力が尽きた。
+            if remaining == 0 {
+                return Err(FramingError::HeaderTooLong);
+            }
+            return Err(FramingError::TruncatedFrame);
         }
 
         let line = line.trim_end_matches(['\r', '\n']);
@@ -134,6 +164,8 @@ pub enum FramingError {
         /// サーバが申告した長さ。
         length: usize,
     },
+    /// ヘッダ部が上限を超えても空行に届かない。
+    HeaderTooLong,
     /// payload を UTF-8 として解釈できない。
     NotUtf8,
     /// 読み取り自体が失敗した。
@@ -157,6 +189,10 @@ impl fmt::Display for FramingError {
                 formatter,
                 "LSP サーバの応答が大きすぎます ({length} バイト / 上限 {MAX_PAYLOAD_BYTES} バイト)"
             ),
+            Self::HeaderTooLong => write!(
+                formatter,
+                "LSP サーバの応答のヘッダが {MAX_HEADER_BYTES} バイトを超えても終わりません"
+            ),
             Self::NotUtf8 => write!(formatter, "LSP サーバの応答が UTF-8 ではありません"),
             Self::Read(cause) => write!(formatter, "LSP サーバの応答を読めません: {cause}"),
         }
@@ -171,6 +207,7 @@ impl Error for FramingError {
             | Self::MissingContentLength
             | Self::MalformedContentLength { .. }
             | Self::PayloadTooLarge { .. }
+            | Self::HeaderTooLong
             | Self::NotUtf8 => None,
             Self::Read(cause) => Some(cause),
         }
@@ -271,6 +308,27 @@ mod tests {
             error,
             FramingError::MalformedContentLength { value } if value == "seven"
         ));
+    }
+
+    #[test]
+    fn test_payload_of_with_a_header_line_that_never_ends_reports_it() {
+        // 改行を送ってこないサーバ。行の長さを縛っていないと、payload の上限に
+        // 触れないまま読み続けさせられる
+        let framed = "Content-Length: ".to_owned() + &"0".repeat(MAX_HEADER_BYTES);
+
+        let error = read_payload(&framed).expect_err("読めない");
+
+        assert!(matches!(error, FramingError::HeaderTooLong));
+    }
+
+    #[test]
+    fn test_payload_of_with_headers_that_never_reach_a_blank_line_reports_it() {
+        // 1 行ずつは短いが空行に辿り着かないサーバ。行の長さだけを縛っていると素通りする
+        let framed = "X: y\r\n".repeat(MAX_HEADER_BYTES);
+
+        let error = read_payload(&framed).expect_err("読めない");
+
+        assert!(matches!(error, FramingError::HeaderTooLong));
     }
 
     #[test]
