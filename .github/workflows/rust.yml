@@ -80,12 +80,19 @@ jobs:
       # 入っているので、直接呼べば足りる（AGENTS.md「CI で使うアクション」）。
       - name: LSP サーバ
         run: |
-          corepack install -g pnpm@10.33.0
-          pnpm --version
+          PNPM_VERSION=10.33.0
           export PNPM_HOME="$HOME/.local/share/pnpm"
           mkdir -p "$PNPM_HOME"
           export PATH="$PNPM_HOME:$PATH"
           echo "$PNPM_HOME" >> "$GITHUB_PATH"
+          # enable がシムを置き、install -g が使う版を決める。両方要る
+          # （install -g だけではシムが PATH に無く、pnpm を呼べない）。
+          corepack enable --install-directory "$PNPM_HOME" pnpm
+          corepack install -g "pnpm@$PNPM_VERSION"
+          # 固定した版で走っていることを確かめる。別の版だと minimumReleaseAge を
+          # 知らないまま素通りしうる。
+          pnpm --version
+          test "$(pnpm --version)" = "$PNPM_VERSION"
           pnpm config set minimumReleaseAge 7200 --global
           pnpm config get minimumReleaseAge --global
           pnpm add -g typescript-language-server@6.0.0 typescript@5.9.3
