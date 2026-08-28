@@ -176,3 +176,22 @@ bash harness/deps/resolve.sh add serde
 警告を出さない）ため、`resolve.sh` は nightly が無ければ落ちる。
 「設定してあるのに守られていない」を作らないのがスクリプトを挟む理由で、
 **素の `cargo update` はそれを迂回する**。
+
+### JavaScript 側のパッケージは pnpm で入れる
+
+**`npm` は使わない。`pnpm` を使い、cooldown を 5 日にする**（`minimumReleaseAge: 7200`。分で指定する）。
+今の対象は CI が入れる typescript-language-server と typescript。
+
+```bash
+pnpm config set minimumReleaseAge 7200 --global
+pnpm add -g <パッケージ>
+```
+
+**Why**: cooldown を掛けられるのが pnpm だけだから。npm には公開からの経過日数で
+解決を止める設定が無く、Cargo 側（`global-min-publish-age`）と同じ守り方ができない。
+**postinstall スクリプトは install の時点でローカル実行される**ので、cargo の build script と
+同じく「掴んだ時点で実行済み」になる。
+
+**pnpm の版を固定する。** `minimumReleaseAge` を知らない版の pnpm は、**その設定を警告なく
+無視する**。設定してあるのに守られていない状態を作らないため、CI では `corepack install -g pnpm@<版>`
+で版ごと固定してから設定する（`cargo` 側で nightly を要求しているのと同じ形）。
