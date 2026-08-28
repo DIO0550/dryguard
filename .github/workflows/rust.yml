@@ -65,11 +65,30 @@ jobs:
       # 配らなくなったため、版を指定しないと解決した TypeScript 次第で
       # initialize が失敗する。
       #
-      # Why not（actions/setup-node）: ランナーに node と npm が入っているので、
-      # 直接呼べば足りる（AGENTS.md「CI で使うアクション」）。
+      # Why（cooldown を効かせる）: 公開直後の版を解決に使わない。Cargo 側
+      # （.cargo/config.toml の global-min-publish-age）と同じ考え方で、
+      # 検知・削除までの時間を稼いでから掴む（AGENTS.md「依存の更新は cooldown を通す」）。
+      # minimumReleaseAge は分で指定するので、5 日 = 7200。
+      #
+      # Why（pnpm の版を corepack で固定する）: ランナーに pnpm は入っていない。
+      # 版を固定しないと minimumReleaseAge を知らない pnpm が走りうるが、**知らない設定は
+      # 警告なく無視される**ので、cooldown が効いていない状態を作れてしまう
+      # （AGENTS.md「強制力の序列」のフェイルオープンかつサイレント）。
+      # corepack は Node に同梱されているので、追加のインストーラは要らない。
+      #
+      # Why not（actions/setup-node・pnpm/action-setup）: ランナーに node と corepack が
+      # 入っているので、直接呼べば足りる（AGENTS.md「CI で使うアクション」）。
       - name: LSP サーバ
         run: |
-          npm install -g typescript-language-server@6.0.0 typescript@5.9.3
+          corepack install -g pnpm@10.33.0
+          pnpm --version
+          export PNPM_HOME="$HOME/.local/share/pnpm"
+          mkdir -p "$PNPM_HOME"
+          export PATH="$PNPM_HOME:$PATH"
+          echo "$PNPM_HOME" >> "$GITHUB_PATH"
+          pnpm config set minimumReleaseAge 7200 --global
+          pnpm config get minimumReleaseAge --global
+          pnpm add -g typescript-language-server@6.0.0 typescript@5.9.3
           typescript-language-server --version
 
       - name: cargo test (LSP)
