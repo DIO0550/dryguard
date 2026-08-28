@@ -97,4 +97,6 @@ typescript-language-server は tsserver を包むだけで、**TypeScript 本体
 
 - **lock が固定し、cooldown は入口を絞るだけ。** 毎回同じものが入るのは lock のおかげで、
   cooldown は lock を作り直す瞬間にしか効かない
-- **CI が使う pnpm 自体は lock の外**。版と SHA-256 を `.github/workflows/rust.yml` で固定する
+- **CI が使う pnpm 自体は lock の外**。版は `package.json` の `packageManager` が持ち、
+  `pnpm/action-setup`（commit hash で固定）が入れる。**中身までは固定していない**
+  （`self-update` が版指定で取るため。経緯は `AGENTS.md`）

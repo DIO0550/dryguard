@@ -23,7 +23,7 @@ jobs:
     name: fmt / clippy / test
     runs-on: ubuntu-latest
     steps:
-      # 使うアクションは GitHub 公式（actions/*）のみ。commit hash で固定する。
+      # アクションは commit hash で固定する。
       #
       # Why: タグは動かせるので、`@v5` のままだと同じ設定でも別のコードが走りうる。
       # ここは無条件のゲートなので、何が走るかを固定できないと検査そのものが信用できない。
@@ -60,31 +60,29 @@ jobs:
       # **無条件に走らせる場所はここしか無い**（AGENTS.md「強制力の序列」の層 1 /
       # rules/testing.md「LSP を要するテストは、飛ばしたことが分かる形にする」）。
       #
-      # Why（pnpm を SHA-256 で固定して取る）: ランナーに pnpm は入っていない。
-      # **版だけでなく中身まで固定する**のは、`actions/*` を commit hash で止めているのと
-      # 同じ理由（AGENTS.md「CI で使うアクション」）。タグやリリースは差し替えられるが、
-      # ハッシュが合わなければ sha256sum -c がステップを落とす。
+      # pnpm はランナーに入っていないので、このアクションが用意する。
+      # 入れる版は package.json の `packageManager` が持つ（アクションがそこを読む）。
       #
-      # 更新するときは PNPM_VERSION と PNPM_SHA256 の両方を直す
-      # （actions の hash とコメントの版を両方直すのと同じ）。
+      # **このアクションで固定できるのは 2 段のうち 1 段目まで。**
+      # 1 段目（bootstrap）は同梱の package-lock.json で integrity 込みに固定され、
+      # その lock は commit hash で止めたこのアクションに含まれる。
+      # 2 段目（`pnpm self-update <版>`）は**版だけを指定して registry から取る**
+      # （`packageManager` に付けた `+sha512...` はアクション側が捨てる）。
+      # したがって**実際に走る pnpm の中身は固定できていない**。
+      #
+      # Why not（curl + sha256sum で取る）: 中身まで固定できるが、版を上げるたびに
+      # ハッシュを取り直すことになる。手間と引き換えに 2 段目の固定を手放した。
       #
       # Why not（corepack）: Node 25.0.0 から同梱されなくなった。それ以降に corepack を
       # 入れる公式の方法は `npm install -g corepack` で、npm を使わない方針と衝突する。
-      #
-      # Why not（pnpm の公式インストールスクリプト）: checksum が無く、
-      # リモートのスクリプトをそのまま sh に流すことになる。
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+
       - name: LSP サーバ
         run: |
-          PNPM_VERSION=10.33.0
-          PNPM_SHA256=aa02280c8d6925b43ded806f22a46ba17a44700271ec6b58679bbe1ffe537973
-          pnpm_directory="$HOME/.local/bin"
-          mkdir -p "$pnpm_directory"
-          export PATH="$pnpm_directory:$PATH"
-          curl -fsSL -o "$pnpm_directory/pnpm" \
-            "https://github.com/pnpm/pnpm/releases/download/v$PNPM_VERSION/pnpm-linuxstatic-x64"
-          echo "$PNPM_SHA256  $pnpm_directory/pnpm" | sha256sum -c -
-          chmod +x "$pnpm_directory/pnpm"
-          pnpm --version
+          # 宣言した版が入ったことを確かめる。2 段目は版指定で取ってくるので、
+          # 別の版が入っても黙って進んでしまう（AGENTS.md「強制力の序列」）。
+          expected_pnpm_version="$(node -p "require('./package.json').packageManager.split('@')[1]")"
+          test "$(pnpm --version)" = "$expected_pnpm_version"
           # lock から入れるだけなので解決は起きない。cooldown は lock を作り直すときに
           # harness/deps/resolve-node.sh が効かせる。
           pnpm install --frozen-lockfile
