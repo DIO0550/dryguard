@@ -77,6 +77,15 @@ bash harness/deps/resolve-node.sh add -D <パッケージ>
 `minimumReleaseAge` は **pnpm 10.16.0 で入った**。それより前の版は**この設定を警告なく無視する**。
 cargo 側で stable が `min-publish-age` を無言で捨てるのと同じ形なので、同じように入口で落とす。
 
+### なぜ cooldown の長さまで見るか
+
+「設定してあるか」だけを見ると、`minimumReleaseAge: 0` や `1`（1 分）でも通る。
+**cooldown が有る状態と無い状態が区別できない**ので、`resolve-node.sh` は
+`pnpm config get` の値が 7200 分に届くことまで要求する。
+
+下限をスクリプトにも書くのは、**片方だけ短くしても通る形にしない**ため。
+一致ではなく下限にしてあるので、期間を延ばす側の変更は通る。
+
 ### typescript の版を固定している理由
 
 typescript-language-server は tsserver を包むだけで、**TypeScript 本体を同梱しない**。

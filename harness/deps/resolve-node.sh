@@ -21,6 +21,12 @@ set -euo pipefail
 # minimumReleaseAge を読むようになった最初の版。これより前は設定を警告なく無視する。
 readonly REQUIRED_PNPM_VERSION=10.16.0
 
+# 要求する cooldown の下限（分）。pnpm-workspace.yaml が宣言している 5 日と同じ値を持つ。
+#
+# Why（あえて 2 箇所に置く）: 片方だけを短くしても通る形にしないため。期間を縮めるには
+# ここも直すことになり、変更が差分に出る。
+readonly REQUIRED_COOLDOWN_MINUTES=7200
+
 # 代入で受けてから cd する。`cd "$(git ...)"` は git が失敗しても `cd ""` が成功するため、
 # リポジトリの外で黙って別のディレクトリのまま走る。
 repository_root="$(git rev-parse --show-toplevel)"
@@ -50,11 +56,15 @@ fi
 
 # **pnpm が読む値そのものを見る。** 設定ファイルを grep すると、値が 0（無効）でも、
 # 名前がコメントにだけ残っていても通ってしまう。確かめたいのは書いてあることではなく
-# 効いていることなので、pnpm に聞く。未設定なら `undefined` が返り、-gt が失敗する。
+# 効いていることなので、pnpm に聞く。未設定なら `undefined` が返り、比較が失敗する。
+#
+# Why not（正の数であることだけを見る）: 1 分でも通る。cooldown が有る状態と無い状態を
+# 区別できず、守っているつもりの値が守っていない。
+# Why not（値が一致することを要求する）: 期間を延ばす（より安全な）変更まで弾く。
 configured_cooldown="$(pnpm config get minimumReleaseAge 2>/dev/null || true)"
-if ! [ "$configured_cooldown" -gt 0 ] 2>/dev/null; then
-  echo "resolve-node: cooldown が効きません（minimumReleaseAge: ${configured_cooldown:-未設定}）" >&2
-  echo "resolve-node: pnpm-workspace.yaml に分単位の正の値を書いてください" >&2
+if ! [ "$configured_cooldown" -ge "$REQUIRED_COOLDOWN_MINUTES" ] 2>/dev/null; then
+  echo "resolve-node: cooldown が $REQUIRED_COOLDOWN_MINUTES 分に届きません（minimumReleaseAge: ${configured_cooldown:-未設定}）" >&2
+  echo "resolve-node: pnpm-workspace.yaml の minimumReleaseAge を確かめてください" >&2
   exit 1
 fi
 
