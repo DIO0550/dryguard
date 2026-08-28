@@ -60,43 +60,36 @@ jobs:
       # **無条件に走らせる場所はここしか無い**（AGENTS.md「強制力の序列」の層 1 /
       # rules/testing.md「LSP を要するテストは、飛ばしたことが分かる形にする」）。
       #
-      # Why（typescript を明示して入れる）: typescript-language-server は tsserver を
-      # 包むだけで、TypeScript 本体を同梱しない。TypeScript 7 は tsserver.js を
-      # 配らなくなったため、版を指定しないと解決した TypeScript 次第で
-      # initialize が失敗する。
+      # Why（pnpm を SHA-256 で固定して取る）: ランナーに pnpm は入っていない。
+      # **版だけでなく中身まで固定する**のは、`actions/*` を commit hash で止めているのと
+      # 同じ理由（AGENTS.md「CI で使うアクション」）。タグやリリースは差し替えられるが、
+      # ハッシュが合わなければ sha256sum -c がステップを落とす。
       #
-      # Why（cooldown を効かせる）: 公開直後の版を解決に使わない。Cargo 側
-      # （.cargo/config.toml の global-min-publish-age）と同じ考え方で、
-      # 検知・削除までの時間を稼いでから掴む（AGENTS.md「依存の更新は cooldown を通す」）。
-      # minimumReleaseAge は分で指定するので、5 日 = 7200。
+      # 更新するときは PNPM_VERSION と PNPM_SHA256 の両方を直す
+      # （actions の hash とコメントの版を両方直すのと同じ）。
       #
-      # Why（pnpm の版を corepack で固定する）: ランナーに pnpm は入っていない。
-      # 版を固定しないと minimumReleaseAge を知らない pnpm が走りうるが、**知らない設定は
-      # 警告なく無視される**ので、cooldown が効いていない状態を作れてしまう
-      # （AGENTS.md「強制力の序列」のフェイルオープンかつサイレント）。
-      # corepack は Node に同梱されているので、追加のインストーラは要らない。
+      # Why not（corepack）: Node 25.0.0 から同梱されなくなった。それ以降に corepack を
+      # 入れる公式の方法は `npm install -g corepack` で、npm を使わない方針と衝突する。
       #
-      # Why not（actions/setup-node・pnpm/action-setup）: ランナーに node と corepack が
-      # 入っているので、直接呼べば足りる（AGENTS.md「CI で使うアクション」）。
+      # Why not（pnpm の公式インストールスクリプト）: checksum が無く、
+      # リモートのスクリプトをそのまま sh に流すことになる。
       - name: LSP サーバ
         run: |
           PNPM_VERSION=10.33.0
-          export PNPM_HOME="$HOME/.local/share/pnpm"
-          mkdir -p "$PNPM_HOME"
-          export PATH="$PNPM_HOME:$PATH"
-          echo "$PNPM_HOME" >> "$GITHUB_PATH"
-          # enable がシムを置き、install -g が使う版を決める。両方要る
-          # （install -g だけではシムが PATH に無く、pnpm を呼べない）。
-          corepack enable --install-directory "$PNPM_HOME" pnpm
-          corepack install -g "pnpm@$PNPM_VERSION"
-          # 固定した版で走っていることを確かめる。別の版だと minimumReleaseAge を
-          # 知らないまま素通りしうる。
+          PNPM_SHA256=aa02280c8d6925b43ded806f22a46ba17a44700271ec6b58679bbe1ffe537973
+          pnpm_directory="$HOME/.local/bin"
+          mkdir -p "$pnpm_directory"
+          export PATH="$pnpm_directory:$PATH"
+          curl -fsSL -o "$pnpm_directory/pnpm" \
+            "https://github.com/pnpm/pnpm/releases/download/v$PNPM_VERSION/pnpm-linuxstatic-x64"
+          echo "$PNPM_SHA256  $pnpm_directory/pnpm" | sha256sum -c -
+          chmod +x "$pnpm_directory/pnpm"
           pnpm --version
-          test "$(pnpm --version)" = "$PNPM_VERSION"
-          pnpm config set minimumReleaseAge 7200 --global
-          pnpm config get minimumReleaseAge --global
-          pnpm add -g typescript-language-server@6.0.0 typescript@5.9.3
-          typescript-language-server --version
+          # lock から入れるだけなので解決は起きない。cooldown は lock を作り直すときに
+          # harness/deps/resolve-node.sh が効かせる。
+          pnpm install --frozen-lockfile
+          echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
+          node_modules/.bin/typescript-language-server --version
 
       - name: cargo test (LSP)
         run: cargo test -- --ignored
