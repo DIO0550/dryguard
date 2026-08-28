@@ -31,13 +31,6 @@ if [ "$#" -eq 0 ]; then
   exit 1
 fi
 
-# 期間の値が無ければ cooldown は掛からない。設定ファイルごと消えても走ってしまう形にしない。
-if ! grep -q "minimumReleaseAge" pnpm-workspace.yaml 2>/dev/null; then
-  echo "resolve-node: pnpm-workspace.yaml に minimumReleaseAge がありません" >&2
-  echo "resolve-node: 期間の指定が無いと cooldown が掛からないため、解決しません" >&2
-  exit 1
-fi
-
 if ! command -v pnpm >/dev/null 2>&1; then
   echo "resolve-node: pnpm がありません" >&2
   echo "resolve-node: .github/workflows/rust.yml と同じ版を入れてください" >&2
@@ -55,5 +48,15 @@ if [ "$oldest_accepted" != "$REQUIRED_PNPM_VERSION" ]; then
   exit 1
 fi
 
-echo "resolve-node: pnpm $*（pnpm $installed_pnpm_version / cooldown は pnpm-workspace.yaml）"
+# **pnpm が読む値そのものを見る。** 設定ファイルを grep すると、値が 0（無効）でも、
+# 名前がコメントにだけ残っていても通ってしまう。確かめたいのは書いてあることではなく
+# 効いていることなので、pnpm に聞く。未設定なら `undefined` が返り、-gt が失敗する。
+configured_cooldown="$(pnpm config get minimumReleaseAge 2>/dev/null || true)"
+if ! [ "$configured_cooldown" -gt 0 ] 2>/dev/null; then
+  echo "resolve-node: cooldown が効きません（minimumReleaseAge: ${configured_cooldown:-未設定}）" >&2
+  echo "resolve-node: pnpm-workspace.yaml に分単位の正の値を書いてください" >&2
+  exit 1
+fi
+
+echo "resolve-node: pnpm $*（pnpm $installed_pnpm_version / cooldown $configured_cooldown 分）"
 exec pnpm "$@"
