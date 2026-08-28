@@ -84,14 +84,18 @@ impl ServerCommand {
 pub struct Client {
     child: Child,
     connection: Connection<BufReader<ChildStdout>, ChildStdin>,
+    program: String,
     terminated: bool,
 }
 
 impl Client {
     /// サーバを起動し、stdin / stdout を配線する。
     ///
-    /// stderr は捨てる。サーバのログをこちらの出力に混ぜないため。起動そのものの失敗は
-    /// フレームの切れ目の EOF（[`FramingError::ServerClosed`]）として表に出る。
+    /// stderr は捨てる。サーバのログをこちらの出力に混ぜないため。起動直後に終わった場合は
+    /// [`ClientError::ServerExitedDuringHandshake`] として表に出る。
+    ///
+    /// **Why not（`Stdio::piped()` で診断を取る）**: こちらが読まないままにすると、
+    /// パイプが埋まった時点でサーバが write でブロックする。診断が消えるより悪い。
     ///
     /// # Errors
     ///
@@ -115,6 +119,7 @@ impl Client {
         Ok(Self {
             child,
             connection: Connection::new(BufReader::new(stdout), stdin),
+            program: command.program.clone(),
             terminated: false,
         })
     }
@@ -126,12 +131,13 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// 往復が失敗したとき。抜けた [`Client`] は `Drop` が kill する。
+    /// 往復が失敗したとき。サーバが答えずに終わった場合は
+    /// [`ClientError::ServerExitedDuringHandshake`]。抜けた [`Client`] は `Drop` が kill する。
     pub fn handshake(mut self) -> Result<Session, ClientError> {
-        let capabilities = self
-            .connection
-            .handshake()
-            .map_err(ClientError::Conversation)?;
+        let capabilities = match self.connection.handshake() {
+            Ok(capabilities) => capabilities,
+            Err(cause) => return Err(handshake_error_of(&self.program, cause)),
+        };
 
         Ok(Session {
             client: self,
@@ -201,6 +207,21 @@ impl Drop for Client {
     }
 }
 
+/// 握手の失敗を、サーバが答えずに終わった場合とそれ以外に分ける。
+///
+/// フレームの切れ目の EOF は「起動はしたが、答えずに終わった」。stderr を捨てているので
+/// **終わった理由そのものは残っていない**が、利用者が次に試すこと（サーバを直接起動して
+/// 起動時のエラーを見る）は他の失敗と違うので、専用のバリアントで返す。
+fn handshake_error_of(program: &str, cause: ConnectionError) -> ClientError {
+    if matches!(cause, ConnectionError::Framing(FramingError::ServerClosed)) {
+        return ClientError::ServerExitedDuringHandshake {
+            program: program.to_owned(),
+        };
+    }
+
+    ClientError::Conversation(cause)
+}
+
 /// 起動の失敗を、実行ファイルが無い場合とそれ以外に分ける。
 ///
 /// 「入っていないので入れてください」と「起動できたが駄目だった」では、
@@ -235,6 +256,11 @@ pub enum ClientError {
     },
     /// 子プロセスの stdin / stdout を取り出せなかった。
     PipesNotWired,
+    /// 起動はしたが、握手に答えないまま終了した。
+    ServerExitedDuringHandshake {
+        /// 終了した実行ファイル名。
+        program: String,
+    },
     /// 起動した後の往復が失敗した。
     Conversation(ConnectionError),
     /// 子プロセスの終了を待てなかった。
@@ -259,6 +285,12 @@ impl fmt::Display for ClientError {
                 formatter,
                 "LSP サーバの stdin / stdout を取り出せませんでした"
             ),
+            // 終了した理由はこちらに残っていない。次に試すことを出す。
+            Self::ServerExitedDuringHandshake { program } => write!(
+                formatter,
+                "LSP サーバ ({program}) が握手に答えずに終了しました。\
+                 {program} を直接起動して、起動時のエラーを確認してください"
+            ),
             Self::Conversation(cause) => write!(formatter, "{cause}"),
             Self::Wait(cause) => {
                 write!(formatter, "LSP サーバの終了を待てませんでした: {cause}")
@@ -273,7 +305,10 @@ impl fmt::Display for ClientError {
 impl Error for ClientError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ServerNotFound { .. } | Self::PipesNotWired | Self::AbnormalExit { .. } => None,
+            Self::ServerNotFound { .. }
+            | Self::PipesNotWired
+            | Self::ServerExitedDuringHandshake { .. }
+            | Self::AbnormalExit { .. } => None,
             Self::Spawn { cause, .. } => Some(cause),
             Self::Conversation(cause) => Some(cause),
             Self::Wait(cause) => Some(cause),
@@ -296,6 +331,31 @@ mod tests {
             error,
             ClientError::ServerNotFound { program } if program == "dryguard-no-such-language-server"
         ));
+    }
+
+    #[test]
+    fn test_handshake_error_of_a_server_that_closed_names_the_program() {
+        // 起動して答えずに終わったサーバ。理由は stderr と共に消えているので、
+        // 利用者が次に試すこと（直接起動して確かめる）を出せる形で返す
+        let cause = ConnectionError::Framing(FramingError::ServerClosed);
+
+        let error = handshake_error_of("typescript-language-server", cause);
+
+        assert!(matches!(
+            error,
+            ClientError::ServerExitedDuringHandshake { program }
+                if program == "typescript-language-server"
+        ));
+    }
+
+    #[test]
+    fn test_handshake_error_of_another_framing_failure_stays_a_conversation_error() {
+        // 「サーバが終了した」以外まで起動失敗として畳むと、直す先を取り違える
+        let cause = ConnectionError::Framing(FramingError::MissingContentLength);
+
+        let error = handshake_error_of("typescript-language-server", cause);
+
+        assert!(matches!(error, ClientError::Conversation(_)));
     }
 
     #[test]
