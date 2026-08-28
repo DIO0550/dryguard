@@ -179,12 +179,16 @@ bash harness/deps/resolve.sh add serde
 
 ### JavaScript 側のパッケージは pnpm で入れる
 
-**`npm` は使わない。`pnpm` を使い、cooldown を 5 日にする**（`minimumReleaseAge: 7200`。分で指定する）。
-今の対象は CI が入れる typescript-language-server と typescript。
+**`npm` は使わない。`pnpm` を使い、cooldown を 5 日にする**（`pnpm-workspace.yaml` の
+`minimumReleaseAge: 7200`。分で指定する）。今の対象は CI が起動する
+typescript-language-server と typescript で、**このリポジトリに JavaScript のコードは無い**。
+
+**`pnpm install` / `pnpm add` を素で叩かない。`harness/deps/resolve-node.sh` を通す**
+（詳細は `harness/deps/README.md`）。
 
 ```bash
-pnpm config set minimumReleaseAge 7200 --global
-pnpm add -g <パッケージ>
+bash harness/deps/resolve-node.sh install --lockfile-only
+bash harness/deps/resolve-node.sh add -D <パッケージ>
 ```
 
 **Why**: cooldown を掛けられるのが pnpm だけだから。npm には公開からの経過日数で
@@ -192,6 +196,18 @@ pnpm add -g <パッケージ>
 **postinstall スクリプトは install の時点でローカル実行される**ので、cargo の build script と
 同じく「掴んだ時点で実行済み」になる。
 
-**pnpm の版を固定する。** `minimumReleaseAge` を知らない版の pnpm は、**その設定を警告なく
-無視する**。設定してあるのに守られていない状態を作らないため、CI では `corepack install -g pnpm@<版>`
-で版ごと固定してから設定する（`cargo` 側で nightly を要求しているのと同じ形）。
+**`pnpm-lock.yaml` を commit する。** cooldown は「新しすぎるものを避ける」だけで、
+**毎回同じものを入れる保証にはならない**。固定は lock が担い、cooldown は lock を
+作り直すときに効かせる（`Cargo.lock` + `resolve.sh` と同じ分担）。
+CI は `pnpm install --frozen-lockfile` で入れるだけなので、解決が起きない。
+
+**pnpm の版を確かめてから解決する。** `minimumReleaseAge` を知らない版（10.16.0 より前）は
+**その設定を警告なく無視する**。設定してあるのに守られていない状態を作らないため、
+`resolve-node.sh` が版を見て落とす（`cargo` 側で nightly を要求しているのと同じ形）。
+
+**CI が使う pnpm は版と SHA-256 の両方で固定する**（`.github/workflows/rust.yml`）。
+`actions/*` を commit hash で止めているのと同じ理由で、**中身まで固定できないと
+何が走るか分からない**。更新するときは版とハッシュの両方を直す。
+
+**Why not（corepack）**: Node 25.0.0 から同梱されなくなった。それ以降に corepack を入れる
+公式の方法が `npm install -g corepack` で、npm を使わない方針と衝突する。
