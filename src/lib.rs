@@ -29,6 +29,7 @@ pub mod location;
 pub mod lsp;
 pub mod pipeline;
 pub mod report;
+pub mod semantics;
 pub mod similarity;
 pub mod source_position;
 pub mod syntax;
