@@ -47,7 +47,8 @@ dryguard 固有の規約は `rules/` が持つ。**
 Issue は判断の履歴、という分担にする。採用した案だけを残すと、後で同じ案が再浮上した
 ときに前回やめた理由が失われる。
 
-マージ後はその回の評価を `harness/records/` に記録する（`harness/records/README.md`）。
+マージ後はその回の評価を `harness/records/` に記録する。**書き方と、記録を作らない例外
+（`harness/records/` 配下だけを変える PR）は `harness/records/README.md`** が持つ。
 記録を数えて規約やフックへ手を入れるのは、別の機会に行う。
 
 ## タスクの分割
