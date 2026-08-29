@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 use super::document::SourceDocument;
 use super::framing::{self, FramingError};
-use super::hover;
+use super::hover::{self, HoverOutcome};
 use super::message::{
     self, MessageError, RequestId, ResponseFailure, ResponseOutcome, ServerMessage,
 };
@@ -173,8 +173,8 @@ impl<R: BufRead, W: Write> Connection<R, W> {
 
     /// 開かせたファイルの、指定位置にある名前の型の綴りを尋ねる。
     ///
-    /// `position` は `Chunk::name_position` が指す識別子の位置。サーバがその位置に
-    /// 答えを持たないときは `Ok(None)`。
+    /// `position` は `Chunk::name_position` が指す識別子の位置。答えが無かったのか
+    /// 読めなかったのかは [`HoverOutcome`] が分けて持つ。
     ///
     /// # Errors
     ///
@@ -184,7 +184,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         &mut self,
         document: &SourceDocument,
         position: SourcePosition,
-    ) -> Result<Option<String>, ConnectionError> {
+    ) -> Result<HoverOutcome, ConnectionError> {
         // 開かせていないドキュメントへ送ると、サーバは中身を知らないまま null を返す。
         // 「その位置に型が無い」と「開かせ忘れ」が同じ答えになるので、送る前に断る。
         if !self.open_documents.contains(document.uri()) {
@@ -214,7 +214,10 @@ impl<R: BufRead, W: Write> Connection<R, W> {
                 cause,
             })?;
 
-        Ok(answered.as_ref().and_then(hover::signature_text_of))
+        Ok(match answered.as_ref() {
+            Some(hover) => hover::outcome_of(hover),
+            None => HoverOutcome::NoAnswer,
+        })
     }
 
     /// 要求を送り、その応答の result を待つ。
@@ -782,7 +785,7 @@ mod tests {
 
         assert_eq!(
             signature,
-            Some("function decl(a: string): number".to_owned())
+            HoverOutcome::Answered("function decl(a: string): number".to_owned())
         );
     }
 
@@ -825,7 +828,7 @@ mod tests {
             .hover(&document, position_after(5, "export function "))
             .expect("応答を受け取れる");
 
-        assert_eq!(signature, None);
+        assert_eq!(signature, HoverOutcome::NoAnswer);
     }
 
     #[test]

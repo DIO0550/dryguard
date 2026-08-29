@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use dryguard::codebase::source_of;
 use dryguard::location::Location;
-use dryguard::lsp::{Client, ServerCommand, Session, SourceDocument, WorkspaceRoot};
+use dryguard::lsp::{Client, HoverOutcome, ServerCommand, Session, SourceDocument, WorkspaceRoot};
 use dryguard::pipeline::chunk_pair_of;
 use dryguard::semantics::type_signature::TypeSignature;
 use dryguard::syntax::chunk::Chunk;
@@ -76,7 +76,7 @@ fn type_signature_of(session: &mut Session, chunk: &Chunk) -> TypeSignature {
             chunk.path().display()
         );
     };
-    let Ok(Some(signature_text)) = session.hover(&document, position) else {
+    let Ok(HoverOutcome::Answered(signature_text)) = session.hover(&document, position) else {
         panic!("名前の位置には hover が答える: {}", chunk.path().display());
     };
     let Some(signature) = TypeSignature::from_signature_text(&signature_text) else {

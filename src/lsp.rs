@@ -32,13 +32,15 @@ use std::fmt;
 use std::io::{self, BufReader};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
-use lsp_types::ServerCapabilities;
+use lsp_types::{HoverProviderCapability, ServerCapabilities};
 
 use crate::source_position::SourcePosition;
 use connection::Connection;
 
 // 開かせるドキュメントとワークスペースの根は、呼ぶ側が組み立てて渡す。
 pub use document::{DocumentError, SourceDocument};
+// hover の結果は「取れた / 取れなかった理由」を分けて持つので、外から読める形で出す。
+pub use hover::HoverOutcome;
 pub use workspace::{WorkspaceError, WorkspaceRoot};
 
 // 失敗を読むための型だけを外へ出す。[`ClientError`] が抱えている以上、
@@ -196,8 +198,13 @@ impl Session {
 
     /// 開かせたファイルの、指定位置にある名前の型の綴りを尋ねる。
     ///
-    /// `position` は `Chunk::name_position` が指す識別子の位置。返るのは
-    /// **正規化前の綴りそのもの**で、サーバがその位置に答えを持たなければ `Ok(None)`。
+    /// `position` は `Chunk::name_position` が指す識別子の位置。答えが返ったのか、
+    /// 無かったのか、読めなかったのかは [`HoverOutcome`] が分けて持つ。
+    ///
+    /// **hover を提供していないサーバには送らない**（[`HoverOutcome::NotSupported`]）。
+    /// 握手で受け取った capabilities を抱えているのはこのためで、送ってしまうと
+    /// 仕様に忠実なサーバは `MethodNotFound` を返し、**シグナルが取れないだけの話が
+    /// 往復の失敗になる**。
     ///
     /// 先に [`Session::open_document`] で開かせておく。開かせていないドキュメントへは
     /// 送らずに断る（サーバは知らない URI に null を返すので、「型が無い」と
@@ -211,7 +218,11 @@ impl Session {
         &mut self,
         document: &SourceDocument,
         position: SourcePosition,
-    ) -> Result<Option<String>, ClientError> {
+    ) -> Result<HoverOutcome, ClientError> {
+        if !provides_hover(&self.capabilities) {
+            return Ok(HoverOutcome::NotSupported);
+        }
+
         self.client
             .connection
             .hover(document, position)
@@ -273,6 +284,17 @@ impl Drop for Client {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// そのサーバが hover に答えるか。
+///
+/// **有無ではなく中身を見る。** 無効を表す `Simple(false)` も「宣言はある」ので、
+/// `is_some()` で見ると hover を切ったサーバへ送ってしまう。
+fn provides_hover(capabilities: &ServerCapabilities) -> bool {
+    matches!(
+        capabilities.hover_provider,
+        Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
+    )
 }
 
 /// 握手の失敗を、サーバが黙った場合とそれ以外に分ける。
@@ -425,6 +447,41 @@ mod tests {
         ));
     }
 
+    /// そのサーバができることとして hover だけを宣言した capabilities。
+    fn capabilities_declaring_hover(
+        hover_provider: Option<HoverProviderCapability>,
+    ) -> ServerCapabilities {
+        ServerCapabilities {
+            hover_provider,
+            ..ServerCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn test_provides_hover_with_a_server_that_declares_it_is_true() {
+        let capabilities =
+            capabilities_declaring_hover(Some(HoverProviderCapability::Simple(true)));
+
+        assert!(provides_hover(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_hover_with_a_server_that_turned_it_off_is_false() {
+        // 対照は上のテスト。**宣言はあるが無効**という形で、`is_some()` で見ていると
+        // hover を切ったサーバへ要求を送ってしまう
+        let capabilities =
+            capabilities_declaring_hover(Some(HoverProviderCapability::Simple(false)));
+
+        assert!(!provides_hover(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_hover_with_a_server_that_does_not_declare_it_is_false() {
+        let capabilities = capabilities_declaring_hover(None);
+
+        assert!(!provides_hover(&capabilities));
+    }
+
     #[test]
     fn test_handshake_error_of_a_server_that_closed_names_the_program() {
         // 起動して答えないまま出力を閉じたサーバ。理由は stderr と共に消えているので、
@@ -469,16 +526,9 @@ mod tests {
             .handshake(&fixture_workspace_root())
             .expect("握手できる");
 
-        // hover は Stage 2 で最初に使う問い合わせ。返らないサーバでは意味情報が採れない。
-        // 有無ではなく中身を見る。無効を表す `Simple(false)` も「ある」なので、
-        // is_some() では hover を切ったサーバでも通ってしまう
-        let provides_hover = matches!(
-            session.capabilities().hover_provider,
-            Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
-        );
-
+        // hover は Stage 2 で最初に使う問い合わせ。返らないサーバでは意味情報が採れない
         assert!(
-            provides_hover,
+            provides_hover(session.capabilities()),
             "typescript-language-server は hover を提供する"
         );
 
@@ -526,7 +576,7 @@ mod tests {
 
         assert_eq!(
             signature,
-            Some("function applyDiscount(invoice: Invoice): number".to_owned())
+            HoverOutcome::Answered("function applyDiscount(invoice: Invoice): number".to_owned())
         );
 
         session.shutdown().expect("終了できる");
@@ -550,7 +600,7 @@ mod tests {
             .hover(&document, SourcePosition::from_preceding_text(line(5), ""))
             .expect("問い合わせられる");
 
-        assert_eq!(signature, None);
+        assert_eq!(signature, HoverOutcome::NoAnswer);
 
         session.shutdown().expect("終了できる");
     }
