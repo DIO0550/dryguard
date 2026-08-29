@@ -4,21 +4,27 @@
 //! 同じ経路を通るので、サーバを起動せずに対応付けの振る舞いを確かめられる
 //! (rules/tdd.md「`lsp` は『応答を受け取ってから先』を切り出す」)。
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, BufRead, Write};
 
-use lsp_types::notification::{Exit, Initialized, Notification as _};
+use lsp_types::notification::{
+    DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized, Notification as _,
+};
 use lsp_types::request::{Initialize, Request as _, Shutdown};
 use lsp_types::{
-    ClientCapabilities, ClientInfo, InitializeParams, InitializeResult, ServerCapabilities,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, InitializeResult, ServerCapabilities,
+    TextDocumentIdentifier, Uri,
 };
 use serde_json::{Value, json};
 
+use super::document::SourceDocument;
 use super::framing::{self, FramingError};
 use super::message::{
     self, MessageError, RequestId, ResponseFailure, ResponseOutcome, ServerMessage,
 };
+use super::workspace::WorkspaceRoot;
 
 /// `initialize` でサーバに名乗る名前。
 const CLIENT_NAME: &str = "dryguard";
@@ -26,11 +32,13 @@ const CLIENT_NAME: &str = "dryguard";
 /// LSP サーバとの往復。
 ///
 /// 1 本のストリームを要求と応答が行き来するので、id の発番と対応付けをここが持つ。
+/// 開いているドキュメントも、**接続が続く限りサーバと共有している状態**なのでここが持つ。
 #[derive(Debug)]
 pub struct Connection<R: BufRead, W: Write> {
     reader: R,
     writer: W,
     next_id: RequestId,
+    open_documents: BTreeSet<Uri>,
 }
 
 impl<R: BufRead, W: Write> Connection<R, W> {
@@ -40,6 +48,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             reader,
             writer,
             next_id: RequestId::first(),
+            open_documents: BTreeSet::new(),
         }
     }
 
@@ -49,28 +58,35 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     /// `initialized` を送らないままだとサーバが要求を受け付けず、しかも黙って待つため
     /// (rules/naming.md「`And` を含む名前を作らない」の「2 つをまとめて表す 1 つの概念名」)。
     ///
-    /// ワークスペースの根は渡さない。サーバはそれ無しでも capabilities を返すので、
-    /// パスから `file:` URI への変換は、それを要求する問い合わせを足すときに入れる。
+    /// `root` はサーバに見せるワークスペースの根。開くファイルがどのプロジェクトのものかを
+    /// サーバが決める起点になる。
+    ///
+    /// **Why not（`workspaceFolders` で渡す）**: typescript-language-server は
+    /// `rootUri` からしか根を取らない（`workspaceFolders` は根の決定に使っていない）。
+    /// 渡すには capabilities での宣言も要るので、宣言しない側の判断とも衝突する。
     ///
     /// # Errors
     ///
     /// 送受信が失敗したとき、応答が `initialize` の結果として読めないとき、
     /// サーバが error を返したとき。
-    pub fn handshake(&mut self) -> Result<ServerCapabilities, ConnectionError> {
-        let params = InitializeParams {
-            process_id: Some(std::process::id()),
+    pub fn handshake(
+        &mut self,
+        root: &WorkspaceRoot,
+    ) -> Result<ServerCapabilities, ConnectionError> {
+        // ここだけ [`lsp_types`] の型を通さずに組み立てる。**`rootUri` が非推奨として
+        // 印されており**（`workspaceFolders` に置き換わった扱い）、型のまま書くと
+        // `-D warnings` に触れる。抑制を足すのは rules/coding.md「禁止事項」で塞いである。
+        let params = json!({
+            "processId": std::process::id(),
+            "clientInfo": { "name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION") },
             // 何も宣言しない。宣言した機能に応じてサーバはこちらへ要求を投げてくるので、
             // 支えていない機能の要求を呼び込まない。ただし `window/showMessageRequest` の
             // ように宣言に依らず届く要求はあり、それは `response_of` が返す。
-            capabilities: ClientCapabilities::default(),
-            client_info: Some(ClientInfo {
-                name: CLIENT_NAME.to_owned(),
-                version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-            }),
-            ..Default::default()
-        };
+            "capabilities": {},
+            "rootUri": root.uri().as_str(),
+        });
 
-        let result = self.request(Initialize::METHOD, Some(params_of(&params)?))?;
+        let result = self.request(Initialize::METHOD, Some(params))?;
         let initialized: InitializeResult =
             serde_json::from_value(result).map_err(|cause| ConnectionError::MalformedResult {
                 method: Initialize::METHOD.to_owned(),
@@ -98,6 +114,58 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         // `handshake` が result を読むのは、そちらの中身が要るからで、ここには無い。
         self.request(Shutdown::METHOD, None)?;
         self.notify(Exit::METHOD, None)
+    }
+
+    /// 候補ペアのファイルをサーバに開かせる。
+    ///
+    /// 既に開いているドキュメントには送らない。**候補ペアは同じファイルを何度も指す**
+    /// （1 つのファイルに複数のチャンクがある）ので、素直に送ると同じ URI への `didOpen` が
+    /// 重なる。LSP は既に開いているドキュメントへの `didOpen` の扱いを定めていない。
+    ///
+    /// # Errors
+    ///
+    /// パラメータを JSON にできないとき、送信が失敗したとき。
+    pub fn open_document(&mut self, document: &SourceDocument) -> Result<(), ConnectionError> {
+        if self.open_documents.contains(document.uri()) {
+            return Ok(());
+        }
+
+        let params = DidOpenTextDocumentParams {
+            text_document: document.to_text_document_item(),
+        };
+        let params = serde_json::to_value(params)
+            .map_err(not_serializable_error_of(DidOpenTextDocument::METHOD))?;
+        self.notify(DidOpenTextDocument::METHOD, Some(params))?;
+
+        // 送れてから覚える。送れていないものを開いていることにすると、
+        // 開いていないドキュメントへ `didClose` を送る。
+        self.open_documents.insert(document.uri().clone());
+
+        Ok(())
+    }
+
+    /// 開かせたファイルを閉じさせる。開いていなければ何もしない。
+    ///
+    /// # Errors
+    ///
+    /// パラメータを JSON にできないとき、送信が失敗したとき。
+    pub fn close_document(&mut self, document: &SourceDocument) -> Result<(), ConnectionError> {
+        if !self.open_documents.contains(document.uri()) {
+            return Ok(());
+        }
+
+        let params = DidCloseTextDocumentParams {
+            text_document: TextDocumentIdentifier {
+                uri: document.uri().clone(),
+            },
+        };
+        let params = serde_json::to_value(params)
+            .map_err(not_serializable_error_of(DidCloseTextDocument::METHOD))?;
+        self.notify(DidCloseTextDocument::METHOD, Some(params))?;
+
+        self.open_documents.remove(document.uri());
+
+        Ok(())
     }
 
     /// 要求を送り、その応答の result を待つ。
@@ -183,16 +251,14 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     }
 }
 
-/// `initialize` のパラメータを JSON にする。
-///
-/// # Errors
-///
-/// JSON にできないとき。
-fn params_of(params: &InitializeParams) -> Result<Value, ConnectionError> {
-    serde_json::to_value(params).map_err(|cause| ConnectionError::ParamsNotSerializable {
-        method: Initialize::METHOD.to_owned(),
+/// パラメータを JSON にできなかったときの理由を、そのメソッド名で組み立てる。
+fn not_serializable_error_of(
+    method: &'static str,
+) -> impl Fn(serde_json::Error) -> ConnectionError {
+    move |cause| ConnectionError::ParamsNotSerializable {
+        method: method.to_owned(),
         cause,
-    })
+    }
 }
 
 /// 往復が失敗した理由。
@@ -276,7 +342,19 @@ impl Error for ConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::repository_path;
     use lsp_types::HoverProviderCapability;
+
+    /// テストが渡すワークスペースの根。実在するディレクトリからしか作れない。
+    fn workspace_root() -> WorkspaceRoot {
+        WorkspaceRoot::enclosing(&[repository_path("src/lib.rs")]).expect("根を決められる")
+    }
+
+    /// テストが開かせるドキュメント。実在するファイルからしか作れない。
+    fn document_of(relative: &str, text: &str) -> SourceDocument {
+        SourceDocument::new(&repository_path(relative), text.to_owned())
+            .expect("ドキュメントにできる")
+    }
 
     /// payload をフレームに並べたバイト列。サーバが吐く側として使う。
     fn frames_of(payloads: &[&str]) -> Vec<u8> {
@@ -434,7 +512,7 @@ mod tests {
         ]);
         let mut connection = connection_over(&server_output);
 
-        let capabilities = connection.handshake().expect("握手できる");
+        let capabilities = connection.handshake(&workspace_root()).expect("握手できる");
 
         assert_eq!(
             capabilities.hover_provider,
@@ -449,7 +527,7 @@ mod tests {
             frames_of(&[r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#]);
         let mut connection = connection_over(&server_output);
 
-        connection.handshake().expect("握手できる");
+        connection.handshake(&workspace_root()).expect("握手できる");
 
         assert_eq!(
             sent_methods(&connection.writer),
@@ -462,12 +540,143 @@ mod tests {
         let server_output = frames_of(&[r#"{"jsonrpc":"2.0","id":1,"result":3}"#]);
         let mut connection = connection_over(&server_output);
 
-        let error = connection.handshake().expect_err("読めない");
+        let error = connection
+            .handshake(&workspace_root())
+            .expect_err("読めない");
 
         assert!(matches!(
             error,
             ConnectionError::MalformedResult { method, .. } if method == "initialize"
         ));
+    }
+
+    #[test]
+    fn test_handshake_names_the_workspace_root_as_the_root_uri() {
+        // 根を渡していないと、サーバは開いたファイルがどのプロジェクトのものか決められない
+        let server_output =
+            frames_of(&[r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#]);
+        let mut connection = connection_over(&server_output);
+        let root = workspace_root();
+
+        connection.handshake(&root).expect("握手できる");
+
+        let sent = sent_payloads(&connection.writer);
+        assert_eq!(sent[0]["params"]["rootUri"], json!(root.uri().as_str()));
+    }
+
+    #[test]
+    fn test_open_document_sends_what_the_server_needs_to_read_it() {
+        let mut connection = connection_over(&[]);
+        let document = document_of("tests/fixtures/billing/discount.ts", "export const a = 1;");
+
+        connection.open_document(&document).expect("送れる");
+
+        let sent = sent_payloads(&connection.writer);
+        assert_eq!(sent.len(), 1, "didOpen 1 通");
+        assert_eq!(sent[0]["method"], json!("textDocument/didOpen"));
+        let opened = &sent[0]["params"]["textDocument"];
+        assert_eq!(opened["uri"], json!(document.uri().as_str()));
+        assert_eq!(opened["languageId"], json!("typescript"));
+        assert_eq!(opened["version"], json!(1));
+        assert_eq!(opened["text"], json!("export const a = 1;"));
+    }
+
+    #[test]
+    fn test_open_document_that_is_already_open_sends_nothing() {
+        // 候補ペアは同じファイルを何度も指す。素直に送ると didOpen が重なる
+        let mut connection = connection_over(&[]);
+        let opened_twice = document_of("tests/fixtures/billing/discount.ts", "export const a = 1;");
+        let another = document_of("tests/fixtures/inventory/reorder.ts", "export const b = 2;");
+
+        connection.open_document(&opened_twice).expect("送れる");
+        connection.open_document(&opened_twice).expect("送れる");
+        connection.open_document(&another).expect("送れる");
+
+        let sent = sent_payloads(&connection.writer);
+        let opened_uris: Vec<&Value> = sent
+            .iter()
+            .map(|payload| &payload["params"]["textDocument"]["uri"])
+            .collect();
+        assert_eq!(
+            opened_uris,
+            vec![
+                &json!(opened_twice.uri().as_str()),
+                &json!(another.uri().as_str())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_close_document_names_the_document_it_closes() {
+        let mut connection = connection_over(&[]);
+        let document = document_of("tests/fixtures/billing/discount.ts", "export const a = 1;");
+        connection.open_document(&document).expect("送れる");
+
+        connection.close_document(&document).expect("送れる");
+
+        let sent = sent_payloads(&connection.writer);
+        assert_eq!(sent.len(), 2, "didOpen と didClose の 2 通");
+        assert_eq!(sent[1]["method"], json!("textDocument/didClose"));
+        assert_eq!(
+            sent[1]["params"]["textDocument"]["uri"],
+            json!(document.uri().as_str())
+        );
+    }
+
+    #[test]
+    fn test_close_document_that_is_not_open_sends_nothing() {
+        // 開いていないドキュメントを閉じさせると、サーバは知らない URI を受け取る
+        let mut connection = connection_over(&[]);
+        let opened = document_of("tests/fixtures/billing/discount.ts", "export const a = 1;");
+        let never_opened =
+            document_of("tests/fixtures/inventory/reorder.ts", "export const b = 2;");
+        connection.open_document(&opened).expect("送れる");
+
+        connection.close_document(&never_opened).expect("送れる");
+        connection.close_document(&opened).expect("送れる");
+
+        let closed_uris: Vec<Value> = sent_payloads(&connection.writer)
+            .iter()
+            .filter(|payload| payload["method"] == json!("textDocument/didClose"))
+            .map(|payload| payload["params"]["textDocument"]["uri"].clone())
+            .collect();
+        assert_eq!(closed_uris, vec![json!(opened.uri().as_str())]);
+    }
+
+    #[test]
+    fn test_close_document_after_it_was_closed_sends_nothing() {
+        // 閉じた記録が残っていると、2 回目の didClose がそのまま出ていく
+        let mut connection = connection_over(&[]);
+        let document = document_of("tests/fixtures/billing/discount.ts", "export const a = 1;");
+        connection.open_document(&document).expect("送れる");
+        connection.close_document(&document).expect("送れる");
+
+        connection.close_document(&document).expect("送れる");
+
+        assert_eq!(
+            sent_methods(&connection.writer),
+            vec!["textDocument/didOpen", "textDocument/didClose"]
+        );
+    }
+
+    #[test]
+    fn test_open_document_after_it_was_closed_sends_it_again() {
+        // 開いた記録が残っていると、閉じた後に開き直せない
+        let mut connection = connection_over(&[]);
+        let document = document_of("tests/fixtures/billing/discount.ts", "export const a = 1;");
+        connection.open_document(&document).expect("送れる");
+        connection.close_document(&document).expect("送れる");
+
+        connection.open_document(&document).expect("送れる");
+
+        assert_eq!(
+            sent_methods(&connection.writer),
+            vec![
+                "textDocument/didOpen",
+                "textDocument/didClose",
+                "textDocument/didOpen"
+            ]
+        );
     }
 
     #[test]

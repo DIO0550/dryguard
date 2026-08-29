@@ -6,7 +6,18 @@
 //!
 //! 汎用の操作（値を別の表現へ直すなど）は実装側の責務なので、ここに書かない。
 
+use std::path::{Path, PathBuf};
+
 use crate::line_number::LineNumber;
+
+/// このリポジトリの中のパス。
+///
+/// 実在するファイルを指す必要があるテスト（パスを辿る・URI にするなど）が使う。
+/// カレントディレクトリではなくクレートの位置から組み立てるので、
+/// どこから `cargo test` を呼んでも同じ場所を指す。
+pub(crate) fn repository_path(relative: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
 
 /// 1 始まりの行番号。
 ///
