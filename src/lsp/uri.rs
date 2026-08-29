@@ -5,7 +5,7 @@
 
 use std::error::Error;
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::str::FromStr;
 
 use lsp_types::Uri;
@@ -40,14 +40,18 @@ pub(super) fn file_uri_of(path: &Path) -> Result<Uri, PathUriError> {
         match component {
             // 根は `file://` に続く `/` が表す。ここで足すと `//` になる。
             Component::RootDir => continue,
-            // Windows の `C:` のような前置き。`:` は符号化せずに置ける記号なので、
-            // 要素と同じ扱いにすると `C%3A` になってしまう。
+            // Windows の `C:` のような前置き。**綴りをそのまま置かない**
+            // （`\\?\C:` の形で渡されると `\` と `?` が URI に混じる）。
             Component::Prefix(prefix) => {
-                let Some(prefix) = prefix.as_os_str().to_str() else {
-                    return Err(not_utf8_error_of(path));
+                let Some(disk) = disk_letter_of(prefix.kind()) else {
+                    return Err(PathUriError::UnsupportedPrefix {
+                        path: path.to_path_buf(),
+                    });
                 };
                 text.push('/');
-                text.push_str(prefix);
+                text.push(char::from(disk));
+                // `:` は符号化せずに置ける記号。要素と同じ扱いにすると `C%3A` になる。
+                text.push(':');
             }
             Component::Normal(name) => {
                 let Some(name) = name.to_str() else {
@@ -91,6 +95,25 @@ fn percent_encoded(name: &str) -> String {
     encoded
 }
 
+/// Windows のドライブ文字。`file:` URI で表せない前置き（UNC・デバイス名前空間）は `None`。
+///
+/// **前置きの綴りではなくドライブ文字を取り出す。** `\\?\C:` のような verbatim 形式を
+/// そのまま置くと、URI に `\` と `?` が混じって読めなくなる。
+///
+/// **Why not（UNC も URI にする）**: `file://server/share/..` の形になり、
+/// 根とドキュメントで authority を揃える手当てが要る。**確かめる手段がここには無い**
+/// （Linux では `Path::components` が `Prefix` を返さない）ので、
+/// 綴れないことを名前で返す側に寄せる。
+fn disk_letter_of(prefix: Prefix<'_>) -> Option<u8> {
+    match prefix {
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => Some(letter),
+        Prefix::Verbatim(_)
+        | Prefix::VerbatimUNC(_, _)
+        | Prefix::UNC(_, _)
+        | Prefix::DeviceNS(_) => None,
+    }
+}
+
 fn not_utf8_error_of(path: &Path) -> PathUriError {
     PathUriError::NotUtf8 {
         path: path.to_path_buf(),
@@ -102,6 +125,11 @@ fn not_utf8_error_of(path: &Path) -> PathUriError {
 pub enum PathUriError {
     /// 絶対パスではない。
     NotAbsolute {
+        /// 渡されたパス。
+        path: PathBuf,
+    },
+    /// `file:` URI で表せない前置き（UNC・デバイス名前空間）を持つ。
+    UnsupportedPrefix {
         /// 渡されたパス。
         path: PathBuf,
     },
@@ -125,6 +153,11 @@ impl fmt::Display for PathUriError {
                 "LSP へ渡すパスが絶対パスではありません: {}",
                 path.display()
             ),
+            Self::UnsupportedPrefix { path } => write!(
+                formatter,
+                "この形式のパスは file: URI にできません（UNC・デバイス名前空間）: {}",
+                path.display()
+            ),
             Self::NotUtf8 { path } => write!(
                 formatter,
                 "LSP へ渡すパスを UTF-8 として読めません: {}",
@@ -142,6 +175,7 @@ impl Error for PathUriError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn test_file_uri_of_an_absolute_path_keeps_the_separators() {
@@ -187,6 +221,23 @@ mod tests {
         let uri = file_uri_of(Path::new("/")).expect("URI にできる");
 
         assert_eq!(uri.as_str(), "file:///");
+    }
+
+    #[test]
+    fn test_disk_letter_of_a_verbatim_prefix_is_the_drive_letter() {
+        // 前置きの綴りをそのまま置くと、`\\?\C:` の `\` と `?` が URI に混じる。
+        // Linux では `Path::components` が `Prefix` を返さないので、file_uri_of 経由では
+        // この分岐に届かない。ここだけ前置きの種類を直接渡して確かめる
+        assert_eq!(disk_letter_of(Prefix::VerbatimDisk(b'C')), Some(b'C'));
+        assert_eq!(disk_letter_of(Prefix::Disk(b'D')), Some(b'D'));
+    }
+
+    #[test]
+    fn test_disk_letter_of_a_unc_prefix_is_absent() {
+        // ドライブ文字を持たない前置きは、URI に綴れないものとして返す
+        let unc = Prefix::UNC(OsStr::new("server"), OsStr::new("share"));
+
+        assert_eq!(disk_letter_of(unc), None);
     }
 
     #[test]
