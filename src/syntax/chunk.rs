@@ -261,6 +261,12 @@ impl Error for ChunkingError {}
 ///
 /// `class_declaration` を入れないのは、比較の単位が関数だから。impl ブロックは
 /// Phase 4 の Rust 対応で grammar ごと足す。
+/// 代入を表すノードの種別。左辺が関数の名前になる形を見分けるのに使う。
+const ASSIGNMENT_KIND: &str = "assignment_expression";
+
+/// 識別子 1 つを表すノードの種別。
+const IDENTIFIER_KIND: &str = "identifier";
+
 const CHUNK_KINDS: [&str; 6] = [
     "function_declaration",
     "generator_function_declaration",
@@ -319,9 +325,39 @@ fn name_node_of(node: Node<'_>) -> Option<Node<'_>> {
     }
 
     let parent = node.parent()?;
-    parent
+    if let Some(name) = parent
         .child_by_field_name("name")
         .or_else(|| parent.child_by_field_name("key"))
+    {
+        return Some(name);
+    }
+
+    assigned_name_of(parent)
+}
+
+/// 代入の左辺のうち、問い合わせられる名前になっているノード。代入でなければ `None`。
+///
+/// `obj.handler = (…) => …` や `exports.run = function (…) {…}` は、宣言ではなく
+/// 代入なので親に `name` も `key` も無い。関数の名前になっているのは左辺の側。
+///
+/// **Why（プロパティを指す）**: 左辺全体（`obj.handler`）の先頭は `obj` で、そこを
+/// 指すと入れ物の型が返る。名前として問い合わせられるのはプロパティのほう。
+///
+/// `target["key"] = …` のように名前になる識別子が無い形は `None`。
+fn assigned_name_of(parent: Node<'_>) -> Option<Node<'_>> {
+    if parent.kind() != ASSIGNMENT_KIND {
+        return None;
+    }
+
+    let assigned = parent.child_by_field_name("left")?;
+    if let Some(property) = assigned.child_by_field_name("property") {
+        return Some(property);
+    }
+    if assigned.kind() == IDENTIFIER_KIND {
+        return Some(assigned);
+    }
+
+    None
 }
 
 /// そのノードが覆っている行範囲。
@@ -880,6 +916,49 @@ function broken() {
             positions,
             vec![Some((1, 16)), None],
             "無名のコールバックだけが名前の位置を持たない"
+        );
+    }
+
+    #[test]
+    fn test_chunk_assigned_to_a_property_points_at_the_property_name() {
+        // 代入なので親に name も key も無い。左辺全体の先頭（`obj`）を指すと
+        // 入れ物の型が返るので、プロパティのほうを指す
+        let assigned_to_a_property = "obj.handler = (value: string): string => value;\n";
+
+        let chunk = chunk_at(assigned_to_a_property, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((1, 4)));
+    }
+
+    #[test]
+    fn test_chunk_assigned_to_a_variable_points_at_the_variable_name() {
+        // 宣言と代入が別の行に分かれている形。宣言側にチャンクは無い
+        let assigned_later = "let later;\n\
+                              later = (value: string): string => value;\n";
+
+        let chunk = chunk_at(assigned_later, "a.ts:2").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((2, 0)));
+    }
+
+    #[test]
+    fn test_chunk_assigned_to_a_computed_key_has_no_name_position() {
+        // 対照として同じソースにプロパティへの代入を 1 件置く。添字の側だけが
+        // 名前を持たない（`target["key"]` に問い合わせられる識別子は無い）
+        let assigned_to_a_property_then_a_key = "obj.handler = (value: string): string => value;\n\
+             target[\"keyed\"] = (value: string): string => value;\n";
+
+        let file_chunks = chunks_at(assigned_to_a_property_then_a_key, "a.ts");
+
+        let positions: Vec<Option<(usize, usize)>> = file_chunks
+            .chunks()
+            .iter()
+            .map(name_position_of_chunk)
+            .collect();
+        assert_eq!(
+            positions,
+            vec![Some((1, 4)), None],
+            "添字への代入だけが名前の位置を持たない"
         );
     }
 
