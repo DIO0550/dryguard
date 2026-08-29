@@ -82,13 +82,46 @@ impl TypeSignature {
     }
 }
 
-/// 空白の連なりを 1 つに畳んだ綴り。
+/// 空白の連なりを 1 つに畳んだ綴り。**引用符の中は畳まない。**
 ///
 /// TS のサーバはオブジェクト型リテラルを複数行に展開して返す
 /// （`<T extends {\n    id: string;\n}, U>`）。改行と字下げが残ったままだと、
 /// 同じ型が書かれ方の違いで別物になる。
+///
+/// **Why not（一律に畳む）**: 文字列リテラル型の中の空白は型の一部で、`"a b"` と
+/// `"a  b"` は別の型。一律に畳むと**別の型が同じ形になり、単一化できると答えてしまう。**
 fn flattened(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<&str>>().join(" ")
+    let mut flattened = String::new();
+    let mut quote: Option<char> = None;
+    let mut after_whitespace = false;
+
+    for character in text.chars() {
+        if let Some(open) = quote {
+            flattened.push(character);
+            if character == open {
+                quote = None;
+            }
+            continue;
+        }
+
+        if character.is_whitespace() {
+            after_whitespace = true;
+            continue;
+        }
+
+        // 先頭の空白は落とす。末尾の空白は次の文字が来ないので、そもそも書き出されない。
+        if after_whitespace && !flattened.is_empty() {
+            flattened.push(' ');
+        }
+        after_whitespace = false;
+        flattened.push(character);
+
+        if matches!(character, '"' | '\'' | '`') {
+            quote = Some(character);
+        }
+    }
+
+    flattened
 }
 
 /// 引数リストの括弧組を見つけ、その手前・中身・後ろに分ける。
@@ -599,6 +632,15 @@ mod tests {
         assert!(unifiable(
             "function withText<T = string>(): T",
             "function alsoText<U = string>(): U"
+        ));
+    }
+
+    #[test]
+    fn test_string_literal_types_differing_only_in_whitespace_are_not_unifiable() {
+        // 引用符の中の空白は型の一部。一律に畳むと別の型が同じ形になる
+        assert!(!unifiable(
+            "function spaced(label: \"a  b\"): void",
+            "function single(label: \"a b\"): void"
         ));
     }
 
