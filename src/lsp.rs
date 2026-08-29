@@ -8,15 +8,22 @@
 //! | `framing` | `Content-Length` による区切り |
 //! | `message` | JSON-RPC の payload の組み立てと解釈 |
 //! | `connection` | 要求と応答の対応付け・ライフサイクル |
+//! | `uri` | パスから `file:` URI への変換 |
+//! | `workspace` | サーバに見せるワークスペースの根 |
+//! | `document` | サーバに開かせるソースファイル |
 //! | ここ | サーバの起動・パイプの配線・終了 |
 //!
-//! **外へ出すのは [`ServerCommand`] / [`Client`] / [`Session`] と、失敗を読むための型だけ。**
+//! **外へ出すのは [`ServerCommand`] / [`Client`] / [`Session`]、渡す値
+//! （[`WorkspaceRoot`] / [`SourceDocument`]）と、失敗を読むための型だけ。**
 //! 区切りや payload の組み立て方は、いつ変えても外に影響しない位置に置く
 //! (rules/architecture.md「モジュールの公開 API」)。
 
 pub(crate) mod connection;
+pub(crate) mod document;
 pub(crate) mod framing;
 pub(crate) mod message;
+pub(crate) mod uri;
+pub(crate) mod workspace;
 
 use std::error::Error;
 use std::fmt;
@@ -27,11 +34,16 @@ use lsp_types::ServerCapabilities;
 
 use connection::Connection;
 
+// 開かせるドキュメントとワークスペースの根は、呼ぶ側が組み立てて渡す。
+pub use document::{DocumentError, SourceDocument};
+pub use workspace::{WorkspaceError, WorkspaceRoot};
+
 // 失敗を読むための型だけを外へ出す。[`ClientError`] が抱えている以上、
 // 外から名前を呼べないと `source()` をたどっても中身を見分けられない。
 pub use connection::ConnectionError;
 pub use framing::FramingError;
 pub use message::{MessageError, RequestId, ResponseFailure};
+pub use uri::PathUriError;
 
 /// TypeScript の LSP サーバの実行ファイル名。
 const TYPESCRIPT_SERVER: &str = "typescript-language-server";
@@ -126,6 +138,8 @@ impl Client {
 
     /// サーバと握手し、問い合わせを送れる状態にする。
     ///
+    /// `root` はサーバに見せるワークスペースの根。開くファイルを含む位置を渡す。
+    ///
     /// 値を取るのは、握手を 2 回できないようにするため。`initialize` を 2 度送られた
     /// サーバは 2 通目を拒む。
     ///
@@ -133,8 +147,8 @@ impl Client {
     ///
     /// 往復が失敗したとき。サーバが答えないまま出力を閉じた場合は
     /// [`ClientError::ServerClosedDuringHandshake`]。抜けた [`Client`] は `Drop` が kill する。
-    pub fn handshake(mut self) -> Result<Session, ClientError> {
-        let capabilities = match self.connection.handshake() {
+    pub fn handshake(mut self, root: &WorkspaceRoot) -> Result<Session, ClientError> {
+        let capabilities = match self.connection.handshake(root) {
             Ok(capabilities) => capabilities,
             Err(cause) => return Err(handshake_error_of(&self.program, cause)),
         };
@@ -160,6 +174,33 @@ impl Session {
     /// サーバができること。
     pub fn capabilities(&self) -> &ServerCapabilities {
         &self.capabilities
+    }
+
+    /// 候補ペアのファイルをサーバに開かせる。
+    ///
+    /// **開くのは候補ペアが含まれるファイルだけ。** コードベース全体を開かせると
+    /// rust-analyzer が実用にならない（`docs/dryguard-plan.md`「Stage 2: 意味情報収集」）。
+    ///
+    /// # Errors
+    ///
+    /// 送信が失敗したとき。
+    pub fn open_document(&mut self, document: &SourceDocument) -> Result<(), ClientError> {
+        self.client
+            .connection
+            .open_document(document)
+            .map_err(ClientError::Conversation)
+    }
+
+    /// 開かせたファイルを閉じさせる。開いていなければ何もしない。
+    ///
+    /// # Errors
+    ///
+    /// 送信が失敗したとき。
+    pub fn close_document(&mut self, document: &SourceDocument) -> Result<(), ClientError> {
+        self.client
+            .connection
+            .close_document(document)
+            .map_err(ClientError::Conversation)
     }
 
     /// サーバを終わらせ、子プロセスの終了を待つ。
@@ -327,7 +368,23 @@ impl Error for ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codebase;
+    use crate::test_support::repository_path;
     use lsp_types::HoverProviderCapability;
+
+    /// 候補ペアのファイルとして開かせる fixture。
+    const A_CANDIDATE_PAIR_FILE: &str = "tests/fixtures/billing/discount.ts";
+
+    fn fixture_workspace_root() -> WorkspaceRoot {
+        WorkspaceRoot::enclosing(&[repository_path(A_CANDIDATE_PAIR_FILE)]).expect("根を決められる")
+    }
+
+    fn fixture_document() -> SourceDocument {
+        let path = repository_path(A_CANDIDATE_PAIR_FILE);
+        let text = codebase::source_of(&path).expect("fixture を読める");
+
+        SourceDocument::new(&path, text).expect("ドキュメントにできる")
+    }
 
     #[test]
     fn test_client_start_with_a_missing_program_reports_the_server_not_found() {
@@ -381,7 +438,9 @@ mod tests {
         let command = ServerCommand::typescript();
         let client = Client::start(&command).expect("サーバを起動できる");
 
-        let session = client.handshake().expect("握手できる");
+        let session = client
+            .handshake(&fixture_workspace_root())
+            .expect("握手できる");
 
         // hover は Stage 2 で最初に使う問い合わせ。返らないサーバでは意味情報が採れない。
         // 有無ではなく中身を見る。無効を表す `Simple(false)` も「ある」なので、
@@ -395,6 +454,25 @@ mod tests {
             provides_hover,
             "typescript-language-server は hover を提供する"
         );
+
+        session.shutdown().expect("終了できる");
+    }
+
+    #[test]
+    #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+    fn test_session_still_answers_after_opening_and_closing_a_candidate_pair_file() {
+        // `didOpen` / `didClose` は通知なので応答が返らない。**受け取れたかは次の要求で分かる**
+        // ので、開いて閉じた後の終了手順（`shutdown` 要求の往復と正常終了）で確かめる。
+        // 開いたファイルの中身をサーバが読めているかは、hover を足す回に見る
+        let command = ServerCommand::typescript();
+        let client = Client::start(&command).expect("サーバを起動できる");
+        let mut session = client
+            .handshake(&fixture_workspace_root())
+            .expect("握手できる");
+        let document = fixture_document();
+
+        session.open_document(&document).expect("開かせられる");
+        session.close_document(&document).expect("閉じさせられる");
 
         session.shutdown().expect("終了できる");
     }

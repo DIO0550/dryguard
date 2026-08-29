@@ -74,6 +74,9 @@ if structurally_similar && domains_differ { ... }
 | `payload` | frame の本文。JSON-RPC のメッセージ 1 通そのもの |
 | `handshake` | `initialize` 要求 → 応答 → `initialized` 通知。ここまでで 1 つ |
 | `session` | handshake を終えた接続。問い合わせを送れる状態。握手前は `client` |
+| `workspace root` | `initialize` でサーバに見せるディレクトリ。開かせるファイル群の共通の祖先 |
+| `document` | サーバに開かせるソースファイル 1 つ分。URI・`language id`・中身の組 |
+| `language id` | LSP がサーバに伝える言語の名前（`typescript` / `typescriptreact`） |
 
 `snippet` / `fragment` / `candidate`（chunk の意味で）/ `label`（verdict の意味で）は使わない。
 **`candidate` が指すのはペアであって chunk ではない。**
@@ -91,6 +94,11 @@ newtype にしているのはこのため）。
 **`frame` と `payload` を混ぜない。** 区切りを付ける側（`lsp::framing`）と中身を読む側
 （`lsp::message`）はモジュールが別で、**失敗の直し先も別**（`Content-Length` が壊れているのと、
 JSON が壊れているのは違う話）。1 語で呼ぶと、どちらの層で落ちたのかがエラーの名前から消える。
+
+**`grammar` と `language id` を混ぜない。** どちらも拡張子で決まるが、`grammar` は
+tree-sitter がソースを読むための文法、`language id` は LSP サーバに言語を伝える綴りで、
+**綴りを決めているのが別の相手**（前者は tree-sitter のクレート、後者は LSP）。
+拡張子の一覧そのものは `Grammar` が 1 箇所で持ち、`language id` はそこから導く。
 
 **語を増やすときは、既にある語で言えないかを先に確かめる。**
 新しい語を足したら、この表にも足す。
