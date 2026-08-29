@@ -18,14 +18,19 @@ const PLACEHOLDER_PREFIX: char = '%';
 /// 型変数の制約を導く語。前後の空白ごと見て、`extendsFoo` のような名前と分ける。
 const CONSTRAINT_KEYWORD: &str = " extends ";
 
+/// 型変数の既定の型を導く印。
+///
+/// 前後の空白ごと見るのは、関数型の `=>` と分けるため（そちらは `=` の後ろが `>`）。
+const DEFAULT_MARKER: &str = " = ";
+
 /// 単一化の可否を比べられる形に直した型シグネチャ。
 ///
 /// 引数名を落とし、型変数を出現順に付け替えてある。**同じ形になった 2 つは
 /// 単一化できる**（[`TypeSignature::is_unifiable_with`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeSignature {
-    /// 型変数の制約。付け替え後の並びで、制約が無ければ `None`。
-    type_parameters: Vec<Option<String>>,
+    /// 型変数。付け替え後の並び。
+    type_parameters: Vec<TypeParameter>,
     /// 引数の型。名前を落とし、`?` と `...` は型の一部として残す。
     parameters: Vec<String>,
     /// 戻り値の型。
@@ -59,7 +64,7 @@ impl TypeSignature {
         let placeholders = placeholders_of(&ordered);
 
         Some(Self {
-            type_parameters: constraints_of(&declared, &ordered, &placeholders),
+            type_parameters: type_parameters_of(&declared, &ordered, &placeholders),
             parameters: parameters
                 .iter()
                 .map(|parameter| renamed(parameter, &placeholders))
@@ -71,7 +76,7 @@ impl TypeSignature {
     /// 2 つの型シグネチャが同じ型構造に重なるか。
     ///
     /// 引数名と型変数名の違いは正規化の時点で消えているので、ここでは形が同じかを見る。
-    /// 引数の数・省略可・可変長・制約が違えば重ならない。
+    /// 引数の数・省略可・可変長・制約・型変数の既定の型が違えば重ならない。
     pub fn is_unifiable_with(&self, other: &Self) -> bool {
         self == other
     }
@@ -235,16 +240,24 @@ fn declared_type_parameters_of(prefix: &str) -> Vec<DeclaredTypeParameter> {
         .collect()
 }
 
-/// 型変数 1 つ分の宣言から、名前と制約を取り出す。名前が無ければ `None`。
+/// 型変数 1 つ分の宣言から、名前・制約・既定の型を取り出す。名前が無ければ `None`。
+///
+/// 既定の型を先に切り離す。`T extends X = D` は制約と既定の両方を持ち、
+/// 切り離さないと制約が `X = D` になる。
 fn declared_type_parameter_of(declaration: &str) -> Option<DeclaredTypeParameter> {
     let declaration = declaration.trim();
-    let name = declaration.split_whitespace().next()?;
+    let (bounded, default) = match declaration.split_once(DEFAULT_MARKER) {
+        Some((bounded, default)) => (bounded, Some(default.trim().to_owned())),
+        None => (declaration, None),
+    };
+    let name = bounded.split_whitespace().next()?;
 
     Some(DeclaredTypeParameter {
         name: name.to_owned(),
-        constraint: declaration
+        constraint: bounded
             .split_once(CONSTRAINT_KEYWORD)
             .map(|(_, constraint)| constraint.trim().to_owned()),
+        default,
     })
 }
 
@@ -255,6 +268,18 @@ fn declared_type_parameter_of(declaration: &str) -> Option<DeclaredTypeParameter
 struct DeclaredTypeParameter {
     name: String,
     constraint: Option<String>,
+    default: Option<String>,
+}
+
+/// 付け替えを終えた型変数 1 つ分。名前は付け替えで消えているので持たない。
+///
+/// 既定の型を持つのは、**型引数を省いて呼んだときの型がそこで決まる**ため。
+/// 落とすと `f<T = string>(): T` と `g<U = number>(): U` が同じ形になるが、
+/// どちらも引数無しで呼ぶと戻り値の型が違う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TypeParameter {
+    constraint: Option<String>,
+    default: Option<String>,
 }
 
 /// 型変数の名前を、引数と戻り値に現れる順に並べる。
@@ -304,23 +329,27 @@ fn placeholders_of(ordered: &[String]) -> HashMap<String, String> {
         .collect()
 }
 
-/// 型変数の制約を、付け替え後の並びで返す。制約が無い型変数は `None`。
+/// 型変数を、付け替え後の並びで返す。
 ///
-/// 制約も付け替えの対象にする。`<T, U extends T>` のように、制約が別の型変数を
-/// 指すことがある。
-fn constraints_of(
+/// 制約と既定の型も付け替えの対象にする。`<T, U extends T>` のように、
+/// どちらも別の型変数を指すことがある。
+fn type_parameters_of(
     declared: &[DeclaredTypeParameter],
     ordered: &[String],
     placeholders: &HashMap<String, String>,
-) -> Vec<Option<String>> {
+) -> Vec<TypeParameter> {
     ordered
         .iter()
         .map(|name| {
-            declared
+            let declaration = declared
                 .iter()
-                .find(|declaration| declaration.name == *name)
-                .and_then(|declaration| declaration.constraint.as_deref())
-                .map(|constraint| renamed(constraint, placeholders))
+                .find(|declaration| declaration.name == *name);
+            let renamed_part = |part: Option<&String>| part.map(|text| renamed(text, placeholders));
+
+            TypeParameter {
+                constraint: renamed_part(declaration.and_then(|it| it.constraint.as_ref())),
+                default: renamed_part(declaration.and_then(|it| it.default.as_ref())),
+            }
         })
         .collect()
 }
@@ -551,6 +580,25 @@ mod tests {
         assert!(unifiable(
             "function bounded<T, U extends T>(a: T, b: U): void",
             "function limited<A, B extends A>(a: A, b: B): void"
+        ));
+    }
+
+    #[test]
+    fn test_type_variables_with_different_defaults_are_not_unifiable() {
+        // 既定の型を落とすと、型引数を省いて呼んだときに戻り値の型が違う 2 つが
+        // 同じ形になる
+        assert!(!unifiable(
+            "function withText<T = string>(): T",
+            "function withCount<U = number>(): U"
+        ));
+    }
+
+    #[test]
+    fn test_type_variables_with_the_same_default_are_unifiable() {
+        // 対照は上のテスト。既定の型だけを揃えている
+        assert!(unifiable(
+            "function withText<T = string>(): T",
+            "function alsoText<U = string>(): U"
         ));
     }
 
