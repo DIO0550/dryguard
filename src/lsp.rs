@@ -11,6 +11,7 @@
 //! | `uri` | パスから `file:` URI への変換 |
 //! | `workspace` | サーバに見せるワークスペースの根 |
 //! | `document` | サーバに開かせるソースファイル |
+//! | `hover` | hover の応答から型の綴りを取り出す |
 //! | ここ | サーバの起動・パイプの配線・終了 |
 //!
 //! **外へ出すのは [`ServerCommand`] / [`Client`] / [`Session`]、渡す値
@@ -21,6 +22,7 @@
 pub(crate) mod connection;
 pub(crate) mod document;
 pub(crate) mod framing;
+pub(crate) mod hover;
 pub(crate) mod message;
 pub(crate) mod uri;
 pub(crate) mod workspace;
@@ -32,6 +34,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
 use lsp_types::ServerCapabilities;
 
+use crate::source_position::SourcePosition;
 use connection::Connection;
 
 // 開かせるドキュメントとワークスペースの根は、呼ぶ側が組み立てて渡す。
@@ -188,6 +191,30 @@ impl Session {
         self.client
             .connection
             .open_document(document)
+            .map_err(ClientError::Conversation)
+    }
+
+    /// 開かせたファイルの、指定位置にある名前の型の綴りを尋ねる。
+    ///
+    /// `position` は `Chunk::name_position` が指す識別子の位置。返るのは
+    /// **正規化前の綴りそのもの**で、サーバがその位置に答えを持たなければ `Ok(None)`。
+    ///
+    /// 先に [`Session::open_document`] で開かせておく。開かせていないドキュメントへは
+    /// 送らずに断る（サーバは知らない URI に null を返すので、「型が無い」と
+    /// 区別が付かなくなる）。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、往復が失敗したとき、
+    /// 応答を hover の結果として読めないとき。
+    pub fn hover(
+        &mut self,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<Option<String>, ClientError> {
+        self.client
+            .connection
+            .hover(document, position)
             .map_err(ClientError::Conversation)
     }
 
@@ -369,7 +396,7 @@ impl Error for ClientError {
 mod tests {
     use super::*;
     use crate::codebase;
-    use crate::test_support::repository_path;
+    use crate::test_support::{line, repository_path};
     use lsp_types::HoverProviderCapability;
 
     /// 候補ペアのファイルとして開かせる fixture。
@@ -473,6 +500,57 @@ mod tests {
 
         session.open_document(&document).expect("開かせられる");
         session.close_document(&document).expect("閉じさせられる");
+
+        session.shutdown().expect("終了できる");
+    }
+
+    #[test]
+    #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+    fn test_session_hover_on_a_function_name_answers_its_type_signature() {
+        // fixture の 5 行目 `export function applyDiscount(invoice: Invoice): number`。
+        // 開かせた中身をサーバが読めているかは、ここで初めて確かめられる
+        let command = ServerCommand::typescript();
+        let client = Client::start(&command).expect("サーバを起動できる");
+        let mut session = client
+            .handshake(&fixture_workspace_root())
+            .expect("握手できる");
+        let document = fixture_document();
+        session.open_document(&document).expect("開かせられる");
+
+        let signature = session
+            .hover(
+                &document,
+                SourcePosition::from_preceding_text(line(5), "export function "),
+            )
+            .expect("問い合わせられる");
+
+        assert_eq!(
+            signature,
+            Some("function applyDiscount(invoice: Invoice): number".to_owned())
+        );
+
+        session.shutdown().expect("終了できる");
+    }
+
+    #[test]
+    #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+    fn test_session_hover_away_from_a_name_has_no_answer() {
+        // 対照は上のテスト。同じファイルの同じ行で、識別子ではない位置（行頭の
+        // `export` の手前）を指す。**位置がずれると黙って答えが消える**ので、
+        // 「答えが返る位置」と「返らない位置」を両方見て初めて指し方を確かめられる
+        let command = ServerCommand::typescript();
+        let client = Client::start(&command).expect("サーバを起動できる");
+        let mut session = client
+            .handshake(&fixture_workspace_root())
+            .expect("握手できる");
+        let document = fixture_document();
+        session.open_document(&document).expect("開かせられる");
+
+        let signature = session
+            .hover(&document, SourcePosition::from_preceding_text(line(5), ""))
+            .expect("問い合わせられる");
+
+        assert_eq!(signature, None);
 
         session.shutdown().expect("終了できる");
     }
