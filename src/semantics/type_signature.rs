@@ -31,12 +31,20 @@ const RECEIVER_PARAMETER: &str = "this";
 /// `this:` で始まる型は書けないので、**本物の型と衝突しない**。
 const RECEIVER_MARKER: &str = "this:";
 
+/// 構築シグネチャの宣言形を導く語（`constructor Result(value: string): Result`）。
+const CONSTRUCTOR_KEYWORD: &str = "constructor";
+
+/// 構築シグネチャの値形を導く語（`new (value: string) => Result`）。
+const NEW_KEYWORD: &str = "new";
+
 /// 単一化の可否を比べられる形に直した型シグネチャ。
 ///
 /// 引数名を落とし、型変数を出現順に付け替えてある。**同じ形になった 2 つは
 /// 単一化できる**（[`TypeSignature::is_unifiable_with`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeSignature {
+    /// 呼び出しの仕方。
+    kind: SignatureKind,
     /// 型変数。付け替え後の並び。
     type_parameters: Vec<TypeParameter>,
     /// 引数の型。名前を落とし、`?` と `...` は型の一部として残す。
@@ -72,6 +80,7 @@ impl TypeSignature {
         let placeholders = placeholders_of(&ordered);
 
         Some(Self {
+            kind: signature_kind_of(prefix),
             type_parameters: type_parameters_of(&declared, &ordered, &placeholders),
             parameters: parameters
                 .iter()
@@ -84,10 +93,43 @@ impl TypeSignature {
     /// 2 つの型シグネチャが同じ型構造に重なるか。
     ///
     /// 引数名と型変数名の違いは正規化の時点で消えているので、ここでは形が同じかを見る。
-    /// 引数の数・省略可・可変長・制約・型変数の既定の型が違えば重ならない。
+    /// 呼び出しの仕方・引数の数・省略可・可変長・制約・型変数の既定の型が違えば重ならない。
     pub fn is_unifiable_with(&self, other: &Self) -> bool {
         self == other
     }
+}
+
+/// 呼び出しの仕方。
+///
+/// **`new` を付けて呼ぶ型と、そのまま呼ぶ型は別の型**なので、同じ形にしない。
+/// クラスのコンストラクタもチャンクになる（tree-sitter では `method_definition`）ので、
+/// 落とすと `constructor Result(value: string): Result` と
+/// `function create(value: string): Result` が単一化可能になる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignatureKind {
+    /// そのまま呼ぶ（`f(a)`）。
+    Call,
+    /// `new` を付けて呼ぶ（`new C(a)`）。
+    Construct,
+}
+
+/// 引数リストの手前の綴りから、呼び出しの仕方を読む。
+///
+/// hover は構築シグネチャを、宣言形なら `constructor Result(value: string): Result`、
+/// 値形なら `new (value: string) => Result` と返す（実測）。
+///
+/// **Why（接頭辞を見てよい理由）**: ここで見分けたいのは「`new` が要るか」の 2 択で、
+/// 綴りはこの 2 つで尽きる。`(method)` / `(property)` のように**この先増える一覧では
+/// ない**ので、`parameter_list_of` が接頭辞を列挙しない判断とは別の話になる。
+fn signature_kind_of(prefix: &str) -> SignatureKind {
+    let prefix = prefix.trim();
+    let declared = prefix.split_whitespace().next() == Some(CONSTRUCTOR_KEYWORD);
+    let annotated = prefix.split_whitespace().next_back() == Some(NEW_KEYWORD);
+
+    if declared || annotated {
+        return SignatureKind::Construct;
+    }
+    SignatureKind::Call
 }
 
 /// 空白の連なりを 1 つに畳んだ綴り。**引用符の中は畳まない。**
@@ -682,6 +724,34 @@ mod tests {
         assert!(unifiable(
             "function withText<T = string>(): T",
             "function alsoText<U = string>(): U"
+        ));
+    }
+
+    #[test]
+    fn test_a_constructor_is_not_unifiable_with_a_function_returning_the_same_type() {
+        // コンストラクタも method_definition なのでチャンクになる。呼び出しの仕方を
+        // 落とすと、`new` が要る型と要らない型が同じ形になる
+        assert!(!unifiable(
+            "constructor Result(value: string): Result",
+            "function create(value: string): Result"
+        ));
+    }
+
+    #[test]
+    fn test_two_constructors_of_the_same_shape_are_unifiable() {
+        // 対照は上のテスト。どちらもコンストラクタなら同じ形になる
+        assert!(unifiable(
+            "constructor Result(value: string): Result",
+            "constructor Wrapper(text: string): Result"
+        ));
+    }
+
+    #[test]
+    fn test_a_construct_signature_in_value_form_is_not_unifiable_with_a_call_signature() {
+        // 値形の構築シグネチャ。`new` の有無だけが違う
+        assert!(!unifiable(
+            "const make: new (value: string) => Result",
+            "const call: (value: string) => Result"
         ));
     }
 
