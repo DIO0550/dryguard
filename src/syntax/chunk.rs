@@ -16,6 +16,7 @@ use tree_sitter::Node;
 
 use crate::line_number::LineNumber;
 use crate::location::Location;
+use crate::source_position::SourcePosition;
 use crate::syntax::import::ImportSet;
 use crate::syntax::line_range::LineRange;
 use crate::syntax::token::TokenSequence;
@@ -33,6 +34,7 @@ use crate::syntax::tree::SyntaxTree;
 pub struct Chunk {
     path: PathBuf,
     lines: LineRange,
+    name_position: Option<SourcePosition>,
     source: String,
     tokens: Option<TokenSequence>,
     imports: Option<ImportSet>,
@@ -72,6 +74,7 @@ impl Chunk {
         Ok(Self::new(
             location.path().to_path_buf(),
             lines,
+            name_position_of(enclosing, tree.source()),
             source_of_lines(tree.source(), lines),
             TokenSequence::from_node(enclosing),
             ImportSet::from_tree(tree, location.path()),
@@ -87,6 +90,7 @@ impl Chunk {
     fn new(
         path: PathBuf,
         lines: LineRange,
+        name_position: Option<SourcePosition>,
         source: String,
         tokens: Option<TokenSequence>,
         imports: Option<ImportSet>,
@@ -94,6 +98,7 @@ impl Chunk {
         Self {
             path,
             lines,
+            name_position,
             source,
             tokens,
             imports,
@@ -108,6 +113,18 @@ impl Chunk {
     /// 切り出した行範囲。
     pub fn lines(&self) -> LineRange {
         self.lines
+    }
+
+    /// このチャンクの名前が置かれている位置。名前が無ければ `None`。
+    ///
+    /// 位置を指す問い合わせ（`semantics` が送る hover）を、どこへ向けるかを決める値。
+    ///
+    /// `None` は「無名なので聞けない」。**チャンクの先頭位置で代用しない**のは、
+    /// そこを指した問い合わせが答えなかったのか、答えた結果が空だったのかを
+    /// 後段が区別できなくなるため (rules/architecture.md
+    /// 「取れなかったシグナルを既定値で埋めない」)。
+    pub fn name_position(&self) -> Option<SourcePosition> {
+        self.name_position
     }
 
     /// 切り出したソース。行の区切りは改行 1 文字。
@@ -173,6 +190,7 @@ impl FileChunks {
             chunks.push(Chunk::new(
                 path.to_path_buf(),
                 lines,
+                name_position_of(node, tree.source()),
                 source_of_lines(tree.source(), lines),
                 TokenSequence::from_node(node),
                 imports.clone(),
@@ -265,6 +283,45 @@ fn innermost_chunk_node<'tree>(
         .filter(|node| CHUNK_KINDS.contains(&node.kind()))
         .filter(|node| line_range_of(*node).contains(line))
         .min_by_key(|node| node.byte_range().len())
+}
+
+/// そのチャンクの名前が置かれている位置。名前が無ければ `None`。
+///
+/// `source` はそのノードを含むファイル全体のソース。列を UTF-16 のコード単位で
+/// 数え直すのに、名前が載っている行の先頭からの文字列が要る
+/// (`SourcePosition::from_preceding_text`)。
+fn name_position_of(node: Node<'_>, source: &str) -> Option<SourcePosition> {
+    let name = name_node_of(node)?;
+    let start = name.start_byte();
+    let line_start = source
+        .get(..start)?
+        .rfind('\n')
+        .map_or(0, |index| index + '\n'.len_utf8());
+
+    Some(SourcePosition::from_preceding_text(
+        LineNumber::from_index(name.start_position().row),
+        source.get(line_start..start)?,
+    ))
+}
+
+/// そのチャンクの名前になっている識別子のノード。無名なら `None`。
+///
+/// 自分の `name` を持たないチャンク（無名の関数式・アロー関数）は、**代入先の名前**を
+/// 使う。`const format = (…) => …` の `format`、クラスのプロパティ、オブジェクトの
+/// プロパティがこれで、grammar 上はそれぞれ親ノードの `name` / `key` に載っている。
+///
+/// **Why（自分の名前を先に見る）**: `const named = function inner(…) {}` は両方持つ。
+/// 代入先を指すと**変数に書かれた型**が返るので、注釈が付いていれば
+/// （`const named: Formatter = function inner(…)`）関数自身の型ではなくその注釈を見ることになる。
+fn name_node_of(node: Node<'_>) -> Option<Node<'_>> {
+    if let Some(name) = node.child_by_field_name("name") {
+        return Some(name);
+    }
+
+    let parent = node.parent()?;
+    parent
+        .child_by_field_name("name")
+        .or_else(|| parent.child_by_field_name("key"))
 }
 
 /// そのノードが覆っている行範囲。
@@ -751,5 +808,90 @@ function broken() {
             [line(5)],
             "飛ばしたことが始まりの行として残る"
         );
+    }
+
+    /// 名前の位置を、行と列で読める形にする。
+    fn name_position_of_chunk(chunk: &Chunk) -> Option<(usize, usize)> {
+        chunk
+            .name_position()
+            .map(|position| (position.line().get(), position.character()))
+    }
+
+    #[test]
+    fn test_chunk_of_a_function_declaration_points_at_its_own_name() {
+        // 先頭（`export` の上）ではなく識別子を指す。位置を指す問い合わせは
+        // 識別子の上でしか答えない
+        let chunk = chunk_at(FUNCTION_AFTER_A_CONSTANT, "a.ts:3").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((3, 16)));
+    }
+
+    #[test]
+    fn test_chunk_of_an_arrow_function_points_at_the_name_it_is_assigned_to() {
+        // アロー関数は自分の名前を持たない。先頭（`(` の上）を指しても答えは返らない
+        let assigned_arrow = "export const format = (value: string): string => value;\n";
+
+        let chunk = chunk_at(assigned_arrow, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((1, 13)));
+    }
+
+    #[test]
+    fn test_chunk_of_a_named_function_expression_points_at_the_function_name() {
+        // 両方の名前がある形。代入先を指すと変数に書かれた型のほうを見ることになる
+        let named_function_expression = "const named = function inner(value: string): string {\n\
+                                         \x20 return value;\n\
+                                         };\n";
+
+        let chunk = chunk_at(named_function_expression, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((1, 23)));
+    }
+
+    #[test]
+    fn test_chunk_of_a_method_points_at_the_method_name() {
+        let class_with_a_method = "export class Cart {\n\
+                                   \x20 total(items: number[]): number {\n\
+                                   \x20   return items.length;\n\
+                                   \x20 }\n\
+                                   }\n";
+
+        let chunk = chunk_at(class_with_a_method, "a.ts:2").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((2, 2)));
+    }
+
+    #[test]
+    fn test_chunk_of_an_anonymous_callback_has_no_name_position() {
+        // 対照として同じソースに名前のある関数を 1 つ置く。名前が無いものだけが
+        // None になり、「そもそもチャンクが 1 つも無い」で通ってしまわないようにする
+        let named_then_anonymous = "export function doubled(values: number[]): number[] {\n\
+                                    \x20 return values.map((value) => value * 2);\n\
+                                    }\n";
+
+        let file_chunks = chunks_at(named_then_anonymous, "a.ts");
+
+        let positions: Vec<Option<(usize, usize)>> = file_chunks
+            .chunks()
+            .iter()
+            .map(name_position_of_chunk)
+            .collect();
+        assert_eq!(
+            positions,
+            vec![Some((1, 16)), None],
+            "無名のコールバックだけが名前の位置を持たない"
+        );
+    }
+
+    #[test]
+    fn test_chunk_whose_line_has_non_ascii_before_the_name_counts_the_column_in_utf16() {
+        // 名前より手前に非 ASCII がある形。バイトで数えていると列が 32 になり、
+        // サーバは名前より後ろを見る
+        let non_ascii_before_the_name =
+            "const handlers = { \"請求\": 1, format: (value: string): string => value };\n";
+
+        let chunk = chunk_at(non_ascii_before_the_name, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((1, 28)));
     }
 }
