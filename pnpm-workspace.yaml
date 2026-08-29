@@ -1,0 +1,8 @@
+# 公開から日が浅いバージョンを解決に使わない（cooldown）。分で指定するので 5 日 = 7200。
+#
+# Why: postinstall スクリプトは install の時点でローカル実行される。掴んでから気付いても
+# 遅いので、cargo 側（.cargo/config.toml）と同じく解決そのものを止める側に置く。
+#
+# **pnpm 10.16.0 より前は、この設定を警告なく無視する。** 設定してあるのに守られていない
+# 状態を作らないため、lock を作り直すときは harness/deps/resolve-node.sh を通す。
+minimumReleaseAge: 7200

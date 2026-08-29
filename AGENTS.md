@@ -9,7 +9,7 @@
   理由付きで判定する CLI**（`docs/dryguard-plan.md`）
 - 言語: Rust（edition 2024）
 - 構成: `src/lib.rs` が本体、`src/main.rs` は引数を受けて呼ぶだけ
-- 外部依存: `clap` / `tree-sitter` / `tree-sitter-typescript`。以降 `lsp-types` / `rayon` / `serde` を足す
+- 外部依存: `clap` / `tree-sitter` / `tree-sitter-typescript` / `rayon` / `lsp-types` / `serde_json`
 - LSP サーバ: TS は typescript-language-server、Rust は rust-analyzer（子プロセスで起動）
 
 ## 規約一覧
@@ -140,13 +140,19 @@ bash harness/githooks/pre-push              # push 前の検査をまとめて�
 
 ### CI で使うアクション
 
-- **GitHub 公式（`actions/*`）以外のアクションを使わない。** 必要なことは
-  `run:` で直接書く（ツールチェーンの用意は `rustup` を呼べば足りる）
 - **バージョンは commit hash で固定する。** `@v5` のようなタグは動かせるので、
   同じ設定でも別のコードが走りうる。**層 1 は無条件のゲートなので、何が走るかを
   固定できないと検査そのものが信用できない**
 - 可読性のため hash の隣に `# v5.1.0` の形で版をコメントする。
   更新するときは hash とコメントの両方を直す
+- **既定は GitHub 公式（`actions/*`）。** それ以外を使うなら、**commit hash で固定したうえで、
+  そのアクションが何を固定できて何を固定できないかをワークフローに書く**
+  （固定できない部分は、残った緩みとして読める形にしておく）
+- 公式以外で `run:` に書き下せることは書き下す。ツールチェーンの用意は `rustup` を呼べば足りる
+
+**今使っている公式以外のアクションは `pnpm/action-setup` の 1 つ。** 固定できる範囲は
+2 段のうち 1 段目まで（bootstrap は同梱 lock で integrity 込み、`self-update` は版指定のみ）。
+詳細は `.github/workflows/rust.yml` のコメント。
 
 ## 依存の更新は cooldown を通す
 
@@ -176,3 +182,54 @@ bash harness/deps/resolve.sh add serde
 警告を出さない）ため、`resolve.sh` は nightly が無ければ落ちる。
 「設定してあるのに守られていない」を作らないのがスクリプトを挟む理由で、
 **素の `cargo update` はそれを迂回する**。
+
+### JavaScript 側のパッケージは pnpm で入れる
+
+**`npm` は使わない。`pnpm` を使い、cooldown を 5 日にする**（`pnpm-workspace.yaml` の
+`minimumReleaseAge: 7200`。分で指定する）。今の対象は CI が起動する
+typescript-language-server と typescript で、**このリポジトリに JavaScript のコードは無い**。
+
+**`pnpm install` / `pnpm add` を素で叩かない。`harness/deps/resolve-node.sh` を通す**
+（詳細は `harness/deps/README.md`）。
+
+```bash
+bash harness/deps/resolve-node.sh install --lockfile-only
+bash harness/deps/resolve-node.sh add -D <パッケージ>
+```
+
+**Why**: cooldown を掛けられるのが pnpm だけだから。npm には公開からの経過日数で
+解決を止める設定が無く、Cargo 側（`global-min-publish-age`）と同じ守り方ができない。
+**postinstall スクリプトは install の時点でローカル実行される**ので、cargo の build script と
+同じく「掴んだ時点で実行済み」になる。
+
+**`pnpm-lock.yaml` を commit する。** cooldown は「新しすぎるものを避ける」だけで、
+**毎回同じものを入れる保証にはならない**。固定は lock が担い、cooldown は lock を
+作り直すときに効かせる（`Cargo.lock` + `resolve.sh` と同じ分担）。
+CI は `pnpm install --frozen-lockfile` で入れるだけなので、解決が起きない。
+
+**pnpm の版を確かめてから解決する。** `minimumReleaseAge` を知らない版（10.16.0 より前）は
+**その設定を警告なく無視する**。設定してあるのに守られていない状態を作らないため、
+`resolve-node.sh` が版を見て落とす（`cargo` 側で nightly を要求しているのと同じ形）。
+
+**効いている cooldown の長さも見る。** `resolve-node.sh` は `pnpm config get` が返す値が
+5 日（7200 分）に届かなければ解決しない。**設定ファイルを読んで「書いてあるか」を見ない**
+（コメントにだけ名前が残っていても、`0` や `1` でも通ってしまう）。期間を縮めるには
+スクリプト側の下限も直すことになるので、**短くする変更は差分に出る**。
+
+**CI が使う pnpm の版は `package.json` の `packageManager` が持つ。** `pnpm/action-setup`
+（commit hash で固定）がそこを読んで入れ、ワークフローが**入った版を突き合わせる**。
+版を上げるときに直すのはこの 1 箇所。
+
+**中身までは固定できていない。** アクションは `pnpm self-update <版>` で目的の版を取るので、
+**固定されるのは版だけ**（`packageManager` に `+sha512...` を付けてもアクション側が捨てる）。
+バイナリをハッシュで固定していた形からは、ここだけ緩めた。
+
+**Why not（curl + `sha256sum -c`）**: 走るバイナリの中身まで固定できるが、pnpm を上げるたびに
+ハッシュを取り直すことになる。その手間と引き換えに 2 段目の固定を手放した。
+
+**Why not（corepack）**: Node 25.0.0 から同梱されなくなった。それ以降に corepack を入れる
+公式の方法が `npm install -g corepack` で、npm を使わない方針と衝突する。
+
+**npm 禁止の対象は「このリポジトリの依存を解決すること」。** `pnpm/action-setup` は
+bootstrap の pnpm を `npm ci` で入れるが、**同梱の lock に integrity があり解決は起きない**ので、
+cooldown を掛けられないという禁止の理由がそもそも当たらない。

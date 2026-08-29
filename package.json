@@ -1,0 +1,10 @@
+{
+  "name": "dryguard-language-servers",
+  "private": true,
+  "description": "CI が Stage 2 のテストで起動する LSP サーバ。dryguard 本体は Rust で、ここに JavaScript のコードは無い",
+  "packageManager": "pnpm@10.33.0",
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "typescript-language-server": "6.0.0"
+  }
+}
