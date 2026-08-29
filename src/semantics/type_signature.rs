@@ -92,15 +92,12 @@ impl TypeSignature {
 /// `"a  b"` は別の型。一律に畳むと**別の型が同じ形になり、単一化できると答えてしまう。**
 fn flattened(text: &str) -> String {
     let mut flattened = String::new();
-    let mut quote: Option<char> = None;
+    let mut quote = QuoteState::new();
     let mut after_whitespace = false;
 
     for character in text.chars() {
-        if let Some(open) = quote {
+        if quote.is_inside(character) {
             flattened.push(character);
-            if character == open {
-                quote = None;
-            }
             continue;
         }
 
@@ -115,13 +112,50 @@ fn flattened(text: &str) -> String {
         }
         after_whitespace = false;
         flattened.push(character);
-
-        if matches!(character, '"' | '\'' | '`') {
-            quote = Some(character);
-        }
     }
 
     flattened
+}
+
+/// 引用符の中にいるかどうかを、文字を 1 つずつ読みながら追う。
+///
+/// 畳む側（[`flattened`]）と深さを数える側（[`scanned`]）が同じ判断を要るので、
+/// **どちらにも同じ状態を持たせない**ために切り出してある。
+struct QuoteState {
+    open: Option<char>,
+    escaped: bool,
+}
+
+impl QuoteState {
+    fn new() -> Self {
+        Self {
+            open: None,
+            escaped: false,
+        }
+    }
+
+    /// その文字が引用符の**中**にあるか。開き引用符そのものは中に数えない。
+    ///
+    /// 閉じるのは**エスケープされていない**同じ引用符だけ。`"a\"  b"` の `\"` で
+    /// 閉じてしまうと、そこから先が引用符の外として扱われ、
+    /// **リテラルの中の空白が畳まれる / 中の区切りで型を切る**。
+    fn is_inside(&mut self, character: char) -> bool {
+        let Some(open) = self.open else {
+            if matches!(character, '"' | '\'' | '`') {
+                self.open = Some(character);
+                self.escaped = false;
+            }
+            return false;
+        };
+
+        let escaped = self.escaped;
+        self.escaped = character == '\\' && !escaped;
+
+        if character == open && !escaped {
+            self.open = None;
+        }
+        true
+    }
 }
 
 /// 引数リストの括弧組を見つけ、その手前・中身・後ろに分ける。
@@ -464,16 +498,13 @@ fn top_level_index_of(text: &str, separator: char) -> Option<usize> {
 fn scanned(text: &str) -> Vec<(usize, char, usize)> {
     let mut scanned = Vec::new();
     let mut depth: usize = 0;
-    let mut quote: Option<char> = None;
+    let mut quote = QuoteState::new();
     let mut previous = ' ';
 
     for (index, character) in text.char_indices() {
-        if let Some(open) = quote {
-            // 引用符の中は数えない。文字列リテラル型 `"a, b"` の中の区切りを、
-            // 型の区切りと取り違えないため。
-            if character == open {
-                quote = None;
-            }
+        // 引用符の中は数えない。文字列リテラル型 `"a, b"` の中の区切りを、
+        // 型の区切りと取り違えないため。
+        if quote.is_inside(character) {
             previous = character;
             continue;
         }
@@ -487,9 +518,6 @@ fn scanned(text: &str) -> Vec<(usize, char, usize)> {
 
         if matches!(character, '(' | '[' | '{' | '<') {
             depth += 1;
-        }
-        if matches!(character, '"' | '\'' | '`') {
-            quote = Some(character);
         }
         previous = character;
     }
@@ -632,6 +660,25 @@ mod tests {
         assert!(unifiable(
             "function withText<T = string>(): T",
             "function alsoText<U = string>(): U"
+        ));
+    }
+
+    #[test]
+    fn test_an_escaped_quote_does_not_end_a_string_literal_type() {
+        // `\"` で引用符を閉じたことにすると、そこから先が引用符の外になり
+        // リテラルの中の空白が畳まれる
+        assert!(!unifiable(
+            "function spaced(label: \"a\\\"  b\"): void",
+            "function single(label: \"a\\\" b\"): void"
+        ));
+    }
+
+    #[test]
+    fn test_a_comma_after_an_escaped_quote_does_not_split_the_parameter_list() {
+        // 引用符を早く閉じると、リテラルの中の `,` が引数の区切りに見える
+        assert!(unifiable(
+            "function labelled(label: \"a\\\", b\", count: number): void",
+            "function other(name: \"a\\\", b\", total: number): void"
         ));
     }
 
