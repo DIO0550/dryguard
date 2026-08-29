@@ -23,6 +23,14 @@ const CONSTRAINT_KEYWORD: &str = " extends ";
 /// 前後の空白ごと見るのは、関数型の `=>` と分けるため（そちらは `=` の後ろが `>`）。
 const DEFAULT_MARKER: &str = " = ";
 
+/// 呼び出し時に渡さない引数（TypeScript の `this` 引数）の名前。
+const RECEIVER_PARAMETER: &str = "this";
+
+/// `this` 引数に付ける印。
+///
+/// `this:` で始まる型は書けないので、**本物の型と衝突しない**。
+const RECEIVER_MARKER: &str = "this:";
+
 /// 単一化の可否を比べられる形に直した型シグネチャ。
 ///
 /// 引数名を落とし、型変数を出現順に付け替えてある。**同じ形になった 2 つは
@@ -237,6 +245,13 @@ fn parameter_types_of(parameter_list: &str) -> Option<Vec<String>> {
 ///
 /// 省略可（`?`）と可変長（`...`）は型の一部として残す。**落とすと `a: string` と
 /// `a?: string` が同じ形になる**が、前者は必ず渡す引数で後者は省ける。
+///
+/// `this` 引数だけは名前も残す。**呼び出し時に渡さない引数**なので、落とすと
+/// `f(this: E, a: string)` と `g(ctx: E, a: string)` が同じ形になるが、
+/// 前者が受け取る値は 1 つで後者は 2 つ。
+///
+/// ただし引数の数からは外していないので、`f(this: E, a: string)` と `g(a: string)` は
+/// 単一化不能に倒れる（呼び出し側から見た形は同じ）。**取りこぼす側の誤り**として残してある。
 fn parameter_type_of(parameter: &str) -> Option<String> {
     let parameter = parameter.trim();
     let (rest_marker, named) = match parameter.strip_prefix("...") {
@@ -249,6 +264,11 @@ fn parameter_type_of(parameter: &str) -> Option<String> {
     let separator = top_level_index_of(named, ':')?;
     let name = named.get(..separator)?.trim_end();
     let optional_marker = if name.ends_with('?') { "?" } else { "" };
+    let receiver_marker = if name == RECEIVER_PARAMETER {
+        RECEIVER_MARKER
+    } else {
+        ""
+    };
     let annotated = named.get(separator + 1..)?.trim();
 
     if annotated.is_empty() {
@@ -256,7 +276,9 @@ fn parameter_type_of(parameter: &str) -> Option<String> {
     }
     let annotated = normalized_type(annotated)?;
 
-    Some(format!("{rest_marker}{optional_marker}{annotated}"))
+    Some(format!(
+        "{receiver_marker}{rest_marker}{optional_marker}{annotated}"
+    ))
 }
 
 /// 型 1 つ分を、名前の入らない形へ直す。読み取れない関数型では `None`。
@@ -660,6 +682,25 @@ mod tests {
         assert!(unifiable(
             "function withText<T = string>(): T",
             "function alsoText<U = string>(): U"
+        ));
+    }
+
+    #[test]
+    fn test_a_this_parameter_is_not_unifiable_with_an_ordinary_parameter_of_the_same_type() {
+        // `this` は呼び出し時に渡さない引数。名前ごと落とすと、受け取る値が
+        // 1 つの関数と 2 つの関数が同じ形になる
+        assert!(!unifiable(
+            "function bound(this: HTMLElement, value: string): void",
+            "function plain(context: HTMLElement, value: string): void"
+        ));
+    }
+
+    #[test]
+    fn test_two_this_parameters_of_the_same_type_are_unifiable() {
+        // 対照は上のテスト。`this` どうしなら名前が残っても同じ形になる
+        assert!(unifiable(
+            "function bound(this: HTMLElement, value: string): void",
+            "function alsoBound(this: HTMLElement, text: string): void"
         ));
     }
 
