@@ -1,10 +1,11 @@
-//! パスから LSP へ渡す `file:` URI を作る。
+//! パスを LSP へ渡せる形（絶対パスと `file:` URI）にする。
 //!
 //! **綴り方をここ 1 箇所に閉じる。** ワークスペースの根とドキュメントの両方が同じ形の
 //! URI を要るので、片方だけ別の綴りになると、サーバから見て**同じファイルが別物**になる。
 
 use std::error::Error;
 use std::fmt;
+use std::io;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::str::FromStr;
 
@@ -19,14 +20,49 @@ const FILE_SCHEME_PREFIX: &str = "file://";
 /// サーバが返す URI と綴りが食い違い、同じファイルを別物として突き合わせることになる。
 const UNENCODED_PUNCTUATION: &[u8] = b"-._~!$&'()*+,;=:@";
 
-/// 絶対パスを `file:` URI にする。
+/// 呼ばれた位置を起点に絶対パスへ直し、`.` と `..` を畳む。
 ///
-/// パスの区切りごとに、符号化が要る文字だけを `%XX` に直す。区切りそのものは符号化しない。
+/// **リンクは辿らない。** Stage 1 は importer に書かれたパスから指定子を畳んで依存先を出す
+/// （`syntax::import`）ので、こちらだけリンクの向こう側へ寄せると、**同じファイルを
+/// 2 つのステージが別のディレクトリから見る**ことになり、依存先の突き合わせがずれる。
+///
+/// **Why not（`fs::canonicalize`）**: 実在するファイルしか受け取れなくなるうえ、
+/// リンクを辿るので上の食い違いが起きる。
 ///
 /// # Errors
 ///
-/// `path` が絶対パスでないとき、UTF-8 として読めない要素を含むとき、
-/// 組み立てた文字列が URI として読めないとき。
+/// 空のパスを渡されたとき、カレントディレクトリを読めないとき。
+pub(super) fn absolute_path_of(path: &Path) -> io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut folded = PathBuf::new();
+
+    for component in absolute.components() {
+        match component {
+            // `.` は位置を変えない。
+            Component::CurDir => {}
+            // 遡る先が無ければそのまま。根より上は無い。
+            Component::ParentDir => {
+                folded.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                folded.push(component);
+            }
+        }
+    }
+
+    Ok(folded)
+}
+
+/// 絶対パスを `file:` URI にする。
+///
+/// パスの区切りごとに、符号化が要る文字だけを `%XX` に直す。区切りそのものは符号化しない。
+/// 渡すのは [`absolute_path_of`] が返したパス。
+///
+/// # Errors
+///
+/// `path` が絶対パスでないとき、`.` / `..` を畳んでいないとき、`file:` URI で表せない
+/// 前置きを持つとき、UTF-8 として読めない要素を含むとき、組み立てた文字列が
+/// URI として読めないとき。
 pub(super) fn file_uri_of(path: &Path) -> Result<Uri, PathUriError> {
     if !path.is_absolute() {
         return Err(PathUriError::NotAbsolute {
@@ -60,9 +96,9 @@ pub(super) fn file_uri_of(path: &Path) -> Result<Uri, PathUriError> {
                 text.push('/');
                 text.push_str(&percent_encoded(name));
             }
-            // 絶対パスに `.` / `..` は現れないが、`is_absolute` はそこまで見ない。
+            // 畳んでいないパスをそのまま URI にすると、同じファイルが 2 通りの綴りで届く。
             Component::CurDir | Component::ParentDir => {
-                return Err(PathUriError::NotAbsolute {
+                return Err(PathUriError::NotFolded {
                     path: path.to_path_buf(),
                 });
             }
@@ -128,6 +164,11 @@ pub enum PathUriError {
         /// 渡されたパス。
         path: PathBuf,
     },
+    /// `.` / `..` を畳んでいない。
+    NotFolded {
+        /// 渡されたパス。
+        path: PathBuf,
+    },
     /// `file:` URI で表せない前置き（UNC・デバイス名前空間）を持つ。
     UnsupportedPrefix {
         /// 渡されたパス。
@@ -151,6 +192,11 @@ impl fmt::Display for PathUriError {
             Self::NotAbsolute { path } => write!(
                 formatter,
                 "LSP へ渡すパスが絶対パスではありません: {}",
+                path.display()
+            ),
+            Self::NotFolded { path } => write!(
+                formatter,
+                "LSP へ渡すパスに `.` / `..` が残っています: {}",
                 path.display()
             ),
             Self::UnsupportedPrefix { path } => write!(
@@ -224,8 +270,26 @@ mod tests {
     }
 
     #[test]
+    fn test_file_uri_of_a_relative_path_reports_it() {
+        let error = file_uri_of(Path::new("src/pad.ts")).expect_err("URI にできない");
+
+        assert!(matches!(
+            error,
+            PathUriError::NotAbsolute { path } if path == Path::new("src/pad.ts")
+        ));
+    }
+
+    #[test]
+    fn test_file_uri_of_a_path_that_still_climbs_reports_it() {
+        // 畳まずに URI にすると、同じファイルが 2 通りの綴りでサーバに届く
+        let error = file_uri_of(Path::new("/home/user/src/../pad.ts")).expect_err("URI にできない");
+
+        assert!(matches!(error, PathUriError::NotFolded { .. }));
+    }
+
+    #[test]
     fn test_disk_letter_of_a_verbatim_prefix_is_the_drive_letter() {
-        // 前置きの綴りをそのまま置くと、`\\?\C:` の `\` と `?` が URI に混じる。
+        // `canonicalize` や利用者が渡す `\\?\C:` をそのまま置くと、`\` と `?` が URI に混じる。
         // Linux では `Path::components` が `Prefix` を返さないので、file_uri_of 経由では
         // この分岐に届かない。ここだけ前置きの種類を直接渡して確かめる
         assert_eq!(disk_letter_of(Prefix::VerbatimDisk(b'C')), Some(b'C'));
@@ -241,12 +305,44 @@ mod tests {
     }
 
     #[test]
-    fn test_file_uri_of_a_relative_path_reports_it() {
-        let error = file_uri_of(Path::new("src/pad.ts")).expect_err("URI にできない");
+    fn test_absolute_path_of_a_relative_path_starts_at_the_current_directory() {
+        let current = std::env::current_dir().expect("カレントディレクトリを読める");
 
-        assert!(matches!(
-            error,
-            PathUriError::NotAbsolute { path } if path == Path::new("src/pad.ts")
-        ));
+        let absolute = absolute_path_of(Path::new("src/pad.ts")).expect("絶対パスにできる");
+
+        assert_eq!(absolute, current.join("src/pad.ts"));
+    }
+
+    #[test]
+    fn test_absolute_path_of_folds_the_components_that_climb() {
+        // 畳まないと、同じファイルが `src/../src/pad.ts` と `src/pad.ts` の 2 通りになる
+        let absolute = absolute_path_of(Path::new("/home/user/src/../lib/./pad.ts"))
+            .expect("絶対パスにできる");
+
+        assert_eq!(absolute, Path::new("/home/user/lib/pad.ts"));
+    }
+
+    #[test]
+    fn test_absolute_path_of_a_path_that_climbs_past_the_root_stops_at_the_root() {
+        let absolute = absolute_path_of(Path::new("/../../pad.ts")).expect("絶対パスにできる");
+
+        assert_eq!(absolute, Path::new("/pad.ts"));
+    }
+
+    #[test]
+    fn test_absolute_path_of_a_path_that_does_not_exist_still_succeeds() {
+        // 実在を要求する（= canonicalize する）と、リンクの向こう側を指すことになり、
+        // Stage 1 が importer の位置から解決するのと食い違う
+        let absolute = absolute_path_of(Path::new("/home/user/dryguard-no-such-file.ts"))
+            .expect("絶対パスにできる");
+
+        assert_eq!(absolute, Path::new("/home/user/dryguard-no-such-file.ts"));
+    }
+
+    #[test]
+    fn test_absolute_path_of_an_empty_path_reports_it() {
+        let error = absolute_path_of(Path::new("")).expect_err("絶対パスにできない");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

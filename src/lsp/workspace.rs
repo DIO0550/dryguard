@@ -5,7 +5,6 @@
 
 use std::error::Error;
 use std::fmt;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -25,15 +24,16 @@ pub struct WorkspaceRoot {
 impl WorkspaceRoot {
     /// 開くファイル群をすべて含む、最も近い共通の祖先ディレクトリ。
     ///
-    /// `paths` は候補ペアが含まれるファイル。シンボリックリンクを辿った後で比べるので、
-    /// 別の綴りで同じファイルを指していても同じ根になる。
+    /// `paths` は候補ペアが含まれるファイル。**リンクは辿らずに**絶対パスへ直してから
+    /// 比べる（理由は [`uri::absolute_path_of`]）。開かせるドキュメントと同じ綴りに
+    /// なっていないと、根の外のファイルを開かせることになる。
     ///
     /// **Why not（`tsconfig.json` を上へ探す）**: 探索が TS 固有になり、Phase 4 の
     /// rust-analyzer に持ち越せない。tsserver は開いたファイルから自分で tsconfig を辿る。
     ///
     /// # Errors
     ///
-    /// `paths` が空のとき、辿れないパスがあるとき、共通の祖先が無いとき、
+    /// `paths` が空のとき、絶対パスにできないパスがあるとき、共通の祖先が無いとき、
     /// URI にできないとき。
     pub fn enclosing(paths: &[PathBuf]) -> Result<Self, WorkspaceError> {
         if paths.is_empty() {
@@ -43,7 +43,7 @@ impl WorkspaceRoot {
         let mut directories = Vec::with_capacity(paths.len());
         for path in paths {
             let resolved =
-                fs::canonicalize(path).map_err(|cause| WorkspaceError::PathUnresolvable {
+                uri::absolute_path_of(path).map_err(|cause| WorkspaceError::PathNotAbsolute {
                     path: path.clone(),
                     cause,
                 })?;
@@ -98,11 +98,11 @@ fn common_ancestor_of(directories: &[PathBuf]) -> Option<PathBuf> {
 pub enum WorkspaceError {
     /// 開くファイルが 1 つも無い。
     NoPaths,
-    /// パスを辿れない。
-    PathUnresolvable {
-        /// 辿れなかったパス。
+    /// パスを絶対パスにできない。
+    PathNotAbsolute {
+        /// 直せなかったパス。
         path: PathBuf,
-        /// 辿れなかった理由。
+        /// 直せなかった理由。
         cause: io::Error,
     },
     /// 共通の祖先ディレクトリが無い。
@@ -121,9 +121,11 @@ impl fmt::Display for WorkspaceError {
                 formatter,
                 "LSP に渡すワークスペースの根を決められません: 開くファイルがありません"
             ),
-            Self::PathUnresolvable { path, cause } => {
-                write!(formatter, "パスを辿れません ({}): {cause}", path.display())
-            }
+            Self::PathNotAbsolute { path, cause } => write!(
+                formatter,
+                "パスを絶対パスにできません ({}): {cause}",
+                path.display()
+            ),
             Self::NoCommonAncestor { directories } => write!(
                 formatter,
                 "共通の祖先ディレクトリがありません: {}",
@@ -142,7 +144,7 @@ impl Error for WorkspaceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::NoPaths | Self::NoCommonAncestor { .. } => None,
-            Self::PathUnresolvable { cause, .. } => Some(cause),
+            Self::PathNotAbsolute { cause, .. } => Some(cause),
             Self::Uri(cause) => Some(cause),
         }
     }
@@ -155,7 +157,8 @@ mod tests {
 
     /// 根として期待するディレクトリの URI。綴りは `uri` の担当なので、そちらで組み立てる。
     fn expected_uri_of(relative: &str) -> String {
-        let directory = fs::canonicalize(repository_path(relative)).expect("実在するディレクトリ");
+        let directory =
+            uri::absolute_path_of(&repository_path(relative)).expect("絶対パスにできる");
 
         uri::file_uri_of(&directory)
             .expect("URI にできる")
@@ -219,15 +222,28 @@ mod tests {
     }
 
     #[test]
-    fn test_enclosing_a_missing_path_reports_which_one() {
-        let missing = repository_path("src/dryguard-no-such-file.rs");
-        let paths = vec![repository_path("src/lib.rs"), missing.clone()];
+    fn test_enclosing_does_not_look_at_the_file_system() {
+        // 実在を確かめる（= リンクを辿る）と、開かせるドキュメント側の綴りとずれる
+        let paths = vec![
+            repository_path("src/lib.rs"),
+            repository_path("src/dryguard-no-such-file.rs"),
+        ];
 
-        let error = WorkspaceRoot::enclosing(&paths).expect_err("辿れない");
+        let root = WorkspaceRoot::enclosing(&paths).expect("根を決められる");
+
+        assert_eq!(root.uri().as_str(), expected_uri_of("src"));
+    }
+
+    #[test]
+    fn test_enclosing_an_empty_path_reports_which_one() {
+        let empty = PathBuf::new();
+        let paths = vec![repository_path("src/lib.rs"), empty.clone()];
+
+        let error = WorkspaceRoot::enclosing(&paths).expect_err("根を決められない");
 
         assert!(matches!(
             error,
-            WorkspaceError::PathUnresolvable { path, .. } if path == missing
+            WorkspaceError::PathNotAbsolute { path, .. } if path == empty
         ));
     }
 }

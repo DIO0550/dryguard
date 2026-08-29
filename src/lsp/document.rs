@@ -2,7 +2,6 @@
 
 use std::error::Error;
 use std::fmt;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -32,12 +31,13 @@ impl SourceDocument {
     /// 読んだファイルのパスと、その中身から組み立てる。
     ///
     /// `text` を渡してもらうのは、ファイルを読むのが `codebase` / `location` の責務のため
-    /// (rules/coding.md「I/O を持ってよい場所」)。ここが読むのはパスの解決だけで、
-    /// **サーバへ渡す URI は絶対パスでなければならない**。
+    /// (rules/coding.md「I/O を持ってよい場所」)。**サーバへ渡す URI は絶対パスでなければ
+    /// ならない**ので、ここでは渡されたパスを絶対パスに直すところまでを行う
+    /// （リンクは辿らない。理由は [`uri::absolute_path_of`]）。
     ///
     /// # Errors
     ///
-    /// パスを辿れないとき、読める拡張子でないとき、URI にできないとき。
+    /// パスを絶対パスにできないとき、読める拡張子でないとき、URI にできないとき。
     pub fn new(path: &Path, text: String) -> Result<Self, DocumentError> {
         let Some(grammar) = Grammar::of_path(path) else {
             return Err(DocumentError::UnreadableExtension {
@@ -45,10 +45,11 @@ impl SourceDocument {
             });
         };
 
-        let resolved = fs::canonicalize(path).map_err(|cause| DocumentError::PathUnresolvable {
-            path: path.to_path_buf(),
-            cause,
-        })?;
+        let resolved =
+            uri::absolute_path_of(path).map_err(|cause| DocumentError::PathNotAbsolute {
+                path: path.to_path_buf(),
+                cause,
+            })?;
 
         Ok(Self {
             uri: uri::file_uri_of(&resolved).map_err(DocumentError::Uri)?,
@@ -110,11 +111,11 @@ pub enum DocumentError {
         /// 渡されたパス。
         path: PathBuf,
     },
-    /// パスを辿れない。
-    PathUnresolvable {
-        /// 辿れなかったパス。
+    /// パスを絶対パスにできない。
+    PathNotAbsolute {
+        /// 直せなかったパス。
         path: PathBuf,
-        /// 辿れなかった理由。
+        /// 直せなかった理由。
         cause: io::Error,
     },
     /// パスを URI にできない。
@@ -129,9 +130,11 @@ impl fmt::Display for DocumentError {
                 "LSP サーバに開かせられる拡張子ではありません: {}",
                 path.display()
             ),
-            Self::PathUnresolvable { path, cause } => {
-                write!(formatter, "パスを辿れません ({}): {cause}", path.display())
-            }
+            Self::PathNotAbsolute { path, cause } => write!(
+                formatter,
+                "パスを絶対パスにできません ({}): {cause}",
+                path.display()
+            ),
             Self::Uri(cause) => write!(formatter, "{cause}"),
         }
     }
@@ -141,7 +144,7 @@ impl Error for DocumentError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::UnreadableExtension { .. } => None,
-            Self::PathUnresolvable { cause, .. } => Some(cause),
+            Self::PathNotAbsolute { cause, .. } => Some(cause),
             Self::Uri(cause) => Some(cause),
         }
     }
@@ -215,15 +218,22 @@ mod tests {
     }
 
     #[test]
-    fn test_new_from_a_missing_file_reports_which_one() {
+    fn test_new_does_not_look_at_the_file_system() {
+        // 実在を確かめる（= リンクを辿る）と、Stage 1 が importer の位置から依存先を
+        // 解決するのに対し、こちらはリンクの向こう側から見ることになる
         let missing = repository_path("tests/fixtures/billing/dryguard-no-such-file.ts");
 
-        let error = SourceDocument::new(&missing, String::new()).expect_err("辿れない");
+        let document =
+            SourceDocument::new(&missing, "export const a = 1;".to_owned()).expect("開かせられる");
 
-        assert!(matches!(
-            error,
-            DocumentError::PathUnresolvable { path, .. } if path == missing
-        ));
+        assert!(
+            document
+                .uri()
+                .as_str()
+                .ends_with("/tests/fixtures/billing/dryguard-no-such-file.ts"),
+            "渡されたパスの綴りのまま URI になる: {}",
+            document.uri().as_str()
+        );
     }
 
     #[test]
