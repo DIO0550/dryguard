@@ -56,8 +56,11 @@ pub struct Connection<R: BufRead, W: Write> {
     open_documents: BTreeSet<Uri>,
     /// 始まりの通知が届き、終わりの通知がまだ来ていない作業。
     running_progress: Vec<ProgressToken>,
-    /// これまでに「起きうる」と分かった作業の数。**減らさない。**
-    started_progress_count: usize,
+    /// サーバの作業について知らされた回数（token を用意する要求と、始まりの通知）。
+    ///
+    /// **減らさない。** 始まって終わった作業は [`Self::running_progress`] から消えるので、
+    /// 尋ねている間に何か起きたかは数でしか追えない。
+    noticed_progress_count: usize,
 }
 
 impl<R: BufRead, W: Write> Connection<R, W> {
@@ -69,7 +72,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             next_id: RequestId::first(),
             open_documents: BTreeSet::new(),
             running_progress: Vec::new(),
-            started_progress_count: 0,
+            noticed_progress_count: 0,
         }
     }
 
@@ -301,14 +304,14 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             // 見える（前の問い合わせで覚えた作業なので、数も増えない）。
             self.wait_for_running_progress()?;
 
-            let started_before = self.started_progress_count;
+            let noticed_before = self.noticed_progress_count;
             let answered = self.ask_references_once(params.clone())?;
 
             // 「今動いているか」だけでは足りない。**尋ねている間に始まって終わった作業**が
             // あると、読み込み前に計算された答えを受け取りながら、手元では何も動いて
             // いないように見える（実測: 進捗の終わりが応答より先に届き、答えは 0 件）。
-            let started_while_answering = self.started_progress_count != started_before;
-            let untouched_by_work = !started_while_answering && self.running_progress.is_empty();
+            let noticed_while_answering = self.noticed_progress_count != noticed_before;
+            let untouched_by_work = !noticed_while_answering && self.running_progress.is_empty();
             if untouched_by_work {
                 return Ok(answered);
             }
@@ -471,10 +474,10 @@ impl<R: BufRead, W: Write> Connection<R, W> {
 
         self.send(&message::null_result_payload_of(id))?;
 
-        // 数だけはここで進める。**作業が起きうると分かるのはこの時点**で、尋ねている間に
+        // 数はここでも進める。**作業が起きうると分かるのはこの時点**で、尋ねている間に
         // ここを通ったかどうかが、答えを信用してよいかの判断材料になる
         // （`running_progress` は始まって終わると空に戻り、痕跡が残らない）。
-        self.started_progress_count = self.started_progress_count.saturating_add(1);
+        self.noticed_progress_count = self.noticed_progress_count.saturating_add(1);
 
         Ok(())
     }
@@ -501,7 +504,13 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         let ProgressParamsValue::WorkDone(work) = progress.value;
 
         match work {
-            WorkDoneProgress::Begin(_) => self.running_progress.push(progress.token),
+            // **始まりでも数を進める。** token を用意するのが前の問い合わせの最中で、
+            // 始まりと終わりだけが次の問い合わせの最中に届く並びがある。用意した時点しか
+            // 数えないと、その並びで「何も起きなかった」ように見える。
+            WorkDoneProgress::Begin(_) => {
+                self.noticed_progress_count = self.noticed_progress_count.saturating_add(1);
+                self.running_progress.push(progress.token);
+            }
             WorkDoneProgress::End(_) => self
                 .running_progress
                 .retain(|token| *token != progress.token),
@@ -1297,6 +1306,35 @@ mod tests {
         assert!(
             matches!(outcome, ReferencesOutcome::ServerStillWorking),
             "落ち着かなかったことを名前で返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_answered_while_work_prepared_earlier_ran_asks_again() {
+        // token を用意するのは前の問い合わせ（hover）の最中で、**始まりと終わりだけが
+        // 参照元を尋ねている間に届く**。用意した時点しか数えていないと、この並びで
+        // 「何も起きなかった」ように見え、読み込み中の答えをそのまま採る
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            &hover_response("function applyDiscount(invoice: Invoice): number"),
+            &progress_begin_notification("loading"),
+            &progress_end_notification("loading"),
+            &no_references_response(2),
+            &references_response(3, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+        connection
+            .hover(&document, position_after(5, "export function "))
+            .expect("hover に答えが返る");
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "前の問い合わせで用意された作業が動いたなら尋ね直す: {outcome:?}"
         );
     }
 
