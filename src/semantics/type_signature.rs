@@ -8,6 +8,7 @@
 //! (`rules/tdd.md`「`lsp` は『応答を受け取ってから先』を切り出す」)。
 
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 
 /// 付け替えた型変数の綴りの前置き。
 ///
@@ -26,11 +27,6 @@ const DEFAULT_MARKER: &str = " = ";
 /// 呼び出し時に渡さない引数（TypeScript の `this` 引数）の名前。
 const RECEIVER_PARAMETER: &str = "this";
 
-/// `this` 引数に付ける印。
-///
-/// `this:` で始まる型は書けないので、**本物の型と衝突しない**。
-const RECEIVER_MARKER: &str = "this:";
-
 /// 構築シグネチャの宣言形を導く語（`constructor Result(value: string): Result`）。
 const CONSTRUCTOR_KEYWORD: &str = "constructor";
 
@@ -47,8 +43,8 @@ pub struct TypeSignature {
     kind: SignatureKind,
     /// 型変数。付け替え後の並び。
     type_parameters: Vec<TypeParameter>,
-    /// 引数の型。名前を落とし、`?` と `...` は型の一部として残す。
-    parameters: Vec<String>,
+    /// 引数。名前を落とし、渡し方と型だけが残る。
+    parameters: Vec<Parameter>,
     /// 戻り値の型。
     return_type: String,
 }
@@ -65,35 +61,35 @@ impl TypeSignature {
     /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
     pub fn from_signature_text(text: &str) -> Option<Self> {
         let flattened = flattened(text);
-        let (prefix, parameter_list, after_parameters) = parameter_list_of(&flattened)?;
-        let return_type = normalized_type(return_type_of(after_parameters)?)?;
-        let parameters = parameter_types_of(parameter_list)?;
-        let declared = declared_type_parameters_of(prefix);
+        let split = SplitSignature::from_signature_text(&flattened)?;
 
-        let ordered = ordered_names_of(
+        let return_type = normalized_type(split.return_type()?)?;
+        let parameters = split.parameters()?;
+        let declared = split.declared_type_parameters();
+
+        let placeholders = Placeholders::of(
             &declared,
             parameters
                 .iter()
-                .chain(std::iter::once(&return_type))
-                .map(String::as_str),
+                .map(Parameter::annotated_type)
+                .chain(std::iter::once(return_type.as_str())),
         );
-        let placeholders = placeholders_of(&ordered);
 
         Some(Self {
-            kind: signature_kind_of(prefix),
-            type_parameters: type_parameters_of(&declared, &ordered, &placeholders),
+            kind: split.kind(),
+            type_parameters: placeholders.type_parameters(&declared),
             parameters: parameters
                 .iter()
-                .map(|parameter| renamed(parameter, &placeholders))
+                .map(|parameter| parameter.renamed(&placeholders))
                 .collect(),
-            return_type: renamed(&return_type, &placeholders),
+            return_type: placeholders.renamed(&return_type),
         })
     }
 
     /// 2 つの型シグネチャが同じ型構造に重なるか。
     ///
     /// 引数名と型変数名の違いは正規化の時点で消えているので、ここでは形が同じかを見る。
-    /// 呼び出しの仕方・引数の数・省略可・可変長・制約・型変数の既定の型が違えば重ならない。
+    /// 呼び出しの仕方・引数の渡し方と型・制約・型変数の既定の型が違えば重ならない。
     pub fn is_unifiable_with(&self, other: &Self) -> bool {
         self == other
     }
@@ -113,23 +109,127 @@ enum SignatureKind {
     Construct,
 }
 
-/// 引数リストの手前の綴りから、呼び出しの仕方を読む。
-///
-/// hover は構築シグネチャを、宣言形なら `constructor Result(value: string): Result`、
-/// 値形なら `new (value: string) => Result` と返す（実測）。
-///
-/// **Why（接頭辞を見てよい理由）**: ここで見分けたいのは「`new` が要るか」の 2 択で、
-/// 綴りはこの 2 つで尽きる。`(method)` / `(property)` のように**この先増える一覧では
-/// ない**ので、`parameter_list_of` が接頭辞を列挙しない判断とは別の話になる。
-fn signature_kind_of(prefix: &str) -> SignatureKind {
-    let prefix = prefix.trim();
-    let declared = prefix.split_whitespace().next() == Some(CONSTRUCTOR_KEYWORD);
-    let annotated = prefix.split_whitespace().next_back() == Some(NEW_KEYWORD);
+impl SignatureKind {
+    /// 引数リストの手前の綴りから読む。
+    ///
+    /// hover は構築シグネチャを、宣言形なら `constructor Result(value: string): Result`、
+    /// 値形なら `new (value: string) => Result` と返す（実測）。
+    ///
+    /// **Why（接頭辞を見てよい理由）**: ここで見分けたいのは「`new` が要るか」の 2 択で、
+    /// 綴りはこの 2 つで尽きる。`(method)` / `(property)` のように**この先増える一覧では
+    /// ない**ので、[`SplitSignature`] が接頭辞を列挙しない判断とは別の話になる。
+    fn from_prefix(prefix: &str) -> Self {
+        let prefix = prefix.trim();
+        let declared = prefix.split_whitespace().next() == Some(CONSTRUCTOR_KEYWORD);
+        let annotated = prefix.split_whitespace().next_back() == Some(NEW_KEYWORD);
 
-    if declared || annotated {
-        return SignatureKind::Construct;
+        if declared || annotated {
+            return Self::Construct;
+        }
+        Self::Call
     }
-    SignatureKind::Call
+}
+
+/// 引数 1 つ分。名前を落とし、**渡し方と型だけ**を残した形。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Parameter {
+    kind: ParameterKind,
+    annotated_type: String,
+}
+
+impl Parameter {
+    /// 引数リストの中の 1 つ分から読む。型注釈が無ければ `None`。
+    fn from_text(parameter: &str) -> Option<Self> {
+        let parameter = parameter.trim();
+        let (rest, named) = match parameter.strip_prefix(ParameterKind::REST_MARKER) {
+            Some(named) => (true, named),
+            None => (false, parameter),
+        };
+
+        // 分割は深さ 0 の `:` で行う。分割代入の引数（`{ a: b }: Shape`）は
+        // 名前の側にも `:` を持つ。
+        let separator = SignatureScan::new(named).top_level_index_of(':')?;
+        let name = named.get(..separator)?.trim_end();
+        let annotated = named.get(separator + 1..)?.trim();
+
+        if annotated.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            kind: ParameterKind::of(name, rest),
+            annotated_type: normalized_type(annotated)?,
+        })
+    }
+
+    /// この引数の型。
+    fn annotated_type(&self) -> &str {
+        &self.annotated_type
+    }
+
+    /// 型変数を付け替えた引数。**渡し方は付け替えの対象にしない。**
+    fn renamed(&self, placeholders: &Placeholders) -> Self {
+        Self {
+            kind: self.kind,
+            annotated_type: placeholders.renamed(&self.annotated_type),
+        }
+    }
+}
+
+impl fmt::Display for Parameter {
+    /// 型 1 つ分の綴りとして書き出す。入れ子の関数型を組み立て直すのに使う。
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}{}", self.kind.marker(), self.annotated_type)
+    }
+}
+
+/// その引数の渡し方。
+///
+/// **落とすと渡し方の違う引数が同じ形になる。** `a: string` は必ず渡す引数、
+/// `a?: string` は省ける引数、`this: E` は呼び出し時に渡さない引数で、
+/// 受け取る値の数がそれぞれ違う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParameterKind {
+    /// 必ず渡す。
+    Required,
+    /// 省略できる（`a?: T`）。
+    Optional,
+    /// 可変長（`...a: T[]`）。
+    Rest,
+    /// 呼び出し時に渡さない（`this: T`）。TypeScript が受け取り手の型を書く場所。
+    Receiver,
+}
+
+impl ParameterKind {
+    /// 可変長を表す綴り。
+    const REST_MARKER: &'static str = "...";
+
+    /// 名前の綴りと、可変長かどうかから決める。
+    ///
+    /// `name` は `:` の手前（`a` / `a?` / `this` / `{ a, b }`）。
+    fn of(name: &str, rest: bool) -> Self {
+        if rest {
+            return Self::Rest;
+        }
+        if name == RECEIVER_PARAMETER {
+            return Self::Receiver;
+        }
+        if name.ends_with('?') {
+            return Self::Optional;
+        }
+        Self::Required
+    }
+
+    /// 型の綴りに前置きする印。入れ子の関数型を書き出すときに使う。
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Required => "",
+            Self::Optional => "?",
+            Self::Rest => Self::REST_MARKER,
+            // `this:` で始まる型は書けないので、本物の型と衝突しない。
+            Self::Receiver => "this:",
+        }
+    }
 }
 
 /// 空白の連なりを 1 つに畳んだ綴り。**引用符の中は畳まない。**
@@ -169,7 +269,7 @@ fn flattened(text: &str) -> String {
 
 /// 引用符の中にいるかどうかを、文字を 1 つずつ読みながら追う。
 ///
-/// 畳む側（[`flattened`]）と深さを数える側（[`scanned`]）が同じ判断を要るので、
+/// 畳む側（[`flattened`]）と深さを数える側（[`SignatureScan`]）が同じ判断を要るので、
 /// **どちらにも同じ状態を持たせない**ために切り出してある。
 struct QuoteState {
     open: Option<char>,
@@ -208,119 +308,212 @@ impl QuoteState {
     }
 }
 
-/// 引数リストの括弧組を見つけ、その手前・中身・後ろに分ける。
+/// 綴りの中の 1 文字と、**その文字の外側**の深さ。
 ///
-/// 引数リストとみなすのは、**閉じ括弧の後ろが `:` か `=>` になる最初の括弧組**。
-///
-/// **Why not（`(method)` などの接頭辞を列挙して剥がす）**: hover の接頭辞は
-/// `(method)` / `(property)` / `(local function)` / `function` / `const` と
-/// サーバごとに増える。列挙から漏れた 1 つが、黙って比較を壊す。
-fn parameter_list_of(text: &str) -> Option<(&str, &str, &str)> {
-    let scanned = scanned(text);
+/// 開き括弧とそれに対応する閉じ括弧が同じ深さになる。
+struct ScannedCharacter {
+    index: usize,
+    character: char,
+    depth: usize,
+}
 
-    for (position, &(index, character, depth)) in scanned.iter().enumerate() {
-        if character != '(' || depth != 0 {
-            continue;
+/// 綴りを 1 文字ずつ、括弧の深さを添えて見たもの。
+///
+/// 引用符の中の文字は含めない。**文字列リテラル型 `"a, b"` の中の区切りを、
+/// 型の区切りと取り違えないため。**
+///
+/// `=>` の `>` は閉じ括弧として数えない。型の中には `(cb: () => void, b: string)` の
+/// ように矢印が現れ、これを数えると以降の深さがずれる。
+struct SignatureScan<'text> {
+    text: &'text str,
+    characters: Vec<ScannedCharacter>,
+}
+
+impl<'text> SignatureScan<'text> {
+    fn new(text: &'text str) -> Self {
+        let mut characters = Vec::new();
+        let mut depth: usize = 0;
+        let mut quote = QuoteState::new();
+        let mut previous = ' ';
+
+        for (index, character) in text.char_indices() {
+            if quote.is_inside(character) {
+                previous = character;
+                continue;
+            }
+
+            let closes =
+                matches!(character, ')' | ']' | '}') || (character == '>' && previous != '=');
+            if closes {
+                depth = depth.saturating_sub(1);
+            }
+
+            characters.push(ScannedCharacter {
+                index,
+                character,
+                depth,
+            });
+
+            if matches!(character, '(' | '[' | '{' | '<') {
+                depth += 1;
+            }
+            previous = character;
         }
 
-        let Some(close) = closing_index_of(&scanned[position..], depth) else {
-            continue;
+        Self { text, characters }
+    }
+
+    /// 深さ 0 にある `separator` で切り分ける。括弧・引用符の中の区切りは無視する。
+    fn top_level_parts(&self, separator: char) -> Vec<&'text str> {
+        let mut parts = Vec::new();
+        let mut start = 0;
+
+        for scanned in &self.characters {
+            if scanned.character != separator || scanned.depth != 0 {
+                continue;
+            }
+            parts.push(&self.text[start..scanned.index]);
+            start = scanned.index + separator.len_utf8();
+        }
+        parts.push(&self.text[start..]);
+
+        parts
+    }
+
+    /// 深さ 0 にある最初の `separator` の位置。無ければ `None`。
+    fn top_level_index_of(&self, separator: char) -> Option<usize> {
+        self.characters
+            .iter()
+            .find(|scanned| scanned.character == separator && scanned.depth == 0)
+            .map(|scanned| scanned.index)
+    }
+
+    /// 深さ 0 にある最後の `target` の位置。無ければ `None`。
+    fn last_top_level_index_of(&self, target: char) -> Option<usize> {
+        self.characters
+            .iter()
+            .rfind(|scanned| scanned.character == target && scanned.depth == 0)
+            .map(|scanned| scanned.index)
+    }
+
+    /// `position` 番目の開き括弧に対応する、閉じ括弧の位置。
+    ///
+    /// 同じ深さに戻った最初の閉じ括弧が対応する相手になる。
+    fn closing_index_after(&self, position: usize, depth: usize) -> Option<usize> {
+        self.characters
+            .get(position + 1..)?
+            .iter()
+            .find(|scanned| scanned.character == ')' && scanned.depth == depth)
+            .map(|scanned| scanned.index)
+    }
+}
+
+/// 綴りを引数リストの括弧組で 3 つに割った形。
+///
+/// **割った先で読むものが違う。** 手前には型変数の宣言と呼び出しの仕方、
+/// 中には引数、後ろには戻り値の型がある。
+struct SplitSignature<'text> {
+    /// 括弧組の手前。
+    prefix: &'text str,
+    /// 括弧組の中身。
+    parameter_list: &'text str,
+    /// 括弧組の後ろ。
+    after_parameters: &'text str,
+}
+
+impl<'text> SplitSignature<'text> {
+    /// 引数リストの括弧組を見つけて割る。見つからなければ `None`。
+    ///
+    /// 引数リストとみなすのは、**閉じ括弧の後ろが `:` か `=>` になる最初の括弧組**。
+    ///
+    /// **Why not（`(method)` などの接頭辞を列挙して剥がす）**: hover の接頭辞は
+    /// `(method)` / `(property)` / `(local function)` / `function` / `const` と
+    /// サーバごとに増える。列挙から漏れた 1 つが、黙って比較を壊す。
+    fn from_signature_text(text: &'text str) -> Option<Self> {
+        let scan = SignatureScan::new(text);
+
+        for (position, scanned) in scan.characters.iter().enumerate() {
+            if scanned.character != '(' || scanned.depth != 0 {
+                continue;
+            }
+
+            let Some(close) = scan.closing_index_after(position, scanned.depth) else {
+                continue;
+            };
+            let after_parameters = text.get(close + 1..)?;
+            let follows = after_parameters.trim_start();
+
+            if follows.starts_with(':') || follows.starts_with("=>") {
+                return Some(Self {
+                    prefix: text.get(..scanned.index)?,
+                    parameter_list: text.get(scanned.index + 1..close)?,
+                    after_parameters,
+                });
+            }
+        }
+
+        None
+    }
+
+    /// 呼び出しの仕方。
+    fn kind(&self) -> SignatureKind {
+        SignatureKind::from_prefix(self.prefix)
+    }
+
+    /// 引数リストの後ろに書かれた戻り値の型。読み取れなければ `None`。
+    ///
+    /// 宣言形は `): number`、値形は `) => number` と区切りが違う。**どちらの区切りだったかは
+    /// 持たない。** 同じ型を指す 2 通りの書かれ方で、比較でも出力でも分岐しないため
+    /// (`rules/coding.md`「まだ動かない選択肢を enum に並べない」)。
+    fn return_type(&self) -> Option<&'text str> {
+        let follows = self.after_parameters.trim_start();
+        let annotated = follows
+            .strip_prefix("=>")
+            .or_else(|| follows.strip_prefix(':'))?;
+        let return_type = annotated.trim();
+
+        if return_type.is_empty() {
+            return None;
+        }
+        Some(return_type)
+    }
+
+    /// 引数の並び。1 つも無ければ空。1 つでも読み取れない引数があれば `None`。
+    fn parameters(&self) -> Option<Vec<Parameter>> {
+        if self.parameter_list.trim().is_empty() {
+            return Some(Vec::new());
+        }
+
+        SignatureScan::new(self.parameter_list)
+            .top_level_parts(',')
+            .into_iter()
+            .map(Parameter::from_text)
+            .collect()
+    }
+
+    /// 引数リストの手前に書かれた型変数の宣言。宣言が無ければ空。
+    fn declared_type_parameters(&self) -> Vec<DeclaredTypeParameter> {
+        let prefix = self.prefix.trim_end();
+        if !prefix.ends_with('>') {
+            return Vec::new();
+        }
+
+        // 深さ 0 にある最後の `<` が、末尾の `>` の相手。`Map<string, X>` のような
+        // 入れ子は深さで外れ、`Foo<A>.bar<T>` のように 2 組並んでも後ろが選ばれる。
+        let Some(open) = SignatureScan::new(prefix).last_top_level_index_of('<') else {
+            return Vec::new();
         };
-        let after_parameters = text.get(close + 1..)?;
-        let follows = after_parameters.trim_start();
 
-        if follows.starts_with(':') || follows.starts_with("=>") {
-            return Some((
-                text.get(..index)?,
-                text.get(index + 1..close)?,
-                after_parameters,
-            ));
-        }
+        let Some(declarations) = prefix.get(open + 1..prefix.len() - '>'.len_utf8()) else {
+            return Vec::new();
+        };
+
+        SignatureScan::new(declarations)
+            .top_level_parts(',')
+            .into_iter()
+            .filter_map(DeclaredTypeParameter::from_text)
+            .collect()
     }
-
-    None
-}
-
-/// 先頭の開き括弧に対応する閉じ括弧の位置。
-///
-/// `scanned` は開き括弧から始まる並び、`depth` はその括弧の外側の深さ。
-/// 同じ深さに戻った最初の閉じ括弧が対応する相手になる。
-fn closing_index_of(scanned: &[(usize, char, usize)], depth: usize) -> Option<usize> {
-    scanned
-        .iter()
-        .skip(1)
-        .find(|(_, character, at)| *character == ')' && *at == depth)
-        .map(|(index, _, _)| *index)
-}
-
-/// 引数リストの後ろに書かれた戻り値の型。読み取れなければ `None`。
-///
-/// 宣言形は `): number`、値形は `) => number` と区切りが違う。
-fn return_type_of(after_parameters: &str) -> Option<&str> {
-    let follows = after_parameters.trim_start();
-    let annotated = follows
-        .strip_prefix("=>")
-        .or_else(|| follows.strip_prefix(':'))?;
-    let return_type = annotated.trim();
-
-    if return_type.is_empty() {
-        return None;
-    }
-    Some(return_type)
-}
-
-/// 引数リストから、名前を落とした型の並びを取り出す。
-///
-/// 引数が 1 つも無ければ空の並び。1 つでも読み取れない引数があれば `None`。
-fn parameter_types_of(parameter_list: &str) -> Option<Vec<String>> {
-    if parameter_list.trim().is_empty() {
-        return Some(Vec::new());
-    }
-
-    top_level_parts_of(parameter_list, ',')
-        .into_iter()
-        .map(parameter_type_of)
-        .collect()
-}
-
-/// 引数 1 つ分から名前を落として型だけにする。型注釈が無ければ `None`。
-///
-/// 省略可（`?`）と可変長（`...`）は型の一部として残す。**落とすと `a: string` と
-/// `a?: string` が同じ形になる**が、前者は必ず渡す引数で後者は省ける。
-///
-/// `this` 引数だけは名前も残す。**呼び出し時に渡さない引数**なので、落とすと
-/// `f(this: E, a: string)` と `g(ctx: E, a: string)` が同じ形になるが、
-/// 前者が受け取る値は 1 つで後者は 2 つ。
-///
-/// ただし引数の数からは外していないので、`f(this: E, a: string)` と `g(a: string)` は
-/// 単一化不能に倒れる（呼び出し側から見た形は同じ）。**取りこぼす側の誤り**として残してある。
-fn parameter_type_of(parameter: &str) -> Option<String> {
-    let parameter = parameter.trim();
-    let (rest_marker, named) = match parameter.strip_prefix("...") {
-        Some(named) => ("...", named),
-        None => ("", parameter),
-    };
-
-    // 分割は深さ 0 の `:` で行う。分割代入の引数（`{ a: b }: Shape`）は
-    // 名前の側にも `:` を持つ。
-    let separator = top_level_index_of(named, ':')?;
-    let name = named.get(..separator)?.trim_end();
-    let optional_marker = if name.ends_with('?') { "?" } else { "" };
-    let receiver_marker = if name == RECEIVER_PARAMETER {
-        RECEIVER_MARKER
-    } else {
-        ""
-    };
-    let annotated = named.get(separator + 1..)?.trim();
-
-    if annotated.is_empty() {
-        return None;
-    }
-    let annotated = normalized_type(annotated)?;
-
-    Some(format!(
-        "{receiver_marker}{rest_marker}{optional_marker}{annotated}"
-    ))
 }
 
 /// 型 1 つ分を、名前の入らない形へ直す。読み取れない関数型では `None`。
@@ -329,67 +522,25 @@ fn parameter_type_of(parameter: &str) -> Option<String> {
 /// **落とさないと `cb: (a: string) => void` と `cb: (b: string) => void` が別物になる。**
 /// コールバックを取る関数はどこにでもあるので、名前の違いがそのまま偽陰性になる。
 ///
-/// 総称型の中に置かれた関数型（`Array<(a: string) => void>`）までは踏み込まない。
+/// 総称型や括弧に包まれた関数型（`Array<(a: string) => void>`）までは踏み込まない。
 /// そこまで見るには型そのものの構文解析が要る。
 fn normalized_type(text: &str) -> Option<String> {
-    let Some((prefix, parameter_list, after_parameters)) = parameter_list_of(text) else {
+    let Some(split) = SplitSignature::from_signature_text(text) else {
         return Some(text.to_owned());
     };
 
-    let return_type = normalized_type(return_type_of(after_parameters)?)?;
-    let parameters = parameter_types_of(parameter_list)?;
+    let return_type = normalized_type(split.return_type()?)?;
+    let parameters: Vec<String> = split
+        .parameters()?
+        .iter()
+        .map(Parameter::to_string)
+        .collect();
 
     Some(format!(
-        "{prefix}({}) => {return_type}",
+        "{}({}) => {return_type}",
+        split.prefix,
         parameters.join(", ")
     ))
-}
-
-/// 引数リストの手前に書かれた型変数の宣言。宣言が無ければ空。
-fn declared_type_parameters_of(prefix: &str) -> Vec<DeclaredTypeParameter> {
-    let prefix = prefix.trim_end();
-    if !prefix.ends_with('>') {
-        return Vec::new();
-    }
-
-    // 深さ 0 にある最後の `<` が、末尾の `>` の相手。`Map<string, X>` のような
-    // 入れ子は深さで外れ、`Foo<A>.bar<T>` のように 2 組並んでも後ろが選ばれる。
-    let Some(open) = scanned(prefix)
-        .into_iter()
-        .rfind(|(_, character, depth)| *character == '<' && *depth == 0)
-    else {
-        return Vec::new();
-    };
-
-    let Some(declarations) = prefix.get(open.0 + 1..prefix.len() - '>'.len_utf8()) else {
-        return Vec::new();
-    };
-
-    top_level_parts_of(declarations, ',')
-        .into_iter()
-        .filter_map(declared_type_parameter_of)
-        .collect()
-}
-
-/// 型変数 1 つ分の宣言から、名前・制約・既定の型を取り出す。名前が無ければ `None`。
-///
-/// 既定の型を先に切り離す。`T extends X = D` は制約と既定の両方を持ち、
-/// 切り離さないと制約が `X = D` になる。
-fn declared_type_parameter_of(declaration: &str) -> Option<DeclaredTypeParameter> {
-    let declaration = declaration.trim();
-    let (bounded, default) = match declaration.split_once(DEFAULT_MARKER) {
-        Some((bounded, default)) => (bounded, Some(default.trim().to_owned())),
-        None => (declaration, None),
-    };
-    let name = bounded.split_whitespace().next()?;
-
-    Some(DeclaredTypeParameter {
-        name: name.to_owned(),
-        constraint: bounded
-            .split_once(CONSTRAINT_KEYWORD)
-            .map(|(_, constraint)| constraint.trim().to_owned()),
-        default,
-    })
 }
 
 /// 綴りに書かれたままの型変数の宣言。
@@ -400,6 +551,29 @@ struct DeclaredTypeParameter {
     name: String,
     constraint: Option<String>,
     default: Option<String>,
+}
+
+impl DeclaredTypeParameter {
+    /// 型変数 1 つ分の宣言から、名前・制約・既定の型を読む。名前が無ければ `None`。
+    ///
+    /// 既定の型を先に切り離す。`T extends X = D` は制約と既定の両方を持ち、
+    /// 切り離さないと制約が `X = D` になる。
+    fn from_text(declaration: &str) -> Option<Self> {
+        let declaration = declaration.trim();
+        let (bounded, default) = match declaration.split_once(DEFAULT_MARKER) {
+            Some((bounded, default)) => (bounded, Some(default.trim().to_owned())),
+            None => (declaration, None),
+        };
+        let name = bounded.split_whitespace().next()?;
+
+        Some(Self {
+            name: name.to_owned(),
+            constraint: bounded
+                .split_once(CONSTRAINT_KEYWORD)
+                .map(|(_, constraint)| constraint.trim().to_owned()),
+            default,
+        })
+    }
 }
 
 /// 付け替えを終えた型変数 1 つ分。名前は付け替えで消えているので持たない。
@@ -413,105 +587,110 @@ struct TypeParameter {
     default: Option<String>,
 }
 
-/// 型変数の名前を、引数と戻り値に現れる順に並べる。
+/// 型変数の名前を、出現順の綴り（`%0`, `%1`, …）へ付け替える対応。
 ///
-/// `occurrences` は引数の型と戻り値の型を、綴りに書かれた順に並べたもの。
-/// 一度も現れない型変数は宣言の順で後ろに置く。
-///
-/// **Why（宣言順ではなく出現順）**: `f<T, U>(a: U, b: T)` と `g<A, B>(a: A, b: B)` は
-/// どちらも「異なる 2 つの型を取る」形で単一化できる。宣言順で付け替えると、
-/// 前者が `(%1, %0)`、後者が `(%0, %1)` になって別物になる。
-fn ordered_names_of<'a>(
-    declared: &[DeclaredTypeParameter],
-    occurrences: impl Iterator<Item = &'a str>,
-) -> Vec<String> {
-    let declared_names: BTreeSet<&str> = declared
-        .iter()
-        .map(|declaration| declaration.name.as_str())
-        .collect();
-    let mut ordered: Vec<String> = Vec::new();
+/// **並びと対応を 1 つの型で持つ。** 型変数の宣言を並べ直すのにも、型の綴りを
+/// 書き換えるのにも同じ並びが要るので、別々に持ち回すと片方だけが古くなる。
+struct Placeholders {
+    /// 付け替え後の並び。`ordered[0]` が `%0` になった型変数の元の名前。
+    ordered: Vec<String>,
+    by_name: HashMap<String, String>,
+}
 
-    for occurrence in occurrences {
-        for identifier in identifiers_of(occurrence) {
-            let already_ordered = ordered.iter().any(|name| name == identifier);
-            if !declared_names.contains(identifier) || already_ordered {
+impl Placeholders {
+    /// 引数と戻り値に現れる順で付け替えを決める。
+    ///
+    /// `occurrences` は引数の型と戻り値の型を、綴りに書かれた順に並べたもの。
+    /// 一度も現れない型変数は宣言の順で後ろに置く。
+    ///
+    /// **Why（宣言順ではなく出現順）**: `f<T, U>(a: U, b: T)` と `g<A, B>(a: A, b: B)` は
+    /// どちらも「異なる 2 つの型を取る」形で単一化できる。宣言順で付け替えると、
+    /// 前者が `(%1, %0)`、後者が `(%0, %1)` になって別物になる。
+    fn of<'a>(
+        declared: &[DeclaredTypeParameter],
+        occurrences: impl Iterator<Item = &'a str>,
+    ) -> Self {
+        let declared_names: BTreeSet<&str> = declared
+            .iter()
+            .map(|declaration| declaration.name.as_str())
+            .collect();
+        let mut ordered: Vec<String> = Vec::new();
+
+        for occurrence in occurrences {
+            for identifier in identifiers_of(occurrence) {
+                let already_ordered = ordered.iter().any(|name| name == identifier);
+                if !declared_names.contains(identifier) || already_ordered {
+                    continue;
+                }
+                ordered.push(identifier.to_owned());
+            }
+        }
+
+        for declaration in declared {
+            if ordered.contains(&declaration.name) {
                 continue;
             }
-            ordered.push(identifier.to_owned());
+            ordered.push(declaration.name.clone());
         }
+
+        let by_name = ordered
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.clone(), format!("{PLACEHOLDER_PREFIX}{index}")))
+            .collect();
+
+        Self { ordered, by_name }
     }
 
-    for declaration in declared {
-        if ordered.contains(&declaration.name) {
-            continue;
-        }
-        ordered.push(declaration.name.clone());
+    /// 型変数を、付け替え後の並びで返す。
+    ///
+    /// 制約と既定の型も付け替えの対象にする。`<T, U extends T>` のように、
+    /// どちらも別の型変数を指すことがある。
+    fn type_parameters(&self, declared: &[DeclaredTypeParameter]) -> Vec<TypeParameter> {
+        self.ordered
+            .iter()
+            .map(|name| {
+                let declaration = declared
+                    .iter()
+                    .find(|declaration| declaration.name == *name);
+                let renamed_part = |part: Option<&String>| part.map(|text| self.renamed(text));
+
+                TypeParameter {
+                    constraint: renamed_part(declaration.and_then(|it| it.constraint.as_ref())),
+                    default: renamed_part(declaration.and_then(|it| it.default.as_ref())),
+                }
+            })
+            .collect()
     }
 
-    ordered
-}
+    /// 型変数の名前を、付け替え後の綴りに置き換えた文字列。
+    ///
+    /// 識別子の単位で置き換える。部分一致で置き換えると `T` が `Tree` の中まで書き換える。
+    fn renamed(&self, text: &str) -> String {
+        let mut renamed = String::new();
+        let mut identifier = String::new();
 
-/// 型変数の名前から、付け替え後の綴りへの対応。
-fn placeholders_of(ordered: &[String]) -> HashMap<String, String> {
-    ordered
-        .iter()
-        .enumerate()
-        .map(|(index, name)| (name.clone(), format!("{PLACEHOLDER_PREFIX}{index}")))
-        .collect()
-}
-
-/// 型変数を、付け替え後の並びで返す。
-///
-/// 制約と既定の型も付け替えの対象にする。`<T, U extends T>` のように、
-/// どちらも別の型変数を指すことがある。
-fn type_parameters_of(
-    declared: &[DeclaredTypeParameter],
-    ordered: &[String],
-    placeholders: &HashMap<String, String>,
-) -> Vec<TypeParameter> {
-    ordered
-        .iter()
-        .map(|name| {
-            let declaration = declared
-                .iter()
-                .find(|declaration| declaration.name == *name);
-            let renamed_part = |part: Option<&String>| part.map(|text| renamed(text, placeholders));
-
-            TypeParameter {
-                constraint: renamed_part(declaration.and_then(|it| it.constraint.as_ref())),
-                default: renamed_part(declaration.and_then(|it| it.default.as_ref())),
+        for character in text.chars() {
+            if is_identifier_character(character) {
+                identifier.push(character);
+                continue;
             }
-        })
-        .collect()
-}
 
-/// 型変数の名前を、付け替え後の綴りに置き換えた文字列。
-///
-/// 識別子の単位で置き換える。部分一致で置き換えると `T` が `Tree` の中まで書き換える。
-fn renamed(text: &str, placeholders: &HashMap<String, String>) -> String {
-    let mut renamed = String::new();
-    let mut identifier = String::new();
-
-    for character in text.chars() {
-        if is_identifier_character(character) {
-            identifier.push(character);
-            continue;
+            self.push_renamed(&mut renamed, &identifier);
+            identifier.clear();
+            renamed.push(character);
         }
+        self.push_renamed(&mut renamed, &identifier);
 
-        push_renamed(&mut renamed, &identifier, placeholders);
-        identifier.clear();
-        renamed.push(character);
+        renamed
     }
-    push_renamed(&mut renamed, &identifier, placeholders);
 
-    renamed
-}
-
-/// 識別子 1 つ分を、付け替え後の綴り（対応が無ければそのまま）で書き足す。
-fn push_renamed(target: &mut String, identifier: &str, placeholders: &HashMap<String, String>) {
-    match placeholders.get(identifier) {
-        Some(placeholder) => target.push_str(placeholder),
-        None => target.push_str(identifier),
+    /// 識別子 1 つ分を、付け替え後の綴り（対応が無ければそのまま）で書き足す。
+    fn push_renamed(&self, target: &mut String, identifier: &str) {
+        match self.by_name.get(identifier) {
+            Some(placeholder) => target.push_str(placeholder),
+            None => target.push_str(identifier),
+        }
     }
 }
 
@@ -525,68 +704,6 @@ fn identifiers_of(text: &str) -> Vec<&str> {
 /// 識別子を作る文字か。TypeScript の識別子には `_` と `$` も入る。
 fn is_identifier_character(character: char) -> bool {
     character.is_alphanumeric() || character == '_' || character == '$'
-}
-
-/// 深さ 0 にある `separator` で切り分ける。括弧・引用符の中にある区切りは無視する。
-fn top_level_parts_of(text: &str, separator: char) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-
-    for (index, character, depth) in scanned(text) {
-        if character != separator || depth != 0 {
-            continue;
-        }
-        parts.push(&text[start..index]);
-        start = index + character.len_utf8();
-    }
-    parts.push(&text[start..]);
-
-    parts
-}
-
-/// 深さ 0 にある最初の `separator` の位置。無ければ `None`。
-fn top_level_index_of(text: &str, separator: char) -> Option<usize> {
-    scanned(text)
-        .into_iter()
-        .find(|(_, character, depth)| *character == separator && *depth == 0)
-        .map(|(index, _, _)| index)
-}
-
-/// 文字を、その位置・文字そのもの・**その文字の外側の深さ**の組で返す。
-///
-/// 開き括弧と、それに対応する閉じ括弧は同じ深さになる。引用符の中は括弧を数えない
-/// （文字列リテラル型 `"a, b"` の中の区切りを、型の区切りと取り違えないため）。
-///
-/// `=>` の `>` は閉じ括弧として数えない。型の中には `(cb: () => void, b: string)` の
-/// ように矢印が現れ、これを数えると以降の深さがずれる。
-fn scanned(text: &str) -> Vec<(usize, char, usize)> {
-    let mut scanned = Vec::new();
-    let mut depth: usize = 0;
-    let mut quote = QuoteState::new();
-    let mut previous = ' ';
-
-    for (index, character) in text.char_indices() {
-        // 引用符の中は数えない。文字列リテラル型 `"a, b"` の中の区切りを、
-        // 型の区切りと取り違えないため。
-        if quote.is_inside(character) {
-            previous = character;
-            continue;
-        }
-
-        let closes = matches!(character, ')' | ']' | '}') || (character == '>' && previous != '=');
-        if closes {
-            depth = depth.saturating_sub(1);
-        }
-
-        scanned.push((index, character, depth));
-
-        if matches!(character, '(' | '[' | '{' | '<') {
-            depth += 1;
-        }
-        previous = character;
-    }
-
-    scanned
 }
 
 #[cfg(test)]
