@@ -140,7 +140,7 @@ pub(super) fn file_uri_of(path: &Path) -> Result<Uri, PathUriError> {
 ///
 /// `file:` 以外のスキームのとき（サーバは開いていないバッファを `untitled:` で指す）、
 /// authority を持つとき（UNC）、Windows のドライブ文字を含むとき、
-/// `%XX` を戻した並びが UTF-8 として読めないとき。
+/// `%XX` を戻した並びが UTF-8 として読めないとき、要素の中に区切りが符号化されているとき。
 ///
 /// **Why not（UNC とドライブ文字をパスに直す）**: どちらも Windows のパスで、
 /// **この環境では正しく直せたかを確かめられない**（Linux の `PathBuf` は
@@ -192,7 +192,12 @@ pub(super) fn path_of(uri: &Uri) -> Result<PathBuf, UriPathError> {
             PARENT_DIRECTORY => {
                 path.pop();
             }
-            _ => path.push(name.as_ref()),
+            _ => {
+                if !is_one_component(&name) {
+                    return Err(UriPathError::EncodedSeparator { uri: text_of(uri) });
+                }
+                path.push(name.as_ref());
+            }
         }
     }
 
@@ -210,6 +215,23 @@ fn is_drive_letter(name: &str) -> bool {
     let ends_with_a_colon = bytes.next() == Some(b':');
 
     starts_with_a_letter && ends_with_a_colon && bytes.next().is_none()
+}
+
+/// 復号した名前が、パスの要素 1 つとして置ける綴りか。
+///
+/// **区切りを含む名前を弾く。** `%2F` を復号すると `/billing` のような綴りになり、
+/// `PathBuf::push` はそれを絶対パスとして扱って**それまでの道のりを捨てる**
+/// （`/repo` に押し込むと `/billing` になる）。
+///
+/// **Why not（区切りで割って要素として足す）**: サーバが区切りを符号化したのか、
+/// 名前にその文字が入っているのかを、こちらからは決められない。**別ドメインの
+/// 呼び出し元をでっち上げるより、読めない URI として断る。**
+fn is_one_component(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+
+    let starts_with_a_name = matches!(components.next(), Some(Component::Normal(_)));
+
+    starts_with_a_name && components.next().is_none()
 }
 
 /// パスの要素 1 つ分を、URI に置ける形にする。
@@ -344,6 +366,11 @@ pub enum UriPathError {
         /// 読めなかった URI。
         uri: String,
     },
+    /// 要素の中に区切りが符号化されている（`%2F`）。
+    EncodedSeparator {
+        /// 読めなかった URI。
+        uri: String,
+    },
 }
 
 impl fmt::Display for UriPathError {
@@ -363,6 +390,10 @@ impl fmt::Display for UriPathError {
             Self::NotUtf8 { uri } => {
                 write!(formatter, "URI が指すパスを UTF-8 として読めません: {uri}")
             }
+            Self::EncodedSeparator { uri } => write!(
+                formatter,
+                "パスの要素の中に区切りが符号化されている URI は読めません: {uri}"
+            ),
         }
     }
 }
@@ -626,5 +657,15 @@ mod tests {
         let path = path_of(&uri("file:///../../pad.ts")).expect("パスに戻せる");
 
         assert_eq!(path, Path::new("/pad.ts"));
+    }
+
+    #[test]
+    fn test_path_of_a_uri_with_an_encoded_separator_reports_it() {
+        // 対照は `%20` のテスト。あちらは名前の一部として置ける文字で、こちらは区切り。
+        // 復号すると `/billing` になり、`PathBuf::push` は**それまでの道のりを捨てる**ので、
+        // `/repo` の下のはずが `/billing/caller.ts` という別ドメインのパスになる
+        let error = path_of(&uri("file:///repo/%2Fbilling/caller.ts")).expect_err("パスに戻せない");
+
+        assert!(matches!(error, UriPathError::EncodedSeparator { .. }));
     }
 }
