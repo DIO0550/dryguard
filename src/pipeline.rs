@@ -16,7 +16,7 @@ use crate::classification::signal::{
     StructuralSimilarity, TypeSignatureMatch,
 };
 use crate::classification::{Classification, classification_of, is_structurally_similar};
-use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
+use crate::codebase::{CodebaseError, is_under_excluded_directory, source_of, typescript_paths_of};
 use crate::location::Location;
 use crate::lsp::{
     Client, ClientError, DocumentError, ServerCommand, Session, SourceDocument, WorkspaceError,
@@ -352,7 +352,6 @@ fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
 
     let asked = asked_semantics_of(
         &mut session,
-        &root,
         &pair.chunk_a,
         &document_a,
         &pair.chunk_b,
@@ -379,7 +378,6 @@ fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
 /// 「測れない」に化ける（[`AskedSemantics`]）。
 fn asked_semantics_of(
     session: &mut Session,
-    root: &WorkspaceRoot,
     chunk_a: &Chunk,
     document_a: &SourceDocument,
     chunk_b: &Chunk,
@@ -405,8 +403,8 @@ fn asked_semantics_of(
     };
 
     asked_semantics_of_outcomes(
-        resolved_type_signature_outcome_of(session, root, chunk_a, document_a, position_a),
-        resolved_type_signature_outcome_of(session, root, chunk_b, document_b, position_b),
+        resolved_type_signature_outcome_of(session, chunk_a, document_a, position_a),
+        resolved_type_signature_outcome_of(session, chunk_b, document_b, position_b),
         caller_domains_outcome_of(session, document_a, position_a),
         caller_domains_outcome_of(session, document_b, position_b),
     )
@@ -423,26 +421,31 @@ fn asked_semantics_of(
 /// 往復が失敗したとき。
 fn resolved_type_signature_outcome_of(
     session: &mut Session,
-    root: &WorkspaceRoot,
     chunk: &Chunk,
     document: &SourceDocument,
     position: SourcePosition,
 ) -> Result<TypeSignatureOutcome, ClientError> {
     let declarations = type_declarations_of(session, document, chunk.type_references())?;
-    open_declaring_documents(session, root, &declarations)?;
+    open_declaring_documents(session, &declarations)?;
     let resolved = resolved_types_of(session, &declarations)?;
 
     type_signature_outcome_of(session, document, position, &resolved)
 }
 
-/// 型が宣言されているファイルのうち、ワークスペースの根の下にあるものを開かせる。
+/// 型が宣言されているファイルのうち、このコードベースのものを開かせる。
 ///
 /// **開かせないと宣言の綴りが返らない。** サーバは開かせていないファイルへの hover に
 /// 綴りを持たない応答を返す（typescript-language-server 6.0.0 で実測）。
 ///
-/// **根の外で宣言された型は開かせない。** `lib.es5.d.ts` の `Date` や依存パッケージの型が
-/// これで、1 つの綴りのために 1 MB のファイルを読んで送ることになる。**両側が同じ宣言へ
-/// 解決されるなら綴りも同じ**なので、開いても比較の結果は変わらない。
+/// **依存の置き場（`node_modules` など）で宣言された型は開かせない。** `Date` は
+/// 約 1 MB の `lib.es5.d.ts` に解決され、1 つの綴りのためにそれを読んで送ることになる。
+/// **両側が同じ宣言へ解決されるなら綴りも同じ**なので、開いても比較の結果は変わらない。
+/// 外す一覧は `codebase` が走査で使うものと同じ。
+///
+/// **Why not（ワークスペースの根の下だけを開かせる）**: 根は候補ペアの 2 ファイルから
+/// 決まるので、**同じディレクトリにある 2 つを比べると根がそのディレクトリになる**。
+/// 兄弟ディレクトリで宣言されたエイリアスが解決できず、この Issue が直したかった
+/// 偽陰性がそのまま残る。
 ///
 /// 読めなかったファイルは飛ばす。**その型名が解決されないまま残るだけ**で、
 /// 比較は綴りのまま続く（今までと同じ形）。
@@ -452,12 +455,11 @@ fn resolved_type_signature_outcome_of(
 /// 開かせる要求の送信が失敗したとき。
 fn open_declaring_documents(
     session: &mut Session,
-    root: &WorkspaceRoot,
     declarations: &[TypeDeclaration],
 ) -> Result<(), ClientError> {
     for declaration in declarations {
         let path = declaration.site().path();
-        if !root.contains(path) {
+        if is_under_excluded_directory(path) {
             continue;
         }
 

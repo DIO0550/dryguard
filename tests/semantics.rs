@@ -380,6 +380,22 @@ fn test_compare_with_an_lsp_opens_a_type_alias_that_replaces_the_whole_signature
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_opens_a_type_alias_declared_outside_the_pair_root() {
+    // 候補ペアが同じディレクトリにあると、根はそのディレクトリになる。エイリアスは
+    // 兄弟ディレクトリで宣言されているので、**根の下だけを開かせる形では解決できない**
+    let scales_by_rate = fixture("references/src/report/scaled.ts", 3);
+    let scales_by_number = fixture("references/src/report/scaled.ts", 7);
+
+    let measured = measured_with_an_lsp(&scales_by_rate, &scales_by_number);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_an_lsp_measures_a_total_caller_domain_overlap_for_the_shared_utility_pair() {
     // ディレクトリは utils と report で分かれているが、どちらも report/monthly.ts から
     // 呼ばれている。**置き場所ではなく実際に誰が使っているか**を見ているのがここ
