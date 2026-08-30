@@ -39,17 +39,28 @@ const CONSTRUCTOR_KEYWORD: &str = "constructor";
 /// 構築シグネチャの値形を導く語（`new (value: string) => Result`）。
 const NEW_KEYWORD: &str = "new";
 
-/// 配列と添字アクセスの印の始まり（`T[]` / `T["key"]`）。
-///
-/// **どちらも型名より強く結び付く**ので、組み合わさった型をこの手前に置くには
-/// 括弧が要る。
-const INDEXED_START: char = '[';
-
-/// 括弧で括られていなければ、より強く結び付く印に負ける演算子。
+/// 括弧で括られていなければ、周りの印に負ける演算子。
 ///
 /// 関数型の `=>` は、深さ 0 の `=` として現れる（`>` は矢印の一部なので
 /// [`SignatureScan`] が閉じ括弧として数えない）。
 const UNGROUPED_TYPE_OPERATORS: [char; 3] = ['|', '&', '='];
+
+/// 型の手前に来る区切り。
+///
+/// `>` は関数型の矢印（`(a: T) => U` の `U` の手前）、`[` はタプルの始まり。
+/// **型名の直後の `[` は配列の印**なので、後ろの一覧（[`TYPE_BOUNDARY_AFTER`]）には入れない。
+const TYPE_BOUNDARY_BEFORE: [char; 6] = [':', ',', '(', '<', '>', '['];
+
+/// 型の後ろに来る区切り。
+const TYPE_BOUNDARY_AFTER: [char; 6] = [',', ')', '>', ';', '}', ']'];
+
+/// メンバーや引数の名前の後ろに続く印。
+const MEMBER_MARKER: char = ':';
+
+/// 省略できるメンバーの名前の後ろに続く印。
+///
+/// **`?` だけでは足りない。** 条件型（`T extends U ? X : Y`）の `?` と見分けが付かない。
+const OPTIONAL_MEMBER_MARKER: &str = "?:";
 
 /// サーバに型シグネチャを尋ねた結果。
 ///
@@ -352,14 +363,11 @@ fn flattened(text: &str) -> String {
 ///
 /// **引用符の中は差し替えない。** 文字列リテラル型 `"Amount"` を書き換えると
 /// 別の型になる（[`flattened`] が引用符の中の空白を畳まないのと同じ理由）。
-///
-/// **Why（綴り全体を対象にする）**: 引数名と関数の名前も差し替えの対象に入るが、
-/// 引数名は正規化で落ち、関数の名前は呼び出しの仕方を読む以外に使わないので、
-/// **比較の結果には出ない**。型が書かれた場所だけを選ぶには、綴りを先に読む必要がある。
 fn substituted(text: &str, resolved: &ResolvedTypes) -> String {
     let mut substituted = String::new();
     let mut identifier = String::new();
     let mut quote = QuoteState::new();
+    let mut preceding = None;
 
     for (index, character) in text.char_indices() {
         let inside_quotes = quote.is_inside(character);
@@ -368,43 +376,95 @@ fn substituted(text: &str, resolved: &ResolvedTypes) -> String {
             continue;
         }
 
-        let following = text.get(index..).unwrap_or_default();
-        push_resolved(&mut substituted, &identifier, resolved, following);
+        let placement = Placement {
+            preceding,
+            following: text.get(index..).unwrap_or_default(),
+        };
+        push_resolved(&mut substituted, &identifier, resolved, &placement);
         identifier.clear();
         substituted.push(character);
+
+        if !character.is_whitespace() {
+            preceding = Some(character);
+        }
     }
-    push_resolved(&mut substituted, &identifier, resolved, "");
+    let placement = Placement {
+        preceding,
+        following: "",
+    };
+    push_resolved(&mut substituted, &identifier, resolved, &placement);
 
     substituted
 }
 
-/// 識別子 1 つ分を、解決後の綴り（解決できていなければそのまま）で書き足す。
+/// 綴りの中で、その名前が置かれている位置の前後。
 ///
-/// `following` はその識別子の後ろに続く綴り。置く位置によって括弧が要るかが変わる
-/// （[`grouped_spelling_of`]）。
-fn push_resolved(target: &mut String, identifier: &str, resolved: &ResolvedTypes, following: &str) {
-    let Some(spelling) = resolved.resolved_of(identifier) else {
+/// **型名なのかも、括弧が要るかも、前後で決まる。** 2 つを別々に持ち回すと、
+/// 片方だけを見て判断する枝が生えやすい。
+struct Placement<'text> {
+    /// 直前の、空白でも識別子でもない文字。綴りの先頭なら `None`。
+    preceding: Option<char>,
+    /// その名前の後ろに続く綴り。綴りの末尾なら空。
+    following: &'text str,
+}
+
+impl Placement<'_> {
+    /// その名前が型ではなく、メンバーや引数の名前か。
+    ///
+    /// 型の綴りでは、名前の後ろにだけ `:`（省略できるなら `?:`）が続く。
+    /// `{ ID: ID }` の左側や `(value: T)` の `value` がこれで、**差し替えると
+    /// 型でないものを型で置き換える**ことになる。
+    fn names_a_member(&self) -> bool {
+        let following = self.following.trim_start();
+
+        following.starts_with(MEMBER_MARKER) || following.starts_with(OPTIONAL_MEMBER_MARKER)
+    }
+
+    /// 前後が型の区切りで、括弧を足さなくても 1 つのまとまりとして読めるか。
+    fn is_bounded(&self) -> bool {
+        let bounded_before = self
+            .preceding
+            .is_none_or(|character| TYPE_BOUNDARY_BEFORE.contains(&character));
+        let bounded_after = self
+            .following
+            .trim_start()
+            .chars()
+            .next()
+            .is_none_or(|character| TYPE_BOUNDARY_AFTER.contains(&character));
+
+        bounded_before && bounded_after
+    }
+}
+
+/// 識別子 1 つ分を、解決後の綴り（解決できていなければそのまま）で書き足す。
+fn push_resolved(
+    target: &mut String,
+    identifier: &str,
+    resolved: &ResolvedTypes,
+    placement: &Placement<'_>,
+) {
+    let opened = resolved
+        .resolved_of(identifier)
+        .filter(|_| !placement.names_a_member());
+    let Some(spelling) = opened else {
         target.push_str(identifier);
         return;
     };
 
-    target.push_str(&grouped_spelling_of(spelling, following));
+    target.push_str(&grouped_spelling_of(spelling, placement));
 }
 
 /// その位置に置くときの型の綴り。括弧が要るなら括ってから返す。
 ///
-/// `following` はその型名の後ろに続く綴り。
-///
 /// **Why**: `type Maybe = string | undefined` を `Maybe[]` の位置へそのまま差し込むと
 /// `string | undefined[]` になり、`(string | undefined)[]` とは別の型を指す。
-/// 呼び出し可能なエイリアスでは**倒れる向きが偽陽性**になり、`Handler[]` が
-/// 「配列を返す関数」として読める。
+/// 呼び出し可能なエイリアスでは**倒れる向きが偽陽性**になり、`Handler | null` が
+/// 「共用体を返す関数」として読める。
 ///
 /// **Why not（常に括る）**: `Amount` が `(number)` になり、書き下した `number` と
 /// 別の綴りになる。**エイリアスを開いた側だけが単一化できなくなる。**
-fn grouped_spelling_of(spelling: &str, following: &str) -> String {
-    let indexed = following.trim_start().starts_with(INDEXED_START);
-    if !indexed || !is_compound_type(spelling) {
+fn grouped_spelling_of(spelling: &str, placement: &Placement<'_>) -> String {
+    if placement.is_bounded() || !is_compound_type(spelling) {
         return spelling.to_owned();
     }
 
@@ -1311,6 +1371,86 @@ mod tests {
         assert!(!aliased.is_unifiable_with(&signature(
             "function other(items: (value: string) => number[]): void"
         )));
+    }
+
+    #[test]
+    fn test_an_opened_callable_alias_keeps_its_precedence_inside_a_union() {
+        // `Handler | null` へ `() => string` をそのまま差し込むと `() => string | null`
+        // になり、**共用体を返す関数**という別の型として読める
+        let aliased = signature_with(
+            "function pick(handler: Handler | null): void",
+            &resolving("Handler", "() => string"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function other(callback: (() => string) | null): void"
+        )));
+    }
+
+    #[test]
+    fn test_an_opened_callable_alias_inside_a_union_is_not_read_as_returning_it() {
+        // 対照は上のテスト。括らないほうの読み方と重ならないことを見る（偽陽性の側）
+        let aliased = signature_with(
+            "function pick(handler: Handler | null): void",
+            &resolving("Handler", "() => string"),
+        );
+
+        assert!(!aliased.is_unifiable_with(&signature(
+            "function other(callback: () => string | null): void"
+        )));
+    }
+
+    #[test]
+    fn test_an_opened_alias_after_a_union_bar_is_wrapped_too() {
+        // 括弧が要るかは後ろだけでは決まらない。手前が区切りでなければ同じく要る
+        let aliased = signature_with(
+            "function pick(handler: null | Handler): void",
+            &resolving("Handler", "() => string"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function other(callback: null | (() => string)): void"
+        )));
+    }
+
+    #[test]
+    fn test_an_opened_alias_inside_a_generic_argument_is_not_wrapped() {
+        // 型引数の中は区切りに挟まれているので括弧は要らない。括ると書き下した綴りと
+        // 別物になる
+        let aliased = signature_with(
+            "function mapped(lookup: Map<string, Maybe>): void",
+            &resolving("Maybe", "string | undefined"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function other(table: Map<string, string | undefined>): void"
+        )));
+    }
+
+    #[test]
+    fn test_a_member_name_that_matches_a_resolved_type_name_is_not_substituted() {
+        // オブジェクト型のキーは型ではない。差し替えると `{ string: string }` になる
+        let aliased = signature_with(
+            "function pick(value: { ID: ID }): void",
+            &resolving("ID", "string"),
+        );
+
+        assert!(
+            aliased.is_unifiable_with(&signature("function other(value: { ID: string }): void"))
+        );
+    }
+
+    #[test]
+    fn test_an_optional_member_name_that_matches_a_resolved_type_name_is_not_substituted() {
+        // 省略できるメンバーは `?:` で続く。`?` だけを見ると条件型の `?` と区別が付かない
+        let aliased = signature_with(
+            "function pick(value: { ID?: ID }): void",
+            &resolving("ID", "string"),
+        );
+
+        assert!(
+            aliased.is_unifiable_with(&signature("function other(value: { ID?: string }): void"))
+        );
     }
 
     #[test]
