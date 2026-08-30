@@ -17,6 +17,15 @@ const FILE_SCHEME_PREFIX: &str = "file://";
 /// `file:` URI のスキーム。
 const FILE_SCHEME: &str = "file";
 
+/// 自分の機械を指す authority。空の authority（`file:///`）と同じ意味を持つ。
+const LOCAL_HOST: &str = "localhost";
+
+/// URI の path に現れる「今いるディレクトリ」。
+const CURRENT_DIRECTORY: &str = ".";
+
+/// URI の path に現れる「1 つ上のディレクトリ」。
+const PARENT_DIRECTORY: &str = "..";
+
 /// URI の path が `/` で始まるとき、その `/` が表すディレクトリ。
 ///
 /// ここに来る URI は authority もドライブ文字も持たないので、根はこれだけ。
@@ -145,10 +154,13 @@ pub(super) fn path_of(uri: &Uri) -> Result<PathBuf, UriPathError> {
         return Err(UriPathError::NotAFileUri { uri: text_of(uri) });
     }
 
-    let names_a_host = uri
-        .authority()
-        .is_some_and(|authority| !authority.as_str().is_empty());
-    if names_a_host {
+    // `file://localhost/..` は `file:///..` と同じ意味（RFC 8089）。弾くと、その綴りで
+    // 返すサーバの参照元をまるごと失う。
+    let names_another_host = uri.authority().is_some_and(|authority| {
+        let host = authority.as_str();
+        !host.is_empty() && !host.eq_ignore_ascii_case(LOCAL_HOST)
+    });
+    if names_another_host {
         return Err(UriPathError::HasAuthority { uri: text_of(uri) });
     }
 
@@ -172,7 +184,16 @@ pub(super) fn path_of(uri: &Uri) -> Result<PathBuf, UriPathError> {
             return Err(UriPathError::DriveLetter { uri: text_of(uri) });
         }
 
-        path.push(name.as_ref());
+        // `.` と `..` を畳む。残したままにすると、同じディレクトリが 2 通りの綴りで
+        // 届き、`Domain` が字句で比べるので**同じ呼び出し元が別ドメインとして数えられる**。
+        // 畳み方は `absolute_path_of` と同じ（リンクは辿らない）。
+        match name.as_ref() {
+            CURRENT_DIRECTORY => continue,
+            PARENT_DIRECTORY => {
+                path.pop();
+            }
+            _ => path.push(name.as_ref()),
+        }
     }
 
     Ok(path)
@@ -573,5 +594,37 @@ mod tests {
         let path = path_of(&uri("file:///repo/C:/caller.ts")).expect("パスに戻せる");
 
         assert_eq!(path, Path::new("/repo/C:/caller.ts"));
+    }
+
+    #[test]
+    fn test_path_of_a_uri_naming_the_local_host_is_the_path_it_spells() {
+        // `file://localhost/..` は `file:///..` と同じ意味（RFC 8089）。弾くと、
+        // その綴りで返すサーバの参照元をまるごと失う
+        let path = path_of(&uri("file://localhost/repo/src/pad.ts")).expect("パスに戻せる");
+
+        assert_eq!(path, Path::new("/repo/src/pad.ts"));
+    }
+
+    #[test]
+    fn test_path_of_a_uri_with_dot_segments_folds_them() {
+        // 畳まないと、同じディレクトリが 2 通りの綴りで届き、`Domain` が字句で比べるので
+        // 同じ呼び出し元が別ドメインとして数えられる
+        let path = path_of(&uri("file:///repo/src/../billing/caller.ts")).expect("パスに戻せる");
+
+        assert_eq!(path, Path::new("/repo/billing/caller.ts"));
+    }
+
+    #[test]
+    fn test_path_of_a_uri_with_a_current_directory_segment_ignores_it() {
+        let path = path_of(&uri("file:///repo/./src/pad.ts")).expect("パスに戻せる");
+
+        assert_eq!(path, Path::new("/repo/src/pad.ts"));
+    }
+
+    #[test]
+    fn test_path_of_a_uri_that_climbs_past_the_root_stops_at_the_root() {
+        let path = path_of(&uri("file:///../../pad.ts")).expect("パスに戻せる");
+
+        assert_eq!(path, Path::new("/pad.ts"));
     }
 }

@@ -22,13 +22,6 @@ use dryguard::semantics::caller_domain::CallerDomains;
 use dryguard::semantics::type_signature::TypeSignature;
 use dryguard::syntax::chunk::Chunk;
 
-/// 参照元を持つフィクスチャの木のプロジェクト設定。
-///
-/// **サーバに見せる根はここを含む位置にする。** tsconfig.json より下を根にすると、
-/// サーバは開いたファイルとその import 先だけでプロジェクトを組み立てる。呼び出し元は
-/// import を辿る向きの逆にあるので、**一部しか返らない**。
-const THE_REFERENCES_PROJECT_FILE: &str = "references/tsconfig.json";
-
 /// `tests/fixtures/` 配下の位置。
 ///
 /// カレントディレクトリではなくマニフェストの位置から組み立てる
@@ -61,6 +54,11 @@ fn document(path: &Path) -> SourceDocument {
 }
 
 /// 2 つのチャンクを開かせられる、握手を終えたサーバ。
+///
+/// 根は `WorkspaceRoot::enclosing` が渡されたパスから決める。**テスト側で広げない**
+/// （広げると、本番が作らない設定でテストが通る）。`tests/fixtures/references/` は
+/// 候補ペアの共通の祖先（`src/`）に tsconfig.json を置いてあり、そこが根になる。
+/// より下が根になるコードベースで呼び出し元が一部しか返らない話は Issue #125。
 fn session_over(paths: &[PathBuf]) -> Session {
     let Ok(root) = WorkspaceRoot::enclosing(paths) else {
         panic!("テストが渡すパスからは根を決められる");
@@ -188,7 +186,6 @@ fn caller_domain_overlap(location_a: &Location, location_b: &Location) -> f64 {
     let mut session = session_over(&[
         location_a.path().to_path_buf(),
         location_b.path().to_path_buf(),
-        fixture(THE_REFERENCES_PROJECT_FILE, 1).path().to_path_buf(),
     ]);
     let domains_a = caller_domains_of(&mut session, &chunk_a);
     let domains_b = caller_domains_of(&mut session, &chunk_b);
@@ -237,13 +234,15 @@ fn test_caller_domains_asked_after_a_type_signature_are_still_complete() {
     // サーバの作業を覚える**ので、その作業が終わる前に references を送ると、
     // 読み込み中に計算された答え（呼び出し元が欠けている）を受け取る
     let discounts_an_invoice = fixture("references/src/billing/discount.ts", 5);
-    let Ok((chunk, _)) = chunk_pair_of(&discounts_an_invoice, &discounts_an_invoice) else {
-        panic!("テストが渡す位置は関数の中を指している");
+    let reorders_stock = fixture("references/src/inventory/reorder.ts", 5);
+    let Ok((chunk, _)) = chunk_pair_of(&discounts_an_invoice, &reorders_stock) else {
+        panic!("テストが渡す位置はどちらも関数の中を指している");
     };
 
+    // 候補ペアの 2 箇所だけを渡す。`compare` が本番で作る根と同じ決め方になる
     let mut session = session_over(&[
         discounts_an_invoice.path().to_path_buf(),
-        fixture(THE_REFERENCES_PROJECT_FILE, 1).path().to_path_buf(),
+        reorders_stock.path().to_path_buf(),
     ]);
     let _signature = type_signature_of(&mut session, &chunk);
     let reference_paths = reference_paths_of(&mut session, &chunk);

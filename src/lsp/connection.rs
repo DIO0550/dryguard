@@ -299,6 +299,25 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         let params =
             serde_json::to_value(params).map_err(not_serializable_error_of(References::METHOD))?;
 
+        let settled = self.settled_references_of(params);
+
+        // 用意されただけの作業を覚えておくのは、**この問い合わせの間だけ**。持ち越すと、
+        // 始まらないまま捨てられた token 1 つで、以降の問い合わせがすべて
+        // `ServerStillWorking` になる。
+        self.prepared_progress.clear();
+
+        settled
+    }
+
+    /// サーバの作業に触れていない答えが返るまで、上限まで尋ね直す。
+    ///
+    /// # Errors
+    ///
+    /// 送受信が失敗したとき、応答を references の結果として読めないとき。
+    fn settled_references_of(
+        &mut self,
+        params: Value,
+    ) -> Result<ReferencesOutcome, ConnectionError> {
         // 読み込み中に返ってきた答えは、**サーバがまだ見ていないファイルの分が抜けている**
         // （呼び出し元は呼び出し先を import する側なので、開かせたファイルからは辿れない）。
         // 作業が終わってから尋ね直し、**作業に触れていない答えだけを採る**。
@@ -325,10 +344,6 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             if untouched_by_work {
                 return Ok(answered);
             }
-
-            // 用意されただけの作業に付き合うのは 1 度だけ。始まらないまま捨てられた token を
-            // 数え続けると、**そのセッションでは参照元を二度と受け取れなくなる**。
-            self.prepared_progress.clear();
 
             attempts_left -= 1;
         }
@@ -1357,15 +1372,16 @@ mod tests {
     }
 
     #[test]
-    fn test_references_answered_before_prepared_work_begins_asks_again() {
-        // token を用意する要求は前の問い合わせ（hover）の最中に届き、**始まりの通知は
-        // 参照元の応答より後ろ**に並ぶ。用意されただけの作業を見ていないと、始まる前に
-        // 計算された答えをそのまま採る
+    fn test_references_with_prepared_work_that_has_not_begun_does_not_settle() {
+        // token を用意する要求は前の問い合わせ（hover）の最中に届き、**始まりの通知が
+        // どの答えよりも後ろ**に並ぶ。用意されただけの作業を 1 度で忘れると、2 通目を
+        // 「何も起きていない」と読んで、始まる前に計算された答えを採る
         let server_output = frames_of(&[
             &progress_create_request(9, "prepared"),
             &hover_response("function applyDiscount(invoice: Invoice): number"),
             &no_references_response(2),
-            &references_response(3, "file:///repo/src/billing/invoice.ts"),
+            &no_references_response(3),
+            &no_references_response(4),
         ]);
         let mut connection = connection_over(&server_output);
         let document = opened_document(&mut connection);
@@ -1378,19 +1394,21 @@ mod tests {
             .expect("応答を受け取れる");
 
         assert!(
-            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
-            "用意されただけの作業があるうちは尋ね直す: {outcome:?}"
+            matches!(outcome, ReferencesOutcome::ServerStillWorking),
+            "用意されただけの作業が残るうちは落ち着いたことにしない: {outcome:?}"
         );
     }
 
     #[test]
     fn test_references_with_a_progress_that_never_begins_does_not_wait_for_it() {
         // token を作ってよいかの要求は、作業が始まったことを意味しない。始まりの通知が
-        // 来ないまま捨てられた token を待つと、**終わりの来ない作業を待ち続ける**
+        // 来ないまま捨てられた token を**待つ**と、終わりの来ない作業を待ち続ける。
+        // 待たずに尋ね直し、上限まで落ち着かなければ名前で返す
         let server_output = frames_of(&[
             &progress_create_request(9, "abandoned"),
             &no_references_response(1),
-            &references_response(2, "file:///repo/src/billing/invoice.ts"),
+            &no_references_response(2),
+            &no_references_response(3),
         ]);
         let mut connection = connection_over(&server_output);
         let document = opened_document(&mut connection);
@@ -1400,8 +1418,35 @@ mod tests {
             .expect("応答を受け取れる");
 
         assert!(
+            matches!(outcome, ReferencesOutcome::ServerStillWorking),
+            "始まらない作業を待ち続けずに返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_after_a_query_that_did_not_settle_can_answer_again() {
+        // 対照は上のテスト。**捨てられた token を次の問い合わせへ持ち越さない**。
+        // 持ち越すと、その接続では参照元を二度と受け取れなくなる
+        let server_output = frames_of(&[
+            &progress_create_request(9, "abandoned"),
+            &no_references_response(1),
+            &no_references_response(2),
+            &no_references_response(3),
+            &references_response(4, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+        connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
             matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
-            "始まっていない作業は待たずに尋ね直す: {outcome:?}"
+            "次の問い合わせは前の token に縛られない: {outcome:?}"
         );
     }
 
