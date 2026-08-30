@@ -23,6 +23,7 @@ use dryguard::lsp::{
 use dryguard::pipeline::{MeasuredPair, chunk_pair_of, measured_pair_of};
 use dryguard::report::text_of;
 use dryguard::semantics::caller_domain::CallerDomains;
+use dryguard::semantics::resolved_type::ResolvedTypes;
 use dryguard::semantics::type_signature::TypeSignature;
 use dryguard::syntax::chunk::Chunk;
 
@@ -77,6 +78,9 @@ fn session_over(paths: &[PathBuf]) -> Session {
 }
 
 /// そのチャンクの型シグネチャを、サーバに尋ねて正規化したもの。
+///
+/// **型名は解決しない。** ここで見たいのは返った綴りを正規化して比べるところまでで、
+/// 解決まで含めた形は `measured_with_an_lsp` を使うテストが見る。
 fn type_signature_of(session: &mut Session, chunk: &Chunk) -> TypeSignature {
     let document = document(chunk.path());
     if session.open_document(&document).is_err() {
@@ -92,7 +96,9 @@ fn type_signature_of(session: &mut Session, chunk: &Chunk) -> TypeSignature {
     let Ok(HoverOutcome::Answered(signature_text)) = session.hover(&document, position) else {
         panic!("名前の位置には hover が答える: {}", chunk.path().display());
     };
-    let Some(signature) = TypeSignature::from_signature_text(&signature_text) else {
+    let Some(signature) =
+        TypeSignature::from_signature_text(&signature_text, &ResolvedTypes::default())
+    else {
         panic!("サーバが返した綴りは読み取れる: {signature_text}");
     };
     signature
@@ -335,6 +341,40 @@ fn test_compare_with_an_lsp_finds_the_accidental_duplication_not_unifiable() {
     assert_eq!(
         measured.signals().type_signature_match(),
         TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_opens_a_type_alias_written_on_a_parameter() {
+    // hover が返すのは `function scaleAmount(amount: Amount, factor: number): Amount` で、
+    // `Amount` は展開されない。解決しないと `(Amount, number) => Amount` と
+    // `(number, number) => number` になり、単一化不能と出る
+    let scales_an_amount = fixture("references/src/billing/scale.ts", 3);
+    let scales_a_total = fixture("references/src/report/total.ts", 1);
+
+    let measured = measured_with_an_lsp(&scales_an_amount, &scales_a_total);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_opens_a_type_alias_that_replaces_the_whole_signature() {
+    // 呼び出し可能なエイリアスで注釈すると、hover は `const halveAmount: Scaling` と
+    // 綴り全体をエイリアス名 1 語で返す。**引数リストが無いので、解決を綴りを読む前に
+    // 差し込まないと入口に入れない**（`from_signature_text` が `None` を返す）
+    let halves_an_amount = fixture("references/src/billing/scale.ts", 7);
+    let halves_a_total = fixture("references/src/report/total.ts", 5);
+
+    let measured = measured_with_an_lsp(&halves_an_amount, &halves_a_total);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
     );
 }
 

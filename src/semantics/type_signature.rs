@@ -13,6 +13,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use crate::lsp::{ClientError, HoverOutcome, Session, SourceDocument};
+use crate::semantics::resolved_type::ResolvedTypes;
 use crate::source_position::SourcePosition;
 
 /// 付け替えた型変数の綴りの前置き。
@@ -60,7 +61,8 @@ pub enum TypeSignatureOutcome {
 /// その位置にある名前の型を尋ねて、正規化した形にする。
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
-/// `Chunk::name_position` が指す識別子の位置。
+/// `Chunk::name_position` が指す識別子の位置。`resolved` は
+/// `semantics::resolved_type` が集めた型エイリアスの右辺。
 ///
 /// # Errors
 ///
@@ -71,9 +73,10 @@ pub fn type_signature_outcome_of(
     session: &mut Session,
     document: &SourceDocument,
     position: SourcePosition,
+    resolved: &ResolvedTypes,
 ) -> Result<TypeSignatureOutcome, ClientError> {
     let outcome = match session.hover(document, position)? {
-        HoverOutcome::Answered(signature_text) => normalized_outcome_of(&signature_text),
+        HoverOutcome::Answered(signature_text) => normalized_outcome_of(&signature_text, resolved),
         HoverOutcome::NoAnswer => TypeSignatureOutcome::NoTypeThere,
         HoverOutcome::Unreadable => TypeSignatureOutcome::UnreadableHover,
         HoverOutcome::NotSupported => TypeSignatureOutcome::HoverNotProvided,
@@ -83,8 +86,8 @@ pub fn type_signature_outcome_of(
 }
 
 /// 綴りを正規化した結果。読み解けなければ、その旨。
-fn normalized_outcome_of(signature_text: &str) -> TypeSignatureOutcome {
-    let Some(signature) = TypeSignature::from_signature_text(signature_text) else {
+fn normalized_outcome_of(signature_text: &str, resolved: &ResolvedTypes) -> TypeSignatureOutcome {
+    let Some(signature) = TypeSignature::from_signature_text(signature_text, resolved) else {
         return TypeSignatureOutcome::UnreadableSignature;
     };
 
@@ -113,12 +116,17 @@ impl TypeSignature {
     /// `text` は正規化前の綴り（`lsp` の `Session::hover` が返すもの）。サーバごとに
     /// 宣言形（`function decl(a: string): number`）と値形
     /// （`const arrow: (a: string) => number`）の 2 通りがあり、どちらも同じ形へ直す。
+    /// `resolved` は型エイリアスの右辺で、綴りを読む前に差し込む。
     ///
     /// 引数リストと戻り値の型を読み取れない綴りでは `None`。**空の引数リストで
     /// 埋めない**ので、後段は「引数が無い関数」と「読めなかった」を区別できる
     /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
-    pub fn from_signature_text(text: &str) -> Option<Self> {
-        let flattened = flattened(text);
+    ///
+    /// **差し込むのは読む前。** シグネチャ全体がエイリアスに置き換わる形
+    /// （`const aliased: Handler`）は引数リストを持たないので、読んだ後に差し込む形では
+    /// **この綴りが入口に入れない**（`None` になる）。
+    pub fn from_signature_text(text: &str, resolved: &ResolvedTypes) -> Option<Self> {
+        let flattened = flattened(&substituted(text, resolved));
         let split = SplitSignature::from_signature_text(&flattened)?;
 
         let return_type = normalized_type(split.return_type()?)?;
@@ -323,6 +331,46 @@ fn flattened(text: &str) -> String {
     }
 
     flattened
+}
+
+/// 型名を、解決後の綴りへ差し替えた文字列。
+///
+/// 差し替えは**識別子の単位**で行う。部分一致で差し替えると、`Amount` が
+/// `AmountRate` の中まで書き換える。
+///
+/// **引用符の中は差し替えない。** 文字列リテラル型 `"Amount"` を書き換えると
+/// 別の型になる（[`flattened`] が引用符の中の空白を畳まないのと同じ理由）。
+///
+/// **Why（綴り全体を対象にする）**: 引数名と関数の名前も差し替えの対象に入るが、
+/// 引数名は正規化で落ち、関数の名前は呼び出しの仕方を読む以外に使わないので、
+/// **比較の結果には出ない**。型が書かれた場所だけを選ぶには、綴りを先に読む必要がある。
+fn substituted(text: &str, resolved: &ResolvedTypes) -> String {
+    let mut substituted = String::new();
+    let mut identifier = String::new();
+    let mut quote = QuoteState::new();
+
+    for character in text.chars() {
+        let inside_quotes = quote.is_inside(character);
+        if !inside_quotes && is_identifier_character(character) {
+            identifier.push(character);
+            continue;
+        }
+
+        push_resolved(&mut substituted, &identifier, resolved);
+        identifier.clear();
+        substituted.push(character);
+    }
+    push_resolved(&mut substituted, &identifier, resolved);
+
+    substituted
+}
+
+/// 識別子 1 つ分を、解決後の綴り（解決できていなければそのまま）で書き足す。
+fn push_resolved(target: &mut String, identifier: &str, resolved: &ResolvedTypes) {
+    match resolved.resolved_of(identifier) {
+        Some(spelling) => target.push_str(spelling),
+        None => target.push_str(identifier),
+    }
 }
 
 /// 引用符の中にいるかどうかを、文字を 1 つずつ読みながら追う。
@@ -768,9 +816,19 @@ fn is_identifier_character(character: char) -> bool {
 mod tests {
     use super::*;
 
-    /// テストが渡す綴りは読み取れる前提で組み立てる。
+    /// テストが渡す綴りは読み取れる前提で組み立てる。解決した型名は無い。
     fn signature(text: &str) -> TypeSignature {
-        TypeSignature::from_signature_text(text).expect("テストが渡す綴りは読み取れる")
+        signature_with(text, &ResolvedTypes::default())
+    }
+
+    /// 解決した型名を差し込んでから組み立てる。
+    fn signature_with(text: &str, resolved: &ResolvedTypes) -> TypeSignature {
+        TypeSignature::from_signature_text(text, resolved).expect("テストが渡す綴りは読み取れる")
+    }
+
+    /// 型名 1 つ分の解決。
+    fn resolving(name: &str, spelling: &str) -> ResolvedTypes {
+        ResolvedTypes::new([(name.to_owned(), spelling.to_owned())])
     }
 
     fn unifiable(one: &str, other: &str) -> bool {
@@ -1028,7 +1086,7 @@ mod tests {
     fn test_a_signature_without_a_parameter_list_cannot_be_read() {
         // 型エイリアスなど、関数でないものへの hover はこの形で返る
         assert_eq!(
-            TypeSignature::from_signature_text("type UserId = string"),
+            TypeSignature::from_signature_text("type UserId = string", &ResolvedTypes::default()),
             None
         );
     }
@@ -1036,7 +1094,10 @@ mod tests {
     #[test]
     fn test_a_signature_without_a_return_type_cannot_be_read() {
         assert_eq!(
-            TypeSignature::from_signature_text("function decl(a: string)"),
+            TypeSignature::from_signature_text(
+                "function decl(a: string)",
+                &ResolvedTypes::default()
+            ),
             None
         );
     }
@@ -1046,7 +1107,10 @@ mod tests {
         // 名前だけの引数からは型を取り出せない。空の型で埋めると、
         // 型注釈の無い引数どうしが「同じ型」として重なる
         assert_eq!(
-            TypeSignature::from_signature_text("function decl(a, b: string): void"),
+            TypeSignature::from_signature_text(
+                "function decl(a, b: string): void",
+                &ResolvedTypes::default()
+            ),
             None
         );
     }
@@ -1074,5 +1138,89 @@ mod tests {
             "function labelled(label: \"a, b\", count: number): void",
             "function other(name: \"a, b\", total: number): void"
         ));
+    }
+
+    #[test]
+    fn test_a_signature_using_a_type_alias_is_unifiable_with_one_written_out() {
+        // hover は `Amount` を展開しないので、解決を差し込まないと
+        // `(Amount, number) => Amount` と `(number, number) => number` になる
+        let aliased = signature_with(
+            "function scaleAmount(amount: Amount, factor: number): Amount",
+            &resolving("Amount", "number"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function scaleTotal(total: number, factor: number): number"
+        )));
+    }
+
+    #[test]
+    fn test_a_signature_using_an_unresolved_type_alias_is_not_unifiable_with_one_written_out() {
+        // 対照は上のテスト。同じ綴りを解決なしで読む。解決が効いているかを見る
+        assert!(!unifiable(
+            "function scaleAmount(amount: Amount, factor: number): Amount",
+            "function scaleTotal(total: number, factor: number): number"
+        ));
+    }
+
+    #[test]
+    fn test_a_signature_that_is_nothing_but_an_alias_is_read_after_the_alias_is_opened() {
+        // 引数リストを持たない綴り。読んだ後に差し込む形では入口に入れない
+        let aliased = signature_with(
+            "const halveAmount: Scaling",
+            &resolving("Scaling", "(amount: number) => number"),
+        );
+
+        assert!(
+            aliased.is_unifiable_with(&signature("const halveTotal: (total: number) => number"))
+        );
+    }
+
+    #[test]
+    fn test_a_signature_that_is_nothing_but_an_unresolved_alias_cannot_be_read() {
+        // 対照は上のテスト。解決が無ければ引数リストが見つからない
+        assert_eq!(
+            TypeSignature::from_signature_text(
+                "const halveAmount: Scaling",
+                &ResolvedTypes::default()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_a_type_name_inside_a_string_literal_type_is_not_substituted() {
+        // 文字列リテラル型の中身は型の一部。差し替えると別の型になる
+        let literal = signature_with(
+            "function labelled(label: \"Amount\"): void",
+            &resolving("Amount", "number"),
+        );
+
+        assert!(!literal.is_unifiable_with(&signature("function other(name: \"number\"): void")));
+    }
+
+    #[test]
+    fn test_a_name_that_only_starts_with_a_resolved_type_name_is_not_substituted() {
+        // 部分一致で差し替えると `Amount` が `AmountRate` の中まで書き換える
+        let longer = signature_with(
+            "function scale(rate: AmountRate): void",
+            &resolving("Amount", "number"),
+        );
+
+        assert!(!longer.is_unifiable_with(&signature("function other(rate: numberRate): void")));
+    }
+
+    #[test]
+    fn test_a_type_alias_opened_into_a_generic_argument_is_substituted_there_too() {
+        // 総称型の中の型名も比較の対象に残る（`test_signatures_differing_inside_a_
+        // generic_argument_are_not_unifiable`）ので、差し替えもそこまで届く必要がある
+        let aliased = signature_with(
+            "function mapped(lookup: Map<string, Amount>): void",
+            &resolving("Amount", "number"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function other(table: Map<string, number>): void"
+        )));
     }
 }

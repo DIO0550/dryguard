@@ -23,7 +23,9 @@ use crate::lsp::{
     WorkspaceRoot,
 };
 use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outcome_of};
+use crate::semantics::resolved_type::{TypeDeclaration, resolved_types_of, type_declarations_of};
 use crate::semantics::type_signature::{TypeSignatureOutcome, type_signature_outcome_of};
+use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks};
 use crate::syntax::module_distance::ModuleDistance;
 use crate::syntax::tree::{Grammar, ParseError, SyntaxTree};
@@ -350,6 +352,7 @@ fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
 
     let asked = asked_semantics_of(
         &mut session,
+        &root,
         &pair.chunk_a,
         &document_a,
         &pair.chunk_b,
@@ -370,11 +373,13 @@ fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
 /// hover を先に送るのは、**references が先の作業の落ち着きを待つ**ため
 /// （順序を入れ替えると、読み込み中に計算された答えを受け取る。
 /// `tests/semantics.rs` の `test_caller_domains_asked_after_a_type_signature_are_still_complete`）。
+/// 型名の解決も hover と同じ側に置くので、references は最後のまま。
 ///
 /// **1 つが落ちても残りを尋ねる。** 途中で降りると、取れていたシグナルまで
 /// 「測れない」に化ける（[`AskedSemantics`]）。
 fn asked_semantics_of(
     session: &mut Session,
+    root: &WorkspaceRoot,
     chunk_a: &Chunk,
     document_a: &SourceDocument,
     chunk_b: &Chunk,
@@ -400,11 +405,73 @@ fn asked_semantics_of(
     };
 
     asked_semantics_of_outcomes(
-        type_signature_outcome_of(session, document_a, position_a),
-        type_signature_outcome_of(session, document_b, position_b),
+        resolved_type_signature_outcome_of(session, root, chunk_a, document_a, position_a),
+        resolved_type_signature_outcome_of(session, root, chunk_b, document_b, position_b),
         caller_domains_outcome_of(session, document_a, position_a),
         caller_domains_outcome_of(session, document_b, position_b),
     )
+}
+
+/// そのチャンクの型シグネチャを、**書かれた型名を解決してから**尋ねる。
+///
+/// hover が返す綴りは書かれた型名のままで、型エイリアスは展開されない。
+/// 先に型名の宣言を辿って右辺を集め、綴りへ差し込んでから読む
+/// （`semantics::resolved_type`）。
+///
+/// # Errors
+///
+/// 往復が失敗したとき。
+fn resolved_type_signature_outcome_of(
+    session: &mut Session,
+    root: &WorkspaceRoot,
+    chunk: &Chunk,
+    document: &SourceDocument,
+    position: SourcePosition,
+) -> Result<TypeSignatureOutcome, ClientError> {
+    let declarations = type_declarations_of(session, document, chunk.type_references())?;
+    open_declaring_documents(session, root, &declarations)?;
+    let resolved = resolved_types_of(session, &declarations)?;
+
+    type_signature_outcome_of(session, document, position, &resolved)
+}
+
+/// 型が宣言されているファイルのうち、ワークスペースの根の下にあるものを開かせる。
+///
+/// **開かせないと宣言の綴りが返らない。** サーバは開かせていないファイルへの hover に
+/// 綴りを持たない応答を返す（typescript-language-server 6.0.0 で実測）。
+///
+/// **根の外で宣言された型は開かせない。** `lib.es5.d.ts` の `Date` や依存パッケージの型が
+/// これで、1 つの綴りのために 1 MB のファイルを読んで送ることになる。**両側が同じ宣言へ
+/// 解決されるなら綴りも同じ**なので、開いても比較の結果は変わらない。
+///
+/// 読めなかったファイルは飛ばす。**その型名が解決されないまま残るだけ**で、
+/// 比較は綴りのまま続く（今までと同じ形）。
+///
+/// # Errors
+///
+/// 開かせる要求の送信が失敗したとき。
+fn open_declaring_documents(
+    session: &mut Session,
+    root: &WorkspaceRoot,
+    declarations: &[TypeDeclaration],
+) -> Result<(), ClientError> {
+    for declaration in declarations {
+        let path = declaration.site().path();
+        if !root.contains(path) {
+            continue;
+        }
+
+        let Ok(text) = source_of(path) else {
+            continue;
+        };
+        let Ok(document) = SourceDocument::new(path, text) else {
+            continue;
+        };
+
+        session.open_document(&document)?;
+    }
+
+    Ok(())
 }
 
 /// 4 つの問い合わせの結果を、シグナルと落ちた理由にまとめる。
@@ -999,6 +1066,7 @@ mod tests {
 
     use crate::classification::DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
     use crate::classification::verdict::Verdict;
+    use crate::semantics::resolved_type::ResolvedTypes;
     use crate::semantics::type_signature::TypeSignature;
     use crate::similarity::Similarity;
     use crate::test_support::line;
@@ -1038,8 +1106,9 @@ mod tests {
 
     /// 正規化できた型シグネチャ。
     fn normalized(signature_text: &str) -> TypeSignatureOutcome {
-        let signature = TypeSignature::from_signature_text(signature_text)
-            .expect("テストが渡す綴りは読み取れる");
+        let signature =
+            TypeSignature::from_signature_text(signature_text, &ResolvedTypes::default())
+                .expect("テストが渡す綴りは読み取れる");
 
         TypeSignatureOutcome::Normalized(signature)
     }
