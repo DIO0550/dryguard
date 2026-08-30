@@ -4,11 +4,16 @@
 //! (`rules/naming.md`「このツールの語彙を固定する」)。**綴りのまま比べると、
 //! 引数名や型変数名が違うだけのペアが別物になる。**
 //!
-//! LSP を呼ばないので、サーバが無くてもここは確かめられる
+//! **綴りを直す部分は LSP を呼ばない**ので、サーバが無くても確かめられる
 //! (`rules/tdd.md`「`lsp` は『応答を受け取ってから先』を切り出す」)。
+//! サーバに尋ねるのは [`type_signature_outcome_of`] だけで、そこは
+//! `tests/semantics.rs` が実サーバで見る。
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+
+use crate::lsp::{ClientError, HoverOutcome, Session, SourceDocument};
+use crate::source_position::SourcePosition;
 
 /// 付け替えた型変数の綴りの前置き。
 ///
@@ -32,6 +37,59 @@ const CONSTRUCTOR_KEYWORD: &str = "constructor";
 
 /// 構築シグネチャの値形を導く語（`new (value: string) => Result`）。
 const NEW_KEYWORD: &str = "new";
+
+/// サーバに型シグネチャを尋ねた結果。
+///
+/// **「取れなかった」を 1 つにまとめない。** どれなのかで**利用者が次に試すことが違う**
+/// （サーバを替える / そのチャンクを諦める / dryguard 側の穴）
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeSignatureOutcome {
+    /// 綴りを正規化できた。
+    Normalized(TypeSignature),
+    /// サーバがその位置に型を持たなかった。
+    NoTypeThere,
+    /// hover の応答を `lsp` が読めなかった。
+    UnreadableHover,
+    /// 綴りは返ったが、[`TypeSignature::from_signature_text`] が読み解けなかった。
+    UnreadableSignature,
+    /// サーバが hover を提供していない。
+    HoverNotProvided,
+}
+
+/// その位置にある名前の型を尋ねて、正規化した形にする。
+///
+/// `document` は先に [`Session::open_document`] で開かせておく。`position` は
+/// `Chunk::name_position` が指す識別子の位置。
+///
+/// # Errors
+///
+/// そのドキュメントを開かせていないとき、往復が失敗したとき。
+/// **答えが無い / 読めないは `Err` にしない**（会話は成立しているので、
+/// シグナルが取れなかっただけ）。
+pub fn type_signature_outcome_of(
+    session: &mut Session,
+    document: &SourceDocument,
+    position: SourcePosition,
+) -> Result<TypeSignatureOutcome, ClientError> {
+    let outcome = match session.hover(document, position)? {
+        HoverOutcome::Answered(signature_text) => normalized_outcome_of(&signature_text),
+        HoverOutcome::NoAnswer => TypeSignatureOutcome::NoTypeThere,
+        HoverOutcome::Unreadable => TypeSignatureOutcome::UnreadableHover,
+        HoverOutcome::NotSupported => TypeSignatureOutcome::HoverNotProvided,
+    };
+
+    Ok(outcome)
+}
+
+/// 綴りを正規化した結果。読み解けなければ、その旨。
+fn normalized_outcome_of(signature_text: &str) -> TypeSignatureOutcome {
+    let Some(signature) = TypeSignature::from_signature_text(signature_text) else {
+        return TypeSignatureOutcome::UnreadableSignature;
+    };
+
+    TypeSignatureOutcome::Normalized(signature)
+}
 
 /// 単一化の可否を比べられる形に直した型シグネチャ。
 ///

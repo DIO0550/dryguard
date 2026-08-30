@@ -1,13 +1,70 @@
 //! 参照元がどのドメインに属しているかと、2 つのチャンクの間でのその重なり。
 //!
-//! LSP を呼ばないので、サーバが無くてもここは確かめられる
+//! **数える部分は LSP を呼ばない**ので、サーバが無くても確かめられる
 //! (`rules/tdd.md`「`lsp` は『応答を受け取ってから先』を切り出す」)。
-//! 参照元を尋ねるのは `lsp::Session::references`、判定に使うのは `classification`。
+//! サーバに尋ねるのは [`caller_domains_outcome_of`] だけで、そこは
+//! `tests/semantics.rs` が実サーバで見る。判定に使うのは `classification`。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::lsp::{ClientError, ReferencesOutcome, Session, SourceDocument};
 use crate::similarity::Similarity;
+use crate::source_position::SourcePosition;
+
+/// サーバに参照元を尋ねて、ドメインごとに数えた結果。
+///
+/// **「取れなかった」を 1 つにまとめない。** `lsp::ReferencesOutcome` が理由を分けて
+/// 持っているのを、そのまま運ぶ（`rules/architecture.md`
+/// 「取れなかったシグナルを既定値で埋めない」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallerDomainsOutcome {
+    /// 参照元をドメインごとに数えられた。
+    Counted(CallerDomains),
+    /// 参照元が 1 件も返らなかった。
+    NoReferences,
+    /// 参照元は返ったが、パスとして読めない URI が混じっていた。
+    UnreadableReferences,
+    /// サーバが作業中で、落ち着いた答えを受け取れなかった。
+    ServerStillWorking,
+    /// サーバが references を提供していない。
+    ReferencesNotProvided,
+}
+
+/// その位置にある名前の参照元を尋ねて、ドメインごとに数える。
+///
+/// `document` は先に [`Session::open_document`] で開かせておく。`position` は
+/// `Chunk::name_position` が指す識別子の位置。
+///
+/// # Errors
+///
+/// そのドキュメントを開かせていないとき、往復が失敗したとき。
+/// **参照元が無い / 読めないは `Err` にしない**（会話は成立しているので、
+/// シグナルが取れなかっただけ）。
+pub fn caller_domains_outcome_of(
+    session: &mut Session,
+    document: &SourceDocument,
+    position: SourcePosition,
+) -> Result<CallerDomainsOutcome, ClientError> {
+    let outcome = match session.references(document, position)? {
+        ReferencesOutcome::Answered(reference_paths) => counted_outcome_of(&reference_paths),
+        ReferencesOutcome::NoAnswer => CallerDomainsOutcome::NoReferences,
+        ReferencesOutcome::Unreadable { .. } => CallerDomainsOutcome::UnreadableReferences,
+        ReferencesOutcome::ServerStillWorking => CallerDomainsOutcome::ServerStillWorking,
+        ReferencesOutcome::NotSupported => CallerDomainsOutcome::ReferencesNotProvided,
+    };
+
+    Ok(outcome)
+}
+
+/// 参照元をドメインごとに数えた結果。1 件も無ければ、その旨。
+fn counted_outcome_of(reference_paths: &[PathBuf]) -> CallerDomainsOutcome {
+    let Some(caller_domains) = CallerDomains::from_reference_paths(reference_paths) else {
+        return CallerDomainsOutcome::NoReferences;
+    };
+
+    CallerDomainsOutcome::Counted(caller_domains)
+}
 
 /// ドメイン。そのファイルを含むディレクトリ。
 ///
