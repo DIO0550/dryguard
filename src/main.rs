@@ -37,6 +37,7 @@ fn main() -> ExitCode {
 /// **LSP サーバを使えなくても失敗にしない。** Stage 1 のシグナルだけで判定でき、
 /// 取れなかったことは判定の根拠に出る。理由だけを stderr へ回すのは、
 /// **判定そのものではなく環境の話**だから（stdout は判定の出力に保つ）。
+/// 片方の問い合わせだけが落ちることもあるので、**stderr でシグナルを数え上げない**。
 ///
 /// 出力の組み立ては `dryguard::report` にある。ここでは stdout / stderr の
 /// どちらへ出すかと、終了コードだけを決める。
@@ -56,7 +57,10 @@ fn report_compare(
     let threshold = threshold_of(options);
     let measured = measured_pair_of(&pair, threshold, &ServerCommand::typescript());
     if let Some(error) = measured.semantics_error() {
-        eprintln!("型シグネチャと呼び出し元を測れません: {error}");
+        // **どのシグナルが取れなかったかはここで言わない。** 片方だけ落ちることが
+        // あるので数え上げると判定の根拠と食い違う。取れなかったシグナルは
+        // 根拠の行が 1 つずつ出す。
+        eprintln!("LSP への問い合わせが最後まで通りませんでした: {error}");
     }
 
     let classification = classification_of(measured.signals(), threshold);

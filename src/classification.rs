@@ -92,11 +92,17 @@ pub fn classification_of(
         signals.structural_similarity(),
         structural_similarity_threshold,
     );
-    let domain_match = domain_match_of(signals);
+    let placement = placement_domain_match_of(signals);
+    let domain_match = domain_match_of(placement, signals);
     let type_signature_lean = type_signature_lean_of(signals.type_signature_match());
 
     Classification {
-        verdict: verdict_of(structurally_similar, type_signature_lean, domain_match),
+        verdict: verdict_of(
+            structurally_similar,
+            type_signature_lean,
+            placement,
+            domain_match,
+        ),
         reasons: reasons_of(signals, structural_similarity_threshold),
     }
 }
@@ -108,6 +114,7 @@ pub fn classification_of(
 fn verdict_of(
     structurally_similar: bool,
     type_signature_lean: Lean,
+    placement: DomainMatch,
     domain_match: DomainMatch,
 ) -> Verdict {
     if !structurally_similar {
@@ -115,13 +122,15 @@ fn verdict_of(
     }
 
     match domain_match {
-        DomainMatch::Same => shared_domain_verdict_of(type_signature_lean),
+        DomainMatch::Same => shared_domain_verdict_of(type_signature_lean, placement),
         DomainMatch::Separate => Verdict::DoNotExtract,
         DomainMatch::Undecidable => Verdict::Review,
     }
 }
 
 /// ドメインが一致しているペアのラベル。型シグネチャが候補側の拒否権を持つ。
+///
+/// `placement` は Stage 1 だけで出したドメインの一致（[`placement_domain_match_of`]）。
 ///
 /// **単一化できないなら、そのままでは 1 つにまとめられない**ので候補として出さない。
 /// 計画が「ここで初めて型シグネチャ単一化可能判定が入り、`EXTRACT-CANDIDATE` 側の
@@ -134,10 +143,31 @@ fn verdict_of(
 /// **Why not（単一化できることを候補側の決め手にする）**: `(Date) => string` のような
 /// 汎用の型は別ドメインでもよく重なる。**重なることは必要条件であって、
 /// 同じドメインである証拠ではない。**
-fn shared_domain_verdict_of(type_signature_lean: Lean) -> Verdict {
+fn shared_domain_verdict_of(type_signature_lean: Lean, placement: DomainMatch) -> Verdict {
     match type_signature_lean {
         Lean::TowardDoNotExtract => Verdict::Review,
-        Lean::TowardExtract | Lean::Neither => Verdict::ExtractCandidate,
+        Lean::TowardExtract => Verdict::ExtractCandidate,
+        Lean::Neither => stage1_shared_domain_verdict_of(placement),
+    }
+}
+
+/// 型シグネチャが取れていないときのラベル。**Stage 1 だけで同じドメインと言えている
+/// 場合に限って**候補に出す。
+///
+/// 呼び出し元の観測だけで `Undecidable` から `Same` へ上げたペアをここで候補にすると、
+/// **単一化できるかを確かめないまま「共通化してよい」と言う**ことになる。
+/// これは hover だけが落ちた環境で起きるので、**環境の差で判定が緩む側へ動く**
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+///
+/// **Why not（`Separate` 側にも同じ条件を付ける）**: 型シグネチャは
+/// 「1 つにまとめられるか」の必要条件で、**偶発的な重複と言うのに要る証拠ではない**
+/// （計画の表でも呼び出し元の分布だけで非推奨側に傾く）。誤る向きも違い、
+/// 偽の `EXTRACT-CANDIDATE` は間違った抽象化を生むが、偽の `DO-NOT-EXTRACT` は
+/// 分離が続くだけ。
+fn stage1_shared_domain_verdict_of(placement: DomainMatch) -> Verdict {
+    match placement {
+        DomainMatch::Same => Verdict::ExtractCandidate,
+        DomainMatch::Separate | DomainMatch::Undecidable => Verdict::Review,
     }
 }
 
@@ -165,12 +195,12 @@ enum DomainMatch {
 /// 呼び出し元は「誰が使っているか」で、片方がもう片方の言い換えではない
 /// (`rules/naming.md`「`module distance` と `caller domain` を混ぜない」)。
 ///
+/// `placement` は Stage 1 だけで出した判定（[`placement_domain_match_of`]）。
+///
 /// - 観測が取れなければ、置き場所の判定のまま（LSP が無い環境が通る道）
 /// - 観測と置き場所が食い違えば `Undecidable`。**潰さずに人へ回す**
 /// - 食い違わなければ観測の側に寄せる
-fn domain_match_of(signals: &Signals) -> DomainMatch {
-    let placement = placement_domain_match_of(signals);
-
+fn domain_match_of(placement: DomainMatch, signals: &Signals) -> DomainMatch {
     match caller_domain_lean_of(signals.caller_domain_overlap()) {
         Lean::Neither => placement,
         Lean::TowardExtract => match placement {
@@ -628,6 +658,61 @@ mod tests {
         let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
 
         assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    /// 依存先を測れず、呼び出し元だけが同じドメインを指す組。
+    ///
+    /// Stage 1 だけでは `REVIEW`（置き場所を決められない）。
+    fn signals_of_a_caller_only_domain_match() -> Signals {
+        Signals::new(
+            StructuralSimilarity::Measured(measured(0.9)),
+            ImportOverlap::NoImports,
+            separate_directories(),
+        )
+    }
+
+    #[test]
+    fn test_classification_of_a_caller_only_domain_match_without_a_type_signature_is_review() {
+        // 呼び出し元だけで候補へ上げると、**単一化できるかを確かめないまま
+        // 「共通化してよい」と言う**ことになる。hover だけが落ちた環境で起きる
+        let signals = signals_of_a_caller_only_domain_match().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable,
+            },
+            callers_in_the_same_domain(),
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    #[test]
+    fn test_classification_of_a_caller_only_domain_match_with_a_type_signature_is_extract_candidate()
+     {
+        // 対照は上のテスト。型シグネチャが取れているかどうかだけが違う
+        let signals = signals_of_a_caller_only_domain_match()
+            .with_semantics(TypeSignatureMatch::Unifiable, callers_in_the_same_domain());
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(classification.verdict(), Verdict::ExtractCandidate);
+    }
+
+    #[test]
+    fn test_classification_of_callers_in_separate_domains_does_not_need_a_type_signature() {
+        // 候補側と違い、非推奨側には型シグネチャを求めない。型は「1 つにまとめられるか」の
+        // 必要条件であって、偶発的な重複と言うのに要る証拠ではない
+        let signals = signals_of_a_caller_only_domain_match().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable,
+            },
+            callers_in_separate_domains(),
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(classification.verdict(), Verdict::DoNotExtract);
     }
 
     #[test]
