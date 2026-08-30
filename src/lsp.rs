@@ -492,17 +492,16 @@ mod tests {
     /// 誰にも呼ばれていない関数を持つ fixture。
     const AN_UNCALLED_FILE: &str = "tests/fixtures/references/src/report/monthly.ts";
 
-    /// その木のプロジェクト設定。
+    /// 2 つの fixture から決まる、サーバに見せる根。
     ///
-    /// **根はここを含む位置にする。** tsconfig.json より下を根にすると、サーバは
-    /// 開いたファイルとその import 先だけのプロジェクトを組み立て、**呼び出し元の
-    /// 一部しか返さない**（呼び出し元は import を辿る向きの逆にある）。
-    const THE_PROJECT_FILE: &str = "tests/fixtures/references/tsconfig.json";
-
+    /// **テスト側で広げない。** `WorkspaceRoot::enclosing` は綴りだけで根を決める
+    /// （実在を確かめない）ので、置いていないパスを混ぜると黙って根が広がり、
+    /// **本番が作らない設定でテストが通る**。2 つの共通の祖先
+    /// （`tests/fixtures/references/src`）に tsconfig.json を置いてあり、そこが根になる。
     fn references_fixture_root() -> WorkspaceRoot {
         WorkspaceRoot::enclosing(&[
             repository_path(A_CALLED_FILE),
-            repository_path(THE_PROJECT_FILE),
+            repository_path(AN_UNCALLED_FILE),
         ])
         .expect("根を決められる")
     }
