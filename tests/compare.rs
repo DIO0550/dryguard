@@ -11,11 +11,16 @@
 
 use std::path::Path;
 
-use dryguard::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
+use dryguard::classification::signal::{
+    CallerDomainOverlap, ImportOverlap, Signals, StructuralSimilarity, TypeSignatureMatch,
+};
 use dryguard::classification::verdict::Verdict;
 use dryguard::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
 use dryguard::location::Location;
-use dryguard::pipeline::{ChunkPairError, chunk_pair_of, signals_of};
+use dryguard::lsp::ServerCommand;
+use dryguard::pipeline::{
+    ChunkPairError, MeasuredPair, chunk_pair_of, measured_pair_of, signals_of,
+};
 use dryguard::report::text_of;
 use dryguard::similarity::Similarity;
 
@@ -258,6 +263,112 @@ fn test_compare_of_similar_functions_in_separate_domains_reports_the_verdict_and
     assert!(
         text.contains("提案: 偶発的な重複の可能性が高い。共通化せず分離を維持する。"),
         "ラベルに対する提案が出る: {text}"
+    );
+}
+
+/// 起動できない LSP サーバの指定。
+///
+/// **モックではなく実物の失敗**を使う（`rules/testing.md`「モックは使わない」）。
+/// 実行ファイルが無いので `Client::start` が `ServerNotFound` で落ち、
+/// **サーバが入っている環境でも入っていない環境でも同じ経路を通る**。
+fn missing_server() -> ServerCommand {
+    ServerCommand::new("dryguard-no-such-language-server", Vec::new())
+}
+
+/// 2 箇所を実ファイルから切り出して、起動できないサーバで Stage 2 を尋ねるところまで。
+fn measured_without_an_lsp(location_a: &Location, location_b: &Location) -> MeasuredPair {
+    let Ok((chunk_a, chunk_b)) = chunk_pair_of(location_a, location_b) else {
+        panic!("テストが渡す位置はどちらも関数の中を指している");
+    };
+
+    measured_pair_of(&chunk_a, &chunk_b, &missing_server())
+}
+
+#[test]
+fn test_compare_without_an_lsp_server_still_reaches_the_stage1_verdict() {
+    // Phase 0 の仮説と同じペア。**サーバを使えなくても判定まで届く**
+    // （届かないと、LSP の入っていない環境でツールが使えなくなる）
+    let measured = measured_without_an_lsp(
+        &fixture("billing/discount.ts", 6),
+        &fixture("inventory/reorder.ts", 6),
+    );
+
+    let verdict =
+        classification_of(measured.signals(), DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD).verdict();
+    assert_eq!(verdict, Verdict::DoNotExtract);
+}
+
+#[test]
+fn test_compare_without_an_lsp_server_marks_the_stage2_signals_as_unmeasured() {
+    // 対照は下のテスト（Stage 1 のシグナルは測れている）。取れなかったことを
+    // 0.00 や「尋ねていない」で埋めると、環境が悪いのか材料が無いのかを読者が区別できない
+    let measured = measured_without_an_lsp(
+        &fixture("billing/discount.ts", 6),
+        &fixture("inventory/reorder.ts", 6),
+    );
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::LspUnusable
+    );
+    assert_eq!(
+        measured.signals().caller_domain_overlap(),
+        &CallerDomainOverlap::LspUnusable
+    );
+}
+
+#[test]
+fn test_compare_without_an_lsp_server_keeps_the_stage1_signals() {
+    let measured = measured_without_an_lsp(
+        &fixture("billing/discount.ts", 6),
+        &fixture("inventory/reorder.ts", 6),
+    );
+
+    assert_eq!(
+        measured.signals().import_overlap(),
+        ImportOverlap::Measured(Similarity::new(0.0).expect("0.0 は範囲に含む")),
+        "LSP が要らないシグナルはそのまま測れている"
+    );
+}
+
+#[test]
+fn test_compare_without_an_lsp_server_reports_which_server_it_could_not_start() {
+    // 「LSP サーバを使えない」だけでは、利用者は何を直せばよいか分からない
+    let measured = measured_without_an_lsp(
+        &fixture("billing/discount.ts", 6),
+        &fixture("inventory/reorder.ts", 6),
+    );
+
+    let Some(error) = measured.semantics_error() else {
+        panic!("起動できないサーバを渡したので理由が付く");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("dryguard-no-such-language-server"),
+        "どの実行ファイルを起こせなかったかが読める: {error}"
+    );
+}
+
+#[test]
+fn test_compare_without_an_lsp_server_reports_the_stage2_signals_as_unmeasured_in_the_text() {
+    let location_a = fixture("billing/discount.ts", 6);
+    let location_b = fixture("inventory/reorder.ts", 6);
+    let measured = measured_without_an_lsp(&location_a, &location_b);
+    let classification =
+        classification_of(measured.signals(), DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+    let text = text_of(
+        &location_a,
+        &location_b,
+        &classification,
+        DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+    );
+
+    assert!(
+        text.contains("型シグネチャ: 測れない (LSP サーバを使えない)")
+            && text.contains("呼び出し元ドメインの重なりを測れない (LSP サーバを使えない)"),
+        "どのシグナルが取れなかったかが出力から読める: {text}"
     );
 }
 
