@@ -54,6 +54,11 @@ pub struct Connection<R: BufRead, W: Write> {
     writer: W,
     next_id: RequestId,
     open_documents: BTreeSet<Uri>,
+    /// token を用意しただけで、始まりの通知がまだ来ていない作業。
+    ///
+    /// **待つ相手ではない**（始まらないまま捨てられることがある）。答えを信用してよいかの
+    /// 判断にだけ使い、1 度尋ね直したら忘れる。
+    prepared_progress: Vec<ProgressToken>,
     /// 始まりの通知が届き、終わりの通知がまだ来ていない作業。
     running_progress: Vec<ProgressToken>,
     /// サーバの作業について知らされた回数（token を用意する要求と、始まりの通知）。
@@ -71,6 +76,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             writer,
             next_id: RequestId::first(),
             open_documents: BTreeSet::new(),
+            prepared_progress: Vec::new(),
             running_progress: Vec::new(),
             noticed_progress_count: 0,
         }
@@ -311,10 +317,18 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             // あると、読み込み前に計算された答えを受け取りながら、手元では何も動いて
             // いないように見える（実測: 進捗の終わりが応答より先に届き、答えは 0 件）。
             let noticed_while_answering = self.noticed_progress_count != noticed_before;
-            let untouched_by_work = !noticed_while_answering && self.running_progress.is_empty();
+            // 用意されただけの作業も落ち着いていない扱いにする。始まりの通知が応答より
+            // 後ろに並ぶと、こちらからは何も起きていないように見える。
+            let work_is_pending =
+                !self.running_progress.is_empty() || !self.prepared_progress.is_empty();
+            let untouched_by_work = !noticed_while_answering && !work_is_pending;
             if untouched_by_work {
                 return Ok(answered);
             }
+
+            // 用意されただけの作業に付き合うのは 1 度だけ。始まらないまま捨てられた token を
+            // 数え続けると、**そのセッションでは参照元を二度と受け取れなくなる**。
+            self.prepared_progress.clear();
 
             attempts_left -= 1;
         }
@@ -467,9 +481,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             return self.send(&message::method_not_found_payload_of(id, method));
         }
 
-        // token を覚えるのは始まりの通知のほうなので、ここでは読めることだけを確かめる。
-        // 読めない要求を黙って受けると、後から届く進捗と突き合わせられない。
-        let _created: WorkDoneProgressCreateParams = serde_json::from_value(params_or_null(params))
+        let created: WorkDoneProgressCreateParams = serde_json::from_value(params_or_null(params))
             .map_err(malformed_params_error_of(WorkDoneProgressCreate::METHOD))?;
 
         self.send(&message::null_result_payload_of(id))?;
@@ -478,6 +490,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         // ここを通ったかどうかが、答えを信用してよいかの判断材料になる
         // （`running_progress` は始まって終わると空に戻り、痕跡が残らない）。
         self.noticed_progress_count = self.noticed_progress_count.saturating_add(1);
+        self.prepared_progress.push(created.token);
 
         Ok(())
     }
@@ -509,11 +522,16 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             // 数えないと、その並びで「何も起きなかった」ように見える。
             WorkDoneProgress::Begin(_) => {
                 self.noticed_progress_count = self.noticed_progress_count.saturating_add(1);
+                self.prepared_progress
+                    .retain(|token| *token != progress.token);
                 self.running_progress.push(progress.token);
             }
-            WorkDoneProgress::End(_) => self
-                .running_progress
-                .retain(|token| *token != progress.token),
+            WorkDoneProgress::End(_) => {
+                self.prepared_progress
+                    .retain(|token| *token != progress.token);
+                self.running_progress
+                    .retain(|token| *token != progress.token);
+            }
             // 途中経過は動いていることを言い直しているだけで、待つ相手は変わらない。
             WorkDoneProgress::Report(_) => {}
         }
@@ -1335,6 +1353,33 @@ mod tests {
         assert!(
             matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
             "前の問い合わせで用意された作業が動いたなら尋ね直す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_answered_before_prepared_work_begins_asks_again() {
+        // token を用意する要求は前の問い合わせ（hover）の最中に届き、**始まりの通知は
+        // 参照元の応答より後ろ**に並ぶ。用意されただけの作業を見ていないと、始まる前に
+        // 計算された答えをそのまま採る
+        let server_output = frames_of(&[
+            &progress_create_request(9, "prepared"),
+            &hover_response("function applyDiscount(invoice: Invoice): number"),
+            &no_references_response(2),
+            &references_response(3, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+        connection
+            .hover(&document, position_after(5, "export function "))
+            .expect("hover に答えが返る");
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "用意されただけの作業があるうちは尋ね直す: {outcome:?}"
         );
     }
 

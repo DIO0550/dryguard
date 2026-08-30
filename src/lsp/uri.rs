@@ -164,7 +164,11 @@ pub(super) fn path_of(uri: &Uri) -> Result<PathBuf, UriPathError> {
         let Ok(name) = segment.decode().into_string() else {
             return Err(UriPathError::NotUtf8 { uri: text_of(uri) });
         };
-        if is_drive_letter(&name) {
+
+        // ドライブ文字を名乗れるのは先頭の要素だけ。**どの段でも見ると**、
+        // `C:` という名前のディレクトリを持つ POSIX のパスまで綴れないことにしてしまう。
+        let at_the_root = path == Path::new(ROOT_DIRECTORY);
+        if at_the_root && is_drive_letter(&name) {
             return Err(UriPathError::DriveLetter { uri: text_of(uri) });
         }
 
@@ -177,6 +181,7 @@ pub(super) fn path_of(uri: &Uri) -> Result<PathBuf, UriPathError> {
 /// Windows のドライブ文字を表す要素か（`C:`）。
 ///
 /// [`file_uri_of`] が前置きをこの綴りで置くので、逆向きでも同じ形で見つかる。
+/// **先頭の要素にだけ当てる**（`path_of`）。前置きは根の直後にしか置けない。
 fn is_drive_letter(name: &str) -> bool {
     let mut bytes = name.bytes();
 
@@ -558,5 +563,15 @@ mod tests {
         let error = path_of(&uri("file:///home/user/%FF.ts")).expect_err("パスに戻せない");
 
         assert!(matches!(error, UriPathError::NotUtf8 { .. }));
+    }
+
+    #[test]
+    fn test_path_of_a_uri_with_a_drive_letter_below_the_root_keeps_it_as_a_directory() {
+        // 対照は上のテスト。同じ `C:` でも根の直下でなければ、POSIX では
+        // ただのディレクトリ名。ここを弾くと、そのディレクトリを持つコードベースは
+        // 参照元をまるごと失う
+        let path = path_of(&uri("file:///repo/C:/caller.ts")).expect("パスに戻せる");
+
+        assert_eq!(path, Path::new("/repo/C:/caller.ts"));
     }
 }

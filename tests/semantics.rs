@@ -9,6 +9,7 @@
 //! 開発機で黙って通さないため（rules/testing.md「LSP を要するテストは、飛ばしたことが
 //! 分かる形にする」）。CI はサーバを入れて `--ignored` で走らせる。
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use dryguard::codebase::source_of;
@@ -137,8 +138,8 @@ fn test_two_functions_taking_types_from_separate_domains_are_not_unifiable() {
     assert!(!unifiable(&discounts_an_invoice, &reorders_stock));
 }
 
-/// そのチャンクの呼び出し元が属するドメイン。サーバに尋ねて数える。
-fn caller_domains_of(session: &mut Session, chunk: &Chunk) -> CallerDomains {
+/// そのチャンクの呼び出し元のファイル。サーバに尋ねて集める。
+fn reference_paths_of(session: &mut Session, chunk: &Chunk) -> Vec<PathBuf> {
     let document = document(chunk.path());
     if session.open_document(&document).is_err() {
         panic!("ファイルを開かせられる: {}", chunk.path().display());
@@ -157,10 +158,25 @@ fn caller_domains_of(session: &mut Session, chunk: &Chunk) -> CallerDomains {
             chunk.path().display()
         );
     };
+    reference_paths
+}
+
+/// そのチャンクの呼び出し元が属するドメイン。サーバに尋ねて数える。
+fn caller_domains_of(session: &mut Session, chunk: &Chunk) -> CallerDomains {
+    let reference_paths = reference_paths_of(session, chunk);
+
     let Some(caller_domains) = CallerDomains::from_reference_paths(&reference_paths) else {
         panic!("返った参照元は 1 件以上ある: {reference_paths:?}");
     };
     caller_domains
+}
+
+/// 参照元のファイル名（重複を畳んだもの）。**どのファイルが返ったか**を見るために使う。
+fn reference_file_names(reference_paths: &[PathBuf]) -> BTreeSet<String> {
+    reference_paths
+        .iter()
+        .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+        .collect()
 }
 
 /// 2 箇所のチャンクの呼び出し元ドメインがどれだけ重なるか、実サーバに尋ねて測る。
@@ -230,23 +246,15 @@ fn test_caller_domains_asked_after_a_type_signature_are_still_complete() {
         fixture(THE_REFERENCES_PROJECT_FILE, 1).path().to_path_buf(),
     ]);
     let _signature = type_signature_of(&mut session, &chunk);
-    let caller_domains = caller_domains_of(&mut session, &chunk);
+    let reference_paths = reference_paths_of(&mut session, &chunk);
     if session.shutdown().is_err() {
         panic!("サーバを終わらせられる");
     }
 
-    let domains: Vec<String> = caller_domains
-        .references_per_domain()
-        .iter()
-        .map(|(domain, _)| domain.directory().display().to_string())
-        .collect();
+    // **ドメインに畳む前のファイルで見る。** 畳んでからだと、片方しか返らなくても
+    // 「billing の 1 ドメイン」になり、欠けたことがテストから消える
     assert_eq!(
-        domains.len(),
-        1,
-        "呼び出し元は 1 つのドメインに収まる: {domains:?}"
-    );
-    assert!(
-        domains[0].ends_with("src/billing"),
-        "呼び出し元は billing の 2 ファイル: {domains:?}"
+        reference_file_names(&reference_paths),
+        BTreeSet::from(["invoice.ts".to_owned(), "statement.ts".to_owned()])
     );
 }
