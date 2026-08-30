@@ -78,6 +78,10 @@ if structurally_similar && domains_differ { ... }
 | `document` | サーバに開かせるソースファイル 1 つ分。URI・`language id`・中身の組 |
 | `language id` | LSP がサーバに伝える言語の名前（`typescript` / `typescriptreact`） |
 | `hover` | ソースの 1 点を指して、そこにある名前の型を尋ねる問い合わせ |
+| `references` | ソースの 1 点を指して、そこにある名前を使っているところを尋ねる問い合わせ |
+| `reference` | `references` が返す 1 件。**その名前を使っている側**のファイルの位置 |
+| `caller domain` | 参照元が属する `domain`。ドメインごとの件数を持つ |
+| `progress` | サーバが自分で始めた作業（プロジェクトの読み込みなど）。作成の要求と、終わりの通知で挟まれる |
 | `source position` | ファイルの中の 1 点。行と、**UTF-16 のコード単位で数えた**列 |
 | `signature text` | hover が返した型の綴りそのもの。**正規化前** |
 | `type signature` | 引数名を落とし、型変数を出現順に付け替えた形。**正規化後**。比較はこれで行う |
@@ -105,6 +109,12 @@ JSON が壊れているのは違う話）。1 語で呼ぶと、どちらの層�
 引数名が違うだけのペアが別物になる**（`specifier` と `module path` を分けているのと同じ形）。
 サーバが返す綴りには宣言形（`function decl(a: string): number`）と値形
 （`const arrow: (a: string) => number`）があり、**同じ型でも書かれ方が 2 通りある**。
+
+**`module distance` と `caller domain` を混ぜない。** どちらもディレクトリで測るが、
+前者は**そのチャンク自身がどこに置かれているか**、後者は**実際に誰が使っているか**。
+片方が `utils/` に置かれていても、呼び出し元が 1 つのドメインに偏っていれば
+「そのドメインのもの」と言える。**置き場所の代理指標を、使われ方の観測で置き換えない**
+（重ねる。`docs/dryguard-plan.md`「Phase 0 のディレクトリ距離との関係」）。
 
 **`grammar` と `language id` を混ぜない。** どちらも拡張子で決まるが、`grammar` は
 tree-sitter がソースを読むための文法、`language id` は LSP サーバに言語を伝える綴りで、
