@@ -1082,6 +1082,18 @@ function broken() {
     }
 
     #[test]
+    fn test_chunk_type_references_leave_out_the_leaf_of_a_qualified_type_name() {
+        // `money.Amount` の `Amount` だけを解決すると、差し込みが `money.number` を作る。
+        // 対照として修飾されていない型名を 1 つ置く
+        let qualified =
+            "export function scale(amount: money.Amount, rate: Rate): number {\n  return 0;\n}\n";
+
+        let chunk = chunk_at(qualified, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Rate"]);
+    }
+
+    #[test]
     fn test_chunk_type_references_of_a_signature_written_with_keyword_types_only_are_empty() {
         let plain = "export function scale(amount: number): number {\n  return amount;\n}\n";
 

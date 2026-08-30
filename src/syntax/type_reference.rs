@@ -19,6 +19,11 @@ use crate::syntax::tree::source_position_of;
 /// 抑える一番外側の網になる。
 const TYPE_IDENTIFIER_KIND: &str = "type_identifier";
 
+/// 修飾された型名を表すノードの種別（`money.Amount`）。
+///
+/// 綴りのうち末尾だけ（`Amount`）が [`TYPE_IDENTIFIER_KIND`] のノードになる。
+const NESTED_TYPE_IDENTIFIER_KIND: &str = "nested_type_identifier";
+
 /// 引数リストを載せるフィールド。
 const PARAMETERS_FIELD: &str = "parameters";
 
@@ -134,7 +139,8 @@ fn type_identifiers_of(node: Node<'_>) -> Vec<Node<'_>> {
 /// 型名を見つけても子へ降り続ける。総称型は名前と型引数が同じ部分木にいるので
 /// （`Box<User>`）、そこで止めると `User` を数え落とす。
 fn push_type_identifiers<'tree>(node: Node<'tree>, found: &mut Vec<Node<'tree>>) {
-    if node.kind() == TYPE_IDENTIFIER_KIND {
+    let named_type = node.kind() == TYPE_IDENTIFIER_KIND && !is_qualified_leaf(node);
+    if named_type {
         found.push(node);
     }
 
@@ -143,6 +149,16 @@ fn push_type_identifiers<'tree>(node: Node<'tree>, found: &mut Vec<Node<'tree>>)
     for child in children {
         push_type_identifiers(child, found);
     }
+}
+
+/// そのノードが、修飾された型名の末尾か（`money.Amount` の `Amount`）。
+///
+/// **Why（末尾だけを解決しない）**: 解決して差し込むと、置き換わるのは末尾だけなので
+/// `money.number` という綴りができる。まとめて置き換えるには修飾ごと持つ必要があり、
+/// それは差し込みが識別子の単位で行われる形とぶつかる。
+fn is_qualified_leaf(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| parent.kind() == NESTED_TYPE_IDENTIFIER_KIND)
 }
 
 /// そのチャンクが宣言した型変数の名前。宣言が無ければ空。
