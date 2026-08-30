@@ -39,6 +39,18 @@ const CONSTRUCTOR_KEYWORD: &str = "constructor";
 /// 構築シグネチャの値形を導く語（`new (value: string) => Result`）。
 const NEW_KEYWORD: &str = "new";
 
+/// 配列と添字アクセスの印の始まり（`T[]` / `T["key"]`）。
+///
+/// **どちらも型名より強く結び付く**ので、組み合わさった型をこの手前に置くには
+/// 括弧が要る。
+const INDEXED_START: char = '[';
+
+/// 括弧で括られていなければ、より強く結び付く印に負ける演算子。
+///
+/// 関数型の `=>` は、深さ 0 の `=` として現れる（`>` は矢印の一部なので
+/// [`SignatureScan`] が閉じ括弧として数えない）。
+const UNGROUPED_TYPE_OPERATORS: [char; 3] = ['|', '&', '='];
+
 /// サーバに型シグネチャを尋ねた結果。
 ///
 /// **「取れなかった」を 1 つにまとめない。** どれなのかで**利用者が次に試すことが違う**
@@ -349,28 +361,66 @@ fn substituted(text: &str, resolved: &ResolvedTypes) -> String {
     let mut identifier = String::new();
     let mut quote = QuoteState::new();
 
-    for character in text.chars() {
+    for (index, character) in text.char_indices() {
         let inside_quotes = quote.is_inside(character);
         if !inside_quotes && is_identifier_character(character) {
             identifier.push(character);
             continue;
         }
 
-        push_resolved(&mut substituted, &identifier, resolved);
+        let following = text.get(index..).unwrap_or_default();
+        push_resolved(&mut substituted, &identifier, resolved, following);
         identifier.clear();
         substituted.push(character);
     }
-    push_resolved(&mut substituted, &identifier, resolved);
+    push_resolved(&mut substituted, &identifier, resolved, "");
 
     substituted
 }
 
 /// 識別子 1 つ分を、解決後の綴り（解決できていなければそのまま）で書き足す。
-fn push_resolved(target: &mut String, identifier: &str, resolved: &ResolvedTypes) {
-    match resolved.resolved_of(identifier) {
-        Some(spelling) => target.push_str(spelling),
-        None => target.push_str(identifier),
+///
+/// `following` はその識別子の後ろに続く綴り。置く位置によって括弧が要るかが変わる
+/// （[`grouped_spelling_of`]）。
+fn push_resolved(target: &mut String, identifier: &str, resolved: &ResolvedTypes, following: &str) {
+    let Some(spelling) = resolved.resolved_of(identifier) else {
+        target.push_str(identifier);
+        return;
+    };
+
+    target.push_str(&grouped_spelling_of(spelling, following));
+}
+
+/// その位置に置くときの型の綴り。括弧が要るなら括ってから返す。
+///
+/// `following` はその型名の後ろに続く綴り。
+///
+/// **Why**: `type Maybe = string | undefined` を `Maybe[]` の位置へそのまま差し込むと
+/// `string | undefined[]` になり、`(string | undefined)[]` とは別の型を指す。
+/// 呼び出し可能なエイリアスでは**倒れる向きが偽陽性**になり、`Handler[]` が
+/// 「配列を返す関数」として読める。
+///
+/// **Why not（常に括る）**: `Amount` が `(number)` になり、書き下した `number` と
+/// 別の綴りになる。**エイリアスを開いた側だけが単一化できなくなる。**
+fn grouped_spelling_of(spelling: &str, following: &str) -> String {
+    let indexed = following.trim_start().starts_with(INDEXED_START);
+    if !indexed || !is_compound_type(spelling) {
+        return spelling.to_owned();
     }
+
+    format!("({spelling})")
+}
+
+/// その型の綴りが、括弧の外で組み合わさっているか。
+///
+/// 深さ 0 だけを見るのは、`Map<string, A | B>` のように**括弧の中で組み合わさって
+/// いる型は、それ自体が 1 つのまとまりとして置ける**ため。
+fn is_compound_type(spelling: &str) -> bool {
+    let scan = SignatureScan::new(spelling);
+
+    UNGROUPED_TYPE_OPERATORS
+        .iter()
+        .any(|operator| scan.top_level_index_of(*operator).is_some())
 }
 
 /// 引用符の中にいるかどうかを、文字を 1 つずつ読みながら追う。
@@ -1208,6 +1258,59 @@ mod tests {
         );
 
         assert!(!longer.is_unifiable_with(&signature("function other(rate: numberRate): void")));
+    }
+
+    #[test]
+    fn test_an_opened_alias_keeps_its_precedence_inside_an_array_type() {
+        // `Maybe[]` へ `string | undefined` をそのまま差し込むと `string | undefined[]`
+        // になり、`(string | undefined)[]` とは別の型を指す
+        let aliased = signature_with(
+            "function pick(values: Maybe[]): void",
+            &resolving("Maybe", "string | undefined"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function other(items: (string | undefined)[]): void"
+        )));
+    }
+
+    #[test]
+    fn test_an_opened_alias_standing_on_its_own_is_not_wrapped() {
+        // 対照は上のテスト。括弧を常に足すと、書き下した綴りと別物になる
+        let aliased = signature_with(
+            "function pick(value: Maybe): void",
+            &resolving("Maybe", "string | undefined"),
+        );
+
+        assert!(
+            aliased.is_unifiable_with(&signature("function other(item: string | undefined): void"))
+        );
+    }
+
+    #[test]
+    fn test_an_opened_alias_of_a_single_type_is_not_wrapped_inside_an_array_type() {
+        // 括弧が要るのは組み合わさった型だけ。`number` を包むと `(number)[]` になり、
+        // 書き下した `number[]` と別物になる
+        let aliased = signature_with(
+            "function pick(values: Amount[]): void",
+            &resolving("Amount", "number"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature("function other(items: number[]): void")));
+    }
+
+    #[test]
+    fn test_an_opened_callable_alias_inside_an_array_type_is_not_read_as_a_function() {
+        // `Handler[]` は関数型の配列。包まないと「number の配列を返す関数」になり、
+        // **別の型なのに単一化可能と出る**（倒れる向きが偽陽性）
+        let aliased = signature_with(
+            "function pick(values: Handler[]): void",
+            &resolving("Handler", "(value: string) => number"),
+        );
+
+        assert!(!aliased.is_unifiable_with(&signature(
+            "function other(items: (value: string) => number[]): void"
+        )));
     }
 
     #[test]
