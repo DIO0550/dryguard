@@ -13,7 +13,8 @@ use lsp_types::notification::{
     DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized, Notification as _, Progress,
 };
 use lsp_types::request::{
-    HoverRequest, Initialize, References, Request as _, Shutdown, WorkDoneProgressCreate,
+    GotoTypeDefinition, GotoTypeDefinitionParams, GotoTypeDefinitionResponse, HoverRequest,
+    Initialize, References, Request as _, Shutdown, WorkDoneProgressCreate,
 };
 use lsp_types::{
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover, HoverParams, InitializeResult,
@@ -32,6 +33,7 @@ use super::message::{
     ServerRequestId,
 };
 use super::references::{self, ReferencesOutcome};
+use super::type_definition::{self, DeclarationSite, TypeDefinitionOutcome};
 use super::workspace::WorkspaceRoot;
 use crate::source_position::SourcePosition;
 
@@ -227,11 +229,49 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             });
         }
 
+        self.hovered(document.uri().clone(), position)
+    }
+
+    /// 宣言の場所を指して、そこにある名前の型の綴りを尋ねる。
+    ///
+    /// `site` は [`Connection::type_definition`] が返した場所。
+    ///
+    /// **宣言のあるファイルは、呼び出し側が先に開かせておく。** 開かせていないファイルへ
+    /// 送ると、サーバは綴りを持たない応答を返す（[`HoverOutcome::Unreadable`] になる。
+    /// typescript-language-server 6.0.0 で実測）。
+    ///
+    /// **Why not（[`Connection::hover`] と同じく開かせていなければ断る）**: 宣言の場所は
+    /// サーバ自身が返した URI で、こちらは `SourceDocument` を持っていない。
+    /// 断るために作らせると、**尋ねるだけの経路にファイルを読ませる**ことになる。
+    ///
+    /// # Errors
+    ///
+    /// パラメータを JSON にできないとき、送受信が失敗したとき、
+    /// 応答を hover の結果として読めないとき。
+    pub fn hover_at_declaration(
+        &mut self,
+        site: &DeclarationSite,
+    ) -> Result<HoverOutcome, ConnectionError> {
+        self.hovered(site.uri().clone(), site.position())
+    }
+
+    /// 指定した URI の指定位置へ hover を送り、応答を読む。
+    ///
+    /// 開かせてあるかの断りは呼び出し側が置く。**断る理由が呼び出し側で違う**ので、
+    /// ここにまとめると片方に合わない断りが入る。
+    ///
+    /// # Errors
+    ///
+    /// パラメータを JSON にできないとき、送受信が失敗したとき、
+    /// 応答を hover の結果として読めないとき。
+    fn hovered(
+        &mut self,
+        uri: Uri,
+        position: SourcePosition,
+    ) -> Result<HoverOutcome, ConnectionError> {
         let params = HoverParams {
             text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: document.uri().clone(),
-                },
+                text_document: TextDocumentIdentifier { uri },
                 position: position.to_lsp_position(),
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
@@ -251,6 +291,60 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         Ok(match answered.as_ref() {
             Some(hover) => hover::outcome_of(hover),
             None => HoverOutcome::NoAnswer,
+        })
+    }
+
+    /// 開かせたファイルの、指定位置に書かれた型が宣言されている場所を尋ねる。
+    ///
+    /// `position` は `TypeReference::position` が指す型名の位置。宣言が無かったのか
+    /// 読めなかったのかは [`TypeDefinitionOutcome`] が分けて持つ。
+    ///
+    /// **`textDocument/definition` では届かない。** 輸入した型名に送ると
+    /// `import Amount` を宣言している import 文の綴りが返り、そこからもう一度尋ねても
+    /// 同じ場所へ戻る（typescript-language-server 6.0.0 で実測）。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、パラメータを JSON にできないとき、
+    /// 送受信が失敗したとき、応答を typeDefinition の結果として読めないとき。
+    pub fn type_definition(
+        &mut self,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<TypeDefinitionOutcome, ConnectionError> {
+        // 開かせていないドキュメントへ送ると、サーバは中身を知らないまま null を返す。
+        // 「宣言が無い」と「開かせ忘れ」が同じ答えになるので、送る前に断る。
+        if !self.open_documents.contains(document.uri()) {
+            return Err(ConnectionError::DocumentNotOpen {
+                uri: document.uri().clone(),
+            });
+        }
+
+        let params = GotoTypeDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: document.uri().clone(),
+                },
+                position: position.to_lsp_position(),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let params = serde_json::to_value(params)
+            .map_err(not_serializable_error_of(GotoTypeDefinition::METHOD))?;
+
+        let result = self.request(GotoTypeDefinition::METHOD, Some(params))?;
+        // 宣言が無いときサーバは null を返す。`Option` で受けて、応答が読めなかった
+        // 場合と分ける。
+        let answered: Option<GotoTypeDefinitionResponse> =
+            serde_json::from_value(result).map_err(|cause| ConnectionError::MalformedResult {
+                method: GotoTypeDefinition::METHOD.to_owned(),
+                cause,
+            })?;
+
+        Ok(match answered.as_ref() {
+            Some(answered) => type_definition::outcome_of(answered),
+            None => TypeDefinitionOutcome::NoAnswer,
         })
     }
 

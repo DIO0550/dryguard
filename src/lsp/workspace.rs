@@ -19,6 +19,7 @@ use super::uri::{self, PathUriError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRoot {
     uri: Uri,
+    path: PathBuf,
 }
 
 impl WorkspaceRoot {
@@ -61,12 +62,24 @@ impl WorkspaceRoot {
 
         Ok(Self {
             uri: uri::file_uri_of(&ancestor).map_err(WorkspaceError::Uri)?,
+            path: ancestor,
         })
     }
 
     /// `rootUri` として送る URI。
     pub(super) fn uri(&self) -> &Uri {
         &self.uri
+    }
+
+    /// そのファイルがこの根の下にあるか。
+    ///
+    /// **サーバが返した場所を開かせるかの判断に使う。** サーバはこちらが見せた範囲の外
+    /// （`lib.es5.d.ts` や `node_modules/` の下）も宣言の場所として返すので、
+    /// 素直に開かせると 1 つの綴りのために大きなファイルを読んで送ることになる。
+    ///
+    /// 綴りで比べるので、`path` は絶対パスで渡す（根は生成時に絶対パスへ直してある）。
+    pub fn contains(&self, path: &Path) -> bool {
+        path.starts_with(&self.path)
     }
 }
 
@@ -245,5 +258,41 @@ mod tests {
             error,
             WorkspaceError::PathNotAbsolute { path, .. } if path == empty
         ));
+    }
+
+    #[test]
+    fn test_root_contains_a_file_under_it() {
+        let paths = vec![
+            repository_path("src/lsp/uri.rs"),
+            repository_path("src/lsp/workspace.rs"),
+        ];
+        let root = WorkspaceRoot::enclosing(&paths).expect("根を決められる");
+
+        assert!(root.contains(&repository_path("src/lsp/hover.rs")));
+    }
+
+    #[test]
+    fn test_root_does_not_contain_a_file_outside_it() {
+        // 対照は上のテスト。同じリポジトリの中だが根より上にある。
+        // サーバは `lib.es5.d.ts` のように見せていない場所も宣言の場所として返す
+        let paths = vec![
+            repository_path("src/lsp/uri.rs"),
+            repository_path("src/lsp/workspace.rs"),
+        ];
+        let root = WorkspaceRoot::enclosing(&paths).expect("根を決められる");
+
+        assert!(!root.contains(&repository_path("src/pipeline.rs")));
+    }
+
+    #[test]
+    fn test_root_does_not_contain_a_sibling_directory_that_shares_a_prefix() {
+        // 文字列の先頭一致で見ると `src/lsp` が `src/lsp_extra` を含むことになる
+        let paths = vec![
+            repository_path("src/lsp/uri.rs"),
+            repository_path("src/lsp/workspace.rs"),
+        ];
+        let root = WorkspaceRoot::enclosing(&paths).expect("根を決められる");
+
+        assert!(!root.contains(&repository_path("src/lsp_extra/uri.rs")));
     }
 }
