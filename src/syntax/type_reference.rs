@@ -31,6 +31,8 @@ const PARAMETERS_FIELD: &str = "parameters";
 const RETURN_TYPE_FIELD: &str = "return_type";
 
 /// 型変数の宣言を載せるフィールド。
+///
+/// ノードの種別も同じ綴りなので、[`nodes_of_kind`] へもこれを渡す。
 const TYPE_PARAMETERS_FIELD: &str = "type_parameters";
 
 /// 名前を載せるフィールド。
@@ -128,26 +130,33 @@ fn annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
 
 /// その部分木にある型名のノードを、書かれた順に返す。
 fn type_identifiers_of(node: Node<'_>) -> Vec<Node<'_>> {
+    nodes_of_kind(node, TYPE_IDENTIFIER_KIND)
+        .into_iter()
+        .filter(|found| !is_qualified_leaf(*found))
+        .collect()
+}
+
+/// その部分木にある、指定した種別のノードを書かれた順に返す。
+fn nodes_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
     let mut found = Vec::new();
-    push_type_identifiers(node, &mut found);
+    push_nodes_of_kind(node, kind, &mut found);
 
     found
 }
 
-/// 型名のノードを、部分木を前順に歩いて書き足す。
+/// 指定した種別のノードを、部分木を前順に歩いて書き足す。
 ///
-/// 型名を見つけても子へ降り続ける。総称型は名前と型引数が同じ部分木にいるので
+/// 見つけても子へ降り続ける。総称型は名前と型引数が同じ部分木にいるので
 /// （`Box<User>`）、そこで止めると `User` を数え落とす。
-fn push_type_identifiers<'tree>(node: Node<'tree>, found: &mut Vec<Node<'tree>>) {
-    let named_type = node.kind() == TYPE_IDENTIFIER_KIND && !is_qualified_leaf(node);
-    if named_type {
+fn push_nodes_of_kind<'tree>(node: Node<'tree>, kind: &str, found: &mut Vec<Node<'tree>>) {
+    if node.kind() == kind {
         found.push(node);
     }
 
     let mut cursor = node.walk();
     let children: Vec<Node<'tree>> = node.named_children(&mut cursor).collect();
     for child in children {
-        push_type_identifiers(child, found);
+        push_nodes_of_kind(child, kind, found);
     }
 }
 
@@ -161,22 +170,32 @@ fn is_qualified_leaf(node: Node<'_>) -> bool {
         .is_some_and(|parent| parent.kind() == NESTED_TYPE_IDENTIFIER_KIND)
 }
 
-/// そのチャンクが宣言した型変数の名前。宣言が無ければ空。
+/// そのシグネチャの中で宣言された型変数の名前。宣言が無ければ空。
 ///
 /// **Why（宣言した名前を尋ねない）**: 型変数の宣言はチャンクごとに別のものなので、
 /// 解決するとファイルごとに違う結果になる。`pickFirst<T>` と `head<U>` が
 /// **単一化できなくなる**（正規化はこの 2 つを同じ形に直す前提で書かれている）。
 ///
+/// **入れ子の宣言も見る。** `(a: T, cb: <T>(x: T) => T)` のように内側が外側の綴りを
+/// 覆うと、外側だけを解決した差し込みが**内側の宣言まで書き換える**
+/// （`<number>(x: number) => number` という綴りになる）。綴りが同じ名前は
+/// まとめて尋ねない側に置く。
+///
+/// **Why not（宣言ごとに区別する）**: 区別するには型名を綴りではなく位置で持ち回る
+/// ことになり、差し込みも位置で行う形へ変わる。倒れる向きは偽陰性（外側の
+/// エイリアスが解決されないだけ）なので、綴りが壊れないほうを採った。
+///
 /// 制約に書かれた型名（`<T extends Amount>` の `Amount`）は宣言された名前ではないので、
 /// 集める側に残る。
 fn declared_type_parameter_names_of(node: Node<'_>, source: &str) -> BTreeSet<String> {
-    let Some(type_parameters) = node.child_by_field_name(TYPE_PARAMETERS_FIELD) else {
-        return BTreeSet::new();
-    };
-
-    let mut cursor = type_parameters.walk();
-    type_parameters
-        .named_children(&mut cursor)
+    annotated_nodes_of(node)
+        .into_iter()
+        .flat_map(|annotated| nodes_of_kind(annotated, TYPE_PARAMETERS_FIELD))
+        .flat_map(|declarations| {
+            let mut cursor = declarations.walk();
+            let declared: Vec<Node<'_>> = declarations.named_children(&mut cursor).collect();
+            declared
+        })
         .filter_map(|parameter| parameter.child_by_field_name(NAME_FIELD))
         .filter_map(|name| source.get(name.byte_range()))
         .map(str::to_owned)

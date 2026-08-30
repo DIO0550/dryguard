@@ -1023,6 +1023,19 @@ function broken() {
     }
 
     #[test]
+    fn test_chunk_type_references_leave_out_a_type_variable_declared_inside_the_signature() {
+        // 内側の `<T>` が外側の綴りを覆う形。外側だけを解決すると、差し込みが
+        // 内側の宣言まで書き換えて `<number>(x: number) => number` になる。
+        // 対照として、覆われていない型名を 1 つ置く
+        let shadowed =
+            "export function run(a: T, rate: Rate, cb: <T>(x: T) => T): void {\n  cb(a);\n}\n";
+
+        let chunk = chunk_at(shadowed, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Rate"]);
+    }
+
+    #[test]
     fn test_chunk_type_references_name_the_same_type_only_once() {
         // 尋ねる先は綴りごとに 1 箇所でよい。畳まないと同じ名前へ 2 度送る
         let repeated =
