@@ -80,13 +80,30 @@ impl ResolvedTypes {
     }
 }
 
+/// 型名の宣言を尋ねた結果。
+///
+/// **サーバが typeDefinition を提供していないことを、宣言が無いのと同じにしない。**
+/// 前者では**どの型名も開けない**ので、綴りのまま比べた結果を「単一化不能」として
+/// 出すと、確かめられなかったことを確かめた答えとして出すことになる
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeDeclarationsOutcome {
+    /// 尋ね終えた。宣言の場所が返らなかった型名は入らない。
+    Located(Vec<TypeDeclaration>),
+    /// サーバが typeDefinition を提供していない。
+    TypeDefinitionNotProvided,
+}
+
 /// シグネチャに書かれた型名の宣言が、どこにあるかを尋ねる。
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`type_references` は
 /// `Chunk::type_references` が集めた型名。
 ///
-/// **宣言の場所が返らなかった型名は落とす。** 解決できないだけで、その型名は
-/// 綴りのまま比較へ進む（今までと同じ形）。
+/// **宣言の場所が返らなかった型名は落とす。** その型名が解決できないだけで、
+/// 残りは解決できるので、綴りのまま比較へ進む（今までと同じ形）。
+///
+/// **サーバが typeDefinition を提供していないときだけは落とさない。** そのときは
+/// **どの型名も開けない**ので、取れなかったこととして返す。
 ///
 /// # Errors
 ///
@@ -95,23 +112,23 @@ pub fn type_declarations_of(
     session: &mut Session,
     document: &SourceDocument,
     type_references: &[TypeReference],
-) -> Result<Vec<TypeDeclaration>, ClientError> {
+) -> Result<TypeDeclarationsOutcome, ClientError> {
     let mut declarations = Vec::new();
 
     for reference in type_references {
-        let TypeDefinitionOutcome::Answered(site) =
-            session.type_definition(document, reference.position())?
-        else {
-            continue;
-        };
-
-        declarations.push(TypeDeclaration {
-            name: reference.name().to_owned(),
-            site,
-        });
+        match session.type_definition(document, reference.position())? {
+            TypeDefinitionOutcome::Answered(site) => declarations.push(TypeDeclaration {
+                name: reference.name().to_owned(),
+                site,
+            }),
+            TypeDefinitionOutcome::NotSupported => {
+                return Ok(TypeDeclarationsOutcome::TypeDefinitionNotProvided);
+            }
+            TypeDefinitionOutcome::NoAnswer | TypeDefinitionOutcome::Unreadable { .. } => continue,
+        }
     }
 
-    Ok(declarations)
+    Ok(TypeDeclarationsOutcome::Located(declarations))
 }
 
 /// 宣言の位置へ hover を送り、型エイリアスの右辺を集める。

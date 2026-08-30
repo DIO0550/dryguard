@@ -23,7 +23,9 @@ use crate::lsp::{
     WorkspaceRoot,
 };
 use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outcome_of};
-use crate::semantics::resolved_type::{TypeDeclaration, resolved_types_of, type_declarations_of};
+use crate::semantics::resolved_type::{
+    TypeDeclaration, TypeDeclarationsOutcome, resolved_types_of, type_declarations_of,
+};
 use crate::semantics::type_signature::{TypeSignatureOutcome, type_signature_outcome_of};
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks};
@@ -425,7 +427,11 @@ fn resolved_type_signature_outcome_of(
     document: &SourceDocument,
     position: SourcePosition,
 ) -> Result<TypeSignatureOutcome, ClientError> {
-    let declarations = type_declarations_of(session, document, chunk.type_references())?;
+    let TypeDeclarationsOutcome::Located(declarations) =
+        type_declarations_of(session, document, chunk.type_references())?
+    else {
+        return Ok(TypeSignatureOutcome::TypeDefinitionNotProvided);
+    };
     open_declaring_documents(session, &declarations)?;
     let resolved = resolved_types_of(session, &declarations)?;
 
@@ -566,6 +572,10 @@ fn type_signature_match_of(
         | (_, TypeSignatureOutcome::UnreadableSignature) => TypeSignatureMatch::UnreadableSignature,
         (TypeSignatureOutcome::HoverNotProvided, _)
         | (_, TypeSignatureOutcome::HoverNotProvided) => TypeSignatureMatch::HoverNotProvided,
+        (TypeSignatureOutcome::TypeDefinitionNotProvided, _)
+        | (_, TypeSignatureOutcome::TypeDefinitionNotProvided) => {
+            TypeSignatureMatch::TypeDefinitionNotProvided
+        }
     }
 }
 
@@ -1113,6 +1123,35 @@ mod tests {
                 .expect("テストが渡す綴りは読み取れる");
 
         TypeSignatureOutcome::Normalized(signature)
+    }
+
+    #[test]
+    fn test_asked_semantics_do_not_call_a_pair_not_unifiable_without_type_definition() {
+        // 型名を 1 つも開けていないので、綴りのまま比べた結果は答えにならない
+        let asked = asked_semantics_of_outcomes(
+            Ok(TypeSignatureOutcome::TypeDefinitionNotProvided),
+            Ok(normalized("function sumOf(amounts: number[]): number")),
+            Ok(CallerDomainsOutcome::NoReferences),
+            Ok(CallerDomainsOutcome::NoReferences),
+        );
+
+        assert_eq!(
+            asked.type_signature_match,
+            TypeSignatureMatch::TypeDefinitionNotProvided
+        );
+    }
+
+    #[test]
+    fn test_asked_semantics_call_a_pair_not_unifiable_when_both_signatures_were_read() {
+        // 対照は上のテスト。どちらも読めていれば、重ならないことを言い切ってよい
+        let asked = asked_semantics_of_outcomes(
+            Ok(normalized("function totalOf(values: string[]): number")),
+            Ok(normalized("function sumOf(amounts: number[]): number")),
+            Ok(CallerDomainsOutcome::NoReferences),
+            Ok(CallerDomainsOutcome::NoReferences),
+        );
+
+        assert_eq!(asked.type_signature_match, TypeSignatureMatch::NotUnifiable);
     }
 
     /// hover は答えたが references が落ちた、4 つの問い合わせの結果。

@@ -79,6 +79,11 @@ pub enum TypeSignatureOutcome {
     UnreadableSignature,
     /// サーバが hover を提供していない。
     HoverNotProvided,
+    /// サーバが typeDefinition を提供していないので、型名を 1 つも開けなかった。
+    ///
+    /// **綴りのまま比べた結果を出さない。** 開けていれば重なったかもしれないので、
+    /// 「単一化不能」として出すと確かめられなかったことを答えにしてしまう。
+    TypeDefinitionNotProvided,
 }
 
 /// その位置にある名前の型を尋ねて、正規化した形にする。
