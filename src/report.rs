@@ -9,10 +9,14 @@
 
 use crate::classification::Classification;
 use crate::classification::reason::{Lean, Reason};
-use crate::classification::signal::{ImportOverlap, StructuralSimilarity};
+use crate::classification::signal::{
+    CallerDomainOverlap, ImportOverlap, MeasuredCallerDomains, SemanticsUnavailable,
+    StructuralSimilarity, TypeSignatureMatch,
+};
 use crate::classification::verdict::Verdict;
 use crate::location::Location;
 use crate::pipeline::{Scan, SkippedFile};
+use crate::semantics::caller_domain::CallerDomains;
 use crate::syntax::module_distance::ModuleDistance;
 use crate::threshold::Threshold;
 
@@ -31,9 +35,11 @@ const REASON_CONTINUATION_INDENT: &str = "        ";
 ///
 /// 末尾に改行は付けない（呼ぶ側が `println!` で出す）。
 ///
-/// Stage 2（LSP）が要る行——型シグネチャ・呼び出し元の分布——は出さない。
-/// Phase 0 では測っていないので、空欄やダミーで埋めずに行ごと出さない
+/// Stage 2（LSP）が要る行——型シグネチャ・呼び出し元の分布——は、**尋ねたときだけ**出す。
+/// 尋ねていないものを空欄やダミーで埋めずに行ごと出さない
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+/// **尋ねて取れなかったときは理由まで出す**（環境が悪いのか材料が無いのかで、
+/// 読者が次にすることが違う）。
 pub fn text_of(
     location_a: &Location,
     location_b: &Location,
@@ -63,6 +69,20 @@ pub fn text_of(
                 module_distance_text_of(*signal),
                 lean_text_of(*lean)
             )),
+            Reason::TypeSignatureMatch { signal, lean } => {
+                lines.extend(type_signature_text_of(*signal).map(|signal_text| {
+                    format!(
+                        "{INDENT}型シグネチャ: {signal_text} → {}",
+                        lean_text_of(*lean)
+                    )
+                }));
+            }
+            Reason::CallerDomainOverlap { signal, lean } => {
+                reason_texts.extend(
+                    caller_domain_overlap_text_of(signal)
+                        .map(|signal_text| format!("{signal_text} → {}", lean_text_of(*lean))),
+                );
+            }
         }
     }
 
@@ -181,6 +201,95 @@ fn import_overlap_text_of(signal: ImportOverlap) -> String {
 /// モジュール距離の値。段数は必ず取れるので、測れなかった形にはならない。
 fn module_distance_text_of(distance: ModuleDistance) -> String {
     format!("モジュール距離 {} 段", distance.steps())
+}
+
+/// 型シグネチャの単一化の可否。測れていなければ、その理由。
+///
+/// LSP に尋ねていないときだけ `None` を返し、**行ごと出さない**。空欄やダミーで
+/// 埋めると、読む側は測った結果としてそれを読む
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+/// **測れなかったのとは別**なので、そちらは理由まで出す。
+fn type_signature_text_of(signal: TypeSignatureMatch) -> Option<&'static str> {
+    match signal {
+        TypeSignatureMatch::Unifiable => Some("単一化可能"),
+        TypeSignatureMatch::NotUnifiable => Some("単一化不能"),
+        TypeSignatureMatch::Unavailable { reason } => semantics_unavailable_text_of(reason),
+        TypeSignatureMatch::NoName => Some("測れない (チャンクが名前を持たない)"),
+        TypeSignatureMatch::NoTypeThere => Some("測れない (サーバがその位置に型を持たない)"),
+        TypeSignatureMatch::UnreadableHover => Some("測れない (hover の応答を読めない)"),
+        TypeSignatureMatch::UnreadableSignature => Some("測れない (返った綴りを読み解けない)"),
+        TypeSignatureMatch::HoverNotProvided => Some("測れない (サーバが hover を提供していない)"),
+    }
+}
+
+/// 呼び出し元ドメインの重なりの値と分布。測れていなければ、その理由。
+///
+/// 尋ねていないときに `None` を返すのは [`type_signature_text_of`] と同じ理由。
+fn caller_domain_overlap_text_of(signal: &CallerDomainOverlap) -> Option<String> {
+    let unmeasured = match signal {
+        CallerDomainOverlap::Measured(measured) => {
+            return Some(measured_caller_domains_text_of(measured));
+        }
+        CallerDomainOverlap::Unavailable { reason } => {
+            let unavailable = semantics_unavailable_text_of(*reason)?;
+
+            return Some(format!("呼び出し元ドメインの重なりを{unavailable}"));
+        }
+        CallerDomainOverlap::NoName => "チャンクが名前を持たない",
+        CallerDomainOverlap::NoReferences => "参照元が 1 件も返らない",
+        CallerDomainOverlap::UnreadableReferences => "読めない URI が混じっている",
+        CallerDomainOverlap::ServerStillWorking => "サーバが作業中で答えが落ち着かない",
+        CallerDomainOverlap::ReferencesNotProvided => "サーバが references を提供していない",
+    };
+
+    Some(format!(
+        "呼び出し元ドメインの重なりを測れない ({unmeasured})"
+    ))
+}
+
+/// Stage 2 へ届かなかったことを表す文。
+///
+/// **尋ねていないだけなら `None`** を返し、行ごと出さない。空欄やダミーで埋めると、
+/// 読む側は測った結果としてそれを読む
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+///
+/// 頭を「測れない」「尋ねていない」に揃えてあるのは、呼び出し元ドメイン側が
+/// `…の重なりを` の後ろに続けて使うため。
+fn semantics_unavailable_text_of(reason: SemanticsUnavailable) -> Option<&'static str> {
+    match reason {
+        SemanticsUnavailable::NotAsked => None,
+        SemanticsUnavailable::NotACandidate => {
+            Some("尋ねていない (構造が似ておらず候補ペアではない)")
+        }
+        SemanticsUnavailable::DocumentUnopenable => Some("測れない (サーバに開かせる形にできない)"),
+        SemanticsUnavailable::WorkspaceRootUndecidable => {
+            Some("測れない (ワークスペースの根を決められない)")
+        }
+        SemanticsUnavailable::LspUnusable => Some("測れない (LSP サーバを使えない)"),
+    }
+}
+
+/// 測れた重なりと、両側のドメインごとの件数。
+fn measured_caller_domains_text_of(measured: &MeasuredCallerDomains) -> String {
+    format!(
+        "呼び出し元ドメインの重なり {} ({} <-> {})",
+        measured.overlap(),
+        references_per_domain_text_of(measured.callers_a()),
+        references_per_domain_text_of(measured.callers_b())
+    )
+}
+
+/// 片側のドメインごとの件数（`src/billing 3件 / src/inventory 5件`）。
+///
+/// **ディレクトリは末尾の 1 段に縮めず、そのまま出す。** 縮めると、別の親の下にある
+/// 同名のディレクトリが同じ綴りになり、分布を読み違える。
+fn references_per_domain_text_of(callers: &CallerDomains) -> String {
+    callers
+        .references_per_domain()
+        .iter()
+        .map(|(domain, count)| format!("{} {count}件", domain.directory().display()))
+        .collect::<Vec<String>>()
+        .join(" / ")
 }
 
 /// シグナルが判定を傾けた向き。
@@ -494,6 +603,171 @@ mod tests {
         assert!(
             !text.contains("読めなかったファイル:") && !text.contains("構文エラーで"),
             "飛ばしたものが無ければ見出しごと出さない: {text}"
+        );
+    }
+
+    /// 呼び出し元が別のドメインに分かれている（重なり 0.00）。
+    fn callers_in_separate_domains() -> CallerDomainOverlap {
+        let paths_a = [PathBuf::from("/repo/src/billing/invoice.ts")];
+        let paths_b = [PathBuf::from("/repo/src/inventory/stock.ts")];
+        let (Some(callers_a), Some(callers_b)) = (
+            CallerDomains::from_reference_paths(&paths_a),
+            CallerDomains::from_reference_paths(&paths_b),
+        ) else {
+            panic!("テストが渡す参照元は 1 件以上");
+        };
+
+        CallerDomainOverlap::Measured(MeasuredCallerDomains::new(callers_a, callers_b))
+    }
+
+    /// 構造が似ていて依存先を共有していない組を、渡した Stage 2 のシグナルで判定した text。
+    fn text_of_accidental_duplication_with_semantics(
+        type_signature_match: TypeSignatureMatch,
+        caller_domain_overlap: CallerDomainOverlap,
+    ) -> String {
+        let threshold = DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
+        let signals = Signals::new(
+            StructuralSimilarity::Measured(measured(0.94)),
+            ImportOverlap::Measured(measured(0.0)),
+            separate_directories(),
+        )
+        .with_semantics(type_signature_match, caller_domain_overlap);
+
+        text_of(
+            &location("src/billing/discount.ts", 42),
+            &location("src/inventory/reorder.ts", 18),
+            &classification_of(&signals, threshold),
+            threshold,
+        )
+    }
+
+    #[test]
+    fn test_text_of_reports_the_type_signature_with_the_direction_it_leaned() {
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::NotUnifiable,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains("  型シグネチャ: 単一化不能 → 共通化しない側\n"),
+            "測った値と傾きが 1 行で読める: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_an_unusable_lsp_reports_why_the_type_signature_is_missing() {
+        // 対照として構造類似度は測れている。測れた値と測れなかったことが
+        // 同じ出方をすると、読者が両者を区別できない
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable,
+            },
+        );
+
+        assert!(
+            text.contains("型シグネチャ: 測れない (LSP サーバを使えない) → どちらでもない"),
+            "型シグネチャを測れなかった理由まで出る: {text}"
+        );
+        assert!(
+            text.contains(
+                "呼び出し元ドメインの重なりを測れない (LSP サーバを使えない) → どちらでもない"
+            ),
+            "呼び出し元を測れなかった理由まで出る: {text}"
+        );
+        assert!(
+            text.contains("構造類似度: 0.94"),
+            "測れたシグナルはそのまま値が出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_an_undecidable_workspace_root_does_not_blame_the_lsp_server() {
+        // 対照は上のテスト（サーバを使えない場合）。**尋ねる前に止まった理由を
+        // 「LSP サーバを使えない」に畳むと、利用者が直す先を取り違える**
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::WorkspaceRootUndecidable,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::WorkspaceRootUndecidable,
+            },
+        );
+
+        assert!(
+            text.contains("型シグネチャ: 測れない (ワークスペースの根を決められない)"),
+            "尋ねる前に止まった理由がそのまま出る: {text}"
+        );
+        assert!(
+            !text.contains("LSP サーバを使えない"),
+            "サーバのせいにしない: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_of_a_pair_below_the_threshold_says_it_did_not_ask() {
+        // 尋ねなかったこと自体は出す。行ごと消すと、読む側は Stage 2 が
+        // 効いたのか効かなかったのかを区別できない
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotACandidate,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotACandidate,
+            },
+        );
+
+        assert!(
+            text.contains("型シグネチャ: 尋ねていない (構造が似ておらず候補ペアではない)")
+                && text.contains(
+                    "呼び出し元ドメインの重なりを尋ねていない (構造が似ておらず候補ペアではない)"
+                ),
+            "尋ねなかった理由が両方の行に出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_without_asking_the_lsp_omits_the_stage2_lines() {
+        // 対照は上のテスト。**尋ねていないことと測れなかったことを同じ出方にしない**。
+        // 空欄やダミーで埋めると、読む側は測った結果としてそれを読む
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            !text.contains("型シグネチャ") && !text.contains("呼び出し元ドメイン"),
+            "尋ねていない Stage 2 の行は出さない: {text}"
+        );
+        assert!(
+            text.contains("依存先の重なり 0.00"),
+            "Stage 1 の根拠はそのまま出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_reports_how_many_references_each_caller_domain_has() {
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            callers_in_separate_domains(),
+        );
+
+        assert!(
+            text.contains(
+                "呼び出し元ドメインの重なり 0.00 \
+                 (/repo/src/billing 1件 <-> /repo/src/inventory 1件) → 共通化しない側"
+            ),
+            "重なりの値と、両側の分布と、傾きが 1 行で読める: {text}"
         );
     }
 

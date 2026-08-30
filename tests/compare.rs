@@ -9,13 +9,21 @@
 //! （`tests/corpus/README.md`）。前者は出力の形を、後者は**実データに当てたときの
 //! 判定そのもの**を固定する。
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process;
 
-use dryguard::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
+use dryguard::classification::signal::{
+    CallerDomainOverlap, ImportOverlap, SemanticsUnavailable, Signals, StructuralSimilarity,
+    TypeSignatureMatch,
+};
 use dryguard::classification::verdict::Verdict;
 use dryguard::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
 use dryguard::location::Location;
-use dryguard::pipeline::{ChunkPairError, chunk_pair_of, signals_of};
+use dryguard::lsp::ServerCommand;
+use dryguard::pipeline::{
+    ChunkPairError, MeasuredPair, chunk_pair_of, measured_pair_of, signals_of,
+};
 use dryguard::report::text_of;
 use dryguard::similarity::Similarity;
 
@@ -56,11 +64,11 @@ fn corpus(relative_path: &str, line: usize) -> Location {
 
 /// 2 箇所を実ファイルから切り出して、シグナルを測るところまで。
 fn signals(location_a: &Location, location_b: &Location) -> Signals {
-    let Ok((chunk_a, chunk_b)) = chunk_pair_of(location_a, location_b) else {
+    let Ok(pair) = chunk_pair_of(location_a, location_b) else {
         panic!("テストが渡す位置はどちらも関数の中を指している");
     };
 
-    signals_of(&chunk_a, &chunk_b)
+    signals_of(pair.chunk_a(), pair.chunk_b())
 }
 
 /// 測れた構造類似度。
@@ -156,33 +164,58 @@ fn test_compare_of_two_functions_sharing_a_utility_reports_a_total_overlap() {
 
 #[test]
 fn test_compare_of_two_locations_yields_a_chunk_for_each() {
-    let (chunk_a, chunk_b) = chunk_pair_of(
+    let pair = chunk_pair_of(
         &fixture("billing/discount.ts", 6),
         &fixture("inventory/reorder.ts", 6),
     )
     .expect("どちらも関数の中を指している");
 
-    assert_eq!(chunk_a.path().file_name(), Some("discount.ts".as_ref()));
-    assert_eq!(chunk_b.path().file_name(), Some("reorder.ts".as_ref()));
+    assert_eq!(
+        pair.chunk_a().path().file_name(),
+        Some("discount.ts".as_ref())
+    );
+    assert_eq!(
+        pair.chunk_b().path().file_name(),
+        Some("reorder.ts".as_ref())
+    );
 }
 
 #[test]
 fn test_compare_of_two_locations_yields_the_function_that_encloses_each_line() {
-    let (chunk_a, chunk_b) = chunk_pair_of(
+    let pair = chunk_pair_of(
         &fixture("billing/discount.ts", 6),
         &fixture("inventory/reorder.ts", 6),
     )
     .expect("どちらも関数の中を指している");
 
-    assert_eq!(chunk_a.lines().to_string(), "5-8");
+    assert_eq!(pair.chunk_a().lines().to_string(), "5-8");
     assert!(
-        chunk_a
+        pair.chunk_a()
             .source()
             .starts_with("export function applyDiscount("),
         "指定行を含む関数の先頭から始まる: {}",
-        chunk_a.source()
+        pair.chunk_a().source()
     );
-    assert_eq!(chunk_b.lines().to_string(), "5-8");
+    assert_eq!(pair.chunk_b().lines().to_string(), "5-8");
+}
+
+#[test]
+fn test_compare_of_two_locations_in_one_file_yields_each_function() {
+    // 同じファイルの 2 箇所。**1 回しか読まない**ので、2 つのチャンクは必ず同じ版から出る
+    // （2 回読むと、間で編集されたときに 1 つのファイルに 2 つの版ができ、
+    // サーバが見る版と後のチャンクの名前の位置がずれる）
+    let pair = chunk_pair_of(
+        &corpus("inventory/warehouse.ts", 13),
+        &corpus("inventory/warehouse.ts", 18),
+    )
+    .expect("どちらも関数の中を指している");
+
+    assert_eq!(pair.chunk_a().lines().to_string(), "13-16");
+    assert_eq!(
+        pair.chunk_b().lines().to_string(),
+        "18-27",
+        "同じファイルでも、指した行ごとに別の関数が切り出される"
+    );
 }
 
 #[test]
@@ -258,6 +291,214 @@ fn test_compare_of_similar_functions_in_separate_domains_reports_the_verdict_and
     assert!(
         text.contains("提案: 偶発的な重複の可能性が高い。共通化せず分離を維持する。"),
         "ラベルに対する提案が出る: {text}"
+    );
+}
+
+/// 起動できない LSP サーバの指定。
+///
+/// **モックではなく実物の失敗**を使う（`rules/testing.md`「モックは使わない」）。
+/// 実行ファイルが無いので `Client::start` が `ServerNotFound` で落ち、
+/// **サーバが入っている環境でも入っていない環境でも同じ経路を通る**。
+fn missing_server() -> ServerCommand {
+    ServerCommand::new("dryguard-no-such-language-server", Vec::new())
+}
+
+/// 2 箇所を実ファイルから切り出して、起動できないサーバで Stage 2 を尋ねるところまで。
+fn measured_without_an_lsp(location_a: &Location, location_b: &Location) -> MeasuredPair {
+    let Ok(pair) = chunk_pair_of(location_a, location_b) else {
+        panic!("テストが渡す位置はどちらも関数の中を指している");
+    };
+
+    measured_pair_of(
+        &pair,
+        DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+        &missing_server(),
+    )
+}
+
+#[test]
+fn test_compare_below_the_threshold_does_not_start_the_lsp_server() {
+    // 似ていないペアの判定は Stage 2 で変わらないので、起こすだけ待たされる
+    // （`docs/dryguard-plan.md`「候補ペアに対してだけ問い合わせる」）。
+    // **起動できないサーバを渡しているので、起こしていれば理由が付く。**
+    // 対照は下のテストで、同じサーバを閾値に届くペアへ渡すと理由が付く
+    let measured = measured_without_an_lsp(
+        &fixture("billing/discount.ts", 6),
+        &fixture("report/summary.ts", 6),
+    );
+
+    assert!(
+        measured.semantics_error().is_none(),
+        "サーバを起こしていない: {:?}",
+        measured.semantics_error().map(ToString::to_string)
+    );
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unavailable {
+            reason: SemanticsUnavailable::NotACandidate
+        }
+    );
+}
+
+#[test]
+fn test_compare_asks_with_the_source_stage1_read_even_if_the_file_disappears() {
+    // 切り出した後にファイルが消えても、**Stage 1 が読んだ版で尋ねに行く**。
+    // 読み直していると、ここで読み込みの失敗が理由に出る（構造のシグナルと
+    // 意味のシグナルが別の版から出るのも同じ読み直しが原因）
+    let directory = scratch_directory("vanishing-source");
+    let vanishing = typescript_file(&directory, "vanishing.ts", SIMILAR_SOURCE);
+    let staying = typescript_file(&directory, "staying.ts", SIMILAR_SOURCE);
+    let Ok(pair) = chunk_pair_of(&location_at(&vanishing, 2), &location_at(&staying, 2)) else {
+        panic!("テストが書いたソースはどちらも関数を持つ");
+    };
+    fs::remove_file(&vanishing).expect("テストが書いたファイルは消せる");
+
+    let measured = measured_pair_of(
+        &pair,
+        DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+        &missing_server(),
+    );
+
+    fs::remove_dir_all(&directory).expect("テストが作ったディレクトリは消せる");
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unavailable {
+            reason: SemanticsUnavailable::LspUnusable
+        },
+        "消えたファイルではなくサーバが理由になる: {:?}",
+        measured.semantics_error().map(ToString::to_string)
+    );
+}
+
+/// 閾値に届くだけの構造を持つソース。2 つのファイルに同じものを書いて候補ペアにする。
+const SIMILAR_SOURCE: &str = "export function totalOf(values: number[]): number {\n\
+                              \x20 return values.reduce((sum, value) => sum + value, 0);\n\
+                              }\n";
+
+/// テストが書き込む作業ディレクトリ。作ってから返す。
+///
+/// 名前にプロセス ID を混ぜるのは、**同時に走る別の実行とぶつからない**ようにするため。
+fn scratch_directory(name: &str) -> PathBuf {
+    let directory = std::env::temp_dir().join(format!("dryguard-{name}-{}", process::id()));
+
+    if fs::create_dir_all(&directory).is_err() {
+        panic!(
+            "テストが作る作業ディレクトリは書ける: {}",
+            directory.display()
+        );
+    }
+    directory
+}
+
+/// そのディレクトリに TypeScript のファイルを書いて、パスを返す。
+fn typescript_file(directory: &Path, name: &str, source: &str) -> PathBuf {
+    let path = directory.join(name);
+
+    if fs::write(&path, source).is_err() {
+        panic!("テストが作るファイルは書ける: {}", path.display());
+    }
+    path
+}
+
+/// 書いたファイルの指定行を指す位置。
+fn location_at(path: &Path, line: usize) -> Location {
+    let text = format!("{}:{line}", path.display());
+
+    let Ok(location) = text.parse() else {
+        panic!("テストが組み立てる位置は解釈できる: {text}");
+    };
+    location
+}
+
+#[test]
+fn test_compare_without_an_lsp_server_still_reaches_the_stage1_verdict() {
+    // Phase 0 の仮説と同じペア。**サーバを使えなくても判定まで届く**
+    // （届かないと、LSP の入っていない環境でツールが使えなくなる）
+    let measured = measured_without_an_lsp(
+        &fixture("billing/discount.ts", 6),
+        &fixture("inventory/reorder.ts", 6),
+    );
+
+    let verdict =
+        classification_of(measured.signals(), DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD).verdict();
+    assert_eq!(verdict, Verdict::DoNotExtract);
+}
+
+#[test]
+fn test_compare_without_an_lsp_server_marks_the_stage2_signals_as_unmeasured() {
+    // 対照は下のテスト（Stage 1 のシグナルは測れている）。取れなかったことを
+    // 0.00 や「尋ねていない」で埋めると、環境が悪いのか材料が無いのかを読者が区別できない
+    let measured = measured_without_an_lsp(
+        &fixture("billing/discount.ts", 6),
+        &fixture("inventory/reorder.ts", 6),
+    );
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unavailable {
+            reason: SemanticsUnavailable::LspUnusable
+        }
+    );
+    assert_eq!(
+        measured.signals().caller_domain_overlap(),
+        &CallerDomainOverlap::Unavailable {
+            reason: SemanticsUnavailable::LspUnusable
+        }
+    );
+}
+
+#[test]
+fn test_compare_without_an_lsp_server_keeps_the_stage1_signals() {
+    let measured = measured_without_an_lsp(
+        &fixture("billing/discount.ts", 6),
+        &fixture("inventory/reorder.ts", 6),
+    );
+
+    assert_eq!(
+        measured.signals().import_overlap(),
+        ImportOverlap::Measured(Similarity::new(0.0).expect("0.0 は範囲に含む")),
+        "LSP が要らないシグナルはそのまま測れている"
+    );
+}
+
+#[test]
+fn test_compare_without_an_lsp_server_reports_which_server_it_could_not_start() {
+    // 「LSP サーバを使えない」だけでは、利用者は何を直せばよいか分からない
+    let measured = measured_without_an_lsp(
+        &fixture("billing/discount.ts", 6),
+        &fixture("inventory/reorder.ts", 6),
+    );
+
+    let Some(error) = measured.semantics_error() else {
+        panic!("起動できないサーバを渡したので理由が付く");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("dryguard-no-such-language-server"),
+        "どの実行ファイルを起こせなかったかが読める: {error}"
+    );
+}
+
+#[test]
+fn test_compare_without_an_lsp_server_reports_the_stage2_signals_as_unmeasured_in_the_text() {
+    let location_a = fixture("billing/discount.ts", 6);
+    let location_b = fixture("inventory/reorder.ts", 6);
+    let measured = measured_without_an_lsp(&location_a, &location_b);
+    let classification =
+        classification_of(measured.signals(), DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+    let text = text_of(
+        &location_a,
+        &location_b,
+        &classification,
+        DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+    );
+
+    assert!(
+        text.contains("型シグネチャ: 測れない (LSP サーバを使えない)")
+            && text.contains("呼び出し元ドメインの重なりを測れない (LSP サーバを使えない)"),
+        "どのシグナルが取れなかったかが出力から読める: {text}"
     );
 }
 

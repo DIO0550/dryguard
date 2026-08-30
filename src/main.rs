@@ -1,7 +1,7 @@
 //! `dryguard` のエントリポイント。
 //!
-//! Phase 0 の骨格。引数を解釈して、判定ラベル・位置・構造類似度・理由・提案を
-//! text で表示する（`docs/dryguard-plan.md`「CLI仕様 (案)」の出力イメージ）。
+//! 引数を解釈して、判定ラベル・位置・シグナルごとの根拠・提案を text で表示する
+//! （`docs/dryguard-plan.md`「CLI仕様 (案)」の出力イメージ）。
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -11,7 +11,8 @@ use clap::Parser;
 use dryguard::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
 use dryguard::cli::{Cli, Command, CommonOptions};
 use dryguard::location::Location;
-use dryguard::pipeline::{chunk_pair_of, scan_of, signals_of};
+use dryguard::lsp::ServerCommand;
+use dryguard::pipeline::{chunk_pair_of, measured_pair_of, scan_of};
 use dryguard::report::{scan_text_of, text_of};
 use dryguard::threshold::Threshold;
 
@@ -33,6 +34,11 @@ fn main() -> ExitCode {
 /// 成功として返すと、後段が「似ていない」と「見ていない」を区別できなくなる
 /// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
 ///
+/// **LSP サーバを使えなくても失敗にしない。** Stage 1 のシグナルだけで判定でき、
+/// 取れなかったことは判定の根拠に出る。理由だけを stderr へ回すのは、
+/// **判定そのものではなく環境の話**だから（stdout は判定の出力に保つ）。
+/// 片方の問い合わせだけが落ちることもあるので、**stderr でシグナルを数え上げない**。
+///
 /// 出力の組み立ては `dryguard::report` にある。ここでは stdout / stderr の
 /// どちらへ出すかと、終了コードだけを決める。
 fn report_compare(
@@ -40,17 +46,24 @@ fn report_compare(
     location_b: &Location,
     options: &CommonOptions,
 ) -> ExitCode {
-    let (chunk_a, chunk_b) = match chunk_pair_of(location_a, location_b) {
-        Ok(chunks) => chunks,
+    let pair = match chunk_pair_of(location_a, location_b) {
+        Ok(pair) => pair,
         Err(error) => {
             eprintln!("{error}");
             return ExitCode::FAILURE;
         }
     };
 
-    let signals = signals_of(&chunk_a, &chunk_b);
     let threshold = threshold_of(options);
-    let classification = classification_of(&signals, threshold);
+    let measured = measured_pair_of(&pair, threshold, &ServerCommand::typescript());
+    if let Some(error) = measured.semantics_error() {
+        // **どのシグナルが取れなかったかはここで言わない。** 片方だけ落ちることが
+        // あるので数え上げると判定の根拠と食い違う。取れなかったシグナルは
+        // 根拠の行が 1 つずつ出す。
+        eprintln!("LSP への問い合わせが最後まで通りませんでした: {error}");
+    }
+
+    let classification = classification_of(measured.signals(), threshold);
 
     println!(
         "{}",

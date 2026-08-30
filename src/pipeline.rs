@@ -11,16 +11,58 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
-use crate::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
+use crate::classification::signal::{
+    CallerDomainOverlap, ImportOverlap, MeasuredCallerDomains, SemanticsUnavailable, Signals,
+    StructuralSimilarity, TypeSignatureMatch,
+};
 use crate::classification::{Classification, classification_of, is_structurally_similar};
 use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
 use crate::location::Location;
+use crate::lsp::{
+    Client, ClientError, DocumentError, ServerCommand, Session, SourceDocument, WorkspaceError,
+    WorkspaceRoot,
+};
+use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outcome_of};
+use crate::semantics::type_signature::{TypeSignatureOutcome, type_signature_outcome_of};
 use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks};
 use crate::syntax::module_distance::ModuleDistance;
 use crate::syntax::tree::{Grammar, ParseError, SyntaxTree};
 use crate::threshold::Threshold;
 
+/// 比較する 2 箇所から切り出したチャンクと、その元になったファイルの中身。
+///
+/// **中身まで持つ**のは、Stage 2 が Stage 1 と同じ版をサーバへ見せるため。
+/// 読み直すと、間で編集されたときに構造のシグナルと意味のシグナルが別の版から出て、
+/// 覚えてある名前の位置が別の識別子を指すことすらある。読む回数が 1 回で済む利点もある。
+#[derive(Debug)]
+pub struct ChunkPair {
+    chunk_a: Chunk,
+    source_a: String,
+    chunk_b: Chunk,
+    source_b: String,
+}
+
+impl ChunkPair {
+    /// 先に指定されたほうのチャンク。
+    pub fn chunk_a(&self) -> &Chunk {
+        &self.chunk_a
+    }
+
+    /// 後に指定されたほうのチャンク。
+    pub fn chunk_b(&self) -> &Chunk {
+        &self.chunk_b
+    }
+}
+
 /// 比較する 2 箇所から、チャンクの組を取り出す。
+///
+/// **同じファイルの 2 箇所なら 1 回しか読まない。** 2 回読むと、間で編集されたときに
+/// 1 つのファイルに 2 つの版ができる。`lsp::Session::open_document` は URI で
+/// 重複を畳むのでサーバが見るのは先の版だけになり、**後のチャンクの名前の位置だけが
+/// 別の版から来る**。
+///
+/// 綴りが違って同じファイルを指す場合（`./a.ts` と `a.ts`）は 2 回読む。パスを絶対に
+/// 直すのは `lsp::uri` の担当で、そこへ寄せると `pipeline` がパスの解決を持つことになる。
 ///
 /// # Errors
 ///
@@ -29,35 +71,105 @@ use crate::threshold::Threshold;
 pub fn chunk_pair_of(
     location_a: &Location,
     location_b: &Location,
-) -> Result<(Chunk, Chunk), ChunkPairError> {
-    Ok((chunk_at(location_a)?, chunk_at(location_b)?))
+) -> Result<ChunkPair, ChunkPairError> {
+    let in_one_file = location_a.path() == location_b.path();
+    if in_one_file {
+        return chunk_pair_in_one_file_of(location_a, location_b);
+    }
+
+    let (chunk_a, source_a) = chunk_at(location_a)?;
+    let (chunk_b, source_b) = chunk_at(location_b)?;
+
+    Ok(ChunkPair {
+        chunk_a,
+        source_a,
+        chunk_b,
+        source_b,
+    })
 }
 
-/// その位置のファイルを読んで、指定行を含む関数を切り出す。
+/// 1 つのファイルを読んで、その中の 2 箇所を切り出す。
+///
+/// # Errors
+///
+/// ファイルを読めない / どちらかのチャンクを切り出せないとき。
+fn chunk_pair_in_one_file_of(
+    location_a: &Location,
+    location_b: &Location,
+) -> Result<ChunkPair, ChunkPairError> {
+    let source = read_source_at(location_a)?;
+    let tree = syntax_tree_at(location_a, &source)?;
+
+    Ok(ChunkPair {
+        chunk_a: enclosing_chunk_at(location_a, &tree)?,
+        source_a: source.clone(),
+        chunk_b: enclosing_chunk_at(location_b, &tree)?,
+        source_b: source,
+    })
+}
+
+/// その位置のファイルを読んで、指定行を含む関数と、読んだ中身を返す。
 ///
 /// パースはファイルにつき 1 回にする。チャンクの範囲も import の集合も同じ木から
 /// 採るので、ソースを渡す形のままだと 1 箇所につき 2 回パースすることになる。
-fn chunk_at(location: &Location) -> Result<Chunk, ChunkPairError> {
+fn chunk_at(location: &Location) -> Result<(Chunk, String), ChunkPairError> {
+    let source = read_source_at(location)?;
+    let chunk = {
+        let tree = syntax_tree_at(location, &source)?;
+
+        enclosing_chunk_at(location, &tree)?
+    };
+
+    Ok((chunk, source))
+}
+
+/// その位置のファイルを読む。読める拡張子でなければ、そこで断る。
+///
+/// # Errors
+///
+/// 拡張子から grammar を選べない / ファイルを読めないとき。
+fn read_source_at(location: &Location) -> Result<String, ChunkPairError> {
+    // grammar を先に確かめる。読めない拡張子のファイルを読んでから断ると、
+    // 読み込みの失敗と拡張子の失敗がどちらも「読めない」として並ぶ。
+    Grammar::of_path(location.path()).ok_or_else(|| ChunkPairError::UnreadableExtension {
+        location: location.clone(),
+    })?;
+
+    location
+        .read_source()
+        .map_err(|cause| ChunkPairError::SourceUnreadable {
+            location: location.clone(),
+            cause,
+        })
+}
+
+/// 読んだ中身を、その位置の拡張子が決める grammar で構文木にする。
+///
+/// # Errors
+///
+/// 拡張子から grammar を選べない / 構文木にできないとき。
+fn syntax_tree_at<'a>(
+    location: &Location,
+    source: &'a str,
+) -> Result<SyntaxTree<'a>, ChunkPairError> {
     let grammar =
         Grammar::of_path(location.path()).ok_or_else(|| ChunkPairError::UnreadableExtension {
             location: location.clone(),
         })?;
 
-    let source = location
-        .read_source()
-        .map_err(|cause| ChunkPairError::SourceUnreadable {
-            location: location.clone(),
-            cause,
-        })?;
+    SyntaxTree::from_source(source, grammar).map_err(|cause| ChunkPairError::SourceUnparsable {
+        location: location.clone(),
+        cause,
+    })
+}
 
-    let tree = SyntaxTree::from_source(&source, grammar).map_err(|cause| {
-        ChunkPairError::SourceUnparsable {
-            location: location.clone(),
-            cause,
-        }
-    })?;
-
-    Chunk::find_enclosing(location, &tree).map_err(|cause| ChunkPairError::ChunkingFailed {
+/// 構文木から、その位置を含む関数を切り出す。
+///
+/// # Errors
+///
+/// 指定位置を含む関数が無い / その関数に構文エラーがあるとき。
+fn enclosing_chunk_at(location: &Location, tree: &SyntaxTree<'_>) -> Result<Chunk, ChunkPairError> {
+    Chunk::find_enclosing(location, tree).map_err(|cause| ChunkPairError::ChunkingFailed {
         location: location.clone(),
         cause,
     })
@@ -92,6 +204,375 @@ fn import_overlap_of(chunk_a: &Chunk, chunk_b: &Chunk) -> ImportOverlap {
     };
 
     ImportOverlap::Measured(imports_a.jaccard(imports_b))
+}
+
+/// 候補ペアについて、Stage 1 と Stage 2 の両方を測った結果。
+///
+/// Stage 2 へ届かなかった理由を一緒に持つ。シグナルの側は
+/// [`SemanticsUnavailable`] のどれかとしか言えないが、**利用者が環境を直すには、
+/// サーバが見つからないのか握手に失敗したのかまで要る**
+/// (`rules/coding.md`「失敗を握りつぶして既定値へフォールバックしない」)。
+#[derive(Debug)]
+pub struct MeasuredPair {
+    signals: Signals,
+    semantics_error: Option<SemanticsError>,
+}
+
+impl MeasuredPair {
+    /// 判定に渡すシグナル。
+    pub fn signals(&self) -> &Signals {
+        &self.signals
+    }
+
+    /// Stage 2 を尋ねられなかった理由。尋ねられた / そもそも尋ねなかったときは `None`。
+    pub fn semantics_error(&self) -> Option<&SemanticsError> {
+        self.semantics_error.as_ref()
+    }
+}
+
+/// ペアを Stage 1 で測り、候補ペアなら Stage 2 を LSP に尋ねて重ねる。
+///
+/// `structural_similarity_threshold` は候補ペアと見なす構造類似度の下限、
+/// `server` は起こす LSP サーバの指定（TypeScript なら [`ServerCommand::typescript`]）。
+///
+/// **候補ペアでなければサーバを起こさない。** 構造が似ていないペアの判定は Stage 2 で
+/// 変わらないので、起動とインデックスの待ち時間だけが増える
+/// （`docs/dryguard-plan.md`「候補ペアに対してだけ問い合わせる」）。
+/// 尋ねなかったことは [`SemanticsUnavailable::NotACandidate`] として出る。
+///
+/// **サーバを使えなくても失敗にしない。** Stage 1 のシグナルだけで判定でき、
+/// 届かなかったことはシグナルと [`MeasuredPair::semantics_error`] に出る
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+pub fn measured_pair_of(
+    pair: &ChunkPair,
+    structural_similarity_threshold: Threshold,
+    server: &ServerCommand,
+) -> MeasuredPair {
+    let signals = signals_of(&pair.chunk_a, &pair.chunk_b);
+
+    let asked = if is_structurally_similar(
+        signals.structural_similarity(),
+        structural_similarity_threshold,
+    ) {
+        semantics_of(pair, server)
+    } else {
+        AskedSemantics::unavailable(SemanticsUnavailable::NotACandidate, None)
+    };
+
+    MeasuredPair {
+        signals: signals.with_semantics(asked.type_signature_match, asked.caller_domain_overlap),
+        semantics_error: asked.error,
+    }
+}
+
+/// Stage 2 に尋ねた結果。
+///
+/// **途中で落ちても、そこまでに取れたシグナルは捨てない。** 捨てると、
+/// 測れていた型シグネチャが「測れない」に化けて判定が変わる（ドメインが一致していて
+/// 単一化できないペアが `REVIEW` から `EXTRACT-CANDIDATE` へ動く）。
+///
+/// 落ちた理由も一緒に持つ。シグナルの側は [`SemanticsUnavailable`] としか言えないが、
+/// 利用者が環境を直すにはそれだけでは足りない。
+#[derive(Debug)]
+struct AskedSemantics {
+    type_signature_match: TypeSignatureMatch,
+    caller_domain_overlap: CallerDomainOverlap,
+    error: Option<SemanticsError>,
+}
+
+impl AskedSemantics {
+    /// どちらのシグナルも取れていない形。
+    ///
+    /// **尋ねる前に止まったときだけこれになる。** そこまでは片方だけ取れることが
+    /// ないので、2 つに別々の理由を持たせない。
+    fn unavailable(reason: SemanticsUnavailable, error: Option<SemanticsError>) -> Self {
+        Self {
+            type_signature_match: TypeSignatureMatch::Unavailable { reason },
+            caller_domain_overlap: CallerDomainOverlap::Unavailable { reason },
+            error,
+        }
+    }
+
+    /// 尋ねる前に止まった失敗から組み立てる。
+    fn from_setup_failure(cause: SemanticsError) -> Self {
+        Self::unavailable(unavailable_of(&cause), Some(cause))
+    }
+}
+
+/// 失敗を、シグナルが持てる理由に直す。
+///
+/// **すべてを「LSP サーバを使えない」に畳まない。** 根を決められないのと
+/// サーバが入っていないのとでは**利用者が直す先が違う**ので、
+/// [`SemanticsError`] のバリアントを 1 対 1 で写す
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+fn unavailable_of(cause: &SemanticsError) -> SemanticsUnavailable {
+    match cause {
+        SemanticsError::Document(_) => SemanticsUnavailable::DocumentUnopenable,
+        SemanticsError::Workspace(_) => SemanticsUnavailable::WorkspaceRootUndecidable,
+        SemanticsError::Client(_) => SemanticsUnavailable::LspUnusable,
+    }
+}
+
+/// サーバを起こし、2 つのチャンクぶんの Stage 2 のシグナルを尋ねて終わらせる。
+///
+/// 根は**候補ペアの 2 ファイルだけ**から決める。広げると、開かせないファイルまで
+/// 含む位置をサーバに見せることになる（`docs/dryguard-plan.md`「Stage 2: 意味情報収集」）。
+/// 根が tsconfig.json より下に来るコードベースで参照元が一部しか返らない話は Issue #125。
+///
+/// 尋ねる前に止まったときも失敗にしない。取れなかったことを持つ [`AskedSemantics`] を返す。
+fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
+    let document_a = match document_of(&pair.chunk_a, &pair.source_a) {
+        Ok(document) => document,
+        Err(cause) => return AskedSemantics::from_setup_failure(cause),
+    };
+    let document_b = match document_of(&pair.chunk_b, &pair.source_b) {
+        Ok(document) => document,
+        Err(cause) => return AskedSemantics::from_setup_failure(cause),
+    };
+    let root = match WorkspaceRoot::enclosing(&[
+        pair.chunk_a.path().to_path_buf(),
+        pair.chunk_b.path().to_path_buf(),
+    ]) {
+        Ok(root) => root,
+        Err(cause) => {
+            return AskedSemantics::from_setup_failure(SemanticsError::Workspace(cause));
+        }
+    };
+
+    let client = match Client::start(server) {
+        Ok(client) => client,
+        Err(cause) => return AskedSemantics::from_setup_failure(SemanticsError::Client(cause)),
+    };
+    let mut session = match client.handshake(&root) {
+        Ok(session) => session,
+        Err(cause) => return AskedSemantics::from_setup_failure(SemanticsError::Client(cause)),
+    };
+
+    let asked = asked_semantics_of(
+        &mut session,
+        &pair.chunk_a,
+        &document_a,
+        &pair.chunk_b,
+        &document_b,
+    );
+
+    // **答えを受け取っていても、異常終了したサーバの答えは採らない。** 途中で
+    // 落ちたサーバは読み込みを終えていないことがあり、参照元が欠けて返る。
+    if let Err(cause) = session.shutdown() {
+        return AskedSemantics::from_setup_failure(SemanticsError::Client(cause));
+    }
+
+    asked
+}
+
+/// 開かせた 2 つのドキュメントに、hover と references を尋ねる。
+///
+/// hover を先に送るのは、**references が先の作業の落ち着きを待つ**ため
+/// （順序を入れ替えると、読み込み中に計算された答えを受け取る。
+/// `tests/semantics.rs` の `test_caller_domains_asked_after_a_type_signature_are_still_complete`）。
+///
+/// **1 つが落ちても残りを尋ねる。** 途中で降りると、取れていたシグナルまで
+/// 「測れない」に化ける（[`AskedSemantics`]）。
+fn asked_semantics_of(
+    session: &mut Session,
+    chunk_a: &Chunk,
+    document_a: &SourceDocument,
+    chunk_b: &Chunk,
+    document_b: &SourceDocument,
+) -> AskedSemantics {
+    // 開かせられなければ 1 つも尋ねられないので、ここは降りてよい。
+    if let Err(cause) = session.open_document(document_a) {
+        return AskedSemantics::from_setup_failure(SemanticsError::Client(cause));
+    }
+    if let Err(cause) = session.open_document(document_b) {
+        return AskedSemantics::from_setup_failure(SemanticsError::Client(cause));
+    }
+
+    let (Some(position_a), Some(position_b)) = (chunk_a.name_position(), chunk_b.name_position())
+    else {
+        // 名前が無ければ尋ねる位置が決まらない。**サーバの失敗ではない**ので、
+        // 取れなかったシグナルとして返す
+        return AskedSemantics {
+            type_signature_match: TypeSignatureMatch::NoName,
+            caller_domain_overlap: CallerDomainOverlap::NoName,
+            error: None,
+        };
+    };
+
+    asked_semantics_of_outcomes(
+        type_signature_outcome_of(session, document_a, position_a),
+        type_signature_outcome_of(session, document_b, position_b),
+        caller_domains_outcome_of(session, document_a, position_a),
+        caller_domains_outcome_of(session, document_b, position_b),
+    )
+}
+
+/// 4 つの問い合わせの結果を、シグナルと落ちた理由にまとめる。
+///
+/// **落ちた側だけを「測れない」にする。** hover が答えていて references だけが
+/// 落ちた場合に両方を捨てると、比べ終わっていた型シグネチャまで失われる。
+fn asked_semantics_of_outcomes(
+    signature_a: Result<TypeSignatureOutcome, ClientError>,
+    signature_b: Result<TypeSignatureOutcome, ClientError>,
+    callers_a: Result<CallerDomainsOutcome, ClientError>,
+    callers_b: Result<CallerDomainsOutcome, ClientError>,
+) -> AskedSemantics {
+    let type_signature_match = asked_type_signature_match_of(&signature_a, &signature_b);
+    let caller_domain_overlap = asked_caller_domain_overlap_of(&callers_a, &callers_b);
+
+    AskedSemantics {
+        type_signature_match,
+        caller_domain_overlap,
+        // 先に落ちたほうを出す。後の失敗で上書きすると、何が起きたのかが入れ替わる。
+        error: signature_a
+            .err()
+            .or_else(|| signature_b.err())
+            .or_else(|| callers_a.err())
+            .or_else(|| callers_b.err())
+            .map(SemanticsError::Client),
+    }
+}
+
+/// 型シグネチャを尋ねた結果から、単一化できるかのシグナルにする。
+fn asked_type_signature_match_of(
+    signature_a: &Result<TypeSignatureOutcome, ClientError>,
+    signature_b: &Result<TypeSignatureOutcome, ClientError>,
+) -> TypeSignatureMatch {
+    let (Ok(signature_a), Ok(signature_b)) = (signature_a, signature_b) else {
+        return TypeSignatureMatch::Unavailable {
+            reason: SemanticsUnavailable::LspUnusable,
+        };
+    };
+
+    type_signature_match_of(signature_a, signature_b)
+}
+
+/// 参照元を尋ねた結果から、呼び出し元ドメインの重なりのシグナルにする。
+fn asked_caller_domain_overlap_of(
+    callers_a: &Result<CallerDomainsOutcome, ClientError>,
+    callers_b: &Result<CallerDomainsOutcome, ClientError>,
+) -> CallerDomainOverlap {
+    let (Ok(callers_a), Ok(callers_b)) = (callers_a, callers_b) else {
+        return CallerDomainOverlap::Unavailable {
+            reason: SemanticsUnavailable::LspUnusable,
+        };
+    };
+
+    caller_domain_overlap_of(callers_a, callers_b)
+}
+
+/// そのチャンクのファイルを、サーバに開かせる形にする。
+///
+/// `source` は**そのチャンクを切り出したときに読んだ中身**（[`ChunkPair`] が持つ）。
+/// チャンクの範囲だけでは足りない。**サーバは位置を行と列で受け取る**ので、
+/// ファイル全体と同じ中身を見せていないと別の場所を指すことになる。
+///
+/// # Errors
+///
+/// 開かせる形にできないとき。
+fn document_of(chunk: &Chunk, source: &str) -> Result<SourceDocument, SemanticsError> {
+    SourceDocument::new(chunk.path(), source.to_owned()).map_err(SemanticsError::Document)
+}
+
+/// 両側の型シグネチャから、単一化できるかのシグナルにする。
+///
+/// **片方でも正規化できていなければ「単一化不能」にしない。** 比べていないので、
+/// 取れなかった理由をそのまま出す（2 つとも取れていなければ、上の枝の理由）。
+fn type_signature_match_of(
+    signature_a: &TypeSignatureOutcome,
+    signature_b: &TypeSignatureOutcome,
+) -> TypeSignatureMatch {
+    match (signature_a, signature_b) {
+        (
+            TypeSignatureOutcome::Normalized(normalized_a),
+            TypeSignatureOutcome::Normalized(normalized_b),
+        ) => unifiable_match_of(normalized_a.is_unifiable_with(normalized_b)),
+        (TypeSignatureOutcome::NoTypeThere, _) | (_, TypeSignatureOutcome::NoTypeThere) => {
+            TypeSignatureMatch::NoTypeThere
+        }
+        (TypeSignatureOutcome::UnreadableHover, _) | (_, TypeSignatureOutcome::UnreadableHover) => {
+            TypeSignatureMatch::UnreadableHover
+        }
+        (TypeSignatureOutcome::UnreadableSignature, _)
+        | (_, TypeSignatureOutcome::UnreadableSignature) => TypeSignatureMatch::UnreadableSignature,
+        (TypeSignatureOutcome::HoverNotProvided, _)
+        | (_, TypeSignatureOutcome::HoverNotProvided) => TypeSignatureMatch::HoverNotProvided,
+    }
+}
+
+/// 単一化できたかどうかを、シグナルのバリアントにする。
+fn unifiable_match_of(unifiable: bool) -> TypeSignatureMatch {
+    if unifiable {
+        return TypeSignatureMatch::Unifiable;
+    }
+    TypeSignatureMatch::NotUnifiable
+}
+
+/// 両側の呼び出し元から、ドメインの重なりのシグナルにする。
+///
+/// **片方でも取れていなければ 0.00 にしない。** 重なりが無いのと材料が無いのは
+/// 別の話で、同じ値にすると判定も読者も区別できない。
+fn caller_domain_overlap_of(
+    callers_a: &CallerDomainsOutcome,
+    callers_b: &CallerDomainsOutcome,
+) -> CallerDomainOverlap {
+    match (callers_a, callers_b) {
+        (CallerDomainsOutcome::Counted(counted_a), CallerDomainsOutcome::Counted(counted_b)) => {
+            CallerDomainOverlap::Measured(MeasuredCallerDomains::new(
+                counted_a.clone(),
+                counted_b.clone(),
+            ))
+        }
+        (CallerDomainsOutcome::NoReferences, _) | (_, CallerDomainsOutcome::NoReferences) => {
+            CallerDomainOverlap::NoReferences
+        }
+        (CallerDomainsOutcome::UnreadableReferences, _)
+        | (_, CallerDomainsOutcome::UnreadableReferences) => {
+            CallerDomainOverlap::UnreadableReferences
+        }
+        (CallerDomainsOutcome::ServerStillWorking, _)
+        | (_, CallerDomainsOutcome::ServerStillWorking) => CallerDomainOverlap::ServerStillWorking,
+        (CallerDomainsOutcome::ReferencesNotProvided, _)
+        | (_, CallerDomainsOutcome::ReferencesNotProvided) => {
+            CallerDomainOverlap::ReferencesNotProvided
+        }
+    }
+}
+
+/// Stage 2 を尋ねられなかった理由。
+///
+/// **1 つにまとめない。** サーバが入っていないのと、根を決められないのとで
+/// **利用者が直す先が違う**
+/// (`rules/coding.md`「エラー型は原因ごとにバリアントを分ける」)。
+/// `classification::signal::SemanticsUnavailable` のバリアントと 1 対 1 で対応する。
+#[derive(Debug)]
+pub enum SemanticsError {
+    /// サーバに開かせる形にできなかった。
+    Document(DocumentError),
+    /// ワークスペースの根を決められなかった。
+    Workspace(WorkspaceError),
+    /// サーバとのやりとりが失敗した。
+    Client(ClientError),
+}
+
+impl fmt::Display for SemanticsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Document(cause) => write!(formatter, "{cause}"),
+            Self::Workspace(cause) => write!(formatter, "{cause}"),
+            Self::Client(cause) => write!(formatter, "{cause}"),
+        }
+    }
+}
+
+impl Error for SemanticsError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Document(cause) => Some(cause),
+            Self::Workspace(cause) => Some(cause),
+            Self::Client(cause) => Some(cause),
+        }
+    }
 }
 
 /// コードベース全体を走査して、候補ペアを判定する。
@@ -518,11 +999,86 @@ mod tests {
 
     use crate::classification::DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
     use crate::classification::verdict::Verdict;
+    use crate::semantics::type_signature::TypeSignature;
     use crate::similarity::Similarity;
     use crate::test_support::line;
 
     fn measured(value: f64) -> Similarity {
         Similarity::new(value).expect("テストが渡す値は 0.0-1.0")
+    }
+
+    /// 尋ねる前に止まった理由が、シグナルの側でも別々のままかを見る。
+    ///
+    /// **例外的に内部の関数を直接呼ぶ。** 根を決められない / 開かせる形にできないは
+    /// Windows のパスでしか起きない（別ドライブに共通の祖先が無い・UNC を URI に
+    /// できない。Issue #112）ので、**この対応付けを外から通せる入力が Linux に無い**。
+    /// 対応付けを固定しないまま置くと、すべてが「LSP サーバを使えない」に畳まれても
+    /// 気づけない（`rules/testing.md`「assert は『落ちうるか』で見る」）。
+    #[test]
+    fn test_unavailable_of_keeps_each_setup_failure_apart() {
+        let reasons = [
+            unavailable_of(&SemanticsError::Workspace(WorkspaceError::NoPaths)),
+            unavailable_of(&SemanticsError::Document(
+                DocumentError::UnreadableExtension {
+                    path: PathBuf::from("notes.md"),
+                },
+            )),
+            unavailable_of(&SemanticsError::Client(ClientError::PipesNotWired)),
+        ];
+
+        assert_eq!(
+            reasons,
+            [
+                SemanticsUnavailable::WorkspaceRootUndecidable,
+                SemanticsUnavailable::DocumentUnopenable,
+                SemanticsUnavailable::LspUnusable,
+            ]
+        );
+    }
+
+    /// 正規化できた型シグネチャ。
+    fn normalized(signature_text: &str) -> TypeSignatureOutcome {
+        let signature = TypeSignature::from_signature_text(signature_text)
+            .expect("テストが渡す綴りは読み取れる");
+
+        TypeSignatureOutcome::Normalized(signature)
+    }
+
+    /// hover は答えたが references が落ちた、4 つの問い合わせの結果。
+    fn references_that_failed() -> AskedSemantics {
+        asked_semantics_of_outcomes(
+            Ok(normalized("function totalOf(values: number[]): number")),
+            Ok(normalized("function sumOf(amounts: number[]): number")),
+            Err(ClientError::PipesNotWired),
+            Ok(CallerDomainsOutcome::NoReferences),
+        )
+    }
+
+    #[test]
+    fn test_asked_semantics_keep_the_type_signature_when_references_fail() {
+        // 両方を捨てると、比べ終わっていた型シグネチャが「測れない」に化ける。
+        // ドメインが一致するペアなら、そこで REVIEW が EXTRACT-CANDIDATE へ動く
+        let asked = references_that_failed();
+
+        assert_eq!(asked.type_signature_match, TypeSignatureMatch::Unifiable);
+    }
+
+    #[test]
+    fn test_asked_semantics_mark_only_the_caller_domain_when_references_fail() {
+        // 対照は上のテスト。落ちた側だけが取れない扱いになり、理由も残る
+        let asked = references_that_failed();
+
+        assert_eq!(
+            asked.caller_domain_overlap,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable
+            }
+        );
+        assert!(
+            asked.error.is_some(),
+            "落ちたことは理由として残る: {:?}",
+            asked.error.map(|error| error.to_string())
+        );
     }
 
     /// ファイルを読まずにチャンクを作る。

@@ -11,7 +11,9 @@ pub mod signal;
 pub mod verdict;
 
 use crate::classification::reason::{Lean, Reason};
-use crate::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
+use crate::classification::signal::{
+    CallerDomainOverlap, ImportOverlap, Signals, StructuralSimilarity, TypeSignatureMatch,
+};
 use crate::classification::verdict::Verdict;
 use crate::syntax::module_distance::ModuleDistance;
 use crate::threshold::Threshold;
@@ -37,6 +39,15 @@ pub const DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD: Threshold = Threshold::from_l
 ///
 /// 半分以上が共通なら、同じ道具立ての上に書かれていると見る。
 const SHARED_IMPORTS_THRESHOLD: Threshold = Threshold::from_literal(0.5);
+
+/// 呼び出し元を共有していると見なす重なりの下限。
+///
+/// 半分以上のドメインが共通なら、同じ機能から使われていると見る。
+///
+/// **Why not（[`SHARED_IMPORTS_THRESHOLD`] を使い回す）**: 測っている集合が違う
+/// （依存先モジュールと呼び出し元ドメイン）。片方を調整したときに、もう片方まで
+/// 黙って動くのを避ける。
+const SHARED_CALLER_DOMAINS_THRESHOLD: Threshold = Threshold::from_literal(0.5);
 
 /// 別のディレクトリへ下りていると見なす段数。
 ///
@@ -81,27 +92,82 @@ pub fn classification_of(
         signals.structural_similarity(),
         structural_similarity_threshold,
     );
-    let domain_match = domain_match_of(signals);
+    let placement = placement_domain_match_of(signals);
+    let domain_match = domain_match_of(placement, signals);
+    let type_signature_lean = type_signature_lean_of(signals.type_signature_match());
 
     Classification {
-        verdict: verdict_of(structurally_similar, domain_match),
+        verdict: verdict_of(
+            structurally_similar,
+            type_signature_lean,
+            placement,
+            domain_match,
+        ),
         reasons: reasons_of(signals, structural_similarity_threshold),
     }
 }
 
-/// 構造が似ているかと、依存ドメインが一致しているかから、ラベルを決める。
+/// 構造が似ているか・型シグネチャが重なるか・依存ドメインが一致しているかから、ラベルを決める。
 ///
 /// 構造が似ていないペアは、ドメインが食い違っていても `DO-NOT-EXTRACT` にしない。
 /// **偶発的な重複と呼べるのは、そもそも共通化したくなるほど似ている場合だけ。**
-fn verdict_of(structurally_similar: bool, domain_match: DomainMatch) -> Verdict {
+fn verdict_of(
+    structurally_similar: bool,
+    type_signature_lean: Lean,
+    placement: DomainMatch,
+    domain_match: DomainMatch,
+) -> Verdict {
     if !structurally_similar {
         return Verdict::Review;
     }
 
     match domain_match {
-        DomainMatch::Same => Verdict::ExtractCandidate,
+        DomainMatch::Same => shared_domain_verdict_of(type_signature_lean, placement),
         DomainMatch::Separate => Verdict::DoNotExtract,
         DomainMatch::Undecidable => Verdict::Review,
+    }
+}
+
+/// ドメインが一致しているペアのラベル。型シグネチャが候補側の拒否権を持つ。
+///
+/// `placement` は Stage 1 だけで出したドメインの一致（[`placement_domain_match_of`]）。
+///
+/// **単一化できないなら、そのままでは 1 つにまとめられない**ので候補として出さない。
+/// 計画が「ここで初めて型シグネチャ単一化可能判定が入り、`EXTRACT-CANDIDATE` 側の
+/// 精度が上がる」と言っているのがこの形（`docs/dryguard-plan.md`「Phase 2」）。
+///
+/// **Why not（`DO-NOT-EXTRACT` にする）**: そちらは「偶発的な重複」を指すラベル
+/// (`classification::verdict`)。ドメインが同じなら偶発ではなく、
+/// 型を一般化すればまとめられることもある。決めるのは人。
+///
+/// **Why not（単一化できることを候補側の決め手にする）**: `(Date) => string` のような
+/// 汎用の型は別ドメインでもよく重なる。**重なることは必要条件であって、
+/// 同じドメインである証拠ではない。**
+fn shared_domain_verdict_of(type_signature_lean: Lean, placement: DomainMatch) -> Verdict {
+    match type_signature_lean {
+        Lean::TowardDoNotExtract => Verdict::Review,
+        Lean::TowardExtract => Verdict::ExtractCandidate,
+        Lean::Neither => stage1_shared_domain_verdict_of(placement),
+    }
+}
+
+/// 型シグネチャが取れていないときのラベル。**Stage 1 だけで同じドメインと言えている
+/// 場合に限って**候補に出す。
+///
+/// 呼び出し元の観測だけで `Undecidable` から `Same` へ上げたペアをここで候補にすると、
+/// **単一化できるかを確かめないまま「共通化してよい」と言う**ことになる。
+/// これは hover だけが落ちた環境で起きるので、**環境の差で判定が緩む側へ動く**
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+///
+/// **Why not（`Separate` 側にも同じ条件を付ける）**: 型シグネチャは
+/// 「1 つにまとめられるか」の必要条件で、**偶発的な重複と言うのに要る証拠ではない**
+/// （計画の表でも呼び出し元の分布だけで非推奨側に傾く）。誤る向きも違い、
+/// 偽の `EXTRACT-CANDIDATE` は間違った抽象化を生むが、偽の `DO-NOT-EXTRACT` は
+/// 分離が続くだけ。
+fn stage1_shared_domain_verdict_of(placement: DomainMatch) -> Verdict {
+    match placement {
+        DomainMatch::Same => Verdict::ExtractCandidate,
+        DomainMatch::Separate | DomainMatch::Undecidable => Verdict::Review,
     }
 }
 
@@ -123,6 +189,31 @@ enum DomainMatch {
     Undecidable,
 }
 
+/// 置き場所の判定に、実際に誰が使っているかの観測を重ねて、ドメインが同じかを決める。
+///
+/// **観測で置き換えない。** ディレクトリと依存先は「どこに置かれているか」、
+/// 呼び出し元は「誰が使っているか」で、片方がもう片方の言い換えではない
+/// (`rules/naming.md`「`module distance` と `caller domain` を混ぜない」)。
+///
+/// `placement` は Stage 1 だけで出した判定（[`placement_domain_match_of`]）。
+///
+/// - 観測が取れなければ、置き場所の判定のまま（LSP が無い環境が通る道）
+/// - 観測と置き場所が食い違えば `Undecidable`。**潰さずに人へ回す**
+/// - 食い違わなければ観測の側に寄せる
+fn domain_match_of(placement: DomainMatch, signals: &Signals) -> DomainMatch {
+    match caller_domain_lean_of(signals.caller_domain_overlap()) {
+        Lean::Neither => placement,
+        Lean::TowardExtract => match placement {
+            DomainMatch::Same | DomainMatch::Undecidable => DomainMatch::Same,
+            DomainMatch::Separate => DomainMatch::Undecidable,
+        },
+        Lean::TowardDoNotExtract => match placement {
+            DomainMatch::Separate | DomainMatch::Undecidable => DomainMatch::Separate,
+            DomainMatch::Same => DomainMatch::Undecidable,
+        },
+    }
+}
+
 /// 依存先の重なりとディレクトリの隔たりから、ドメインが同じかを決める。
 ///
 /// **根拠が持つ傾きをそのまま材料にする。** 同じ条件を判定用にもう一度書くと、
@@ -135,7 +226,7 @@ enum DomainMatch {
 ///
 /// 逆に**別のドメインと言うには隔たりも要る**。ディレクトリはドメイン境界の代理指標
 /// でしかないので、同じディレクトリにあるものを依存先の違いだけで別ドメインと呼ばない。
-fn domain_match_of(signals: &Signals) -> DomainMatch {
+fn placement_domain_match_of(signals: &Signals) -> DomainMatch {
     match import_overlap_lean_of(signals.import_overlap()) {
         Lean::TowardExtract => DomainMatch::Same,
         Lean::Neither => DomainMatch::Undecidable,
@@ -177,7 +268,44 @@ fn reasons_of(signals: &Signals, structural_similarity_threshold: Threshold) -> 
             signal: signals.module_distance(),
             lean: module_distance_lean_of(signals.module_distance()),
         },
+        Reason::TypeSignatureMatch {
+            signal: signals.type_signature_match(),
+            lean: type_signature_lean_of(signals.type_signature_match()),
+        },
+        Reason::CallerDomainOverlap {
+            signal: signals.caller_domain_overlap().clone(),
+            lean: caller_domain_lean_of(signals.caller_domain_overlap()),
+        },
     ]
+}
+
+/// 型シグネチャの単一化の可否が傾けた向き。尋ねていない / 測れなければ傾けない。
+fn type_signature_lean_of(signal: TypeSignatureMatch) -> Lean {
+    match signal {
+        TypeSignatureMatch::Unifiable => Lean::TowardExtract,
+        TypeSignatureMatch::NotUnifiable => Lean::TowardDoNotExtract,
+        TypeSignatureMatch::Unavailable { .. }
+        | TypeSignatureMatch::NoName
+        | TypeSignatureMatch::NoTypeThere
+        | TypeSignatureMatch::UnreadableHover
+        | TypeSignatureMatch::UnreadableSignature
+        | TypeSignatureMatch::HoverNotProvided => Lean::Neither,
+    }
+}
+
+/// 呼び出し元ドメインの重なりが傾けた向き。尋ねていない / 測れなければ傾けない。
+fn caller_domain_lean_of(signal: &CallerDomainOverlap) -> Lean {
+    let CallerDomainOverlap::Measured(measured) = signal else {
+        return Lean::Neither;
+    };
+
+    if measured
+        .overlap()
+        .is_at_least(SHARED_CALLER_DOMAINS_THRESHOLD)
+    {
+        return Lean::TowardExtract;
+    }
+    Lean::TowardDoNotExtract
 }
 
 /// 構造類似度が傾けた向き。
@@ -221,15 +349,43 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    use std::path::PathBuf;
+
     use crate::classification::reason::{Lean, Reason};
-    use crate::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
+    use crate::classification::signal::{
+        CallerDomainOverlap, ImportOverlap, MeasuredCallerDomains, SemanticsUnavailable, Signals,
+        StructuralSimilarity, TypeSignatureMatch,
+    };
     use crate::classification::verdict::Verdict;
+    use crate::semantics::caller_domain::CallerDomains;
     use crate::similarity::Similarity;
     use crate::syntax::module_distance::ModuleDistance;
     use crate::threshold::Threshold;
 
     fn measured(value: f64) -> Similarity {
         Similarity::new(value).expect("テストが渡す値は 0.0-1.0")
+    }
+
+    fn caller_domains(reference_paths: &[&str]) -> CallerDomains {
+        let paths: Vec<PathBuf> = reference_paths.iter().map(PathBuf::from).collect();
+
+        CallerDomains::from_reference_paths(&paths).expect("テストが渡す参照元は 1 件以上")
+    }
+
+    /// 呼び出し元が別のドメインに分かれている（重なり 0.00）。
+    fn callers_in_separate_domains() -> CallerDomainOverlap {
+        CallerDomainOverlap::Measured(MeasuredCallerDomains::new(
+            caller_domains(&["src/billing/invoice.ts"]),
+            caller_domains(&["src/inventory/stock.ts"]),
+        ))
+    }
+
+    /// 呼び出し元が同じドメインから来ている（重なり 1.00）。
+    fn callers_in_the_same_domain() -> CallerDomainOverlap {
+        CallerDomainOverlap::Measured(MeasuredCallerDomains::new(
+            caller_domains(&["src/report/monthly.ts"]),
+            caller_domains(&["src/report/daily.ts"]),
+        ))
     }
 
     /// 別のディレクトリにある 2 ファイルの隔たり（2 段）。
@@ -380,7 +536,334 @@ mod tests {
 
         let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
 
-        assert_eq!(classification.reasons().len(), 3);
+        assert_eq!(classification.reasons().len(), 5);
+    }
+
+    /// 構造が似ていて依存先も共有している組（Stage 1 だけなら `EXTRACT-CANDIDATE`）。
+    fn signals_of_a_shared_domain() -> Signals {
+        Signals::new(
+            StructuralSimilarity::Measured(measured(0.9)),
+            ImportOverlap::Measured(measured(1.0)),
+            separate_directories(),
+        )
+    }
+
+    /// 構造が似ていて依存先が食い違い、ディレクトリも分かれている組
+    /// （Stage 1 だけなら `DO-NOT-EXTRACT`）。
+    fn signals_of_separate_domains() -> Signals {
+        Signals::new(
+            StructuralSimilarity::Measured(measured(0.9)),
+            ImportOverlap::Measured(measured(0.0)),
+            separate_directories(),
+        )
+    }
+
+    #[test]
+    fn test_classification_of_a_shared_domain_whose_type_signatures_do_not_unify_is_review() {
+        // ドメインは一致している。**そのままでは 1 つにまとめられない**ので、
+        // 候補として出さずに人へ回す
+        let signals = signals_of_a_shared_domain().with_semantics(
+            TypeSignatureMatch::NotUnifiable,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    #[test]
+    fn test_classification_of_a_shared_domain_whose_type_signatures_unify_is_extract_candidate() {
+        // 対照は上のテスト。型シグネチャ以外はすべて同じ
+        let signals = signals_of_a_shared_domain().with_semantics(
+            TypeSignatureMatch::Unifiable,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(classification.verdict(), Verdict::ExtractCandidate);
+    }
+
+    #[test]
+    fn test_classification_with_an_unusable_lsp_keeps_the_verdict_the_stage1_signals_reach() {
+        // サーバを使えないことを「単一化できない」と同じ扱いにすると、環境が悪いだけで
+        // 候補が REVIEW に落ちる。上の 2 つと同じ入力で、Stage 2 だけを取れなくしてある
+        let signals = signals_of_a_shared_domain().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable,
+            },
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(classification.verdict(), Verdict::ExtractCandidate);
+    }
+
+    #[test]
+    fn test_classification_of_callers_in_separate_domains_decides_an_undecidable_placement() {
+        // import が無いので Stage 1 だけでは REVIEW。実際に誰が使っているかが
+        // 取れて初めて別ドメインと言える
+        let signals = Signals::new(
+            StructuralSimilarity::Measured(measured(0.9)),
+            ImportOverlap::NoImports,
+            separate_directories(),
+        )
+        .with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            callers_in_separate_domains(),
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(classification.verdict(), Verdict::DoNotExtract);
+    }
+
+    #[test]
+    fn test_classification_of_callers_sharing_a_domain_against_a_separate_placement_is_review() {
+        // 置き場所と依存先は別ドメインと言っているのに、使っているのは同じドメイン。
+        // **観測で置き換えず、食い違いとして人へ回す**
+        // (`rules/naming.md`「置き場所の代理指標を、使われ方の観測で置き換えない」)
+        let signals = signals_of_separate_domains().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            callers_in_the_same_domain(),
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    #[test]
+    fn test_classification_of_callers_in_separate_domains_against_a_shared_placement_is_review() {
+        // 上と逆向きの食い違い。依存先は共有しているが、使っているドメインは分かれている
+        let signals = signals_of_a_shared_domain().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            callers_in_separate_domains(),
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    /// 依存先を測れず、呼び出し元だけが同じドメインを指す組。
+    ///
+    /// Stage 1 だけでは `REVIEW`（置き場所を決められない）。
+    fn signals_of_a_caller_only_domain_match() -> Signals {
+        Signals::new(
+            StructuralSimilarity::Measured(measured(0.9)),
+            ImportOverlap::NoImports,
+            separate_directories(),
+        )
+    }
+
+    #[test]
+    fn test_classification_of_a_caller_only_domain_match_without_a_type_signature_is_review() {
+        // 呼び出し元だけで候補へ上げると、**単一化できるかを確かめないまま
+        // 「共通化してよい」と言う**ことになる。hover だけが落ちた環境で起きる
+        let signals = signals_of_a_caller_only_domain_match().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable,
+            },
+            callers_in_the_same_domain(),
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    #[test]
+    fn test_classification_of_a_caller_only_domain_match_with_a_type_signature_is_extract_candidate()
+     {
+        // 対照は上のテスト。型シグネチャが取れているかどうかだけが違う
+        let signals = signals_of_a_caller_only_domain_match()
+            .with_semantics(TypeSignatureMatch::Unifiable, callers_in_the_same_domain());
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(classification.verdict(), Verdict::ExtractCandidate);
+    }
+
+    #[test]
+    fn test_classification_of_callers_in_separate_domains_does_not_need_a_type_signature() {
+        // 候補側と違い、非推奨側には型シグネチャを求めない。型は「1 つにまとめられるか」の
+        // 必要条件であって、偶発的な重複と言うのに要る証拠ではない
+        let signals = signals_of_a_caller_only_domain_match().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable,
+            },
+            callers_in_separate_domains(),
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(classification.verdict(), Verdict::DoNotExtract);
+    }
+
+    #[test]
+    fn test_classification_of_unifiable_type_signatures_leans_that_reason_toward_extract() {
+        let signals = signals_of_a_shared_domain().with_semantics(
+            TypeSignatureMatch::Unifiable,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert!(
+            leans(
+                &classification,
+                &Reason::TypeSignatureMatch {
+                    signal: TypeSignatureMatch::Unifiable,
+                    lean: Lean::TowardExtract,
+                }
+            ),
+            "単一化できることが候補側へ傾けた根拠になる: {:?}",
+            classification.reasons()
+        );
+    }
+
+    #[test]
+    fn test_classification_of_type_signatures_that_do_not_unify_leans_that_reason_the_other_way() {
+        let signals = signals_of_a_shared_domain().with_semantics(
+            TypeSignatureMatch::NotUnifiable,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert!(
+            leans(
+                &classification,
+                &Reason::TypeSignatureMatch {
+                    signal: TypeSignatureMatch::NotUnifiable,
+                    lean: Lean::TowardDoNotExtract,
+                }
+            ),
+            "単一化できないことが共通化しない側へ傾けた根拠になる: {:?}",
+            classification.reasons()
+        );
+    }
+
+    #[test]
+    fn test_classification_without_asking_the_lsp_leans_the_stage2_reasons_neither_way() {
+        let signals = signals_of_a_shared_domain();
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert!(
+            leans(
+                &classification,
+                &Reason::TypeSignatureMatch {
+                    signal: TypeSignatureMatch::Unavailable {
+                        reason: SemanticsUnavailable::NotAsked
+                    },
+                    lean: Lean::Neither,
+                }
+            ) && leans(
+                &classification,
+                &Reason::CallerDomainOverlap {
+                    signal: CallerDomainOverlap::Unavailable {
+                        reason: SemanticsUnavailable::NotAsked
+                    },
+                    lean: Lean::Neither,
+                }
+            ),
+            "尋ねていないシグナルはどちらへも傾けない: {:?}",
+            classification.reasons()
+        );
+    }
+
+    #[test]
+    fn test_classification_of_callers_in_separate_domains_leans_that_reason_toward_do_not_extract()
+    {
+        let signals = signals_of_separate_domains().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            callers_in_separate_domains(),
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert!(
+            leans(
+                &classification,
+                &Reason::CallerDomainOverlap {
+                    signal: callers_in_separate_domains(),
+                    lean: Lean::TowardDoNotExtract,
+                }
+            ),
+            "呼び出し元が分かれていることが共通化しない側へ傾けた根拠になる: {:?}",
+            classification.reasons()
+        );
+    }
+
+    #[test]
+    fn test_classification_of_callers_sharing_a_domain_leans_that_reason_toward_extract() {
+        // 対照は上のテスト。呼び出し元のドメインだけが違う
+        let signals = signals_of_separate_domains().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            callers_in_the_same_domain(),
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert!(
+            leans(
+                &classification,
+                &Reason::CallerDomainOverlap {
+                    signal: callers_in_the_same_domain(),
+                    lean: Lean::TowardExtract,
+                }
+            ),
+            "同じドメインから呼ばれていることが候補側へ傾けた根拠になる: {:?}",
+            classification.reasons()
+        );
+    }
+
+    #[test]
+    fn test_classification_of_callers_overlapping_at_the_threshold_leans_toward_extract() {
+        // 境界。合わせて 2 ドメインのうち 1 つが共通で、重なりは閾値ちょうどの 0.50
+        let callers = CallerDomainOverlap::Measured(MeasuredCallerDomains::new(
+            caller_domains(&["src/report/monthly.ts", "src/billing/invoice.ts"]),
+            caller_domains(&["src/report/daily.ts"]),
+        ));
+        let signals = signals_of_separate_domains().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            callers,
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(
+            classification.verdict(),
+            Verdict::Review,
+            "閾値ちょうどを共有している側に数えるので、置き場所の判定と食い違う: {:?}",
+            classification.reasons()
+        );
     }
 
     #[test]
