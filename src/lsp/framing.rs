@@ -13,6 +13,8 @@ use std::fmt;
 // （`R: BufRead` の supertrait）で解決し、借りているはずの読み口ごと動かそうとする。
 use std::io::{self, BufRead, Read};
 
+use super::message::Payload;
+
 /// 長さを載せるヘッダの名前。比較は ASCII 大文字小文字を無視して行う。
 const CONTENT_LENGTH: &str = "content-length";
 
@@ -37,9 +39,10 @@ const MAX_HEADER_BYTES: usize = 1024;
 ///
 /// 長さは**文字数ではなくバイト数**。ヘッダが数えているのは受け手が読み取るバイト数で、
 /// 非 ASCII を含む payload では文字数と食い違う。
-pub fn framed_bytes_of(payload: &str) -> Vec<u8> {
-    let mut framed = format!("Content-Length: {}\r\n\r\n", payload.len()).into_bytes();
-    framed.extend_from_slice(payload.as_bytes());
+pub fn framed_bytes_of(payload: &Payload) -> Vec<u8> {
+    let text = payload.as_str();
+    let mut framed = format!("Content-Length: {}\r\n\r\n", text.len()).into_bytes();
+    framed.extend_from_slice(text.as_bytes());
     framed
 }
 
@@ -52,7 +55,7 @@ pub fn framed_bytes_of(payload: &str) -> Vec<u8> {
 /// フレームの切れ目で入力が尽きた（サーバが終了した）とき、フレームの途中で尽きたとき、
 /// `Content-Length` が無い / 数として読めない / 上限を超えるとき、payload が UTF-8 でないとき、
 /// 読み取り自体が失敗したとき。
-pub fn payload_of<R: BufRead>(reader: &mut R) -> Result<String, FramingError> {
+pub fn payload_of<R: BufRead>(reader: &mut R) -> Result<Payload, FramingError> {
     let length = content_length_of(reader)?;
 
     // 確保する前に見る。確保してからでは、失敗が `Result` ではなくプロセスの死で返る。
@@ -68,7 +71,9 @@ pub fn payload_of<R: BufRead>(reader: &mut R) -> Result<String, FramingError> {
         FramingError::Read(error)
     })?;
 
-    String::from_utf8(payload).map_err(|_| FramingError::NotUtf8)
+    let text = String::from_utf8(payload).map_err(|_| FramingError::NotUtf8)?;
+
+    Ok(Payload::new(text))
 }
 
 /// ヘッダ部を空行まで読み進め、`Content-Length` の値を返す。
@@ -232,14 +237,14 @@ impl Error for FramingError {
 mod tests {
     use super::*;
 
-    fn read_payload(framed: &str) -> Result<String, FramingError> {
+    fn read_payload(framed: &str) -> Result<Payload, FramingError> {
         payload_of(&mut framed.as_bytes())
     }
 
     #[test]
     fn test_framed_bytes_of_a_payload_counts_bytes_not_characters() {
         // 9 文字だが 11 バイト。文字数を数える実装ではここで 9 が出る
-        let framed = framed_bytes_of(r#"{"a":"あ"}"#);
+        let framed = framed_bytes_of(&Payload::new(r#"{"a":"あ"}"#.to_owned()));
 
         assert_eq!(
             String::from_utf8(framed).expect("組み立てた結果は UTF-8"),
@@ -251,7 +256,7 @@ mod tests {
     fn test_payload_of_a_framed_message_returns_the_body() {
         let payload = read_payload("Content-Length: 7\r\n\r\n{\"a\":1}").expect("読める");
 
-        assert_eq!(payload, r#"{"a":1}"#);
+        assert_eq!(payload.as_str(), r#"{"a":1}"#);
     }
 
     #[test]
@@ -259,14 +264,14 @@ mod tests {
         let framed =
             "Content-Length: 7\r\nContent-Type: application/vscode-jsonrpc\r\n\r\n{\"a\":1}";
 
-        assert_eq!(read_payload(framed).expect("読める"), r#"{"a":1}"#);
+        assert_eq!(read_payload(framed).expect("読める").as_str(), r#"{"a":1}"#);
     }
 
     #[test]
     fn test_payload_of_accepts_a_content_length_header_in_any_case() {
         let payload = read_payload("content-length: 7\r\n\r\n{\"a\":1}").expect("読める");
 
-        assert_eq!(payload, r#"{"a":1}"#);
+        assert_eq!(payload.as_str(), r#"{"a":1}"#);
     }
 
     #[test]
@@ -278,7 +283,9 @@ mod tests {
         payload_of(&mut reader).expect("1 フレーム目は読める");
 
         assert_eq!(
-            payload_of(&mut reader).expect("2 フレーム目も読める"),
+            payload_of(&mut reader)
+                .expect("2 フレーム目も読める")
+                .as_str(),
             r#"{"b":2}"#
         );
     }
@@ -385,7 +392,7 @@ mod tests {
         let framed = format!("Content-Length: {MAX_PAYLOAD_BYTES}\r\n\r\n{payload}");
 
         assert_eq!(
-            read_payload(&framed).expect("読める").len(),
+            read_payload(&framed).expect("読める").as_str().len(),
             MAX_PAYLOAD_BYTES
         );
     }

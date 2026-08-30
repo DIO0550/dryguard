@@ -28,7 +28,8 @@ use super::document::SourceDocument;
 use super::framing::{self, FramingError};
 use super::hover::{self, HoverOutcome};
 use super::message::{
-    self, MessageError, RequestId, ResponseFailure, ResponseOutcome, ServerMessage, ServerRequestId,
+    self, MessageError, Payload, RequestId, ResponseFailure, ResponseOutcome, ServerMessage,
+    ServerRequestId,
 };
 use super::references::{self, ReferencesOutcome};
 use super::workspace::WorkspaceRoot;
@@ -455,7 +456,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     /// 読み取りが失敗したとき、中身を解釈できないとき、要求への返信を書き出せないとき。
     fn handled_message(&mut self) -> Result<Option<(RequestId, ResponseOutcome)>, ConnectionError> {
         let payload = framing::payload_of(&mut self.reader).map_err(ConnectionError::Framing)?;
-        let message = ServerMessage::from_json(&payload).map_err(ConnectionError::Message)?;
+        let message = ServerMessage::from_payload(&payload).map_err(ConnectionError::Message)?;
 
         match message {
             // 応答の前後にサーバの通知（window/logMessage・$/progress）が挟まる。
@@ -559,7 +560,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     /// # Errors
     ///
     /// 書き出しが失敗したとき。
-    fn send(&mut self, payload: &str) -> Result<(), ConnectionError> {
+    fn send(&mut self, payload: &Payload) -> Result<(), ConnectionError> {
         self.writer
             .write_all(&framing::framed_bytes_of(payload))
             .map_err(ConnectionError::Send)?;
@@ -736,7 +737,7 @@ mod tests {
     fn frames_of(payloads: &[&str]) -> Vec<u8> {
         payloads
             .iter()
-            .flat_map(|payload| framing::framed_bytes_of(payload))
+            .flat_map(|payload| framing::framed_bytes_of(&Payload::new((*payload).to_owned())))
             .collect()
     }
 
@@ -746,7 +747,7 @@ mod tests {
         let mut payloads = Vec::new();
 
         while let Ok(payload) = framing::payload_of(&mut reader) {
-            payloads.push(serde_json::from_str(&payload).expect("送った payload は JSON"));
+            payloads.push(serde_json::from_str(payload.as_str()).expect("送った payload は JSON"));
         }
 
         payloads
