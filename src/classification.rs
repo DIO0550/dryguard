@@ -81,10 +81,10 @@ pub fn classification_of(
         signals.structural_similarity(),
         structural_similarity_threshold,
     );
-    let domain = domain_of(signals);
+    let domain_match = domain_match_of(signals);
 
     Classification {
-        verdict: verdict_of(structurally_similar, domain),
+        verdict: verdict_of(structurally_similar, domain_match),
         reasons: reasons_of(signals, structural_similarity_threshold),
     }
 }
@@ -93,15 +93,15 @@ pub fn classification_of(
 ///
 /// 構造が似ていないペアは、ドメインが食い違っていても `DO-NOT-EXTRACT` にしない。
 /// **偶発的な重複と呼べるのは、そもそも共通化したくなるほど似ている場合だけ。**
-fn verdict_of(structurally_similar: bool, domain: Domain) -> Verdict {
+fn verdict_of(structurally_similar: bool, domain_match: DomainMatch) -> Verdict {
     if !structurally_similar {
         return Verdict::Review;
     }
 
-    match domain {
-        Domain::Same => Verdict::ExtractCandidate,
-        Domain::Separate => Verdict::DoNotExtract,
-        Domain::Undecidable => Verdict::Review,
+    match domain_match {
+        DomainMatch::Same => Verdict::ExtractCandidate,
+        DomainMatch::Separate => Verdict::DoNotExtract,
+        DomainMatch::Undecidable => Verdict::Review,
     }
 }
 
@@ -109,8 +109,12 @@ fn verdict_of(structurally_similar: bool, domain: Domain) -> Verdict {
 ///
 /// `classification` の中だけの中間の値なので公開しない。外へ出すのは
 /// ラベルと根拠で、その間の畳み方は判定の内側にある。
+///
+/// **ドメインそのものではなく、一致しているかどうか**を持つ
+/// （`rules/naming.md`「名前と実体を一致させる」）。ドメインを表す値は
+/// `semantics::caller_domain::Domain` にある。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Domain {
+enum DomainMatch {
     /// 同じドメイン。
     Same,
     /// 別のドメイン。
@@ -131,14 +135,14 @@ enum Domain {
 ///
 /// 逆に**別のドメインと言うには隔たりも要る**。ディレクトリはドメイン境界の代理指標
 /// でしかないので、同じディレクトリにあるものを依存先の違いだけで別ドメインと呼ばない。
-fn domain_of(signals: &Signals) -> Domain {
+fn domain_match_of(signals: &Signals) -> DomainMatch {
     match import_overlap_lean_of(signals.import_overlap()) {
-        Lean::TowardExtract => Domain::Same,
-        Lean::Neither => Domain::Undecidable,
+        Lean::TowardExtract => DomainMatch::Same,
+        Lean::Neither => DomainMatch::Undecidable,
         Lean::TowardDoNotExtract => match module_distance_lean_of(signals.module_distance()) {
-            Lean::TowardDoNotExtract => Domain::Separate,
-            Lean::TowardExtract => Domain::Undecidable,
-            Lean::Neither => Domain::Undecidable,
+            Lean::TowardDoNotExtract => DomainMatch::Separate,
+            Lean::TowardExtract => DomainMatch::Undecidable,
+            Lean::Neither => DomainMatch::Undecidable,
         },
     }
 }
