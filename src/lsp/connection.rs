@@ -294,6 +294,11 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         let mut attempts_left = REFERENCES_ATTEMPTS;
 
         while attempts_left > 0 {
+            // **尋ねる前に、動いている作業を待ち切る。** 動いている最中に送ると、
+            // その作業が終わってから応答が届いたときに、こちらからは何も起きなかったように
+            // 見える（前の問い合わせで覚えた作業なので、数も増えない）。
+            self.wait_for_running_progress()?;
+
             let started_before = self.started_progress_count;
             let answered = self.ask_references_once(params.clone())?;
 
@@ -307,9 +312,6 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             }
 
             attempts_left -= 1;
-            if attempts_left > 0 {
-                self.wait_for_running_progress()?;
-            }
         }
 
         Ok(ReferencesOutcome::ServerStillWorking)

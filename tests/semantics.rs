@@ -213,3 +213,40 @@ fn test_two_functions_called_from_the_same_domain_share_their_caller_domains() {
         1.0
     );
 }
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_caller_domains_asked_after_a_type_signature_are_still_complete() {
+    // #29 が組む順（hover → references）を 1 つのセッションで通す。**先の hover で
+    // サーバの作業を覚える**ので、その作業が終わる前に references を送ると、
+    // 読み込み中に計算された答え（呼び出し元が欠けている）を受け取る
+    let discounts_an_invoice = fixture("references/src/billing/discount.ts", 5);
+    let Ok((chunk, _)) = chunk_pair_of(&discounts_an_invoice, &discounts_an_invoice) else {
+        panic!("テストが渡す位置は関数の中を指している");
+    };
+
+    let mut session = session_over(&[
+        discounts_an_invoice.path().to_path_buf(),
+        fixture(THE_REFERENCES_PROJECT_FILE, 1).path().to_path_buf(),
+    ]);
+    let _signature = type_signature_of(&mut session, &chunk);
+    let caller_domains = caller_domains_of(&mut session, &chunk);
+    if session.shutdown().is_err() {
+        panic!("サーバを終わらせられる");
+    }
+
+    let domains: Vec<String> = caller_domains
+        .references_per_domain()
+        .iter()
+        .map(|(domain, _)| domain.directory().display().to_string())
+        .collect();
+    assert_eq!(
+        domains.len(),
+        1,
+        "呼び出し元は 1 つのドメインに収まる: {domains:?}"
+    );
+    assert!(
+        domains[0].ends_with("src/billing"),
+        "呼び出し元は billing の 2 ファイル: {domains:?}"
+    );
+}
