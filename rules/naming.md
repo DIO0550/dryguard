@@ -77,6 +77,11 @@ if structurally_similar && domains_differ { ... }
 | `workspace root` | `initialize` でサーバに見せるディレクトリ。開かせるファイル群の共通の祖先 |
 | `document` | サーバに開かせるソースファイル 1 つ分。URI・`language id`・中身の組 |
 | `language id` | LSP がサーバに伝える言語の名前（`typescript` / `typescriptreact`） |
+| `hover` | ソースの 1 点を指して、そこにある名前の型を尋ねる問い合わせ |
+| `source position` | ファイルの中の 1 点。行と、**UTF-16 のコード単位で数えた**列 |
+| `signature text` | hover が返した型の綴りそのもの。**正規化前** |
+| `type signature` | 引数名を落とし、型変数を出現順に付け替えた形。**正規化後**。比較はこれで行う |
+| `unifiable` | 2 つの `type signature` が同じ型構造に重なること（単一化可能） |
 
 `snippet` / `fragment` / `candidate`（chunk の意味で）/ `label`（verdict の意味で）は使わない。
 **`candidate` が指すのはペアであって chunk ではない。**
@@ -94,6 +99,12 @@ newtype にしているのはこのため）。
 **`frame` と `payload` を混ぜない。** 区切りを付ける側（`lsp::framing`）と中身を読む側
 （`lsp::message`）はモジュールが別で、**失敗の直し先も別**（`Content-Length` が壊れているのと、
 JSON が壊れているのは違う話）。1 語で呼ぶと、どちらの層で落ちたのかがエラーの名前から消える。
+
+**`signature text` と `type signature` を混ぜない。** どちらも 1 つの関数の型を指すが、
+綴りは書いた人の付けた引数名と型変数名に依存し、正規化後は依存しない。**綴りのまま比べると、
+引数名が違うだけのペアが別物になる**（`specifier` と `module path` を分けているのと同じ形）。
+サーバが返す綴りには宣言形（`function decl(a: string): number`）と値形
+（`const arrow: (a: string) => number`）があり、**同じ型でも書かれ方が 2 通りある**。
 
 **`grammar` と `language id` を混ぜない。** どちらも拡張子で決まるが、`grammar` は
 tree-sitter がソースを読むための文法、`language id` は LSP サーバに言語を伝える綴りで、

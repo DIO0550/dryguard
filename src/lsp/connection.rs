@@ -12,19 +12,22 @@ use std::io::{self, BufRead, Write};
 use lsp_types::notification::{
     DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized, Notification as _,
 };
-use lsp_types::request::{Initialize, Request as _, Shutdown};
+use lsp_types::request::{HoverRequest, Initialize, Request as _, Shutdown};
 use lsp_types::{
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, InitializeResult, ServerCapabilities,
-    TextDocumentIdentifier, Uri,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover, HoverParams, InitializeResult,
+    ServerCapabilities, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
+    WorkDoneProgressParams,
 };
 use serde_json::{Value, json};
 
 use super::document::SourceDocument;
 use super::framing::{self, FramingError};
+use super::hover::{self, HoverOutcome};
 use super::message::{
     self, MessageError, RequestId, ResponseFailure, ResponseOutcome, ServerMessage,
 };
 use super::workspace::WorkspaceRoot;
+use crate::source_position::SourcePosition;
 
 /// `initialize` でサーバに名乗る名前。
 const CLIENT_NAME: &str = "dryguard";
@@ -168,6 +171,55 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         Ok(())
     }
 
+    /// 開かせたファイルの、指定位置にある名前の型の綴りを尋ねる。
+    ///
+    /// `position` は `Chunk::name_position` が指す識別子の位置。答えが無かったのか
+    /// 読めなかったのかは [`HoverOutcome`] が分けて持つ。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、パラメータを JSON にできないとき、
+    /// 送受信が失敗したとき、応答を hover の結果として読めないとき。
+    pub fn hover(
+        &mut self,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<HoverOutcome, ConnectionError> {
+        // 開かせていないドキュメントへ送ると、サーバは中身を知らないまま null を返す。
+        // 「その位置に型が無い」と「開かせ忘れ」が同じ答えになるので、送る前に断る。
+        if !self.open_documents.contains(document.uri()) {
+            return Err(ConnectionError::DocumentNotOpen {
+                uri: document.uri().clone(),
+            });
+        }
+
+        let params = HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: document.uri().clone(),
+                },
+                position: position.to_lsp_position(),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+        let params = serde_json::to_value(params)
+            .map_err(not_serializable_error_of(HoverRequest::METHOD))?;
+
+        let result = self.request(HoverRequest::METHOD, Some(params))?;
+        // 答えが無いときサーバは null を返す。`Option` で受けて、応答が読めなかった
+        // 場合と分ける。
+        let answered: Option<Hover> =
+            serde_json::from_value(result).map_err(|cause| ConnectionError::MalformedResult {
+                method: HoverRequest::METHOD.to_owned(),
+                cause,
+            })?;
+
+        Ok(match answered.as_ref() {
+            Some(hover) => hover::outcome_of(hover),
+            None => HoverOutcome::NoAnswer,
+        })
+    }
+
     /// 要求を送り、その応答の result を待つ。
     ///
     /// # Errors
@@ -298,6 +350,14 @@ pub enum ConnectionError {
         /// できなかった理由。
         cause: serde_json::Error,
     },
+    /// 開かせていないドキュメントの位置を問い合わせようとした。
+    ///
+    /// サーバは知らない URI に対して null を返すので、送ってしまうと
+    /// 「その位置に型が無い」と区別が付かない。
+    DocumentNotOpen {
+        /// 開かせていなかったドキュメントの URI。
+        uri: Uri,
+    },
 }
 
 impl fmt::Display for ConnectionError {
@@ -321,6 +381,11 @@ impl fmt::Display for ConnectionError {
                 formatter,
                 "{method} のパラメータを JSON にできません: {cause}"
             ),
+            Self::DocumentNotOpen { uri } => write!(
+                formatter,
+                "LSP サーバに開かせていないドキュメントです: {}",
+                uri.as_str()
+            ),
         }
     }
 }
@@ -328,7 +393,9 @@ impl fmt::Display for ConnectionError {
 impl Error for ConnectionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::UnexpectedResponse { .. } | Self::ServerFailure { .. } => None,
+            Self::UnexpectedResponse { .. }
+            | Self::ServerFailure { .. }
+            | Self::DocumentNotOpen { .. } => None,
             Self::Framing(cause) => Some(cause),
             Self::Message(cause) => Some(cause),
             Self::Send(cause) => Some(cause),
@@ -342,7 +409,7 @@ impl Error for ConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::repository_path;
+    use crate::test_support::{line, repository_path};
     use lsp_types::HoverProviderCapability;
 
     /// テストが渡すワークスペースの根。実在するディレクトリからしか作れない。
@@ -676,6 +743,101 @@ mod tests {
                 "textDocument/didClose",
                 "textDocument/didOpen"
             ]
+        );
+    }
+
+    /// テストが指す位置。行頭から数えた列で組み立てる。
+    fn position_after(line_number: usize, preceding: &str) -> SourcePosition {
+        SourcePosition::from_preceding_text(line(line_number), preceding)
+    }
+
+    /// hover の応答 1 通分の payload。
+    fn hover_response(signature: &str) -> String {
+        let contents = json!({
+            "kind": "markdown",
+            "value": format!("\n```typescript\n{signature}\n```\n"),
+        });
+
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"contents": contents}}).to_string()
+    }
+
+    #[test]
+    fn test_hover_returns_the_signature_the_server_answered() {
+        let server_output = frames_of(&[&hover_response("function decl(a: string): number")]);
+        let mut connection = connection_over(&server_output);
+        let document = document_of("tests/fixtures/billing/discount.ts", "export const a = 1;");
+        connection.open_document(&document).expect("送れる");
+
+        let signature = connection
+            .hover(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert_eq!(
+            signature,
+            HoverOutcome::Answered("function decl(a: string): number".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_hover_names_the_document_and_the_position_it_asks_about() {
+        // 行は 0 始まりに直して送る。1 始まりのまま送ると 1 行下を見ることになる
+        let server_output = frames_of(&[&hover_response("function decl(a: string): number")]);
+        let mut connection = connection_over(&server_output);
+        let document = document_of("tests/fixtures/billing/discount.ts", "export const a = 1;");
+        connection.open_document(&document).expect("送れる");
+
+        connection
+            .hover(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        let sent = sent_payloads(&connection.writer);
+        let asked = sent
+            .iter()
+            .find(|payload| payload["method"] == json!("textDocument/hover"))
+            .expect("hover を送っている");
+        assert_eq!(
+            asked["params"]["textDocument"]["uri"],
+            json!(document.uri().as_str())
+        );
+        assert_eq!(
+            asked["params"]["position"],
+            json!({"line": 4, "character": 16})
+        );
+    }
+
+    #[test]
+    fn test_hover_where_the_server_has_no_answer_returns_nothing() {
+        // 対照は上のテスト。同じ位置で、サーバが null を返す側
+        let server_output = frames_of(&[r#"{"jsonrpc":"2.0","id":1,"result":null}"#]);
+        let mut connection = connection_over(&server_output);
+        let document = document_of("tests/fixtures/billing/discount.ts", "export const a = 1;");
+        connection.open_document(&document).expect("送れる");
+
+        let signature = connection
+            .hover(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert_eq!(signature, HoverOutcome::NoAnswer);
+    }
+
+    #[test]
+    fn test_hover_on_a_document_that_was_not_opened_is_refused_before_it_is_sent() {
+        // 送ってしまうとサーバは知らない URI に null を返し、「型が無い」と区別が付かない
+        let mut connection = connection_over(&[]);
+        let never_opened =
+            document_of("tests/fixtures/inventory/reorder.ts", "export const b = 2;");
+
+        let error = connection
+            .hover(&never_opened, position_after(5, "export function "))
+            .expect_err("送らずに断る");
+
+        assert!(matches!(
+            error,
+            ConnectionError::DocumentNotOpen { uri } if uri == *never_opened.uri()
+        ));
+        assert!(
+            sent_payloads(&connection.writer).is_empty(),
+            "断ったので 1 通も送っていない"
         );
     }
 
