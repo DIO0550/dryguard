@@ -200,6 +200,25 @@ fn test_compare_of_two_locations_yields_the_function_that_encloses_each_line() {
 }
 
 #[test]
+fn test_compare_of_two_locations_in_one_file_yields_each_function() {
+    // 同じファイルの 2 箇所。**1 回しか読まない**ので、2 つのチャンクは必ず同じ版から出る
+    // （2 回読むと、間で編集されたときに 1 つのファイルに 2 つの版ができ、
+    // サーバが見る版と後のチャンクの名前の位置がずれる）
+    let pair = chunk_pair_of(
+        &corpus("inventory/warehouse.ts", 13),
+        &corpus("inventory/warehouse.ts", 18),
+    )
+    .expect("どちらも関数の中を指している");
+
+    assert_eq!(pair.chunk_a().lines().to_string(), "13-16");
+    assert_eq!(
+        pair.chunk_b().lines().to_string(),
+        "18-27",
+        "同じファイルでも、指した行ごとに別の関数が切り出される"
+    );
+}
+
+#[test]
 fn test_compare_with_a_missing_file_reports_the_location_that_could_not_be_read() {
     let missing = fixture("billing/missing.ts", 6);
 

@@ -56,6 +56,14 @@ impl ChunkPair {
 
 /// 比較する 2 箇所から、チャンクの組を取り出す。
 ///
+/// **同じファイルの 2 箇所なら 1 回しか読まない。** 2 回読むと、間で編集されたときに
+/// 1 つのファイルに 2 つの版ができる。`lsp::Session::open_document` は URI で
+/// 重複を畳むのでサーバが見るのは先の版だけになり、**後のチャンクの名前の位置だけが
+/// 別の版から来る**。
+///
+/// 綴りが違って同じファイルを指す場合（`./a.ts` と `a.ts`）は 2 回読む。パスを絶対に
+/// 直すのは `lsp::uri` の担当で、そこへ寄せると `pipeline` がパスの解決を持つことになる。
+///
 /// # Errors
 ///
 /// どちらかのファイルが読めない / どちらかのチャンクを切り出せないとき。
@@ -64,6 +72,11 @@ pub fn chunk_pair_of(
     location_a: &Location,
     location_b: &Location,
 ) -> Result<ChunkPair, ChunkPairError> {
+    let in_one_file = location_a.path() == location_b.path();
+    if in_one_file {
+        return chunk_pair_in_one_file_of(location_a, location_b);
+    }
+
     let (chunk_a, source_a) = chunk_at(location_a)?;
     let (chunk_b, source_b) = chunk_at(location_b)?;
 
@@ -75,37 +88,91 @@ pub fn chunk_pair_of(
     })
 }
 
+/// 1 つのファイルを読んで、その中の 2 箇所を切り出す。
+///
+/// # Errors
+///
+/// ファイルを読めない / どちらかのチャンクを切り出せないとき。
+fn chunk_pair_in_one_file_of(
+    location_a: &Location,
+    location_b: &Location,
+) -> Result<ChunkPair, ChunkPairError> {
+    let source = read_source_at(location_a)?;
+    let tree = syntax_tree_at(location_a, &source)?;
+
+    Ok(ChunkPair {
+        chunk_a: enclosing_chunk_at(location_a, &tree)?,
+        source_a: source.clone(),
+        chunk_b: enclosing_chunk_at(location_b, &tree)?,
+        source_b: source,
+    })
+}
+
 /// その位置のファイルを読んで、指定行を含む関数と、読んだ中身を返す。
 ///
 /// パースはファイルにつき 1 回にする。チャンクの範囲も import の集合も同じ木から
 /// 採るので、ソースを渡す形のままだと 1 箇所につき 2 回パースすることになる。
 fn chunk_at(location: &Location) -> Result<(Chunk, String), ChunkPairError> {
+    let source = read_source_at(location)?;
+    let chunk = {
+        let tree = syntax_tree_at(location, &source)?;
+
+        enclosing_chunk_at(location, &tree)?
+    };
+
+    Ok((chunk, source))
+}
+
+/// その位置のファイルを読む。読める拡張子でなければ、そこで断る。
+///
+/// # Errors
+///
+/// 拡張子から grammar を選べない / ファイルを読めないとき。
+fn read_source_at(location: &Location) -> Result<String, ChunkPairError> {
+    // grammar を先に確かめる。読めない拡張子のファイルを読んでから断ると、
+    // 読み込みの失敗と拡張子の失敗がどちらも「読めない」として並ぶ。
+    Grammar::of_path(location.path()).ok_or_else(|| ChunkPairError::UnreadableExtension {
+        location: location.clone(),
+    })?;
+
+    location
+        .read_source()
+        .map_err(|cause| ChunkPairError::SourceUnreadable {
+            location: location.clone(),
+            cause,
+        })
+}
+
+/// 読んだ中身を、その位置の拡張子が決める grammar で構文木にする。
+///
+/// # Errors
+///
+/// 拡張子から grammar を選べない / 構文木にできないとき。
+fn syntax_tree_at<'a>(
+    location: &Location,
+    source: &'a str,
+) -> Result<SyntaxTree<'a>, ChunkPairError> {
     let grammar =
         Grammar::of_path(location.path()).ok_or_else(|| ChunkPairError::UnreadableExtension {
             location: location.clone(),
         })?;
 
-    let source = location
-        .read_source()
-        .map_err(|cause| ChunkPairError::SourceUnreadable {
-            location: location.clone(),
-            cause,
-        })?;
+    SyntaxTree::from_source(source, grammar).map_err(|cause| ChunkPairError::SourceUnparsable {
+        location: location.clone(),
+        cause,
+    })
+}
 
-    let tree = SyntaxTree::from_source(&source, grammar).map_err(|cause| {
-        ChunkPairError::SourceUnparsable {
-            location: location.clone(),
-            cause,
-        }
-    })?;
-
-    let chunk =
-        Chunk::find_enclosing(location, &tree).map_err(|cause| ChunkPairError::ChunkingFailed {
-            location: location.clone(),
-            cause,
-        })?;
-
-    Ok((chunk, source))
+/// 構文木から、その位置を含む関数を切り出す。
+///
+/// # Errors
+///
+/// 指定位置を含む関数が無い / その関数に構文エラーがあるとき。
+fn enclosing_chunk_at(location: &Location, tree: &SyntaxTree<'_>) -> Result<Chunk, ChunkPairError> {
+    Chunk::find_enclosing(location, tree).map_err(|cause| ChunkPairError::ChunkingFailed {
+        location: location.clone(),
+        cause,
+    })
 }
 
 /// チャンクの組から、判定の材料になるシグナルを測る。
@@ -183,37 +250,53 @@ pub fn measured_pair_of(
 ) -> MeasuredPair {
     let signals = signals_of(&pair.chunk_a, &pair.chunk_b);
 
-    if !is_structurally_similar(
+    let asked = if is_structurally_similar(
         signals.structural_similarity(),
         structural_similarity_threshold,
     ) {
-        return MeasuredPair {
-            signals: unavailable_semantics_added_to(signals, SemanticsUnavailable::NotACandidate),
-            semantics_error: None,
-        };
-    }
+        semantics_of(pair, server)
+    } else {
+        AskedSemantics::unavailable(SemanticsUnavailable::NotACandidate, None)
+    };
 
-    match semantics_of(pair, server) {
-        Ok((type_signature_match, caller_domain_overlap)) => MeasuredPair {
-            signals: signals.with_semantics(type_signature_match, caller_domain_overlap),
-            semantics_error: None,
-        },
-        Err(cause) => MeasuredPair {
-            signals: unavailable_semantics_added_to(signals, unavailable_of(&cause)),
-            semantics_error: Some(cause),
-        },
+    MeasuredPair {
+        signals: signals.with_semantics(asked.type_signature_match, asked.caller_domain_overlap),
+        semantics_error: asked.error,
     }
 }
 
-/// 両方の Stage 2 シグナルを、同じ「届かなかった理由」で重ねる。
+/// Stage 2 に尋ねた結果。
 ///
-/// 2 つを別々の理由にしないのは、**サーバに尋ねる前に止まるので片方だけ取れることが
-/// ないため**（`classification::signal::SemanticsUnavailable`）。
-fn unavailable_semantics_added_to(signals: Signals, reason: SemanticsUnavailable) -> Signals {
-    signals.with_semantics(
-        TypeSignatureMatch::Unavailable { reason },
-        CallerDomainOverlap::Unavailable { reason },
-    )
+/// **途中で落ちても、そこまでに取れたシグナルは捨てない。** 捨てると、
+/// 測れていた型シグネチャが「測れない」に化けて判定が変わる（ドメインが一致していて
+/// 単一化できないペアが `REVIEW` から `EXTRACT-CANDIDATE` へ動く）。
+///
+/// 落ちた理由も一緒に持つ。シグナルの側は [`SemanticsUnavailable`] としか言えないが、
+/// 利用者が環境を直すにはそれだけでは足りない。
+#[derive(Debug)]
+struct AskedSemantics {
+    type_signature_match: TypeSignatureMatch,
+    caller_domain_overlap: CallerDomainOverlap,
+    error: Option<SemanticsError>,
+}
+
+impl AskedSemantics {
+    /// どちらのシグナルも取れていない形。
+    ///
+    /// **尋ねる前に止まったときだけこれになる。** そこまでは片方だけ取れることが
+    /// ないので、2 つに別々の理由を持たせない。
+    fn unavailable(reason: SemanticsUnavailable, error: Option<SemanticsError>) -> Self {
+        Self {
+            type_signature_match: TypeSignatureMatch::Unavailable { reason },
+            caller_domain_overlap: CallerDomainOverlap::Unavailable { reason },
+            error,
+        }
+    }
+
+    /// 尋ねる前に止まった失敗から組み立てる。
+    fn from_setup_failure(cause: SemanticsError) -> Self {
+        Self::unavailable(unavailable_of(&cause), Some(cause))
+    }
 }
 
 /// 失敗を、シグナルが持てる理由に直す。
@@ -234,42 +317,52 @@ fn unavailable_of(cause: &SemanticsError) -> SemanticsUnavailable {
 ///
 /// 根は**候補ペアの 2 ファイルだけ**から決める。広げると、開かせないファイルまで
 /// 含む位置をサーバに見せることになる（`docs/dryguard-plan.md`「Stage 2: 意味情報収集」）。
+/// 根が tsconfig.json より下に来るコードベースで参照元が一部しか返らない話は Issue #125。
 ///
-/// # Errors
-///
-/// 開かせる形にできない / 根を決められない / サーバを起こせない / 会話が失敗したとき。
-fn semantics_of(
-    pair: &ChunkPair,
-    server: &ServerCommand,
-) -> Result<(TypeSignatureMatch, CallerDomainOverlap), SemanticsError> {
-    let document_a = document_of(&pair.chunk_a, &pair.source_a)?;
-    let document_b = document_of(&pair.chunk_b, &pair.source_b)?;
-    let root = WorkspaceRoot::enclosing(&[
+/// 尋ねる前に止まったときも失敗にしない。取れなかったことを持つ [`AskedSemantics`] を返す。
+fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
+    let document_a = match document_of(&pair.chunk_a, &pair.source_a) {
+        Ok(document) => document,
+        Err(cause) => return AskedSemantics::from_setup_failure(cause),
+    };
+    let document_b = match document_of(&pair.chunk_b, &pair.source_b) {
+        Ok(document) => document,
+        Err(cause) => return AskedSemantics::from_setup_failure(cause),
+    };
+    let root = match WorkspaceRoot::enclosing(&[
         pair.chunk_a.path().to_path_buf(),
         pair.chunk_b.path().to_path_buf(),
-    ])
-    .map_err(SemanticsError::Workspace)?;
+    ]) {
+        Ok(root) => root,
+        Err(cause) => {
+            return AskedSemantics::from_setup_failure(SemanticsError::Workspace(cause));
+        }
+    };
 
-    let client = Client::start(server).map_err(SemanticsError::Client)?;
-    let mut session = client.handshake(&root).map_err(SemanticsError::Client)?;
+    let client = match Client::start(server) {
+        Ok(client) => client,
+        Err(cause) => return AskedSemantics::from_setup_failure(SemanticsError::Client(cause)),
+    };
+    let mut session = match client.handshake(&root) {
+        Ok(session) => session,
+        Err(cause) => return AskedSemantics::from_setup_failure(SemanticsError::Client(cause)),
+    };
 
-    let measured = measured_semantics_of(
+    let asked = asked_semantics_of(
         &mut session,
         &pair.chunk_a,
         &document_a,
         &pair.chunk_b,
         &document_b,
     );
-    let shutdown = session.shutdown();
-
-    // 会話の失敗を先に出す。終了の失敗で上書きすると、何が起きたのかが入れ替わる。
-    let measured = measured?;
 
     // **答えを受け取っていても、異常終了したサーバの答えは採らない。** 途中で
     // 落ちたサーバは読み込みを終えていないことがあり、参照元が欠けて返る。
-    shutdown.map_err(SemanticsError::Client)?;
+    if let Err(cause) = session.shutdown() {
+        return AskedSemantics::from_setup_failure(SemanticsError::Client(cause));
+    }
 
-    Ok(measured)
+    asked
 }
 
 /// 開かせた 2 つのドキュメントに、hover と references を尋ねる。
@@ -277,40 +370,95 @@ fn semantics_of(
 /// hover を先に送るのは、**references が先の作業の落ち着きを待つ**ため
 /// （順序を入れ替えると、読み込み中に計算された答えを受け取る。
 /// `tests/semantics.rs` の `test_caller_domains_asked_after_a_type_signature_are_still_complete`）。
-fn measured_semantics_of(
+///
+/// **1 つが落ちても残りを尋ねる。** 途中で降りると、取れていたシグナルまで
+/// 「測れない」に化ける（[`AskedSemantics`]）。
+fn asked_semantics_of(
     session: &mut Session,
     chunk_a: &Chunk,
     document_a: &SourceDocument,
     chunk_b: &Chunk,
     document_b: &SourceDocument,
-) -> Result<(TypeSignatureMatch, CallerDomainOverlap), SemanticsError> {
-    session
-        .open_document(document_a)
-        .map_err(SemanticsError::Client)?;
-    session
-        .open_document(document_b)
-        .map_err(SemanticsError::Client)?;
+) -> AskedSemantics {
+    // 開かせられなければ 1 つも尋ねられないので、ここは降りてよい。
+    if let Err(cause) = session.open_document(document_a) {
+        return AskedSemantics::from_setup_failure(SemanticsError::Client(cause));
+    }
+    if let Err(cause) = session.open_document(document_b) {
+        return AskedSemantics::from_setup_failure(SemanticsError::Client(cause));
+    }
 
     let (Some(position_a), Some(position_b)) = (chunk_a.name_position(), chunk_b.name_position())
     else {
         // 名前が無ければ尋ねる位置が決まらない。**サーバの失敗ではない**ので、
         // 取れなかったシグナルとして返す
-        return Ok((TypeSignatureMatch::NoName, CallerDomainOverlap::NoName));
+        return AskedSemantics {
+            type_signature_match: TypeSignatureMatch::NoName,
+            caller_domain_overlap: CallerDomainOverlap::NoName,
+            error: None,
+        };
     };
 
-    let signature_a = type_signature_outcome_of(session, document_a, position_a)
-        .map_err(SemanticsError::Client)?;
-    let signature_b = type_signature_outcome_of(session, document_b, position_b)
-        .map_err(SemanticsError::Client)?;
-    let callers_a = caller_domains_outcome_of(session, document_a, position_a)
-        .map_err(SemanticsError::Client)?;
-    let callers_b = caller_domains_outcome_of(session, document_b, position_b)
-        .map_err(SemanticsError::Client)?;
+    asked_semantics_of_outcomes(
+        type_signature_outcome_of(session, document_a, position_a),
+        type_signature_outcome_of(session, document_b, position_b),
+        caller_domains_outcome_of(session, document_a, position_a),
+        caller_domains_outcome_of(session, document_b, position_b),
+    )
+}
 
-    Ok((
-        type_signature_match_of(&signature_a, &signature_b),
-        caller_domain_overlap_of(callers_a, callers_b),
-    ))
+/// 4 つの問い合わせの結果を、シグナルと落ちた理由にまとめる。
+///
+/// **落ちた側だけを「測れない」にする。** hover が答えていて references だけが
+/// 落ちた場合に両方を捨てると、比べ終わっていた型シグネチャまで失われる。
+fn asked_semantics_of_outcomes(
+    signature_a: Result<TypeSignatureOutcome, ClientError>,
+    signature_b: Result<TypeSignatureOutcome, ClientError>,
+    callers_a: Result<CallerDomainsOutcome, ClientError>,
+    callers_b: Result<CallerDomainsOutcome, ClientError>,
+) -> AskedSemantics {
+    let type_signature_match = asked_type_signature_match_of(&signature_a, &signature_b);
+    let caller_domain_overlap = asked_caller_domain_overlap_of(&callers_a, &callers_b);
+
+    AskedSemantics {
+        type_signature_match,
+        caller_domain_overlap,
+        // 先に落ちたほうを出す。後の失敗で上書きすると、何が起きたのかが入れ替わる。
+        error: signature_a
+            .err()
+            .or_else(|| signature_b.err())
+            .or_else(|| callers_a.err())
+            .or_else(|| callers_b.err())
+            .map(SemanticsError::Client),
+    }
+}
+
+/// 型シグネチャを尋ねた結果から、単一化できるかのシグナルにする。
+fn asked_type_signature_match_of(
+    signature_a: &Result<TypeSignatureOutcome, ClientError>,
+    signature_b: &Result<TypeSignatureOutcome, ClientError>,
+) -> TypeSignatureMatch {
+    let (Ok(signature_a), Ok(signature_b)) = (signature_a, signature_b) else {
+        return TypeSignatureMatch::Unavailable {
+            reason: SemanticsUnavailable::LspUnusable,
+        };
+    };
+
+    type_signature_match_of(signature_a, signature_b)
+}
+
+/// 参照元を尋ねた結果から、呼び出し元ドメインの重なりのシグナルにする。
+fn asked_caller_domain_overlap_of(
+    callers_a: &Result<CallerDomainsOutcome, ClientError>,
+    callers_b: &Result<CallerDomainsOutcome, ClientError>,
+) -> CallerDomainOverlap {
+    let (Ok(callers_a), Ok(callers_b)) = (callers_a, callers_b) else {
+        return CallerDomainOverlap::Unavailable {
+            reason: SemanticsUnavailable::LspUnusable,
+        };
+    };
+
+    caller_domain_overlap_of(callers_a, callers_b)
 }
 
 /// そのチャンクのファイルを、サーバに開かせる形にする。
@@ -365,12 +513,15 @@ fn unifiable_match_of(unifiable: bool) -> TypeSignatureMatch {
 /// **片方でも取れていなければ 0.00 にしない。** 重なりが無いのと材料が無いのは
 /// 別の話で、同じ値にすると判定も読者も区別できない。
 fn caller_domain_overlap_of(
-    callers_a: CallerDomainsOutcome,
-    callers_b: CallerDomainsOutcome,
+    callers_a: &CallerDomainsOutcome,
+    callers_b: &CallerDomainsOutcome,
 ) -> CallerDomainOverlap {
     match (callers_a, callers_b) {
         (CallerDomainsOutcome::Counted(counted_a), CallerDomainsOutcome::Counted(counted_b)) => {
-            CallerDomainOverlap::Measured(MeasuredCallerDomains::new(counted_a, counted_b))
+            CallerDomainOverlap::Measured(MeasuredCallerDomains::new(
+                counted_a.clone(),
+                counted_b.clone(),
+            ))
         }
         (CallerDomainsOutcome::NoReferences, _) | (_, CallerDomainsOutcome::NoReferences) => {
             CallerDomainOverlap::NoReferences
@@ -848,6 +999,7 @@ mod tests {
 
     use crate::classification::DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
     use crate::classification::verdict::Verdict;
+    use crate::semantics::type_signature::TypeSignature;
     use crate::similarity::Similarity;
     use crate::test_support::line;
 
@@ -881,6 +1033,51 @@ mod tests {
                 SemanticsUnavailable::DocumentUnopenable,
                 SemanticsUnavailable::LspUnusable,
             ]
+        );
+    }
+
+    /// 正規化できた型シグネチャ。
+    fn normalized(signature_text: &str) -> TypeSignatureOutcome {
+        let signature = TypeSignature::from_signature_text(signature_text)
+            .expect("テストが渡す綴りは読み取れる");
+
+        TypeSignatureOutcome::Normalized(signature)
+    }
+
+    /// hover は答えたが references が落ちた、4 つの問い合わせの結果。
+    fn references_that_failed() -> AskedSemantics {
+        asked_semantics_of_outcomes(
+            Ok(normalized("function totalOf(values: number[]): number")),
+            Ok(normalized("function sumOf(amounts: number[]): number")),
+            Err(ClientError::PipesNotWired),
+            Ok(CallerDomainsOutcome::NoReferences),
+        )
+    }
+
+    #[test]
+    fn test_asked_semantics_keep_the_type_signature_when_references_fail() {
+        // 両方を捨てると、比べ終わっていた型シグネチャが「測れない」に化ける。
+        // ドメインが一致するペアなら、そこで REVIEW が EXTRACT-CANDIDATE へ動く
+        let asked = references_that_failed();
+
+        assert_eq!(asked.type_signature_match, TypeSignatureMatch::Unifiable);
+    }
+
+    #[test]
+    fn test_asked_semantics_mark_only_the_caller_domain_when_references_fail() {
+        // 対照は上のテスト。落ちた側だけが取れない扱いになり、理由も残る
+        let asked = references_that_failed();
+
+        assert_eq!(
+            asked.caller_domain_overlap,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable
+            }
+        );
+        assert!(
+            asked.error.is_some(),
+            "落ちたことは理由として残る: {:?}",
+            asked.error.map(|error| error.to_string())
         );
     }
 
