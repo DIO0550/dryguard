@@ -396,6 +396,23 @@ fn test_compare_with_an_lsp_opens_a_type_alias_declared_outside_the_pair_root() 
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_opens_a_type_alias_declared_by_a_dependency() {
+    // `PropertyKey` は `lib.es5.d.ts`（約 1 MB・依存の置き場の下）で
+    // `string | number | symbol` として宣言されている。開かせる相手を絞ると、
+    // 書き下した綴りと比べる側が解決できない
+    let keyed_by_property = fixture("references/src/report/keyed.ts", 1);
+    let keyed_by_union = fixture("references/src/report/keyed.ts", 5);
+
+    let measured = measured_with_an_lsp(&keyed_by_property, &keyed_by_union);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_an_lsp_measures_a_total_caller_domain_overlap_for_the_shared_utility_pair() {
     // ディレクトリは utils と report で分かれているが、どちらも report/monthly.ts から
     // 呼ばれている。**置き場所ではなく実際に誰が使っているか**を見ているのがここ

@@ -120,19 +120,6 @@ fn is_excluded_name(name: &OsStr) -> bool {
         .any(|excluded| name == *excluded)
 }
 
-/// そのファイルが、走査から外すディレクトリの下にあるか。
-///
-/// [`typescript_paths_of`] が中へ降りないのと**同じ一覧で見る**。走査で拾わない
-/// ファイルは、LSP が宣言の場所として返しても開かせる相手にしない。
-///
-/// **Why（このモジュールが持つ）**: 一覧を 2 箇所に置くと、外すものを増やしたときに
-/// 片方だけが古くなる。走査の対象と、開かせる対象は同じ「このコードベースのファイルか」
-/// を見ている。
-pub fn is_under_excluded_directory(path: &Path) -> bool {
-    path.components()
-        .any(|component| is_excluded_name(component.as_os_str()))
-}
-
 /// コードベースを走査できなかった理由。
 ///
 /// 2 つに分けているのは利用者が直す先が違うため。根の指定は引数の間違いで、
@@ -312,29 +299,5 @@ mod tests {
             matches!(result, Err(CodebaseError::RootNotADirectory { .. })),
             "ファイルを根に渡しても走査は始まらない"
         );
-    }
-
-    #[test]
-    fn test_a_file_under_a_dependency_directory_is_excluded() {
-        // `lib.es5.d.ts` はここに解決される。1 つの綴りのために約 1 MB を読むことになる
-        assert!(is_under_excluded_directory(Path::new(
-            "/repo/node_modules/typescript/lib/lib.es5.d.ts"
-        )));
-    }
-
-    #[test]
-    fn test_a_file_under_the_source_tree_is_not_excluded() {
-        // 対照は上のテスト。走査で拾うファイルは、宣言の場所としても開かせる
-        assert!(!is_under_excluded_directory(Path::new(
-            "/repo/src/shared/money.ts"
-        )));
-    }
-
-    #[test]
-    fn test_a_file_whose_name_only_starts_like_an_excluded_directory_is_not_excluded() {
-        // 名前は要素ごとに比べる。先頭一致で見ると `dist-types/` まで外れる
-        assert!(!is_under_excluded_directory(Path::new(
-            "/repo/dist-types/money.ts"
-        )));
     }
 }

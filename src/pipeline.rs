@@ -16,7 +16,7 @@ use crate::classification::signal::{
     StructuralSimilarity, TypeSignatureMatch,
 };
 use crate::classification::{Classification, classification_of, is_structurally_similar};
-use crate::codebase::{CodebaseError, is_under_excluded_directory, source_of, typescript_paths_of};
+use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
 use crate::location::Location;
 use crate::lsp::{
     Client, ClientError, DocumentError, ServerCommand, Session, SourceDocument, WorkspaceError,
@@ -432,15 +432,18 @@ fn resolved_type_signature_outcome_of(
     type_signature_outcome_of(session, document, position, &resolved)
 }
 
-/// 型が宣言されているファイルのうち、このコードベースのものを開かせる。
+/// 型が宣言されているファイルを開かせる。
 ///
 /// **開かせないと宣言の綴りが返らない。** サーバは開かせていないファイルへの hover に
 /// 綴りを持たない応答を返す（typescript-language-server 6.0.0 で実測）。
 ///
-/// **依存の置き場（`node_modules` など）で宣言された型は開かせない。** `Date` は
-/// 約 1 MB の `lib.es5.d.ts` に解決され、1 つの綴りのためにそれを読んで送ることになる。
-/// **両側が同じ宣言へ解決されるなら綴りも同じ**なので、開いても比較の結果は変わらない。
-/// 外す一覧は `codebase` が走査で使うものと同じ。
+/// **どこで宣言されていても開かせる。** 依存の置き場で宣言されたエイリアス
+/// （`lib.es5.d.ts` の `PropertyKey` など）も、書き下した綴りと比べる側から見れば
+/// 開く価値は同じ。**開く相手を絞ると、絞った分だけ偽陰性が残る。**
+///
+/// **Why not（大きいファイルを避けて絞る）**: `Date` が解決される `lib.es5.d.ts` は
+/// 約 1 MB あるが、**開かせても `compare` の実測は 1.120 秒で、開かせない場合と
+/// 変わらなかった**。避ける理由になるコストが出ていない。
 ///
 /// **Why not（ワークスペースの根の下だけを開かせる）**: 根は候補ペアの 2 ファイルから
 /// 決まるので、**同じディレクトリにある 2 つを比べると根がそのディレクトリになる**。
@@ -459,9 +462,6 @@ fn open_declaring_documents(
 ) -> Result<(), ClientError> {
     for declaration in declarations {
         let path = declaration.site().path();
-        if is_under_excluded_directory(path) {
-            continue;
-        }
 
         let Ok(text) = source_of(path) else {
             continue;
