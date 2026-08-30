@@ -55,12 +55,15 @@ const TYPE_BOUNDARY_BEFORE: [char; 6] = [':', ',', '(', '<', '>', '['];
 const TYPE_BOUNDARY_AFTER: [char; 6] = [',', ')', '>', ';', '}', ']'];
 
 /// メンバーや引数の名前の後ろに続く印。
-const MEMBER_MARKER: char = ':';
-
-/// 省略できるメンバーの名前の後ろに続く印。
+///
+/// 型の綴りでは、名前の後ろにだけこれらが続く。`(` と `<` はメソッドの名前
+/// （`{ ID(): X }` / `{ ID<T>(): X }`）、`?` の付く形は省略できるメンバー。
 ///
 /// **`?` だけでは足りない。** 条件型（`T extends U ? X : Y`）の `?` と見分けが付かない。
-const OPTIONAL_MEMBER_MARKER: &str = "?:";
+///
+/// **`<` が型名の後ろに来るのは総称型（`Box<User>`）だけ**で、そのときは型引数を取る
+/// エイリアスなので開く対象に入っていない（[`ResolvedTypes`] へ入らない）。
+const MEMBER_MARKERS: [&str; 5] = [":", "?:", "(", "?(", "<"];
 
 /// サーバに型シグネチャを尋ねた結果。
 ///
@@ -386,6 +389,12 @@ fn substituted(text: &str, resolved: &ResolvedTypes) -> String {
             following: text.get(index..).unwrap_or_default(),
         };
         push_resolved(&mut substituted, &identifier, resolved, &placement);
+
+        // 識別子が終わったことを覚えてから、区切りの文字で上書きする。空白は覚えない
+        // （`keyof Maybe` の `Maybe` から見た直前は、空白ではなく `keyof` の末尾）。
+        if let Some(last) = identifier.chars().next_back() {
+            preceding = Some(last);
+        }
         identifier.clear();
         substituted.push(character);
 
@@ -407,7 +416,10 @@ fn substituted(text: &str, resolved: &ResolvedTypes) -> String {
 /// **型名なのかも、括弧が要るかも、前後で決まる。** 2 つを別々に持ち回すと、
 /// 片方だけを見て判断する枝が生えやすい。
 struct Placement<'text> {
-    /// 直前の、空白でも識別子でもない文字。綴りの先頭なら `None`。
+    /// 直前の、空白でない文字。識別子で終わっていればその最後の文字。綴りの先頭なら `None`。
+    ///
+    /// **識別子で終わったことも覚える。** 覚えないと `keyof Maybe` の `Maybe` が
+    /// その手前の `:` に挟まれて見え、括弧が要らないと判断してしまう。
     preceding: Option<char>,
     /// その名前の後ろに続く綴り。綴りの末尾なら空。
     following: &'text str,
@@ -416,16 +428,21 @@ struct Placement<'text> {
 impl Placement<'_> {
     /// その名前が型ではなく、メンバーや引数の名前か。
     ///
-    /// 型の綴りでは、名前の後ろにだけ `:`（省略できるなら `?:`）が続く。
-    /// `{ ID: ID }` の左側や `(value: T)` の `value` がこれで、**差し替えると
+    /// 型の綴りでは、名前の後ろにだけ [`MEMBER_MARKERS`] が続く。`{ ID: ID }` の左側、
+    /// `{ ID(): ID }` のメソッド名、`(value: T)` の `value` がこれで、**差し替えると
     /// 型でないものを型で置き換える**ことになる。
     fn names_a_member(&self) -> bool {
         let following = self.following.trim_start();
 
-        following.starts_with(MEMBER_MARKER) || following.starts_with(OPTIONAL_MEMBER_MARKER)
+        MEMBER_MARKERS
+            .iter()
+            .any(|marker| following.starts_with(marker))
     }
 
     /// 前後が型の区切りで、括弧を足さなくても 1 つのまとまりとして読めるか。
+    ///
+    /// 直前が識別子で終わっていれば挟まれていない。前置きの型演算子（`keyof` /
+    /// `readonly` / `infer`）がこれで、**`keyof A | B` は `(keyof A) | B` と読まれる**。
     fn is_bounded(&self) -> bool {
         let bounded_before = self
             .preceding
@@ -1456,6 +1473,57 @@ mod tests {
         assert!(
             aliased.is_unifiable_with(&signature("function other(value: { ID?: string }): void"))
         );
+    }
+
+    #[test]
+    fn test_a_method_name_that_matches_a_resolved_type_name_is_not_substituted() {
+        // メソッド名の後ろは `:` ではなく `(`。名前まで差し替えると
+        // `{ string(): string }` になる
+        let aliased = signature_with(
+            "function pick(value: { ID(): ID }): void",
+            &resolving("ID", "string"),
+        );
+
+        assert!(
+            aliased.is_unifiable_with(&signature("function other(value: { ID(): string }): void"))
+        );
+    }
+
+    #[test]
+    fn test_a_generic_method_name_that_matches_a_resolved_type_name_is_not_substituted() {
+        // 総称メソッドの名前の後ろは `<`。型名が `<` を伴うのは総称型のときだけで、
+        // そちらは開く対象に入っていない
+        let aliased = signature_with(
+            "function pick(value: { ID<T>(x: T): ID }): void",
+            &resolving("ID", "string"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function other(value: { ID<T>(x: T): string }): void"
+        )));
+    }
+
+    #[test]
+    fn test_an_opened_alias_after_a_type_operator_keyword_is_wrapped() {
+        // `keyof Maybe` へ `A | B` をそのまま差し込むと `keyof A | B` になり、
+        // TypeScript は `(keyof A) | B` と読む
+        let aliased = signature_with(
+            "function pick(key: keyof Maybe): void",
+            &resolving("Maybe", "A | B"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature("function other(key: keyof (A | B)): void")));
+    }
+
+    #[test]
+    fn test_an_opened_alias_after_a_type_operator_keyword_is_not_read_as_binding_tighter() {
+        // 対照は上のテスト。括らない読み方と重ならないことを見る（偽陽性の側）
+        let aliased = signature_with(
+            "function pick(key: keyof Maybe): void",
+            &resolving("Maybe", "A | B"),
+        );
+
+        assert!(!aliased.is_unifiable_with(&signature("function other(key: keyof A | B): void")));
     }
 
     #[test]
