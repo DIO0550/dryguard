@@ -1,5 +1,7 @@
 //! ソースファイルの中の 1 点。
 
+use lsp_types::Position;
+
 use crate::line_number::LineNumber;
 
 /// ファイルの中の 1 点。行と、行頭からの列。
@@ -41,6 +43,21 @@ impl SourcePosition {
     /// 行頭からの列。UTF-16 のコード単位で 0 始まり。
     pub fn character(self) -> usize {
         self.character
+    }
+
+    /// LSP が受け取る形の位置。
+    ///
+    /// 行を 0 始まりに直す。列は既にこの型が UTF-16 のコード単位で数えているので、
+    /// そのまま渡す。どちらも `u32` なのは LSP がそう定めているため。
+    ///
+    /// **Why（この型が持つ）**: 0 始まりへの直しと UTF-16 の数え方は、どちらも
+    /// **この位置が何を意味するか**の話。呼び出し側に組み立てさせると、
+    /// 数え方を知らない場所で `Position` が作られる余地が残る。
+    pub fn to_lsp_position(self) -> Position {
+        Position {
+            line: self.line.to_index() as u32,
+            character: self.character as u32,
+        }
     }
 }
 

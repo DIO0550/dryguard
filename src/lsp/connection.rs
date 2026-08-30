@@ -15,7 +15,7 @@ use lsp_types::notification::{
 use lsp_types::request::{HoverRequest, Initialize, Request as _, Shutdown};
 use lsp_types::{
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover, HoverParams, InitializeResult,
-    Position, ServerCapabilities, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
+    ServerCapabilities, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
     WorkDoneProgressParams,
 };
 use serde_json::{Value, json};
@@ -198,7 +198,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
                 text_document: TextDocumentIdentifier {
                     uri: document.uri().clone(),
                 },
-                position: lsp_position_of(position),
+                position: position.to_lsp_position(),
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
@@ -300,17 +300,6 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         // 都度流す。パイプの向こうは応答を返すまでこちらの続きを読まないので、
         // 溜めたままだと双方が待ち合う。
         self.writer.flush().map_err(ConnectionError::Send)
-    }
-}
-
-/// LSP が受け取る形の位置。
-///
-/// 行を 0 始まりに直す。列は既に UTF-16 のコード単位で数えてある
-/// ([`SourcePosition`])。どちらも `u32` なのは LSP がそう定めているため。
-fn lsp_position_of(position: SourcePosition) -> Position {
-    Position {
-        line: position.line().to_index() as u32,
-        character: position.character() as u32,
     }
 }
 
