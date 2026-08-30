@@ -1,9 +1,9 @@
-//! 候補ペアのチャンクから、LSP へ問い合わせて型シグネチャを比べるところまで。
+//! 候補ペアのチャンクから、LSP へ問い合わせて型シグネチャと参照元を比べるところまで。
 //!
 //! ステージをつないだ結果はここで見る（rules/testing.md「ステージをまたぐテストと
 //! 単体のテストを分ける」）。名前の位置は `syntax::chunk`、応答の読み取りは
-//! `lsp::hover`、正規化と単一化の判定は `semantics::type_signature` の
-//! モジュール内テストにある。
+//! `lsp::hover` / `lsp::references`、正規化と比較は `semantics::type_signature` /
+//! `semantics::caller_domain` のモジュール内テストにある。
 //!
 //! **どのテストも実サーバを要するので `#[ignore]` を付ける。** サーバの入っていない
 //! 開発機で黙って通さないため（rules/testing.md「LSP を要するテストは、飛ばしたことが
@@ -13,10 +13,20 @@ use std::path::{Path, PathBuf};
 
 use dryguard::codebase::source_of;
 use dryguard::location::Location;
-use dryguard::lsp::{Client, HoverOutcome, ServerCommand, Session, SourceDocument, WorkspaceRoot};
+use dryguard::lsp::{
+    Client, HoverOutcome, ReferencesOutcome, ServerCommand, Session, SourceDocument, WorkspaceRoot,
+};
 use dryguard::pipeline::chunk_pair_of;
+use dryguard::semantics::caller_domain::CallerDomains;
 use dryguard::semantics::type_signature::TypeSignature;
 use dryguard::syntax::chunk::Chunk;
+
+/// 参照元を持つフィクスチャの木のプロジェクト設定。
+///
+/// **サーバに見せる根はここを含む位置にする。** tsconfig.json より下を根にすると、
+/// サーバは開いたファイルとその import 先だけでプロジェクトを組み立てる。呼び出し元は
+/// import を辿る向きの逆にあるので、**一部しか返らない**。
+const THE_REFERENCES_PROJECT_FILE: &str = "references/tsconfig.json";
 
 /// `tests/fixtures/` 配下の位置。
 ///
@@ -125,4 +135,78 @@ fn test_two_functions_taking_types_from_separate_domains_are_not_unifiable() {
     let reorders_stock = fixture("inventory/reorder.ts", 5);
 
     assert!(!unifiable(&discounts_an_invoice, &reorders_stock));
+}
+
+/// そのチャンクの呼び出し元が属するドメイン。サーバに尋ねて数える。
+fn caller_domains_of(session: &mut Session, chunk: &Chunk) -> CallerDomains {
+    let document = document(chunk.path());
+    if session.open_document(&document).is_err() {
+        panic!("ファイルを開かせられる: {}", chunk.path().display());
+    }
+
+    let Some(position) = chunk.name_position() else {
+        panic!(
+            "テストが指すチャンクは名前を持つ: {}",
+            chunk.path().display()
+        );
+    };
+    let Ok(ReferencesOutcome::Answered(reference_paths)) = session.references(&document, position)
+    else {
+        panic!("名前の位置には参照元が返る: {}", chunk.path().display());
+    };
+    let Some(caller_domains) = CallerDomains::from_reference_paths(&reference_paths) else {
+        panic!("返った参照元は 1 件以上ある: {reference_paths:?}");
+    };
+    caller_domains
+}
+
+/// 2 箇所のチャンクの呼び出し元ドメインがどれだけ重なるか、実サーバに尋ねて測る。
+fn caller_domain_overlap(location_a: &Location, location_b: &Location) -> f64 {
+    let Ok((chunk_a, chunk_b)) = chunk_pair_of(location_a, location_b) else {
+        panic!("テストが渡す位置はどちらも関数の中を指している");
+    };
+
+    let mut session = session_over(&[
+        location_a.path().to_path_buf(),
+        location_b.path().to_path_buf(),
+        fixture(THE_REFERENCES_PROJECT_FILE, 1).path().to_path_buf(),
+    ]);
+    let domains_a = caller_domains_of(&mut session, &chunk_a);
+    let domains_b = caller_domains_of(&mut session, &chunk_b);
+    let overlap = domains_a.jaccard(&domains_b).value();
+
+    if session.shutdown().is_err() {
+        panic!("サーバを終わらせられる");
+    }
+    overlap
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_two_functions_called_from_separate_domains_share_no_caller_domains() {
+    // 計画の出力イメージで DO-NOT-EXTRACT 側に置かれているペア
+    // （`docs/dryguard-plan.md`「出力イメージ」）。applyDiscount は billing の
+    // 2 ファイルから、reorderAmount は inventory の 1 ファイルから呼ばれている
+    let discounts_an_invoice = fixture("references/src/billing/discount.ts", 5);
+    let reorders_stock = fixture("references/src/inventory/reorder.ts", 5);
+
+    assert_eq!(
+        caller_domain_overlap(&discounts_an_invoice, &reorders_stock),
+        0.0
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_two_functions_called_from_the_same_domain_share_their_caller_domains() {
+    // 対照は上のテスト。**ディレクトリは utils と report で分かれている**が、
+    // どちらも report/monthly.ts から呼ばれている。ここが Phase 0 の
+    // ディレクトリ距離との違いで、置き場所ではなく実際に誰が使っているかを見る
+    let formats_a_date = fixture("references/src/utils/formatDate.ts", 3);
+    let helps_with_dates = fixture("references/src/report/dateHelper.ts", 3);
+
+    assert_eq!(
+        caller_domain_overlap(&formats_a_date, &helps_with_dates),
+        1.0
+    );
 }
