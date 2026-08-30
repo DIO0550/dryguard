@@ -54,7 +54,9 @@ pub struct Connection<R: BufRead, W: Write> {
     writer: W,
     next_id: RequestId,
     open_documents: BTreeSet<Uri>,
+    /// 始まりの通知が届き、終わりの通知がまだ来ていない作業。
     running_progress: Vec<ProgressToken>,
+    /// これまでに「起きうる」と分かった作業の数。**減らさない。**
     started_progress_count: usize,
 }
 
@@ -445,6 +447,10 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     /// 進捗を作ってよいかの要求だけは受ける（受けないと進捗が届かない）。
     /// **それ以外は支えていないと返す。**
     ///
+    /// 受けた時点では**待つ対象にしない**。この要求は token を用意するだけで、
+    /// 作業が始まったことを意味しない。始まらないまま捨てられた token を待つと、
+    /// 終わりの来ない作業を待ち続ける。始まりを覚えるのは [`Self::note_progress`]。
+    ///
     /// # Errors
     ///
     /// 進捗の要求から token を読めないとき、書き出しが失敗したとき。
@@ -458,20 +464,25 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             return self.send(&message::method_not_found_payload_of(id, method));
         }
 
-        let created: WorkDoneProgressCreateParams = serde_json::from_value(params_or_null(params))
+        // token を覚えるのは始まりの通知のほうなので、ここでは読めることだけを確かめる。
+        // 読めない要求を黙って受けると、後から届く進捗と突き合わせられない。
+        let _created: WorkDoneProgressCreateParams = serde_json::from_value(params_or_null(params))
             .map_err(malformed_params_error_of(WorkDoneProgressCreate::METHOD))?;
 
-        // 受けてから覚える。返せていない進捗を待つと、終わりの来ない作業を待つことになる。
         self.send(&message::null_result_payload_of(id))?;
-        self.running_progress.push(created.token);
-        // 終わった分も数に残す。**始まって終わった作業**を見落とさないため
-        // （`running_progress` は終わると空に戻る）。
+
+        // 数だけはここで進める。**作業が起きうると分かるのはこの時点**で、尋ねている間に
+        // ここを通ったかどうかが、答えを信用してよいかの判断材料になる
+        // （`running_progress` は始まって終わると空に戻り、痕跡が残らない）。
         self.started_progress_count = self.started_progress_count.saturating_add(1);
 
         Ok(())
     }
 
-    /// 進捗の終わりを覚える。進捗でない通知は見ない。
+    /// 動いている作業を、始まりと終わりの通知で覚える。進捗でない通知は見ない。
+    ///
+    /// **待つ対象にするのは始まりの通知から。** token を作ってよいかの要求
+    /// （[`Self::answer`]）は用意するだけで、そのまま始まらないこともある。
     ///
     /// # Errors
     ///
@@ -487,16 +498,16 @@ impl<R: BufRead, W: Write> Connection<R, W> {
 
         let progress: ProgressParams = serde_json::from_value(params_or_null(params))
             .map_err(malformed_params_error_of(Progress::METHOD))?;
-        let ended = matches!(
-            progress.value,
-            ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
-        );
-        if !ended {
-            return Ok(());
-        }
+        let ProgressParamsValue::WorkDone(work) = progress.value;
 
-        self.running_progress
-            .retain(|token| *token != progress.token);
+        match work {
+            WorkDoneProgress::Begin(_) => self.running_progress.push(progress.token),
+            WorkDoneProgress::End(_) => self
+                .running_progress
+                .retain(|token| *token != progress.token),
+            // 途中経過は動いていることを言い直しているだけで、待つ相手は変わらない。
+            WorkDoneProgress::Report(_) => {}
+        }
 
         Ok(())
     }
@@ -1141,6 +1152,13 @@ mod tests {
         )
     }
 
+    /// その作業が始まったという通知。
+    fn progress_begin_notification(token: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"$/progress","params":{{"token":"{token}","value":{{"kind":"begin","title":"読み込み"}}}}}}"#
+        )
+    }
+
     /// その作業が終わったという通知。
     fn progress_end_notification(token: &str) -> String {
         format!(
@@ -1180,6 +1198,7 @@ mod tests {
         // 1 通目の空の答えをそのまま返すと、「呼び出し元が無い」と読める
         let server_output = frames_of(&[
             &progress_create_request(9, "loading"),
+            &progress_begin_notification("loading"),
             &no_references_response(1),
             &progress_end_notification("loading"),
             &references_response(2, "file:///repo/src/billing/invoice.ts"),
@@ -1204,6 +1223,7 @@ mod tests {
         // 何も動いていない状態で受け取り、そのまま最終の答えにしてしまう
         let server_output = frames_of(&[
             &progress_create_request(9, "loading"),
+            &progress_begin_notification("loading"),
             &progress_end_notification("loading"),
             &no_references_response(1),
             &references_response(2, "file:///repo/src/billing/invoice.ts"),
@@ -1227,9 +1247,11 @@ mod tests {
         // 2 通目をそのまま返すと、まだ見ていないファイルの分が抜けた答えが最終になる
         let server_output = frames_of(&[
             &progress_create_request(9, "loading-first"),
+            &progress_begin_notification("loading-first"),
             &no_references_response(1),
             &progress_end_notification("loading-first"),
             &progress_create_request(10, "loading-next"),
+            &progress_begin_notification("loading-next"),
             &no_references_response(2),
             &progress_end_notification("loading-next"),
             &references_response(3, "file:///repo/src/billing/invoice.ts"),
@@ -1254,12 +1276,15 @@ mod tests {
         // 分布が実際より狭く出る
         let server_output = frames_of(&[
             &progress_create_request(9, "loading-first"),
+            &progress_begin_notification("loading-first"),
             &no_references_response(1),
             &progress_end_notification("loading-first"),
             &progress_create_request(10, "loading-next"),
+            &progress_begin_notification("loading-next"),
             &no_references_response(2),
             &progress_end_notification("loading-next"),
             &progress_create_request(11, "loading-more"),
+            &progress_begin_notification("loading-more"),
             &references_response(3, "file:///repo/src/billing/invoice.ts"),
         ]);
         let mut connection = connection_over(&server_output);
@@ -1272,6 +1297,28 @@ mod tests {
         assert!(
             matches!(outcome, ReferencesOutcome::ServerStillWorking),
             "落ち着かなかったことを名前で返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_with_a_progress_that_never_begins_does_not_wait_for_it() {
+        // token を作ってよいかの要求は、作業が始まったことを意味しない。始まりの通知が
+        // 来ないまま捨てられた token を待つと、**終わりの来ない作業を待ち続ける**
+        let server_output = frames_of(&[
+            &progress_create_request(9, "abandoned"),
+            &no_references_response(1),
+            &references_response(2, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "始まっていない作業は待たずに尋ね直す: {outcome:?}"
         );
     }
 
@@ -1300,6 +1347,7 @@ mod tests {
         // 読み込み中かどうかが分からず、尋ね直す機会も無くなる
         let server_output = frames_of(&[
             &progress_create_request(9, "loading"),
+            &progress_begin_notification("loading"),
             &no_references_response(1),
             &progress_end_notification("loading"),
             &no_references_response(2),
