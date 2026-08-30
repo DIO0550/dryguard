@@ -65,6 +65,13 @@ const TYPE_BOUNDARY_AFTER: [char; 6] = [',', ')', '>', ';', '}', ']'];
 /// エイリアスなので開く対象に入っていない（[`ResolvedTypes`] へ入らない）。
 const MEMBER_MARKERS: [&str; 5] = [":", "?:", "(", "?(", "<"];
 
+/// 後ろに値の名前を取る演算子。
+///
+/// `typeof x` の `x` は**値の名前**で、型の名前ではない。同じ綴りの型エイリアスがあると
+/// 差し替えが `typeof string` という綴りを作る（TypeScript では型と値が別の名前空間なので、
+/// 同じ綴りが両方にありうる）。
+const VALUE_OPERATOR: &str = "typeof";
+
 /// サーバに型シグネチャを尋ねた結果。
 ///
 /// **「取れなかった」を 1 つにまとめない。** どれなのかで**利用者が次に試すことが違う**
@@ -87,6 +94,11 @@ pub enum TypeSignatureOutcome {
     /// **綴りのまま比べた結果を出さない。** 開けていれば重なったかもしれないので、
     /// 「単一化不能」として出すと確かめられなかったことを答えにしてしまう。
     TypeDefinitionNotProvided,
+    /// 宣言の場所は返ったが、`lsp` がパスとして読めなかった。
+    ///
+    /// **サーバは宣言を持っている。** 読めないのはこちら側の穴なので、宣言が無いのとは
+    /// 分けて出す。
+    UnreadableTypeDefinition,
 }
 
 /// その位置にある名前の型を尋ねて、正規化した形にする。
@@ -375,7 +387,7 @@ fn substituted(text: &str, resolved: &ResolvedTypes) -> String {
     let mut substituted = String::new();
     let mut identifier = String::new();
     let mut quote = QuoteState::new();
-    let mut preceding = None;
+    let mut preceded = Preceded::Nothing;
 
     for (index, character) in text.char_indices() {
         let inside_quotes = quote.is_inside(character);
@@ -385,25 +397,25 @@ fn substituted(text: &str, resolved: &ResolvedTypes) -> String {
         }
 
         let placement = Placement {
-            preceding,
+            preceded: preceded.clone(),
             following: text.get(index..).unwrap_or_default(),
         };
         push_resolved(&mut substituted, &identifier, resolved, &placement);
 
         // 識別子が終わったことを覚えてから、区切りの文字で上書きする。空白は覚えない
-        // （`keyof Maybe` の `Maybe` から見た直前は、空白ではなく `keyof` の末尾）。
-        if let Some(last) = identifier.chars().next_back() {
-            preceding = Some(last);
+        // （`keyof Maybe` の `Maybe` から見た直前は、空白ではなく `keyof` そのもの）。
+        if !identifier.is_empty() {
+            preceded = Preceded::Word(identifier.clone());
         }
         identifier.clear();
         substituted.push(character);
 
         if !character.is_whitespace() {
-            preceding = Some(character);
+            preceded = Preceded::Separator(character);
         }
     }
     let placement = Placement {
-        preceding,
+        preceded,
         following: "",
     };
     push_resolved(&mut substituted, &identifier, resolved, &placement);
@@ -416,13 +428,24 @@ fn substituted(text: &str, resolved: &ResolvedTypes) -> String {
 /// **型名なのかも、括弧が要るかも、前後で決まる。** 2 つを別々に持ち回すと、
 /// 片方だけを見て判断する枝が生えやすい。
 struct Placement<'text> {
-    /// 直前の、空白でない文字。識別子で終わっていればその最後の文字。綴りの先頭なら `None`。
-    ///
-    /// **識別子で終わったことも覚える。** 覚えないと `keyof Maybe` の `Maybe` が
-    /// その手前の `:` に挟まれて見え、括弧が要らないと判断してしまう。
-    preceding: Option<char>,
+    /// その名前の直前にあったもの。
+    preceded: Preceded,
     /// その名前の後ろに続く綴り。綴りの末尾なら空。
     following: &'text str,
+}
+
+/// 名前の直前にあったもの。
+///
+/// **区切りの文字と識別子を分けて持つ。** 識別子を「最後の 1 文字」に潰すと、
+/// `keyof` と `typeof` を見分けられない（どちらも `f` で終わる）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Preceded {
+    /// 綴りの先頭。
+    Nothing,
+    /// 区切りの文字。
+    Separator(char),
+    /// 識別子。前置きの型演算子（`keyof`）や、値を取る `typeof` がこれ。
+    Word(String),
 }
 
 impl Placement<'_> {
@@ -439,14 +462,24 @@ impl Placement<'_> {
             .any(|marker| following.starts_with(marker))
     }
 
+    /// その名前が型ではなく、値を指しているか。
+    ///
+    /// `typeof x` の `x` がこれ。**TypeScript は型と値で名前空間が別**なので、
+    /// 同じ綴りの型エイリアスがあっても、ここを差し替えると型でないものを置き換えることになる。
+    fn names_a_value(&self) -> bool {
+        matches!(&self.preceded, Preceded::Word(word) if word == VALUE_OPERATOR)
+    }
+
     /// 前後が型の区切りで、括弧を足さなくても 1 つのまとまりとして読めるか。
     ///
     /// 直前が識別子で終わっていれば挟まれていない。前置きの型演算子（`keyof` /
     /// `readonly` / `infer`）がこれで、**`keyof A | B` は `(keyof A) | B` と読まれる**。
     fn is_bounded(&self) -> bool {
-        let bounded_before = self
-            .preceding
-            .is_none_or(|character| TYPE_BOUNDARY_BEFORE.contains(&character));
+        let bounded_before = match &self.preceded {
+            Preceded::Nothing => true,
+            Preceded::Separator(character) => TYPE_BOUNDARY_BEFORE.contains(character),
+            Preceded::Word(_) => false,
+        };
         let bounded_after = self
             .following
             .trim_start()
@@ -467,7 +500,7 @@ fn push_resolved(
 ) {
     let opened = resolved
         .resolved_of(identifier)
-        .filter(|_| !placement.names_a_member());
+        .filter(|_| !placement.names_a_member() && !placement.names_a_value());
     let Some(spelling) = opened else {
         target.push_str(identifier);
         return;
@@ -1524,6 +1557,20 @@ mod tests {
         );
 
         assert!(!aliased.is_unifiable_with(&signature("function other(key: keyof A | B): void")));
+    }
+
+    #[test]
+    fn test_a_value_named_like_a_resolved_type_is_not_substituted() {
+        // `typeof ID` の `ID` は値の名前。TypeScript は型と値で名前空間が別なので、
+        // 同じ綴りが両方にありうる。差し替えると `typeof string` という綴りになる
+        let aliased = signature_with(
+            "function pick(x: ID, y: typeof ID): void",
+            &resolving("ID", "string"),
+        );
+
+        assert!(
+            aliased.is_unifiable_with(&signature("function other(a: string, b: typeof ID): void"))
+        );
     }
 
     #[test]

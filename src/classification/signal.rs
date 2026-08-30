@@ -166,6 +166,8 @@ pub enum TypeSignatureMatch {
     HoverNotProvided,
     /// サーバが typeDefinition を提供していないので、書かれた型名を 1 つも開けなかった。
     TypeDefinitionNotProvided,
+    /// typeDefinition の応答を `lsp` が読めなかった。
+    UnreadableTypeDefinition,
 }
 
 /// 呼び出し元ドメインの重なりのシグナル（Stage 2）。

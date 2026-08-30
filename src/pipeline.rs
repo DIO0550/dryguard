@@ -427,10 +427,14 @@ fn resolved_type_signature_outcome_of(
     document: &SourceDocument,
     position: SourcePosition,
 ) -> Result<TypeSignatureOutcome, ClientError> {
-    let TypeDeclarationsOutcome::Located(declarations) =
-        type_declarations_of(session, document, chunk.type_references())?
-    else {
-        return Ok(TypeSignatureOutcome::TypeDefinitionNotProvided);
+    let declarations = match type_declarations_of(session, document, chunk.type_references())? {
+        TypeDeclarationsOutcome::Located(declarations) => declarations,
+        TypeDeclarationsOutcome::TypeDefinitionNotProvided => {
+            return Ok(TypeSignatureOutcome::TypeDefinitionNotProvided);
+        }
+        TypeDeclarationsOutcome::UnreadableTypeDefinition => {
+            return Ok(TypeSignatureOutcome::UnreadableTypeDefinition);
+        }
     };
     open_declaring_documents(session, &declarations)?;
     let resolved = resolved_types_of(session, &declarations)?;
@@ -575,6 +579,10 @@ fn type_signature_match_of(
         (TypeSignatureOutcome::TypeDefinitionNotProvided, _)
         | (_, TypeSignatureOutcome::TypeDefinitionNotProvided) => {
             TypeSignatureMatch::TypeDefinitionNotProvided
+        }
+        (TypeSignatureOutcome::UnreadableTypeDefinition, _)
+        | (_, TypeSignatureOutcome::UnreadableTypeDefinition) => {
+            TypeSignatureMatch::UnreadableTypeDefinition
         }
     }
 }
@@ -1152,6 +1160,22 @@ mod tests {
         );
 
         assert_eq!(asked.type_signature_match, TypeSignatureMatch::NotUnifiable);
+    }
+
+    #[test]
+    fn test_asked_semantics_do_not_call_a_pair_not_unifiable_with_an_unreadable_type_definition() {
+        // 宣言は返っているが読めていない。開けていれば重なったかもしれない
+        let asked = asked_semantics_of_outcomes(
+            Ok(TypeSignatureOutcome::UnreadableTypeDefinition),
+            Ok(normalized("function sumOf(amounts: number[]): number")),
+            Ok(CallerDomainsOutcome::NoReferences),
+            Ok(CallerDomainsOutcome::NoReferences),
+        );
+
+        assert_eq!(
+            asked.type_signature_match,
+            TypeSignatureMatch::UnreadableTypeDefinition
+        );
     }
 
     /// hover は答えたが references が落ちた、4 つの問い合わせの結果。

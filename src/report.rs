@@ -222,6 +222,9 @@ fn type_signature_text_of(signal: TypeSignatureMatch) -> Option<&'static str> {
         TypeSignatureMatch::TypeDefinitionNotProvided => {
             Some("測れない (サーバが typeDefinition を提供していない)")
         }
+        TypeSignatureMatch::UnreadableTypeDefinition => {
+            Some("測れない (typeDefinition の応答を読めない)")
+        }
     }
 }
 
@@ -675,6 +678,25 @@ mod tests {
                 "型シグネチャ: 測れない (サーバが typeDefinition を提供していない) → どちらでもない"
             ),
             "開けなかったことが理由として出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_an_unreadable_type_definition_says_so_instead_of_blaming_the_server() {
+        // 対照は 1 つ上のテスト（サーバが提供していない場合）。**サーバは宣言を持っており、
+        // 読めないのはこちら側の穴**なので、直す先が違う
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::UnreadableTypeDefinition,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (typeDefinition の応答を読めない) → どちらでもない"
+            ),
+            "読めなかったことが理由として出る: {text}"
         );
     }
 

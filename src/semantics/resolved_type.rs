@@ -92,6 +92,8 @@ pub enum TypeDeclarationsOutcome {
     Located(Vec<TypeDeclaration>),
     /// サーバが typeDefinition を提供していない。
     TypeDefinitionNotProvided,
+    /// 宣言の場所は返ったが、パスとして読めない URI だった。
+    UnreadableTypeDefinition,
 }
 
 /// シグネチャに書かれた型名の宣言が、どこにあるかを尋ねる。
@@ -99,11 +101,13 @@ pub enum TypeDeclarationsOutcome {
 /// `document` は先に [`Session::open_document`] で開かせておく。`type_references` は
 /// `Chunk::type_references` が集めた型名。
 ///
-/// **宣言の場所が返らなかった型名は落とす。** その型名が解決できないだけで、
-/// 残りは解決できるので、綴りのまま比較へ進む（今までと同じ形）。
+/// **宣言が返らなかった型名は落とす。** その型名が解決できないだけで、残りは解決できるので、
+/// 綴りのまま比較へ進む（今までと同じ形）。
 ///
-/// **サーバが typeDefinition を提供していないときだけは落とさない。** そのときは
-/// **どの型名も開けない**ので、取れなかったこととして返す。
+/// **落とさないのは 2 つ。** サーバが typeDefinition を提供していないとき（どの型名も
+/// 開けない）と、返った URI をパスとして読めなかったとき（**サーバは宣言を持っており、
+/// 読めないのはこちら側の穴**）。どちらも、綴りのまま比べた結果を答えとして出さない
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
 ///
 /// # Errors
 ///
@@ -124,7 +128,11 @@ pub fn type_declarations_of(
             TypeDefinitionOutcome::NotSupported => {
                 return Ok(TypeDeclarationsOutcome::TypeDefinitionNotProvided);
             }
-            TypeDefinitionOutcome::NoAnswer | TypeDefinitionOutcome::Unreadable { .. } => continue,
+            TypeDefinitionOutcome::Unreadable { .. } => {
+                return Ok(TypeDeclarationsOutcome::UnreadableTypeDefinition);
+            }
+            // 宣言が無いのはサーバの答えそのもの。読めないのと違い、こちら側の穴ではない。
+            TypeDefinitionOutcome::NoAnswer => continue,
         }
     }
 
