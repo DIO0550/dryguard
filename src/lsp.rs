@@ -12,6 +12,7 @@
 //! | `workspace` | サーバに見せるワークスペースの根 |
 //! | `document` | サーバに開かせるソースファイル |
 //! | `hover` | hover の応答から型の綴りを取り出す |
+//! | `references` | references の応答から参照元のファイルを取り出す |
 //! | ここ | サーバの起動・パイプの配線・終了 |
 //!
 //! **外へ出すのは [`ServerCommand`] / [`Client`] / [`Session`]、渡す値
@@ -24,6 +25,7 @@ pub(crate) mod document;
 pub(crate) mod framing;
 pub(crate) mod hover;
 pub(crate) mod message;
+pub(crate) mod references;
 pub(crate) mod uri;
 pub(crate) mod workspace;
 
@@ -32,15 +34,17 @@ use std::fmt;
 use std::io::{self, BufReader};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
-use lsp_types::{HoverProviderCapability, ServerCapabilities};
+use lsp_types::{HoverProviderCapability, OneOf, ServerCapabilities};
 
 use crate::source_position::SourcePosition;
 use connection::Connection;
 
 // 開かせるドキュメントとワークスペースの根は、呼ぶ側が組み立てて渡す。
 pub use document::{DocumentError, SourceDocument};
-// hover の結果は「取れた / 取れなかった理由」を分けて持つので、外から読める形で出す。
+// hover / references の結果は「取れた / 取れなかった理由」を分けて持つので、
+// 外から読める形で出す。
 pub use hover::HoverOutcome;
+pub use references::ReferencesOutcome;
 pub use workspace::{WorkspaceError, WorkspaceRoot};
 
 // 失敗を読むための型だけを外へ出す。[`ClientError`] が抱えている以上、
@@ -48,7 +52,7 @@ pub use workspace::{WorkspaceError, WorkspaceRoot};
 pub use connection::ConnectionError;
 pub use framing::FramingError;
 pub use message::{MessageError, RequestId, ResponseFailure};
-pub use uri::PathUriError;
+pub use uri::{PathUriError, UriPathError};
 
 /// TypeScript の LSP サーバの実行ファイル名。
 const TYPESCRIPT_SERVER: &str = "typescript-language-server";
@@ -229,6 +233,35 @@ impl Session {
             .map_err(ClientError::Conversation)
     }
 
+    /// 開かせたファイルの、指定位置にある名前を参照しているところを尋ねる。
+    ///
+    /// `position` は `Chunk::name_position` が指す識別子の位置。参照元が返ったのか、
+    /// 無かったのか、読めなかったのかは [`ReferencesOutcome`] が分けて持つ。
+    ///
+    /// **references を提供していないサーバには送らない**（[`ReferencesOutcome::NotSupported`]）。
+    /// hover と同じ理由で、送ると**シグナルが取れないだけの話が往復の失敗になる**。
+    ///
+    /// 先に [`Session::open_document`] で開かせておく。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、往復が失敗したとき、
+    /// 応答を references の結果として読めないとき。
+    pub fn references(
+        &mut self,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<ReferencesOutcome, ClientError> {
+        if !provides_references(&self.capabilities) {
+            return Ok(ReferencesOutcome::NotSupported);
+        }
+
+        self.client
+            .connection
+            .references(document, position)
+            .map_err(ClientError::Conversation)
+    }
+
     /// 開かせたファイルを閉じさせる。開いていなければ何もしない。
     ///
     /// # Errors
@@ -294,6 +327,17 @@ fn provides_hover(capabilities: &ServerCapabilities) -> bool {
     matches!(
         capabilities.hover_provider,
         Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
+    )
+}
+
+/// そのサーバが references に答えるか。
+///
+/// hover と同じく**有無ではなく中身を見る**。無効を表す `Left(false)` も「宣言はある」ので、
+/// `is_some()` で見ると references を切ったサーバへ送ってしまう。
+fn provides_references(capabilities: &ServerCapabilities) -> bool {
+    matches!(
+        capabilities.references_provider,
+        Some(OneOf::Left(true) | OneOf::Right(_))
     )
 }
 
@@ -417,6 +461,8 @@ impl Error for ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
     use crate::codebase;
     use crate::test_support::{line, repository_path};
     use lsp_types::HoverProviderCapability;
@@ -433,6 +479,55 @@ mod tests {
         let text = codebase::source_of(&path).expect("fixture を読める");
 
         SourceDocument::new(&path, text).expect("ドキュメントにできる")
+    }
+
+    /// 呼び出し元を持つ fixture のうち、`applyDiscount` を宣言しているファイル。
+    ///
+    /// `tests/fixtures/references/` は tsconfig.json を持つ木にしてある。**参照元は
+    /// 開かせたファイルからは辿れない**（呼び出し元が呼び出し先を import するので、
+    /// import を辿る向きが逆）ため、サーバがコードベース全体をプロジェクトとして
+    /// 見ていないと 1 件も返らない。
+    const A_CALLED_FILE: &str = "tests/fixtures/references/src/billing/discount.ts";
+
+    /// 誰にも呼ばれていない関数を持つ fixture。
+    const AN_UNCALLED_FILE: &str = "tests/fixtures/references/src/report/monthly.ts";
+
+    /// 2 つの fixture から決まる、サーバに見せる根。
+    ///
+    /// **テスト側で広げない。** `WorkspaceRoot::enclosing` は綴りだけで根を決める
+    /// （実在を確かめない）ので、置いていないパスを混ぜると黙って根が広がり、
+    /// **本番が作らない設定でテストが通る**。2 つの共通の祖先
+    /// （`tests/fixtures/references/src`）に tsconfig.json を置いてあり、そこが根になる。
+    fn references_fixture_root() -> WorkspaceRoot {
+        WorkspaceRoot::enclosing(&[
+            repository_path(A_CALLED_FILE),
+            repository_path(AN_UNCALLED_FILE),
+        ])
+        .expect("根を決められる")
+    }
+
+    fn document_of(relative_path: &str) -> SourceDocument {
+        let path = repository_path(relative_path);
+        let text = codebase::source_of(&path).expect("fixture を読める");
+
+        SourceDocument::new(&path, text).expect("ドキュメントにできる")
+    }
+
+    /// 開かせたファイルの、その位置にある名前の参照元をサーバに尋ねる。
+    fn references_at(relative_path: &str, position: SourcePosition) -> ReferencesOutcome {
+        let client = Client::start(&ServerCommand::typescript()).expect("サーバを起動できる");
+        let mut session = client
+            .handshake(&references_fixture_root())
+            .expect("握手できる");
+        let document = document_of(relative_path);
+        session.open_document(&document).expect("開かせられる");
+
+        let outcome = session
+            .references(&document, position)
+            .expect("問い合わせられる");
+
+        session.shutdown().expect("終了できる");
+        outcome
     }
 
     #[test]
@@ -480,6 +575,39 @@ mod tests {
         let capabilities = capabilities_declaring_hover(None);
 
         assert!(!provides_hover(&capabilities));
+    }
+
+    /// そのサーバができることとして references だけを宣言した capabilities。
+    fn capabilities_declaring_references(
+        references_provider: Option<OneOf<bool, lsp_types::ReferencesOptions>>,
+    ) -> ServerCapabilities {
+        ServerCapabilities {
+            references_provider,
+            ..ServerCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn test_provides_references_with_a_server_that_declares_it_is_true() {
+        let capabilities = capabilities_declaring_references(Some(OneOf::Left(true)));
+
+        assert!(provides_references(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_references_with_a_server_that_turned_it_off_is_false() {
+        // 対照は上のテスト。**宣言はあるが無効**という形で、`is_some()` で見ていると
+        // references を切ったサーバへ要求を送ってしまう
+        let capabilities = capabilities_declaring_references(Some(OneOf::Left(false)));
+
+        assert!(!provides_references(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_references_with_a_server_that_does_not_declare_it_is_false() {
+        let capabilities = capabilities_declaring_references(None);
+
+        assert!(!provides_references(&capabilities));
     }
 
     #[test]
@@ -603,5 +731,45 @@ mod tests {
         assert_eq!(signature, HoverOutcome::NoAnswer);
 
         session.shutdown().expect("終了できる");
+    }
+
+    #[test]
+    #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+    fn test_session_references_at_a_function_name_answers_the_files_that_call_it() {
+        // fixture の 5 行目 `export function applyDiscount`。呼び出し元は同じ billing の
+        // invoice.ts と statement.ts で、**どちらも開かせていない**（開かせるのは
+        // 候補ペアのファイルだけ）
+        let outcome = references_at(
+            A_CALLED_FILE,
+            SourcePosition::from_preceding_text(line(5), "export function "),
+        );
+
+        let ReferencesOutcome::Answered(paths) = outcome else {
+            panic!("呼び出し元のあるチャンクには参照元が返る: {outcome:?}");
+        };
+        let names: BTreeSet<String> = paths
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from(["invoice.ts".to_owned(), "statement.ts".to_owned()])
+        );
+    }
+
+    #[test]
+    #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+    fn test_session_references_at_a_function_nobody_calls_has_no_answer() {
+        // 対照は上のテスト。同じ木の中で、誰にも呼ばれていない関数を指す。
+        // 宣言そのものを数えていれば、ここでも 1 件返ってしまう
+        let outcome = references_at(
+            AN_UNCALLED_FILE,
+            SourcePosition::from_preceding_text(line(4), "export function "),
+        );
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::NoAnswer),
+            "呼び出し元の無いチャンクでは参照元が返らない: {outcome:?}"
+        );
     }
 }

@@ -10,6 +10,31 @@ use serde_json::{Value, json};
 /// JSON-RPC のバージョン。2.0 以外は送らないし、受け取っても見ない。
 const JSON_RPC_VERSION: &str = "2.0";
 
+/// frame の本文。JSON-RPC のメッセージ 1 通そのもの（`rules/naming.md` の `payload`）。
+///
+/// **素の `String` で持ち回らない。** 区切りを付ける側（[`super::framing`]）と中身を読む側
+/// （ここ）の間を行き来する値で、`String` のままだと**エラーメッセージやパスと
+/// 同じ顔で流通する**（`rules/coding.md`「値の語彙を型で閉じる」）。
+///
+/// **Why not（作るときに JSON として検証する）**: 中身が JSON かどうかを見るのは
+/// [`ServerMessage::from_payload`] の担当。ここで検証すると、**区切りしか見ないはずの
+/// `framing` が JSON の壊れ方を報告する**ことになり、層の分け方（`rules/naming.md`
+/// 「`frame` と `payload` を混ぜない」）が崩れる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Payload(String);
+
+impl Payload {
+    /// 受け取った 1 通分の本文から作る。
+    pub fn new(text: String) -> Self {
+        Self(text)
+    }
+
+    /// 本文の綴りそのもの。フレームに載せるときに使う。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// 支えていないメソッドを要求されたときに返すコード（JSON-RPC の Method not found）。
 const METHOD_NOT_FOUND: i64 = -32601;
 
@@ -84,7 +109,7 @@ impl ServerRequestId {
 ///
 /// `params` が `None` のときはキーごと省く。`null` を送ると、省略と区別するサーバに
 /// 別物として届く。
-pub fn request_payload_of(id: RequestId, method: &str, params: Option<Value>) -> String {
+pub fn request_payload_of(id: RequestId, method: &str, params: Option<Value>) -> Payload {
     let message = match params {
         Some(params) => json!({
             "jsonrpc": JSON_RPC_VERSION,
@@ -99,13 +124,13 @@ pub fn request_payload_of(id: RequestId, method: &str, params: Option<Value>) ->
         }),
     };
 
-    message.to_string()
+    Payload::new(message.to_string())
 }
 
 /// 応答を伴わない通知の payload。
 ///
 /// 要求との違いは id を持たないこと。持たせるとサーバは応答を返そうとする。
-pub fn notification_payload_of(method: &str, params: Option<Value>) -> String {
+pub fn notification_payload_of(method: &str, params: Option<Value>) -> Payload {
     let message = match params {
         Some(params) => json!({
             "jsonrpc": JSON_RPC_VERSION,
@@ -118,14 +143,29 @@ pub fn notification_payload_of(method: &str, params: Option<Value>) -> String {
         }),
     };
 
-    message.to_string()
+    Payload::new(message.to_string())
+}
+
+/// サーバからの要求に「受け取った」とだけ返す payload。
+///
+/// **中身を持たない応答が要る相手がいる。** `window/workDoneProgress/create` は
+/// 進捗を作ってよいかを尋ねる要求で、返す値そのものは無い（仕様上 result は null）。
+/// [`method_not_found_payload_of`] で断ると、サーバは進捗を送ってこない。
+pub fn null_result_payload_of(id: &ServerRequestId) -> Payload {
+    let message = json!({
+        "jsonrpc": JSON_RPC_VERSION,
+        "id": id.to_json(),
+        "result": Value::Null,
+    });
+
+    Payload::new(message.to_string())
 }
 
 /// サーバからの要求に「そのメソッドは支えていない」と返す payload。
 ///
 /// **支えていないからこそ返す。** 黙って捨てると、応答を待つサーバはそこで止まり、
 /// こちらは次のフレームを待つので、双方が待ち合う。
-pub fn method_not_found_payload_of(id: &ServerRequestId, method: &str) -> String {
+pub fn method_not_found_payload_of(id: &ServerRequestId, method: &str) -> Payload {
     let message = json!({
         "jsonrpc": JSON_RPC_VERSION,
         "id": id.to_json(),
@@ -135,7 +175,7 @@ pub fn method_not_found_payload_of(id: &ServerRequestId, method: &str) -> String
         },
     });
 
-    message.to_string()
+    Payload::new(message.to_string())
 }
 
 /// サーバから届いた 1 通。
@@ -158,11 +198,15 @@ pub enum ServerMessage {
         id: ServerRequestId,
         /// 要求されたメソッド名。
         method: String,
+        /// 要求に添えられた値。無ければ `None`。
+        params: Option<Value>,
     },
     /// サーバからの通知。
     Notification {
         /// 通知のメソッド名。
         method: String,
+        /// 通知に添えられた値。無ければ `None`。
+        params: Option<Value>,
     },
 }
 
@@ -174,8 +218,9 @@ impl ServerMessage {
     /// JSON として読めないとき、id も method も持たないとき、応答の id が数でないとき、
     /// 要求の id が数でも文字列でもないとき、応答が result も error も持たないとき、
     /// error に code / message が揃っていないとき。
-    pub fn from_json(payload: &str) -> Result<Self, MessageError> {
-        let message: Value = serde_json::from_str(payload).map_err(MessageError::NotJson)?;
+    pub fn from_payload(payload: &Payload) -> Result<Self, MessageError> {
+        let message: Value =
+            serde_json::from_str(payload.as_str()).map_err(MessageError::NotJson)?;
         let method = message.get("method").and_then(Value::as_str);
 
         match (message.get("id"), method) {
@@ -186,9 +231,11 @@ impl ServerMessage {
             (Some(id), Some(method)) => Ok(Self::Request {
                 id: server_request_id_of(id)?,
                 method: method.to_owned(),
+                params: message.get("params").cloned(),
             }),
             (None, Some(method)) => Ok(Self::Notification {
                 method: method.to_owned(),
+                params: message.get("params").cloned(),
             }),
             (None, None) => Err(MessageError::Unrecognized),
         }
@@ -330,8 +377,13 @@ impl Error for MessageError {
 mod tests {
     use super::*;
 
-    fn parsed(payload: &str) -> Value {
-        serde_json::from_str(payload).expect("組み立てた payload は JSON")
+    fn parsed(payload: &Payload) -> Value {
+        serde_json::from_str(payload.as_str()).expect("組み立てた payload は JSON")
+    }
+
+    /// サーバから届いた 1 通として解釈する。
+    fn server_message(text: &str) -> Result<ServerMessage, MessageError> {
+        ServerMessage::from_payload(&Payload::new(text.to_owned()))
     }
 
     #[test]
@@ -373,8 +425,8 @@ mod tests {
 
     #[test]
     fn test_server_message_from_a_response_with_a_result_is_a_success() {
-        let message = ServerMessage::from_json(r#"{"jsonrpc":"2.0","id":1,"result":{"a":1}}"#)
-            .expect("解釈できる");
+        let message =
+            server_message(r#"{"jsonrpc":"2.0","id":1,"result":{"a":1}}"#).expect("解釈できる");
 
         assert_eq!(
             message,
@@ -388,8 +440,8 @@ mod tests {
     #[test]
     fn test_server_message_from_a_response_with_a_null_result_is_a_success() {
         // shutdown の応答は result が null。キーの有無ではなく値で見ていると落ちる
-        let message = ServerMessage::from_json(r#"{"jsonrpc":"2.0","id":1,"result":null}"#)
-            .expect("解釈できる");
+        let message =
+            server_message(r#"{"jsonrpc":"2.0","id":1,"result":null}"#).expect("解釈できる");
 
         assert_eq!(
             message,
@@ -404,7 +456,7 @@ mod tests {
     fn test_server_message_from_a_response_with_an_error_is_a_failure() {
         let payload = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"unknown"}}"#;
 
-        let message = ServerMessage::from_json(payload).expect("解釈できる");
+        let message = server_message(payload).expect("解釈できる");
 
         assert_eq!(
             message,
@@ -422,12 +474,29 @@ mod tests {
     fn test_server_message_without_an_id_is_a_notification() {
         let payload = r#"{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":3}}"#;
 
-        let message = ServerMessage::from_json(payload).expect("解釈できる");
+        let message = server_message(payload).expect("解釈できる");
 
         assert_eq!(
             message,
             ServerMessage::Notification {
                 method: "window/logMessage".to_owned(),
+                params: Some(json!({"type": 3})),
+            }
+        );
+    }
+
+    #[test]
+    fn test_server_message_from_a_notification_keeps_the_params_it_carries() {
+        // 進捗の終わりは params の中にしか無い。落とすと、どの作業が終わったのかが消える
+        let payload = r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"tk","value":{"kind":"end"}}}"#;
+
+        let message = server_message(payload).expect("解釈できる");
+
+        assert_eq!(
+            message,
+            ServerMessage::Notification {
+                method: "$/progress".to_owned(),
+                params: Some(json!({"token": "tk", "value": {"kind": "end"}})),
             }
         );
     }
@@ -437,13 +506,14 @@ mod tests {
         // サーバからこちらへの要求。応答（id だけ）と取り違えると、待っている応答として拾う
         let payload = r#"{"jsonrpc":"2.0","id":7,"method":"client/registerCapability"}"#;
 
-        let message = ServerMessage::from_json(payload).expect("解釈できる");
+        let message = server_message(payload).expect("解釈できる");
 
         assert_eq!(
             message,
             ServerMessage::Request {
                 id: ServerRequestId::Number(7),
                 method: "client/registerCapability".to_owned(),
+                params: None,
             }
         );
     }
@@ -453,13 +523,14 @@ mod tests {
         // サーバは文字列の id も使える。数に寄せると、そのまま返せなくなる
         let payload = r#"{"jsonrpc":"2.0","id":"req-1","method":"window/showMessageRequest"}"#;
 
-        let message = ServerMessage::from_json(payload).expect("解釈できる");
+        let message = server_message(payload).expect("解釈できる");
 
         assert_eq!(
             message,
             ServerMessage::Request {
                 id: ServerRequestId::Text("req-1".to_owned()),
                 method: "window/showMessageRequest".to_owned(),
+                params: None,
             }
         );
     }
@@ -468,9 +539,20 @@ mod tests {
     fn test_server_message_from_a_request_with_an_id_that_cannot_be_echoed_reports_it() {
         let payload = r#"{"jsonrpc":"2.0","id":[1],"method":"window/showMessageRequest"}"#;
 
-        let error = ServerMessage::from_json(payload).expect_err("解釈できない");
+        let error = server_message(payload).expect_err("解釈できない");
 
         assert!(matches!(error, MessageError::RequestIdNotSupported { .. }));
+    }
+
+    #[test]
+    fn test_null_result_payload_of_answers_with_the_id_it_was_given() {
+        // 進捗を作ってよいかの要求への返事。断ると（method not found）、
+        // サーバは進捗を送ってこない
+        let payload = null_result_payload_of(&ServerRequestId::Text("tk-1".to_owned()));
+
+        let message: Value = parsed(&payload);
+        assert_eq!(message["id"], json!("tk-1"));
+        assert_eq!(message["result"], Value::Null);
     }
 
     #[test]
@@ -494,22 +576,21 @@ mod tests {
 
     #[test]
     fn test_server_message_from_a_non_json_payload_reports_it() {
-        let error = ServerMessage::from_json("not json").expect_err("解釈できない");
+        let error = server_message("not json").expect_err("解釈できない");
 
         assert!(matches!(error, MessageError::NotJson(_)));
     }
 
     #[test]
     fn test_server_message_without_an_id_or_a_method_is_unrecognized() {
-        let error = ServerMessage::from_json(r#"{"jsonrpc":"2.0"}"#).expect_err("解釈できない");
+        let error = server_message(r#"{"jsonrpc":"2.0"}"#).expect_err("解釈できない");
 
         assert!(matches!(error, MessageError::Unrecognized));
     }
 
     #[test]
     fn test_server_message_from_a_response_without_a_result_or_an_error_reports_it() {
-        let error =
-            ServerMessage::from_json(r#"{"jsonrpc":"2.0","id":1}"#).expect_err("解釈できない");
+        let error = server_message(r#"{"jsonrpc":"2.0","id":1}"#).expect_err("解釈できない");
 
         assert!(matches!(error, MessageError::ResponseWithoutOutcome));
     }
@@ -518,7 +599,7 @@ mod tests {
     fn test_server_message_from_a_response_with_a_string_id_reports_it() {
         let payload = r#"{"jsonrpc":"2.0","id":"seven","result":null}"#;
 
-        let error = ServerMessage::from_json(payload).expect_err("解釈できない");
+        let error = server_message(payload).expect_err("解釈できない");
 
         assert!(matches!(
             error,
@@ -530,7 +611,7 @@ mod tests {
     fn test_server_message_from_a_response_with_an_error_missing_its_code_reports_it() {
         let payload = r#"{"jsonrpc":"2.0","id":1,"error":{"message":"unknown"}}"#;
 
-        let error = ServerMessage::from_json(payload).expect_err("解釈できない");
+        let error = server_message(payload).expect_err("解釈できない");
 
         assert!(matches!(error, MessageError::MalformedResponseFailure));
     }

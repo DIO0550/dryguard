@@ -1,20 +1,24 @@
-//! 候補ペアのチャンクから、LSP へ問い合わせて型シグネチャを比べるところまで。
+//! 候補ペアのチャンクから、LSP へ問い合わせて型シグネチャと参照元を比べるところまで。
 //!
 //! ステージをつないだ結果はここで見る（rules/testing.md「ステージをまたぐテストと
 //! 単体のテストを分ける」）。名前の位置は `syntax::chunk`、応答の読み取りは
-//! `lsp::hover`、正規化と単一化の判定は `semantics::type_signature` の
-//! モジュール内テストにある。
+//! `lsp::hover` / `lsp::references`、正規化と比較は `semantics::type_signature` /
+//! `semantics::caller_domain` のモジュール内テストにある。
 //!
 //! **どのテストも実サーバを要するので `#[ignore]` を付ける。** サーバの入っていない
 //! 開発機で黙って通さないため（rules/testing.md「LSP を要するテストは、飛ばしたことが
 //! 分かる形にする」）。CI はサーバを入れて `--ignored` で走らせる。
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use dryguard::codebase::source_of;
 use dryguard::location::Location;
-use dryguard::lsp::{Client, HoverOutcome, ServerCommand, Session, SourceDocument, WorkspaceRoot};
+use dryguard::lsp::{
+    Client, HoverOutcome, ReferencesOutcome, ServerCommand, Session, SourceDocument, WorkspaceRoot,
+};
 use dryguard::pipeline::chunk_pair_of;
+use dryguard::semantics::caller_domain::CallerDomains;
 use dryguard::semantics::type_signature::TypeSignature;
 use dryguard::syntax::chunk::Chunk;
 
@@ -50,6 +54,11 @@ fn document(path: &Path) -> SourceDocument {
 }
 
 /// 2 つのチャンクを開かせられる、握手を終えたサーバ。
+///
+/// 根は `WorkspaceRoot::enclosing` が渡されたパスから決める。**テスト側で広げない**
+/// （広げると、本番が作らない設定でテストが通る）。`tests/fixtures/references/` は
+/// 候補ペアの共通の祖先（`src/`）に tsconfig.json を置いてあり、そこが根になる。
+/// より下が根になるコードベースで呼び出し元が一部しか返らない話は Issue #125。
 fn session_over(paths: &[PathBuf]) -> Session {
     let Ok(root) = WorkspaceRoot::enclosing(paths) else {
         panic!("テストが渡すパスからは根を決められる");
@@ -125,4 +134,126 @@ fn test_two_functions_taking_types_from_separate_domains_are_not_unifiable() {
     let reorders_stock = fixture("inventory/reorder.ts", 5);
 
     assert!(!unifiable(&discounts_an_invoice, &reorders_stock));
+}
+
+/// そのチャンクの呼び出し元のファイル。サーバに尋ねて集める。
+fn reference_paths_of(session: &mut Session, chunk: &Chunk) -> Vec<PathBuf> {
+    let document = document(chunk.path());
+    if session.open_document(&document).is_err() {
+        panic!("ファイルを開かせられる: {}", chunk.path().display());
+    }
+
+    let Some(position) = chunk.name_position() else {
+        panic!(
+            "テストが指すチャンクは名前を持つ: {}",
+            chunk.path().display()
+        );
+    };
+    let outcome = session.references(&document, position);
+    let Ok(ReferencesOutcome::Answered(reference_paths)) = outcome else {
+        panic!(
+            "名前の位置には参照元が返る: {} ({outcome:?})",
+            chunk.path().display()
+        );
+    };
+    reference_paths
+}
+
+/// そのチャンクの呼び出し元が属するドメイン。サーバに尋ねて数える。
+fn caller_domains_of(session: &mut Session, chunk: &Chunk) -> CallerDomains {
+    let reference_paths = reference_paths_of(session, chunk);
+
+    let Some(caller_domains) = CallerDomains::from_reference_paths(&reference_paths) else {
+        panic!("返った参照元は 1 件以上ある: {reference_paths:?}");
+    };
+    caller_domains
+}
+
+/// 参照元のファイル名（重複を畳んだもの）。**どのファイルが返ったか**を見るために使う。
+fn reference_file_names(reference_paths: &[PathBuf]) -> BTreeSet<String> {
+    reference_paths
+        .iter()
+        .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+        .collect()
+}
+
+/// 2 箇所のチャンクの呼び出し元ドメインがどれだけ重なるか、実サーバに尋ねて測る。
+fn caller_domain_overlap(location_a: &Location, location_b: &Location) -> f64 {
+    let Ok((chunk_a, chunk_b)) = chunk_pair_of(location_a, location_b) else {
+        panic!("テストが渡す位置はどちらも関数の中を指している");
+    };
+
+    let mut session = session_over(&[
+        location_a.path().to_path_buf(),
+        location_b.path().to_path_buf(),
+    ]);
+    let domains_a = caller_domains_of(&mut session, &chunk_a);
+    let domains_b = caller_domains_of(&mut session, &chunk_b);
+    let overlap = domains_a.jaccard(&domains_b).value();
+
+    if session.shutdown().is_err() {
+        panic!("サーバを終わらせられる");
+    }
+    overlap
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_two_functions_called_from_separate_domains_share_no_caller_domains() {
+    // 計画の出力イメージで DO-NOT-EXTRACT 側に置かれているペア
+    // （`docs/dryguard-plan.md`「出力イメージ」）。applyDiscount は billing の
+    // 2 ファイルから、reorderAmount は inventory の 1 ファイルから呼ばれている
+    let discounts_an_invoice = fixture("references/src/billing/discount.ts", 5);
+    let reorders_stock = fixture("references/src/inventory/reorder.ts", 5);
+
+    assert_eq!(
+        caller_domain_overlap(&discounts_an_invoice, &reorders_stock),
+        0.0
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_two_functions_called_from_the_same_domain_share_their_caller_domains() {
+    // 対照は上のテスト。**ディレクトリは utils と report で分かれている**が、
+    // どちらも report/monthly.ts から呼ばれている。ここが Phase 0 の
+    // ディレクトリ距離との違いで、置き場所ではなく実際に誰が使っているかを見る
+    let formats_a_date = fixture("references/src/utils/formatDate.ts", 3);
+    let helps_with_dates = fixture("references/src/report/dateHelper.ts", 3);
+
+    assert_eq!(
+        caller_domain_overlap(&formats_a_date, &helps_with_dates),
+        1.0
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_caller_domains_asked_after_a_type_signature_are_still_complete() {
+    // #29 が組む順（hover → references）を 1 つのセッションで通す。**先の hover で
+    // サーバの作業を覚える**ので、その作業が終わる前に references を送ると、
+    // 読み込み中に計算された答え（呼び出し元が欠けている）を受け取る
+    let discounts_an_invoice = fixture("references/src/billing/discount.ts", 5);
+    let reorders_stock = fixture("references/src/inventory/reorder.ts", 5);
+    let Ok((chunk, _)) = chunk_pair_of(&discounts_an_invoice, &reorders_stock) else {
+        panic!("テストが渡す位置はどちらも関数の中を指している");
+    };
+
+    // 候補ペアの 2 箇所だけを渡す。`compare` が本番で作る根と同じ決め方になる
+    let mut session = session_over(&[
+        discounts_an_invoice.path().to_path_buf(),
+        reorders_stock.path().to_path_buf(),
+    ]);
+    let _signature = type_signature_of(&mut session, &chunk);
+    let reference_paths = reference_paths_of(&mut session, &chunk);
+    if session.shutdown().is_err() {
+        panic!("サーバを終わらせられる");
+    }
+
+    // **ドメインに畳む前のファイルで見る。** 畳んでからだと、片方しか返らなくても
+    // 「billing の 1 ドメイン」になり、欠けたことがテストから消える
+    assert_eq!(
+        reference_file_names(&reference_paths),
+        BTreeSet::from(["invoice.ts".to_owned(), "statement.ts".to_owned()])
+    );
 }

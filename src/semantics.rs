@@ -4,7 +4,12 @@
 //! （`rules/architecture.md`「3 ステージのパイプライン」）。ラベルを決めるのは
 //! `classification` にしか無い。
 //!
-//! 今あるのは、hover が返した綴りを単一化の可否を比べられる形へ直すところまで
-//! （`type_signature`）。呼び出し先・呼び出し元の収集はこの後の Phase で足す。
+//! | モジュール | 持つもの |
+//! |---|---|
+//! | `type_signature` | hover が返した綴りを、単一化の可否を比べられる形へ直す |
+//! | `caller_domain` | 参照元がどのドメインに属するかと、その重なり |
+//!
+//! 呼び出し先（callHierarchy）の収集はこの後の Phase で足す。
 
+pub mod caller_domain;
 pub mod type_signature;

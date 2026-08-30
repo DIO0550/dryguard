@@ -10,12 +10,16 @@ use std::fmt;
 use std::io::{self, BufRead, Write};
 
 use lsp_types::notification::{
-    DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized, Notification as _,
+    DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized, Notification as _, Progress,
 };
-use lsp_types::request::{HoverRequest, Initialize, Request as _, Shutdown};
+use lsp_types::request::{
+    HoverRequest, Initialize, References, Request as _, Shutdown, WorkDoneProgressCreate,
+};
 use lsp_types::{
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover, HoverParams, InitializeResult,
-    ServerCapabilities, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
+    Location, PartialResultParams, ProgressParams, ProgressParamsValue, ProgressToken,
+    ReferenceContext, ReferenceParams, ServerCapabilities, TextDocumentIdentifier,
+    TextDocumentPositionParams, Uri, WorkDoneProgress, WorkDoneProgressCreateParams,
     WorkDoneProgressParams,
 };
 use serde_json::{Value, json};
@@ -24,13 +28,22 @@ use super::document::SourceDocument;
 use super::framing::{self, FramingError};
 use super::hover::{self, HoverOutcome};
 use super::message::{
-    self, MessageError, RequestId, ResponseFailure, ResponseOutcome, ServerMessage,
+    self, MessageError, Payload, RequestId, ResponseFailure, ResponseOutcome, ServerMessage,
+    ServerRequestId,
 };
+use super::references::{self, ReferencesOutcome};
 use super::workspace::WorkspaceRoot;
 use crate::source_position::SourcePosition;
 
 /// `initialize` でサーバに名乗る名前。
 const CLIENT_NAME: &str = "dryguard";
+
+/// references を尋ねる回数の上限。
+///
+/// 1 回目は読み込みの途中に当たりうる。2 回目はその読み込みが終わってからになる。
+/// **3 回目でも作業に触れているなら、尋ねるたびに始まっている**ので、待っても
+/// 答えは落ち着かない（`ReferencesOutcome::ServerStillWorking`）。
+const REFERENCES_ATTEMPTS: usize = 3;
 
 /// LSP サーバとの往復。
 ///
@@ -42,6 +55,18 @@ pub struct Connection<R: BufRead, W: Write> {
     writer: W,
     next_id: RequestId,
     open_documents: BTreeSet<Uri>,
+    /// token を用意しただけで、始まりの通知がまだ来ていない作業。
+    ///
+    /// **待つ相手ではない**（始まらないまま捨てられることがある）。答えを信用してよいかの
+    /// 判断にだけ使い、1 度尋ね直したら忘れる。
+    prepared_progress: Vec<ProgressToken>,
+    /// 始まりの通知が届き、終わりの通知がまだ来ていない作業。
+    running_progress: Vec<ProgressToken>,
+    /// サーバの作業について知らされた回数（token を用意する要求と、始まりの通知）。
+    ///
+    /// **減らさない。** 始まって終わった作業は [`Self::running_progress`] から消えるので、
+    /// 尋ねている間に何か起きたかは数でしか追えない。
+    noticed_progress_count: usize,
 }
 
 impl<R: BufRead, W: Write> Connection<R, W> {
@@ -52,6 +77,9 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             writer,
             next_id: RequestId::first(),
             open_documents: BTreeSet::new(),
+            prepared_progress: Vec::new(),
+            running_progress: Vec::new(),
+            noticed_progress_count: 0,
         }
     }
 
@@ -82,10 +110,16 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         let params = json!({
             "processId": std::process::id(),
             "clientInfo": { "name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION") },
-            // 何も宣言しない。宣言した機能に応じてサーバはこちらへ要求を投げてくるので、
-            // 支えていない機能の要求を呼び込まない。ただし `window/showMessageRequest` の
-            // ように宣言に依らず届く要求はあり、それは `response_of` が返す。
-            "capabilities": {},
+            // 宣言するのは進捗を受け取ることだけ。宣言した機能に応じてサーバはこちらへ
+            // 要求を投げてくるので、支えていない機能の要求を呼び込まない。ただし
+            // `window/showMessageRequest` のように宣言に依らず届く要求はあり、
+            // それは `answer` が断る。
+            //
+            // Why（進捗だけは宣言する）: **サーバは読み込みの途中でも要求に答える。**
+            // typescript-language-server はプロジェクトを読み終える前の
+            // `textDocument/references` に空の答えを返すので、宣言しないと
+            // 「呼び出し元が無い」と「まだ読んでいない」を区別できない。
+            "capabilities": { "window": { "workDoneProgress": true } },
             "rootUri": root.uri().as_str(),
         });
 
@@ -220,6 +254,145 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         })
     }
 
+    /// 開かせたファイルの、指定位置にある名前を参照しているところを尋ねる。
+    ///
+    /// `position` は `Chunk::name_position` が指す識別子の位置。返るのは参照元の
+    /// ファイルで、読めなかったのか 1 件も無かったのかは [`ReferencesOutcome`] が分けて持つ。
+    ///
+    /// **宣言そのものは数えない**（`include_declaration` を立てない）。数えると、
+    /// 呼び出し元が 1 件も無いチャンクでも自分の宣言だけが返り、**自分のドメインに
+    /// 呼ばれている**ように読める。
+    ///
+    /// 答えを採るのは**サーバの作業が動いていないとき**だけ。動いている間の答えは
+    /// まだ見ていないファイルの分が抜けており、それを最終的なシグナルとして扱うと、
+    /// 呼び出し元の分布が実際より狭く出る。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、パラメータを JSON にできないとき、
+    /// 送受信が失敗したとき、応答を references の結果として読めないとき。
+    pub fn references(
+        &mut self,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<ReferencesOutcome, ConnectionError> {
+        // 開かせていないドキュメントへ送ると、サーバは中身を知らないまま空を返す。
+        // 「参照元が無い」と「開かせ忘れ」が同じ答えになるので、送る前に断る。
+        if !self.open_documents.contains(document.uri()) {
+            return Err(ConnectionError::DocumentNotOpen {
+                uri: document.uri().clone(),
+            });
+        }
+
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: document.uri().clone(),
+                },
+                position: position.to_lsp_position(),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+            context: ReferenceContext {
+                include_declaration: false,
+            },
+        };
+        let params =
+            serde_json::to_value(params).map_err(not_serializable_error_of(References::METHOD))?;
+
+        let settled = self.settled_references_of(params);
+
+        // 用意されただけの作業を覚えておくのは、**この問い合わせの間だけ**。持ち越すと、
+        // 始まらないまま捨てられた token 1 つで、以降の問い合わせがすべて
+        // `ServerStillWorking` になる。
+        self.prepared_progress.clear();
+
+        settled
+    }
+
+    /// サーバの作業に触れていない答えが返るまで、上限まで尋ね直す。
+    ///
+    /// # Errors
+    ///
+    /// 送受信が失敗したとき、応答を references の結果として読めないとき。
+    fn settled_references_of(
+        &mut self,
+        params: Value,
+    ) -> Result<ReferencesOutcome, ConnectionError> {
+        // 読み込み中に返ってきた答えは、**サーバがまだ見ていないファイルの分が抜けている**
+        // （呼び出し元は呼び出し先を import する側なので、開かせたファイルからは辿れない）。
+        // 作業が終わってから尋ね直し、**作業に触れていない答えだけを採る**。
+        let mut attempts_left = REFERENCES_ATTEMPTS;
+
+        while attempts_left > 0 {
+            // **尋ねる前に、動いている作業を待ち切る。** 動いている最中に送ると、
+            // その作業が終わってから応答が届いたときに、こちらからは何も起きなかったように
+            // 見える（前の問い合わせで覚えた作業なので、数も増えない）。
+            self.wait_for_running_progress()?;
+
+            let noticed_before = self.noticed_progress_count;
+            let answered = self.ask_references_once(params.clone())?;
+
+            // 「今動いているか」だけでは足りない。**尋ねている間に始まって終わった作業**が
+            // あると、読み込み前に計算された答えを受け取りながら、手元では何も動いて
+            // いないように見える（実測: 進捗の終わりが応答より先に届き、答えは 0 件）。
+            let noticed_while_answering = self.noticed_progress_count != noticed_before;
+            // 用意されただけの作業も落ち着いていない扱いにする。始まりの通知が応答より
+            // 後ろに並ぶと、こちらからは何も起きていないように見える。
+            let work_is_pending =
+                !self.running_progress.is_empty() || !self.prepared_progress.is_empty();
+            let untouched_by_work = !noticed_while_answering && !work_is_pending;
+            if untouched_by_work {
+                return Ok(answered);
+            }
+
+            attempts_left -= 1;
+        }
+
+        Ok(ReferencesOutcome::ServerStillWorking)
+    }
+
+    /// references を 1 往復だけ尋ねる。
+    ///
+    /// # Errors
+    ///
+    /// 送受信が失敗したとき、応答を references の結果として読めないとき。
+    fn ask_references_once(&mut self, params: Value) -> Result<ReferencesOutcome, ConnectionError> {
+        let result = self.request(References::METHOD, Some(params))?;
+        // 参照元が無いときサーバは null を返す。`Option` で受けて、応答が読めなかった
+        // 場合と分ける。
+        let answered: Option<Vec<Location>> =
+            serde_json::from_value(result).map_err(|cause| ConnectionError::MalformedResult {
+                method: References::METHOD.to_owned(),
+                cause,
+            })?;
+
+        Ok(match answered.as_deref() {
+            Some(locations) => references::outcome_of(locations),
+            None => ReferencesOutcome::NoAnswer,
+        })
+    }
+
+    /// サーバが始めた作業がすべて終わるまで、届くメッセージを読み進める。
+    ///
+    /// 待つのは**始まったと分かっている作業だけ**。始まっていないものを待つと、
+    /// 何も送ってこないサーバの前で止まる（待ちに期限を設ける話は Issue #108）。
+    ///
+    /// # Errors
+    ///
+    /// 読み取りが失敗したとき、要求していない応答が届いたとき。
+    fn wait_for_running_progress(&mut self) -> Result<(), ConnectionError> {
+        while !self.running_progress.is_empty() {
+            if let Some(responded) = self.handled_message()? {
+                return Err(ConnectionError::UnrequestedResponse {
+                    received: responded.0,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     /// 要求を送り、その応答の result を待つ。
     ///
     /// # Errors
@@ -253,21 +426,8 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     /// サーバが error を返したとき。
     fn response_of(&mut self, id: RequestId, method: &str) -> Result<Value, ConnectionError> {
         loop {
-            let payload =
-                framing::payload_of(&mut self.reader).map_err(ConnectionError::Framing)?;
-            let message = ServerMessage::from_json(&payload).map_err(ConnectionError::Message)?;
-
-            let (responded, outcome) = match message {
-                // 応答の前後にサーバの通知（window/logMessage・$/progress）が挟まる。
-                // 通知に応答は要らないので、次のフレームへ進むだけでよい。
-                ServerMessage::Notification { .. } => continue,
-                // 要求には返す。黙って捨てると、応答を待つサーバはそこで止まり、
-                // こちらは次のフレームを待つので、双方が待ち合う。
-                ServerMessage::Request { id, method } => {
-                    self.send(&message::method_not_found_payload_of(&id, &method))?;
-                    continue;
-                }
-                ServerMessage::Response { id, outcome } => (id, outcome),
+            let Some((responded, outcome)) = self.handled_message()? else {
+                continue;
             };
 
             if responded != id {
@@ -287,12 +447,120 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         }
     }
 
+    /// 次の 1 通を読み、応答でなければその場で捌く。
+    ///
+    /// 応答だったときだけ、その id と中身を返す。
+    ///
+    /// # Errors
+    ///
+    /// 読み取りが失敗したとき、中身を解釈できないとき、要求への返信を書き出せないとき。
+    fn handled_message(&mut self) -> Result<Option<(RequestId, ResponseOutcome)>, ConnectionError> {
+        let payload = framing::payload_of(&mut self.reader).map_err(ConnectionError::Framing)?;
+        let message = ServerMessage::from_payload(&payload).map_err(ConnectionError::Message)?;
+
+        match message {
+            // 応答の前後にサーバの通知（window/logMessage・$/progress）が挟まる。
+            // 通知に応答は要らないが、進捗の終わりだけは覚える。
+            ServerMessage::Notification { method, params } => {
+                self.note_progress(&method, params.as_ref())?;
+                Ok(None)
+            }
+            // 要求には返す。黙って捨てると、応答を待つサーバはそこで止まり、
+            // こちらは次のフレームを待つので、双方が待ち合う。
+            ServerMessage::Request { id, method, params } => {
+                self.answer(&id, &method, params.as_ref())?;
+                Ok(None)
+            }
+            ServerMessage::Response { id, outcome } => Ok(Some((id, outcome))),
+        }
+    }
+
+    /// サーバからの要求に返す。
+    ///
+    /// 進捗を作ってよいかの要求だけは受ける（受けないと進捗が届かない）。
+    /// **それ以外は支えていないと返す。**
+    ///
+    /// 受けた時点では**待つ対象にしない**。この要求は token を用意するだけで、
+    /// 作業が始まったことを意味しない。始まらないまま捨てられた token を待つと、
+    /// 終わりの来ない作業を待ち続ける。始まりを覚えるのは [`Self::note_progress`]。
+    ///
+    /// # Errors
+    ///
+    /// 進捗の要求から token を読めないとき、書き出しが失敗したとき。
+    fn answer(
+        &mut self,
+        id: &ServerRequestId,
+        method: &str,
+        params: Option<&Value>,
+    ) -> Result<(), ConnectionError> {
+        if method != WorkDoneProgressCreate::METHOD {
+            return self.send(&message::method_not_found_payload_of(id, method));
+        }
+
+        let created: WorkDoneProgressCreateParams = serde_json::from_value(params_or_null(params))
+            .map_err(malformed_params_error_of(WorkDoneProgressCreate::METHOD))?;
+
+        self.send(&message::null_result_payload_of(id))?;
+
+        // 数はここでも進める。**作業が起きうると分かるのはこの時点**で、尋ねている間に
+        // ここを通ったかどうかが、答えを信用してよいかの判断材料になる
+        // （`running_progress` は始まって終わると空に戻り、痕跡が残らない）。
+        self.noticed_progress_count = self.noticed_progress_count.saturating_add(1);
+        self.prepared_progress.push(created.token);
+
+        Ok(())
+    }
+
+    /// 動いている作業を、始まりと終わりの通知で覚える。進捗でない通知は見ない。
+    ///
+    /// **待つ対象にするのは始まりの通知から。** token を作ってよいかの要求
+    /// （[`Self::answer`]）は用意するだけで、そのまま始まらないこともある。
+    ///
+    /// # Errors
+    ///
+    /// 進捗の通知から token と中身を読めないとき。
+    fn note_progress(
+        &mut self,
+        method: &str,
+        params: Option<&Value>,
+    ) -> Result<(), ConnectionError> {
+        if method != Progress::METHOD {
+            return Ok(());
+        }
+
+        let progress: ProgressParams = serde_json::from_value(params_or_null(params))
+            .map_err(malformed_params_error_of(Progress::METHOD))?;
+        let ProgressParamsValue::WorkDone(work) = progress.value;
+
+        match work {
+            // **始まりでも数を進める。** token を用意するのが前の問い合わせの最中で、
+            // 始まりと終わりだけが次の問い合わせの最中に届く並びがある。用意した時点しか
+            // 数えないと、その並びで「何も起きなかった」ように見える。
+            WorkDoneProgress::Begin(_) => {
+                self.noticed_progress_count = self.noticed_progress_count.saturating_add(1);
+                self.prepared_progress
+                    .retain(|token| *token != progress.token);
+                self.running_progress.push(progress.token);
+            }
+            WorkDoneProgress::End(_) => {
+                self.prepared_progress
+                    .retain(|token| *token != progress.token);
+                self.running_progress
+                    .retain(|token| *token != progress.token);
+            }
+            // 途中経過は動いていることを言い直しているだけで、待つ相手は変わらない。
+            WorkDoneProgress::Report(_) => {}
+        }
+
+        Ok(())
+    }
+
     /// payload を 1 フレームとして書き出す。
     ///
     /// # Errors
     ///
     /// 書き出しが失敗したとき。
-    fn send(&mut self, payload: &str) -> Result<(), ConnectionError> {
+    fn send(&mut self, payload: &Payload) -> Result<(), ConnectionError> {
         self.writer
             .write_all(&framing::framed_bytes_of(payload))
             .map_err(ConnectionError::Send)?;
@@ -300,6 +568,24 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         // 都度流す。パイプの向こうは応答を返すまでこちらの続きを読まないので、
         // 溜めたままだと双方が待ち合う。
         self.writer.flush().map_err(ConnectionError::Send)
+    }
+}
+
+/// サーバが添えた値。付いていなければ `null`。
+///
+/// **付いていないことを別扱いにしない。** 読む相手（進捗）はどれも値を要求するので、
+/// 無いのと読めないのは同じ「読めません」に落ちる。
+fn params_or_null(params: Option<&Value>) -> Value {
+    params.cloned().unwrap_or(Value::Null)
+}
+
+/// サーバが添えた値を読めなかったときの理由を、そのメソッド名で組み立てる。
+fn malformed_params_error_of(
+    method: &'static str,
+) -> impl Fn(serde_json::Error) -> ConnectionError {
+    move |cause| ConnectionError::MalformedParams {
+        method: method.to_owned(),
+        cause,
     }
 }
 
@@ -335,6 +621,21 @@ pub enum ConnectionError {
         method: String,
         /// サーバが返した内容。
         failure: ResponseFailure,
+    },
+    /// 要求していない応答が届いた。
+    ///
+    /// 進捗の終わりを待っている間はこちらの要求が 1 つも出ていないので、
+    /// 応答が来ること自体が食い違いになる。
+    UnrequestedResponse {
+        /// 届いた応答の id。
+        received: RequestId,
+    },
+    /// サーバが添えた値を、そのメソッドのパラメータとして読めない。
+    MalformedParams {
+        /// 読めなかった要求・通知のメソッド名。
+        method: String,
+        /// 読めなかった理由。
+        cause: serde_json::Error,
     },
     /// 応答の result を、そのメソッドの結果として読めない。
     MalformedResult {
@@ -373,6 +674,12 @@ impl fmt::Display for ConnectionError {
             Self::ServerFailure { method, failure } => {
                 write!(formatter, "LSP サーバが {method} を拒みました: {failure}")
             }
+            Self::UnrequestedResponse { received } => {
+                write!(formatter, "要求していない応答が届きました (id {received})")
+            }
+            Self::MalformedParams { method, cause } => {
+                write!(formatter, "{method} に添えられた値を読めません: {cause}")
+            }
             Self::MalformedResult { method, cause } => write!(
                 formatter,
                 "LSP サーバの {method} の応答を読めません: {cause}"
@@ -394,14 +701,15 @@ impl Error for ConnectionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::UnexpectedResponse { .. }
+            | Self::UnrequestedResponse { .. }
             | Self::ServerFailure { .. }
             | Self::DocumentNotOpen { .. } => None,
             Self::Framing(cause) => Some(cause),
             Self::Message(cause) => Some(cause),
             Self::Send(cause) => Some(cause),
-            Self::MalformedResult { cause, .. } | Self::ParamsNotSerializable { cause, .. } => {
-                Some(cause)
-            }
+            Self::MalformedResult { cause, .. }
+            | Self::MalformedParams { cause, .. }
+            | Self::ParamsNotSerializable { cause, .. } => Some(cause),
         }
     }
 }
@@ -409,6 +717,8 @@ impl Error for ConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
     use crate::test_support::{line, repository_path};
     use lsp_types::HoverProviderCapability;
 
@@ -427,7 +737,7 @@ mod tests {
     fn frames_of(payloads: &[&str]) -> Vec<u8> {
         payloads
             .iter()
-            .flat_map(|payload| framing::framed_bytes_of(payload))
+            .flat_map(|payload| framing::framed_bytes_of(&Payload::new((*payload).to_owned())))
             .collect()
     }
 
@@ -437,7 +747,7 @@ mod tests {
         let mut payloads = Vec::new();
 
         while let Ok(payload) = framing::payload_of(&mut reader) {
-            payloads.push(serde_json::from_str(&payload).expect("送った payload は JSON"));
+            payloads.push(serde_json::from_str(payload.as_str()).expect("送った payload は JSON"));
         }
 
         payloads
@@ -864,5 +1174,342 @@ mod tests {
             error,
             ConnectionError::Framing(FramingError::ServerClosed)
         ));
+    }
+
+    /// 参照元 1 件を返す応答。
+    fn references_response(id: u64, uri: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"result":[{{"uri":"{uri}","range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":1}}}}}}]}}"#
+        )
+    }
+
+    /// 参照元が 1 件も無いという応答。
+    fn no_references_response(id: u64) -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":{id},"result":[]}}"#)
+    }
+
+    /// サーバが作業を始めるときに送ってくる要求。
+    fn progress_create_request(id: u64, token: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"window/workDoneProgress/create","params":{{"token":"{token}"}}}}"#
+        )
+    }
+
+    /// その作業が始まったという通知。
+    fn progress_begin_notification(token: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"$/progress","params":{{"token":"{token}","value":{{"kind":"begin","title":"読み込み"}}}}}}"#
+        )
+    }
+
+    /// その作業が終わったという通知。
+    fn progress_end_notification(token: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"$/progress","params":{{"token":"{token}","value":{{"kind":"end"}}}}}}"#
+        )
+    }
+
+    /// 参照元を尋ねられる状態のドキュメント。
+    fn opened_document<R: BufRead>(connection: &mut Connection<R, Vec<u8>>) -> SourceDocument {
+        let document = document_of("tests/fixtures/billing/discount.ts", "export const a = 1;");
+        connection.open_document(&document).expect("送れる");
+        document
+    }
+
+    #[test]
+    fn test_references_returns_the_files_the_server_answered() {
+        let server_output = frames_of(&[&references_response(
+            1,
+            "file:///repo/src/billing/invoice.ts",
+        )]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        let ReferencesOutcome::Answered(paths) = outcome else {
+            panic!("参照元が返る: {outcome:?}");
+        };
+        assert_eq!(paths, vec![PathBuf::from("/repo/src/billing/invoice.ts")]);
+    }
+
+    #[test]
+    fn test_references_answered_while_the_server_is_still_working_asks_again_when_it_finished() {
+        // サーバは読み込みの途中でも答えるが、まだ見ていないファイルの参照元は入らない。
+        // 1 通目の空の答えをそのまま返すと、「呼び出し元が無い」と読める
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            &progress_begin_notification("loading"),
+            &no_references_response(1),
+            &progress_end_notification("loading"),
+            &references_response(2, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "読み込みが終わってから尋ね直した答えを返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_answered_after_work_that_began_and_ended_asks_again() {
+        // **作業が始まって終わるまでが、応答より先に届く**（実測で起きる）。
+        // 「今動いているか」だけを見ていると、読み込み前に計算された答えを
+        // 何も動いていない状態で受け取り、そのまま最終の答えにしてしまう
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            &progress_begin_notification("loading"),
+            &progress_end_notification("loading"),
+            &no_references_response(1),
+            &references_response(2, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "作業に触れていない答えを返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_interrupted_again_keeps_asking_until_no_work_is_running() {
+        // 2 通目を返している間に別の作業が始まる（monorepo が次のプロジェクトを読むなど）。
+        // 2 通目をそのまま返すと、まだ見ていないファイルの分が抜けた答えが最終になる
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading-first"),
+            &progress_begin_notification("loading-first"),
+            &no_references_response(1),
+            &progress_end_notification("loading-first"),
+            &progress_create_request(10, "loading-next"),
+            &progress_begin_notification("loading-next"),
+            &no_references_response(2),
+            &progress_end_notification("loading-next"),
+            &references_response(3, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "作業が動いていないときの答えを返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_that_never_settles_does_not_return_a_partial_answer() {
+        // 対照は上のテスト。最後の答えは 1 件持っているが、**その答えを返している間も
+        // 作業が動いている**。途中の答えを最終的なシグナルとして返すと、呼び出し元の
+        // 分布が実際より狭く出る
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading-first"),
+            &progress_begin_notification("loading-first"),
+            &no_references_response(1),
+            &progress_end_notification("loading-first"),
+            &progress_create_request(10, "loading-next"),
+            &progress_begin_notification("loading-next"),
+            &no_references_response(2),
+            &progress_end_notification("loading-next"),
+            &progress_create_request(11, "loading-more"),
+            &progress_begin_notification("loading-more"),
+            &references_response(3, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::ServerStillWorking),
+            "落ち着かなかったことを名前で返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_answered_while_work_prepared_earlier_ran_asks_again() {
+        // token を用意するのは前の問い合わせ（hover）の最中で、**始まりと終わりだけが
+        // 参照元を尋ねている間に届く**。用意した時点しか数えていないと、この並びで
+        // 「何も起きなかった」ように見え、読み込み中の答えをそのまま採る
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            &hover_response("function applyDiscount(invoice: Invoice): number"),
+            &progress_begin_notification("loading"),
+            &progress_end_notification("loading"),
+            &no_references_response(2),
+            &references_response(3, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+        connection
+            .hover(&document, position_after(5, "export function "))
+            .expect("hover に答えが返る");
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "前の問い合わせで用意された作業が動いたなら尋ね直す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_with_prepared_work_that_has_not_begun_does_not_settle() {
+        // token を用意する要求は前の問い合わせ（hover）の最中に届き、**始まりの通知が
+        // どの答えよりも後ろ**に並ぶ。用意されただけの作業を 1 度で忘れると、2 通目を
+        // 「何も起きていない」と読んで、始まる前に計算された答えを採る
+        let server_output = frames_of(&[
+            &progress_create_request(9, "prepared"),
+            &hover_response("function applyDiscount(invoice: Invoice): number"),
+            &no_references_response(2),
+            &no_references_response(3),
+            &no_references_response(4),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+        connection
+            .hover(&document, position_after(5, "export function "))
+            .expect("hover に答えが返る");
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::ServerStillWorking),
+            "用意されただけの作業が残るうちは落ち着いたことにしない: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_with_a_progress_that_never_begins_does_not_wait_for_it() {
+        // token を作ってよいかの要求は、作業が始まったことを意味しない。始まりの通知が
+        // 来ないまま捨てられた token を**待つ**と、終わりの来ない作業を待ち続ける。
+        // 待たずに尋ね直し、上限まで落ち着かなければ名前で返す
+        let server_output = frames_of(&[
+            &progress_create_request(9, "abandoned"),
+            &no_references_response(1),
+            &no_references_response(2),
+            &no_references_response(3),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::ServerStillWorking),
+            "始まらない作業を待ち続けずに返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_after_a_query_that_did_not_settle_can_answer_again() {
+        // 対照は上のテスト。**捨てられた token を次の問い合わせへ持ち越さない**。
+        // 持ち越すと、その接続では参照元を二度と受け取れなくなる
+        let server_output = frames_of(&[
+            &progress_create_request(9, "abandoned"),
+            &no_references_response(1),
+            &no_references_response(2),
+            &no_references_response(3),
+            &references_response(4, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+        connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "次の問い合わせは前の token に縛られない: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_answered_while_nothing_is_running_asks_only_once() {
+        // 対照は上のテスト。作業が始まっていなければ待つものが無いので、1 往復で終わる。
+        // 待ってしまうと、何も送ってこないサーバの前で止まる
+        let server_output = frames_of(&[&no_references_response(1)]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        let asked = sent_methods(&connection.writer)
+            .iter()
+            .filter(|method| *method == References::METHOD)
+            .count();
+        assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn test_references_accepts_the_progress_the_server_asks_to_create() {
+        // 断る（method not found）と、サーバは進捗を送ってこない。送ってこなければ
+        // 読み込み中かどうかが分からず、尋ね直す機会も無くなる
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            &progress_begin_notification("loading"),
+            &no_references_response(1),
+            &progress_end_notification("loading"),
+            &no_references_response(2),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        let sent = sent_payloads(&connection.writer);
+        let answered = sent
+            .iter()
+            .find(|payload| payload["id"] == json!(9))
+            .expect("進捗の要求に返している");
+        assert_eq!(answered["result"], Value::Null);
+    }
+
+    #[test]
+    fn test_references_with_a_progress_notification_it_cannot_read_reports_it() {
+        // 読めない進捗を黙って捨てると、終わりの来ない作業を待ち続ける
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"loading"}}"#,
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let error = connection
+            .references(&document, position_after(5, "export function "))
+            .expect_err("読み進められない");
+
+        assert!(matches!(error, ConnectionError::MalformedParams { .. }));
     }
 }
