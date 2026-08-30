@@ -11,10 +11,19 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
-use crate::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
+use crate::classification::signal::{
+    CallerDomainOverlap, ImportOverlap, MeasuredCallerDomains, Signals, StructuralSimilarity,
+    TypeSignatureMatch,
+};
 use crate::classification::{Classification, classification_of, is_structurally_similar};
 use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
 use crate::location::Location;
+use crate::lsp::{
+    Client, ClientError, DocumentError, ServerCommand, Session, SourceDocument, WorkspaceError,
+    WorkspaceRoot,
+};
+use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outcome_of};
+use crate::semantics::type_signature::{TypeSignatureOutcome, type_signature_outcome_of};
 use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks};
 use crate::syntax::module_distance::ModuleDistance;
 use crate::syntax::tree::{Grammar, ParseError, SyntaxTree};
@@ -92,6 +101,259 @@ fn import_overlap_of(chunk_a: &Chunk, chunk_b: &Chunk) -> ImportOverlap {
     };
 
     ImportOverlap::Measured(imports_a.jaccard(imports_b))
+}
+
+/// 候補ペアについて、Stage 1 と Stage 2 の両方を測った結果。
+///
+/// LSP サーバを使えなかった理由を一緒に持つ。シグナルの側は
+/// [`TypeSignatureMatch::LspUnusable`] としか言えないが、**利用者が環境を直すには、
+/// 見つからないのか握手に失敗したのかまで要る**
+/// (`rules/coding.md`「失敗を握りつぶして既定値へフォールバックしない」)。
+#[derive(Debug)]
+pub struct MeasuredPair {
+    signals: Signals,
+    semantics_error: Option<SemanticsError>,
+}
+
+impl MeasuredPair {
+    /// 判定に渡すシグナル。
+    pub fn signals(&self) -> &Signals {
+        &self.signals
+    }
+
+    /// Stage 2 を尋ねられなかった理由。尋ねられたときは `None`。
+    pub fn semantics_error(&self) -> Option<&SemanticsError> {
+        self.semantics_error.as_ref()
+    }
+}
+
+/// 候補ペアを Stage 1 で測り、Stage 2 を LSP に尋ねて重ねる。
+///
+/// `server` は起こす LSP サーバの指定。TypeScript なら [`ServerCommand::typescript`]。
+///
+/// **サーバを使えなくても失敗にしない。** Stage 1 のシグナルだけで判定でき、
+/// 尋ねられなかったことはシグナルと [`MeasuredPair::semantics_error`] に出る
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+pub fn measured_pair_of(chunk_a: &Chunk, chunk_b: &Chunk, server: &ServerCommand) -> MeasuredPair {
+    let signals = signals_of(chunk_a, chunk_b);
+
+    match semantics_of(chunk_a, chunk_b, server) {
+        Ok((type_signature_match, caller_domain_overlap)) => MeasuredPair {
+            signals: signals.with_semantics(type_signature_match, caller_domain_overlap),
+            semantics_error: None,
+        },
+        Err(cause) => MeasuredPair {
+            signals: signals.with_semantics(
+                TypeSignatureMatch::LspUnusable,
+                CallerDomainOverlap::LspUnusable,
+            ),
+            semantics_error: Some(cause),
+        },
+    }
+}
+
+/// サーバを起こし、2 つのチャンクぶんの Stage 2 のシグナルを尋ねて終わらせる。
+///
+/// 根は**候補ペアの 2 ファイルだけ**から決める。広げると、開かせないファイルまで
+/// 含む位置をサーバに見せることになる（`docs/dryguard-plan.md`「Stage 2: 意味情報収集」）。
+///
+/// # Errors
+///
+/// ファイルを読み直せない / 開かせる形にできない / 根を決められない /
+/// サーバを起こせない / 会話が失敗したとき。
+fn semantics_of(
+    chunk_a: &Chunk,
+    chunk_b: &Chunk,
+    server: &ServerCommand,
+) -> Result<(TypeSignatureMatch, CallerDomainOverlap), SemanticsError> {
+    let document_a = document_of(chunk_a)?;
+    let document_b = document_of(chunk_b)?;
+    let root =
+        WorkspaceRoot::enclosing(&[chunk_a.path().to_path_buf(), chunk_b.path().to_path_buf()])
+            .map_err(SemanticsError::Workspace)?;
+
+    let client = Client::start(server).map_err(SemanticsError::Client)?;
+    let mut session = client.handshake(&root).map_err(SemanticsError::Client)?;
+
+    let measured = measured_semantics_of(&mut session, chunk_a, &document_a, chunk_b, &document_b);
+    let shutdown = session.shutdown();
+
+    // 会話の失敗を先に出す。終了の失敗で上書きすると、何が起きたのかが入れ替わる。
+    let measured = measured?;
+
+    // **答えを受け取っていても、異常終了したサーバの答えは採らない。** 途中で
+    // 落ちたサーバは読み込みを終えていないことがあり、参照元が欠けて返る。
+    shutdown.map_err(SemanticsError::Client)?;
+
+    Ok(measured)
+}
+
+/// 開かせた 2 つのドキュメントに、hover と references を尋ねる。
+///
+/// hover を先に送るのは、**references が先の作業の落ち着きを待つ**ため
+/// （順序を入れ替えると、読み込み中に計算された答えを受け取る。
+/// `tests/semantics.rs` の `test_caller_domains_asked_after_a_type_signature_are_still_complete`）。
+fn measured_semantics_of(
+    session: &mut Session,
+    chunk_a: &Chunk,
+    document_a: &SourceDocument,
+    chunk_b: &Chunk,
+    document_b: &SourceDocument,
+) -> Result<(TypeSignatureMatch, CallerDomainOverlap), SemanticsError> {
+    session
+        .open_document(document_a)
+        .map_err(SemanticsError::Client)?;
+    session
+        .open_document(document_b)
+        .map_err(SemanticsError::Client)?;
+
+    let (Some(position_a), Some(position_b)) = (chunk_a.name_position(), chunk_b.name_position())
+    else {
+        // 名前が無ければ尋ねる位置が決まらない。**サーバの失敗ではない**ので、
+        // 取れなかったシグナルとして返す
+        return Ok((TypeSignatureMatch::NoName, CallerDomainOverlap::NoName));
+    };
+
+    let signature_a = type_signature_outcome_of(session, document_a, position_a)
+        .map_err(SemanticsError::Client)?;
+    let signature_b = type_signature_outcome_of(session, document_b, position_b)
+        .map_err(SemanticsError::Client)?;
+    let callers_a = caller_domains_outcome_of(session, document_a, position_a)
+        .map_err(SemanticsError::Client)?;
+    let callers_b = caller_domains_outcome_of(session, document_b, position_b)
+        .map_err(SemanticsError::Client)?;
+
+    Ok((
+        type_signature_match_of(&signature_a, &signature_b),
+        caller_domain_overlap_of(callers_a, callers_b),
+    ))
+}
+
+/// そのチャンクのファイルを、サーバに開かせる形にする。
+///
+/// チャンクの範囲だけでは足りない。**サーバは位置を行と列で受け取る**ので、
+/// ファイル全体と同じ中身を見せていないと別の場所を指すことになる。
+///
+/// # Errors
+///
+/// ファイルを読めない / 開かせる形にできないとき。
+fn document_of(chunk: &Chunk) -> Result<SourceDocument, SemanticsError> {
+    let text = source_of(chunk.path()).map_err(|cause| SemanticsError::SourceUnreadable {
+        path: chunk.path().to_path_buf(),
+        cause,
+    })?;
+
+    SourceDocument::new(chunk.path(), text).map_err(SemanticsError::Document)
+}
+
+/// 両側の型シグネチャから、単一化できるかのシグナルにする。
+///
+/// **片方でも正規化できていなければ「単一化不能」にしない。** 比べていないので、
+/// 取れなかった理由をそのまま出す（2 つとも取れていなければ、上の枝の理由）。
+fn type_signature_match_of(
+    signature_a: &TypeSignatureOutcome,
+    signature_b: &TypeSignatureOutcome,
+) -> TypeSignatureMatch {
+    match (signature_a, signature_b) {
+        (
+            TypeSignatureOutcome::Normalized(normalized_a),
+            TypeSignatureOutcome::Normalized(normalized_b),
+        ) => unifiable_match_of(normalized_a.is_unifiable_with(normalized_b)),
+        (TypeSignatureOutcome::NoTypeThere, _) | (_, TypeSignatureOutcome::NoTypeThere) => {
+            TypeSignatureMatch::NoTypeThere
+        }
+        (TypeSignatureOutcome::UnreadableHover, _) | (_, TypeSignatureOutcome::UnreadableHover) => {
+            TypeSignatureMatch::UnreadableHover
+        }
+        (TypeSignatureOutcome::UnreadableSignature, _)
+        | (_, TypeSignatureOutcome::UnreadableSignature) => TypeSignatureMatch::UnreadableSignature,
+        (TypeSignatureOutcome::HoverNotProvided, _)
+        | (_, TypeSignatureOutcome::HoverNotProvided) => TypeSignatureMatch::HoverNotProvided,
+    }
+}
+
+/// 単一化できたかどうかを、シグナルのバリアントにする。
+fn unifiable_match_of(unifiable: bool) -> TypeSignatureMatch {
+    if unifiable {
+        return TypeSignatureMatch::Unifiable;
+    }
+    TypeSignatureMatch::NotUnifiable
+}
+
+/// 両側の呼び出し元から、ドメインの重なりのシグナルにする。
+///
+/// **片方でも取れていなければ 0.00 にしない。** 重なりが無いのと材料が無いのは
+/// 別の話で、同じ値にすると判定も読者も区別できない。
+fn caller_domain_overlap_of(
+    callers_a: CallerDomainsOutcome,
+    callers_b: CallerDomainsOutcome,
+) -> CallerDomainOverlap {
+    match (callers_a, callers_b) {
+        (CallerDomainsOutcome::Counted(counted_a), CallerDomainsOutcome::Counted(counted_b)) => {
+            CallerDomainOverlap::Measured(MeasuredCallerDomains::new(counted_a, counted_b))
+        }
+        (CallerDomainsOutcome::NoReferences, _) | (_, CallerDomainsOutcome::NoReferences) => {
+            CallerDomainOverlap::NoReferences
+        }
+        (CallerDomainsOutcome::UnreadableReferences, _)
+        | (_, CallerDomainsOutcome::UnreadableReferences) => {
+            CallerDomainOverlap::UnreadableReferences
+        }
+        (CallerDomainsOutcome::ServerStillWorking, _)
+        | (_, CallerDomainsOutcome::ServerStillWorking) => CallerDomainOverlap::ServerStillWorking,
+        (CallerDomainsOutcome::ReferencesNotProvided, _)
+        | (_, CallerDomainsOutcome::ReferencesNotProvided) => {
+            CallerDomainOverlap::ReferencesNotProvided
+        }
+    }
+}
+
+/// Stage 2 を尋ねられなかった理由。
+///
+/// **1 つにまとめない。** サーバが入っていないのと、根を決められないのと、
+/// ファイルを読み直せないのとで**利用者が直す先が違う**
+/// (`rules/coding.md`「エラー型は原因ごとにバリアントを分ける」)。
+#[derive(Debug)]
+pub enum SemanticsError {
+    /// サーバに渡すためにファイルを読み直せなかった。
+    SourceUnreadable {
+        /// 読めなかったファイル。
+        path: PathBuf,
+        /// 読めなかった理由。
+        cause: io::Error,
+    },
+    /// サーバに開かせる形にできなかった。
+    Document(DocumentError),
+    /// ワークスペースの根を決められなかった。
+    Workspace(WorkspaceError),
+    /// サーバとのやりとりが失敗した。
+    Client(ClientError),
+}
+
+impl fmt::Display for SemanticsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceUnreadable { path, cause } => write!(
+                formatter,
+                "{} を LSP サーバへ渡すために読み直せません: {cause}",
+                path.display()
+            ),
+            Self::Document(cause) => write!(formatter, "{cause}"),
+            Self::Workspace(cause) => write!(formatter, "{cause}"),
+            Self::Client(cause) => write!(formatter, "{cause}"),
+        }
+    }
+}
+
+impl Error for SemanticsError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::SourceUnreadable { cause, .. } => Some(cause),
+            Self::Document(cause) => Some(cause),
+            Self::Workspace(cause) => Some(cause),
+            Self::Client(cause) => Some(cause),
+        }
+    }
 }
 
 /// コードベース全体を走査して、候補ペアを判定する。
