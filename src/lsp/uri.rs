@@ -14,6 +14,14 @@ use lsp_types::Uri;
 /// `file:` URI の、根より前の部分。
 const FILE_SCHEME_PREFIX: &str = "file://";
 
+/// `file:` URI のスキーム。
+const FILE_SCHEME: &str = "file";
+
+/// URI の path が `/` で始まるとき、その `/` が表すディレクトリ。
+///
+/// ここに来る URI は authority もドライブ文字も持たないので、根はこれだけ。
+const ROOT_DIRECTORY: &str = "/";
+
 /// URI の path に符号化せずに置ける記号（RFC 3986 の pchar から `%` を除いたもの）。
 ///
 /// **符号化しすぎない。** ここを狭めて `@` や `+` まで `%40` / `%2B` にすると、
@@ -111,6 +119,71 @@ pub(super) fn file_uri_of(path: &Path) -> Result<Uri, PathUriError> {
     }
 
     Uri::from_str(&text).map_err(|_| PathUriError::Malformed { text })
+}
+
+/// `file:` URI が指すパス。[`file_uri_of`] の逆。
+///
+/// 渡すのはサーバが応答で返した URI（`references` が返す参照元など）。要素ごとに
+/// `%XX` を戻し、区切りでつなぐ。**綴りのまま扱わない**のは、符号化された名前が
+/// そのままディレクトリ名になるため（`my%20project` という名前のディレクトリを指す）。
+///
+/// # Errors
+///
+/// `file:` 以外のスキームのとき（サーバは開いていないバッファを `untitled:` で指す）、
+/// authority を持つとき（UNC）、Windows のドライブ文字を含むとき、
+/// `%XX` を戻した並びが UTF-8 として読めないとき。
+///
+/// **Why not（UNC とドライブ文字をパスに直す）**: どちらも Windows のパスで、
+/// **この環境では正しく直せたかを確かめられない**（Linux の `PathBuf` は
+/// `/C:/repo` を 1 つのディレクトリ名として持つ）。間違ったパスを返すより、
+/// 綴れないことを名前で返す側に寄せる（`disk_letter_of` と同じ判断。Issue #112）。
+pub(super) fn path_of(uri: &Uri) -> Result<PathBuf, UriPathError> {
+    let spells_a_file = uri
+        .scheme()
+        .is_some_and(|scheme| scheme.eq_lowercase(FILE_SCHEME));
+    if !spells_a_file {
+        return Err(UriPathError::NotAFileUri { uri: text_of(uri) });
+    }
+
+    let names_a_host = uri
+        .authority()
+        .is_some_and(|authority| !authority.as_str().is_empty());
+    if names_a_host {
+        return Err(UriPathError::HasAuthority { uri: text_of(uri) });
+    }
+
+    let mut path = PathBuf::from(ROOT_DIRECTORY);
+
+    for segment in uri.path().segments() {
+        // 末尾の `/` と `//` は空の要素として現れる。要素として置くと、同じファイルが
+        // 2 通りの綴りで届く。
+        if segment.as_str().is_empty() {
+            continue;
+        }
+
+        let Ok(name) = segment.decode().into_string() else {
+            return Err(UriPathError::NotUtf8 { uri: text_of(uri) });
+        };
+        if is_drive_letter(&name) {
+            return Err(UriPathError::DriveLetter { uri: text_of(uri) });
+        }
+
+        path.push(name.as_ref());
+    }
+
+    Ok(path)
+}
+
+/// Windows のドライブ文字を表す要素か（`C:`）。
+///
+/// [`file_uri_of`] が前置きをこの綴りで置くので、逆向きでも同じ形で見つかる。
+fn is_drive_letter(name: &str) -> bool {
+    let mut bytes = name.bytes();
+
+    let starts_with_a_letter = bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic());
+    let ends_with_a_colon = bytes.next() == Some(b':');
+
+    starts_with_a_letter && ends_with_a_colon && bytes.next().is_none()
 }
 
 /// パスの要素 1 つ分を、URI に置ける形にする。
@@ -217,6 +290,63 @@ impl fmt::Display for PathUriError {
 }
 
 impl Error for PathUriError {}
+
+/// URI をパスにできなかった理由。
+///
+/// [`PathUriError`] と向きが逆。**1 つにまとめない**のは、綴れないパスを渡された話と、
+/// サーバが返した URI を読めない話で**直す先が違う**ため（前者はこちらの入力、
+/// 後者はサーバか dryguard の穴）。
+#[derive(Debug)]
+pub enum UriPathError {
+    /// `file:` 以外のスキームを持つ。
+    NotAFileUri {
+        /// 読めなかった URI。
+        uri: String,
+    },
+    /// authority（ホスト名）を持つ。UNC はまだ扱えない。
+    HasAuthority {
+        /// 読めなかった URI。
+        uri: String,
+    },
+    /// Windows のドライブ文字を含む。
+    DriveLetter {
+        /// 読めなかった URI。
+        uri: String,
+    },
+    /// `%XX` を戻した並びが UTF-8 として読めない。
+    NotUtf8 {
+        /// 読めなかった URI。
+        uri: String,
+    },
+}
+
+impl fmt::Display for UriPathError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotAFileUri { uri } => {
+                write!(formatter, "ファイルを指す URI ではありません: {uri}")
+            }
+            Self::HasAuthority { uri } => write!(
+                formatter,
+                "ホスト名を持つ URI はまだパスにできません（UNC）: {uri}"
+            ),
+            Self::DriveLetter { uri } => write!(
+                formatter,
+                "Windows のドライブ文字を含む URI はまだパスにできません: {uri}"
+            ),
+            Self::NotUtf8 { uri } => {
+                write!(formatter, "URI が指すパスを UTF-8 として読めません: {uri}")
+            }
+        }
+    }
+}
+
+impl Error for UriPathError {}
+
+/// 読めなかった URI を、失敗に残す綴りにする。
+fn text_of(uri: &Uri) -> String {
+    uri.as_str().to_owned()
+}
 
 #[cfg(test)]
 mod tests {
@@ -344,5 +474,89 @@ mod tests {
         let error = absolute_path_of(Path::new("")).expect_err("絶対パスにできない");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// サーバが返す形の URI。
+    fn uri(text: &str) -> Uri {
+        Uri::from_str(text).expect("テストが渡す文字列は URI として読める")
+    }
+
+    #[test]
+    fn test_path_of_a_file_uri_is_the_path_it_spells() {
+        let path = path_of(&uri("file:///home/user/src/pad.ts")).expect("パスに戻せる");
+
+        assert_eq!(path, Path::new("/home/user/src/pad.ts"));
+    }
+
+    #[test]
+    fn test_path_of_a_uri_with_an_encoded_space_decodes_it() {
+        // 対照は上のテスト。符号化された要素を含む URI を、綴りのまま受け取ると
+        // `my%20project` という名前のディレクトリを指す
+        let path = path_of(&uri("file:///home/user/my%20project/pad.ts")).expect("パスに戻せる");
+
+        assert_eq!(path, Path::new("/home/user/my project/pad.ts"));
+    }
+
+    #[test]
+    fn test_path_of_a_uri_outside_ascii_decodes_each_utf8_byte() {
+        let path =
+            path_of(&uri("file:///home/user/%E6%97%A5%E6%9C%AC/pad.ts")).expect("パスに戻せる");
+
+        assert_eq!(path, Path::new("/home/user/日本/pad.ts"));
+    }
+
+    #[test]
+    fn test_path_of_a_uri_a_path_was_turned_into_returns_that_path() {
+        // 往復させる。片方だけの綴り方を変えると、同じファイルが別物として突き合わされる
+        let original = Path::new("/home/user/my project/日本/pad.ts");
+
+        let path = path_of(&file_uri_of(original).expect("URI にできる")).expect("パスに戻せる");
+
+        assert_eq!(path, original);
+    }
+
+    #[test]
+    fn test_path_of_a_uri_with_a_trailing_separator_does_not_keep_it() {
+        // 末尾の `/` は空の要素として現れる。要素として置くと、同じディレクトリが
+        // 2 通りの綴りで届く
+        let path = path_of(&uri("file:///home/user/src/")).expect("パスに戻せる");
+
+        assert_eq!(path, Path::new("/home/user/src"));
+    }
+
+    #[test]
+    fn test_path_of_a_uri_with_another_scheme_reports_it() {
+        // サーバは開いていないバッファを `untitled:` で指すことがある。
+        // ファイルのパスとして読むと、実在しないファイルを指す
+        let error = path_of(&uri("untitled:Untitled-1")).expect_err("パスに戻せない");
+
+        assert!(matches!(error, UriPathError::NotAFileUri { .. }));
+    }
+
+    #[test]
+    fn test_path_of_a_uri_naming_a_host_reports_it() {
+        // `file://server/share/pad.ts` は UNC。authority を落とすと、
+        // ネットワーク共有上のファイルをローカルの `/share/pad.ts` として指す
+        let error = path_of(&uri("file://server/share/pad.ts")).expect_err("パスに戻せない");
+
+        assert!(matches!(error, UriPathError::HasAuthority { .. }));
+    }
+
+    #[test]
+    fn test_path_of_a_uri_with_a_drive_letter_reports_it() {
+        // `file:///C:/repo/pad.ts` をそのまま組み立てると `/C:/repo/pad.ts` になり、
+        // Windows でも Linux でも存在しないファイルを指す。**間違ったパスを返すより
+        // 綴れないことを名前で返す**（Windows の扱いは Issue #112）
+        let error = path_of(&uri("file:///C:/repo/pad.ts")).expect_err("パスに戻せない");
+
+        assert!(matches!(error, UriPathError::DriveLetter { .. }));
+    }
+
+    #[test]
+    fn test_path_of_a_uri_encoding_bytes_that_are_not_utf8_reports_it() {
+        // 対照は %E6%97%A5 のテスト。そちらは UTF-8 として読める並びで、こちらは読めない
+        let error = path_of(&uri("file:///home/user/%FF.ts")).expect_err("パスに戻せない");
+
+        assert!(matches!(error, UriPathError::NotUtf8 { .. }));
     }
 }

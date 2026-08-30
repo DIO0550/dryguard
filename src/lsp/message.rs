@@ -121,6 +121,21 @@ pub fn notification_payload_of(method: &str, params: Option<Value>) -> String {
     message.to_string()
 }
 
+/// サーバからの要求に「受け取った」とだけ返す payload。
+///
+/// **中身を持たない応答が要る相手がいる。** `window/workDoneProgress/create` は
+/// 進捗を作ってよいかを尋ねる要求で、返す値そのものは無い（仕様上 result は null）。
+/// [`method_not_found_payload_of`] で断ると、サーバは進捗を送ってこない。
+pub fn null_result_payload_of(id: &ServerRequestId) -> String {
+    let message = json!({
+        "jsonrpc": JSON_RPC_VERSION,
+        "id": id.to_json(),
+        "result": Value::Null,
+    });
+
+    message.to_string()
+}
+
 /// サーバからの要求に「そのメソッドは支えていない」と返す payload。
 ///
 /// **支えていないからこそ返す。** 黙って捨てると、応答を待つサーバはそこで止まり、
@@ -158,11 +173,15 @@ pub enum ServerMessage {
         id: ServerRequestId,
         /// 要求されたメソッド名。
         method: String,
+        /// 要求に添えられた値。無ければ `None`。
+        params: Option<Value>,
     },
     /// サーバからの通知。
     Notification {
         /// 通知のメソッド名。
         method: String,
+        /// 通知に添えられた値。無ければ `None`。
+        params: Option<Value>,
     },
 }
 
@@ -186,9 +205,11 @@ impl ServerMessage {
             (Some(id), Some(method)) => Ok(Self::Request {
                 id: server_request_id_of(id)?,
                 method: method.to_owned(),
+                params: message.get("params").cloned(),
             }),
             (None, Some(method)) => Ok(Self::Notification {
                 method: method.to_owned(),
+                params: message.get("params").cloned(),
             }),
             (None, None) => Err(MessageError::Unrecognized),
         }
@@ -428,6 +449,23 @@ mod tests {
             message,
             ServerMessage::Notification {
                 method: "window/logMessage".to_owned(),
+                params: Some(json!({"type": 3})),
+            }
+        );
+    }
+
+    #[test]
+    fn test_server_message_from_a_notification_keeps_the_params_it_carries() {
+        // 進捗の終わりは params の中にしか無い。落とすと、どの作業が終わったのかが消える
+        let payload = r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"tk","value":{"kind":"end"}}}"#;
+
+        let message = ServerMessage::from_json(payload).expect("解釈できる");
+
+        assert_eq!(
+            message,
+            ServerMessage::Notification {
+                method: "$/progress".to_owned(),
+                params: Some(json!({"token": "tk", "value": {"kind": "end"}})),
             }
         );
     }
@@ -444,6 +482,7 @@ mod tests {
             ServerMessage::Request {
                 id: ServerRequestId::Number(7),
                 method: "client/registerCapability".to_owned(),
+                params: None,
             }
         );
     }
@@ -460,6 +499,7 @@ mod tests {
             ServerMessage::Request {
                 id: ServerRequestId::Text("req-1".to_owned()),
                 method: "window/showMessageRequest".to_owned(),
+                params: None,
             }
         );
     }
@@ -471,6 +511,17 @@ mod tests {
         let error = ServerMessage::from_json(payload).expect_err("解釈できない");
 
         assert!(matches!(error, MessageError::RequestIdNotSupported { .. }));
+    }
+
+    #[test]
+    fn test_null_result_payload_of_answers_with_the_id_it_was_given() {
+        // 進捗を作ってよいかの要求への返事。断ると（method not found）、
+        // サーバは進捗を送ってこない
+        let payload = null_result_payload_of(&ServerRequestId::Text("tk-1".to_owned()));
+
+        let message: Value = serde_json::from_str(&payload).expect("JSON として読める");
+        assert_eq!(message["id"], json!("tk-1"));
+        assert_eq!(message["result"], Value::Null);
     }
 
     #[test]
