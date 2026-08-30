@@ -150,9 +150,12 @@ fn caller_domains_of(session: &mut Session, chunk: &Chunk) -> CallerDomains {
             chunk.path().display()
         );
     };
-    let Ok(ReferencesOutcome::Answered(reference_paths)) = session.references(&document, position)
-    else {
-        panic!("名前の位置には参照元が返る: {}", chunk.path().display());
+    let outcome = session.references(&document, position);
+    let Ok(ReferencesOutcome::Answered(reference_paths)) = outcome else {
+        panic!(
+            "名前の位置には参照元が返る: {} ({outcome:?})",
+            chunk.path().display()
+        );
     };
     let Some(caller_domains) = CallerDomains::from_reference_paths(&reference_paths) else {
         panic!("返った参照元は 1 件以上ある: {reference_paths:?}");

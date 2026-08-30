@@ -34,6 +34,12 @@ pub enum ReferencesOutcome {
         /// 読めなかった理由。どの URI で落ちたかを持つ。
         cause: UriPathError,
     },
+    /// 尋ねるたびにサーバが作業を始めるので、落ち着いた答えを受け取れなかった。
+    ///
+    /// **途中の答えを最終的なシグナルとして返さない。** 作業中の答えは
+    /// まだ見ていないファイルの分が抜けており、呼び出し元の分布が実際より狭く出る
+    /// （`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」）。
+    ServerStillWorking,
     /// サーバが references を提供していない。要求は送っていない。
     NotSupported,
 }

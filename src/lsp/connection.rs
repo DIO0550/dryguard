@@ -37,6 +37,13 @@ use crate::source_position::SourcePosition;
 /// `initialize` でサーバに名乗る名前。
 const CLIENT_NAME: &str = "dryguard";
 
+/// references を尋ねる回数の上限。
+///
+/// 1 回目は読み込みの途中に当たりうる。2 回目はその読み込みが終わってからになる。
+/// **3 回目でも作業に触れているなら、尋ねるたびに始まっている**ので、待っても
+/// 答えは落ち着かない（`ReferencesOutcome::ServerStillWorking`）。
+const REFERENCES_ATTEMPTS: usize = 3;
+
 /// LSP サーバとの往復。
 ///
 /// 1 本のストリームを要求と応答が行き来するので、id の発番と対応付けをここが持つ。
@@ -48,6 +55,7 @@ pub struct Connection<R: BufRead, W: Write> {
     next_id: RequestId,
     open_documents: BTreeSet<Uri>,
     running_progress: Vec<ProgressToken>,
+    started_progress_count: usize,
 }
 
 impl<R: BufRead, W: Write> Connection<R, W> {
@@ -59,6 +67,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             next_id: RequestId::first(),
             open_documents: BTreeSet::new(),
             running_progress: Vec::new(),
+            started_progress_count: 0,
         }
     }
 
@@ -242,6 +251,10 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     /// 呼び出し元が 1 件も無いチャンクでも自分の宣言だけが返り、**自分のドメインに
     /// 呼ばれている**ように読める。
     ///
+    /// 答えを採るのは**サーバの作業が動いていないとき**だけ。動いている間の答えは
+    /// まだ見ていないファイルの分が抜けており、それを最終的なシグナルとして扱うと、
+    /// 呼び出し元の分布が実際より狭く出る。
+    ///
     /// # Errors
     ///
     /// そのドキュメントを開かせていないとき、パラメータを JSON にできないとき、
@@ -275,17 +288,31 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         let params =
             serde_json::to_value(params).map_err(not_serializable_error_of(References::METHOD))?;
 
-        let answered = self.ask_references_once(params.clone())?;
-        if self.running_progress.is_empty() {
-            return Ok(answered);
-        }
-
         // 読み込み中に返ってきた答えは、**サーバがまだ見ていないファイルの分が抜けている**
         // （呼び出し元は呼び出し先を import する側なので、開かせたファイルからは辿れない）。
-        // 進捗が終わってから尋ね直す。
-        self.wait_for_running_progress()?;
+        // 作業が終わってから尋ね直し、**作業に触れていない答えだけを採る**。
+        let mut attempts_left = REFERENCES_ATTEMPTS;
 
-        self.ask_references_once(params)
+        while attempts_left > 0 {
+            let started_before = self.started_progress_count;
+            let answered = self.ask_references_once(params.clone())?;
+
+            // 「今動いているか」だけでは足りない。**尋ねている間に始まって終わった作業**が
+            // あると、読み込み前に計算された答えを受け取りながら、手元では何も動いて
+            // いないように見える（実測: 進捗の終わりが応答より先に届き、答えは 0 件）。
+            let started_while_answering = self.started_progress_count != started_before;
+            let untouched_by_work = !started_while_answering && self.running_progress.is_empty();
+            if untouched_by_work {
+                return Ok(answered);
+            }
+
+            attempts_left -= 1;
+            if attempts_left > 0 {
+                self.wait_for_running_progress()?;
+            }
+        }
+
+        Ok(ReferencesOutcome::ServerStillWorking)
     }
 
     /// references を 1 往復だけ尋ねる。
@@ -435,6 +462,9 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         // 受けてから覚える。返せていない進捗を待つと、終わりの来ない作業を待つことになる。
         self.send(&message::null_result_payload_of(id))?;
         self.running_progress.push(created.token);
+        // 終わった分も数に残す。**始まって終わった作業**を見落とさないため
+        // （`running_progress` は終わると空に戻る）。
+        self.started_progress_count = self.started_progress_count.saturating_add(1);
 
         Ok(())
     }
@@ -1162,6 +1192,84 @@ mod tests {
         assert!(
             matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
             "読み込みが終わってから尋ね直した答えを返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_answered_after_work_that_began_and_ended_asks_again() {
+        // **作業が始まって終わるまでが、応答より先に届く**（実測で起きる）。
+        // 「今動いているか」だけを見ていると、読み込み前に計算された答えを
+        // 何も動いていない状態で受け取り、そのまま最終の答えにしてしまう
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            &progress_end_notification("loading"),
+            &no_references_response(1),
+            &references_response(2, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "作業に触れていない答えを返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_interrupted_again_keeps_asking_until_no_work_is_running() {
+        // 2 通目を返している間に別の作業が始まる（monorepo が次のプロジェクトを読むなど）。
+        // 2 通目をそのまま返すと、まだ見ていないファイルの分が抜けた答えが最終になる
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading-first"),
+            &no_references_response(1),
+            &progress_end_notification("loading-first"),
+            &progress_create_request(10, "loading-next"),
+            &no_references_response(2),
+            &progress_end_notification("loading-next"),
+            &references_response(3, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "作業が動いていないときの答えを返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_that_never_settles_does_not_return_a_partial_answer() {
+        // 対照は上のテスト。最後の答えは 1 件持っているが、**その答えを返している間も
+        // 作業が動いている**。途中の答えを最終的なシグナルとして返すと、呼び出し元の
+        // 分布が実際より狭く出る
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading-first"),
+            &no_references_response(1),
+            &progress_end_notification("loading-first"),
+            &progress_create_request(10, "loading-next"),
+            &no_references_response(2),
+            &progress_end_notification("loading-next"),
+            &progress_create_request(11, "loading-more"),
+            &references_response(3, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::ServerStillWorking),
+            "落ち着かなかったことを名前で返す: {outcome:?}"
         );
     }
 
