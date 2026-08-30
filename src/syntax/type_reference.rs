@@ -35,6 +35,11 @@ const RETURN_TYPE_FIELD: &str = "return_type";
 /// ノードの種別も同じ綴りなので、[`nodes_of_kind`] へもこれを渡す。
 const TYPE_PARAMETERS_FIELD: &str = "type_parameters";
 
+/// マップ型の束縛を表すノードの種別（`{ [K in "a"]: K }` の `K in "a"`）。
+///
+/// 型変数の宣言と同じく、**その綴りはこのシグネチャの中でだけ意味を持つ**。
+const MAPPED_TYPE_CLAUSE_KIND: &str = "mapped_type_clause";
+
 /// 名前を載せるフィールド。
 const NAME_FIELD: &str = "name";
 
@@ -74,7 +79,7 @@ impl TypeReference {
 /// **空は「書かれていない」。** キーワードの型だけで書かれたシグネチャがこれで、
 /// 集められなかったという状態は無い（構文木からは必ず採れる）ので `Option` にしない。
 pub(super) fn type_references_of(node: Node<'_>, source: &str) -> Vec<TypeReference> {
-    let declared = declared_type_parameter_names_of(node, source);
+    let declared = bound_type_names_of(node, source);
     let mut references: Vec<TypeReference> = Vec::new();
 
     for annotated in annotated_nodes_of(node) {
@@ -170,36 +175,63 @@ fn is_qualified_leaf(node: Node<'_>) -> bool {
         .is_some_and(|parent| parent.kind() == NESTED_TYPE_IDENTIFIER_KIND)
 }
 
-/// そのシグネチャの中で宣言された型変数の名前。宣言が無ければ空。
+/// そのシグネチャの中で束縛された型の名前。束縛が無ければ空。
 ///
-/// **Why（宣言した名前を尋ねない）**: 型変数の宣言はチャンクごとに別のものなので、
+/// 束縛は 2 通りある。型変数の宣言（`<T>`）と、マップ型の束縛（`[K in "a"]`）。
+/// **どちらもその綴りはこのシグネチャの中でだけ意味を持つ**ので、解決の対象にしない。
+///
+/// **Why（束縛された名前を尋ねない）**: 束縛はチャンクごとに別のものなので、
 /// 解決するとファイルごとに違う結果になる。`pickFirst<T>` と `head<U>` が
 /// **単一化できなくなる**（正規化はこの 2 つを同じ形に直す前提で書かれている）。
 ///
-/// **入れ子の宣言も見る。** `(a: T, cb: <T>(x: T) => T)` のように内側が外側の綴りを
-/// 覆うと、外側だけを解決した差し込みが**内側の宣言まで書き換える**
+/// **入れ子の束縛も見る。** `(a: T, cb: <T>(x: T) => T)` のように内側が外側の綴りを
+/// 覆うと、外側だけを解決した差し込みが**内側の束縛まで書き換える**
 /// （`<number>(x: number) => number` という綴りになる）。綴りが同じ名前は
 /// まとめて尋ねない側に置く。
 ///
-/// **Why not（宣言ごとに区別する）**: 区別するには型名を綴りではなく位置で持ち回る
+/// **Why not（束縛ごとに区別する）**: 区別するには型名を綴りではなく位置で持ち回る
 /// ことになり、差し込みも位置で行う形へ変わる。倒れる向きは偽陰性（外側の
 /// エイリアスが解決されないだけ）なので、綴りが壊れないほうを採った。
 ///
-/// 制約に書かれた型名（`<T extends Amount>` の `Amount`）は宣言された名前ではないので、
-/// 集める側に残る。
-fn declared_type_parameter_names_of(node: Node<'_>, source: &str) -> BTreeSet<String> {
-    annotated_nodes_of(node)
-        .into_iter()
-        .flat_map(|annotated| nodes_of_kind(annotated, TYPE_PARAMETERS_FIELD))
-        .flat_map(|declarations| {
+/// 制約に書かれた型名（`<T extends Amount>` の `Amount`、`[K in Keys]` の `Keys`）は
+/// 束縛された名前ではないので、集める側に残る。
+fn bound_type_names_of(node: Node<'_>, source: &str) -> BTreeSet<String> {
+    let mut bound = BTreeSet::new();
+
+    for annotated in annotated_nodes_of(node) {
+        for declarations in nodes_of_kind(annotated, TYPE_PARAMETERS_FIELD) {
             let mut cursor = declarations.walk();
             let declared: Vec<Node<'_>> = declarations.named_children(&mut cursor).collect();
-            declared
-        })
-        .filter_map(|parameter| parameter.child_by_field_name(NAME_FIELD))
-        .filter_map(|name| source.get(name.byte_range()))
-        .map(str::to_owned)
-        .collect()
+            for parameter in declared {
+                push_name(
+                    &mut bound,
+                    parameter.child_by_field_name(NAME_FIELD),
+                    source,
+                );
+            }
+        }
+
+        for clause in nodes_of_kind(annotated, MAPPED_TYPE_CLAUSE_KIND) {
+            // 束縛されるのは先頭の型名だけ。`[K in Keys]` の `Keys` は制約なので残す。
+            let mut cursor = clause.walk();
+            let binder = clause
+                .named_children(&mut cursor)
+                .next()
+                .filter(|child| child.kind() == TYPE_IDENTIFIER_KIND);
+            push_name(&mut bound, binder, source);
+        }
+    }
+
+    bound
+}
+
+/// そのノードが覆う綴りを、束縛された名前として書き足す。ノードが無ければ何もしない。
+fn push_name(bound: &mut BTreeSet<String>, node: Option<Node<'_>>, source: &str) {
+    let Some(name) = node.and_then(|node| source.get(node.byte_range())) else {
+        return;
+    };
+
+    bound.insert(name.to_owned());
 }
 
 /// 型名のノード 1 つを、綴りと位置の組にする。

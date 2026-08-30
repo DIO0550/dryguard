@@ -1036,6 +1036,29 @@ function broken() {
     }
 
     #[test]
+    fn test_chunk_type_references_leave_out_a_name_bound_by_a_mapped_type() {
+        // `[K in "a"]` の `K` はこのシグネチャの中でだけ意味を持つ。外側の同じ綴りを
+        // 解決すると、差し込みが `{ [string in "a"]: string }` を作る。
+        // 対照として、束縛されていない型名を 1 つ置く
+        let mapped = "export function pick(x: K, m: { [K in \"a\"]: K }, rate: Rate): void {\n  return;\n}\n";
+
+        let chunk = chunk_at(mapped, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Rate"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_keep_the_constraint_of_a_mapped_type() {
+        // 対照は上のテスト。`[K in Keys]` の `Keys` は制約であって束縛ではない
+        let constrained =
+            "export function pick(m: { [K in Keys]: number }): void {\n  return;\n}\n";
+
+        let chunk = chunk_at(constrained, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Keys"]);
+    }
+
+    #[test]
     fn test_chunk_type_references_name_the_same_type_only_once() {
         // 尋ねる先は綴りごとに 1 箇所でよい。畳まないと同じ名前へ 2 度送る
         let repeated =

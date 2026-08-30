@@ -528,14 +528,21 @@ fn grouped_spelling_of(spelling: &str, placement: &Placement<'_>) -> String {
 
 /// その型の綴りが、括弧の外で組み合わさっているか。
 ///
-/// 深さ 0 だけを見るのは、`Map<string, A | B>` のように**括弧の中で組み合わさって
-/// いる型は、それ自体が 1 つのまとまりとして置ける**ため。
+/// **深さ 0 に空白があれば組み合わさっている。** 前置きの型演算子（`keyof Model`）や
+/// 条件型（`A extends B ? C : D`）は演算子の一覧に載らないが、どれも語を空白で
+/// つないだ形になる。演算子を列挙すると**漏れた 1 つが黙って偽陽性を作る**。
+///
+/// 深さ 0 だけを見るのは、`Map<string, A | B>` や `{ id: string }` のように
+/// **括弧の中で組み合わさっている型は、それ自体が 1 つのまとまりとして置ける**ため。
+/// 既に括られている綴り（`(A | B)`）も深さ 0 には何も無いので、二重に括らない。
 fn is_compound_type(spelling: &str) -> bool {
     let scan = SignatureScan::new(spelling);
-
-    UNGROUPED_TYPE_OPERATORS
+    let joined_by_space = scan.has_top_level_whitespace();
+    let joined_by_operator = UNGROUPED_TYPE_OPERATORS
         .iter()
-        .any(|operator| scan.top_level_index_of(*operator).is_some())
+        .any(|operator| scan.top_level_index_of(*operator).is_some());
+
+    joined_by_space || joined_by_operator
 }
 
 /// 引用符の中にいるかどうかを、文字を 1 つずつ読みながら追う。
@@ -657,6 +664,13 @@ impl<'text> SignatureScan<'text> {
             .iter()
             .find(|scanned| scanned.character == separator && scanned.depth == 0)
             .map(|scanned| scanned.index)
+    }
+
+    /// 深さ 0 に空白があるか。
+    fn has_top_level_whitespace(&self) -> bool {
+        self.characters
+            .iter()
+            .any(|scanned| scanned.depth == 0 && scanned.character.is_whitespace())
     }
 
     /// 深さ 0 にある最後の `target` の位置。無ければ `None`。
@@ -1571,6 +1585,45 @@ mod tests {
         assert!(
             aliased.is_unifiable_with(&signature("function other(a: string, b: typeof ID): void"))
         );
+    }
+
+    #[test]
+    fn test_an_opened_alias_whose_body_starts_with_a_type_operator_is_wrapped() {
+        // `type Keys = keyof Model` を `Keys[]` の位置へそのまま差し込むと
+        // `keyof Model[]` になり、TypeScript は `keyof (Model[])` と読む
+        let aliased = signature_with(
+            "function pick(keys: Keys[]): void",
+            &resolving("Keys", "keyof Model"),
+        );
+
+        assert!(
+            aliased.is_unifiable_with(&signature("function other(keys: (keyof Model)[]): void"))
+        );
+    }
+
+    #[test]
+    fn test_an_opened_alias_whose_body_starts_with_a_type_operator_is_not_read_as_an_array_of_it() {
+        // 対照は上のテスト。括らない読み方と重ならないことを見る（偽陽性の側）
+        let aliased = signature_with(
+            "function pick(keys: Keys[]): void",
+            &resolving("Keys", "keyof Model"),
+        );
+
+        assert!(
+            !aliased.is_unifiable_with(&signature("function other(keys: keyof Model[]): void"))
+        );
+    }
+
+    #[test]
+    fn test_an_already_grouped_alias_body_is_not_wrapped_again() {
+        // 括弧の中で組み合わさっている綴りは、それ自体が 1 つのまとまり。
+        // 二重に括ると書き下した綴りと別物になる
+        let aliased = signature_with(
+            "function pick(value: Grouped[]): void",
+            &resolving("Grouped", "(A | B)"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature("function other(value: (A | B)[]): void")));
     }
 
     #[test]
