@@ -10,8 +10,8 @@
 use crate::classification::Classification;
 use crate::classification::reason::{Lean, Reason};
 use crate::classification::signal::{
-    CallerDomainOverlap, ImportOverlap, MeasuredCallerDomains, StructuralSimilarity,
-    TypeSignatureMatch,
+    CallerDomainOverlap, ImportOverlap, MeasuredCallerDomains, SemanticsUnavailable,
+    StructuralSimilarity, TypeSignatureMatch,
 };
 use crate::classification::verdict::Verdict;
 use crate::location::Location;
@@ -213,8 +213,7 @@ fn type_signature_text_of(signal: TypeSignatureMatch) -> Option<&'static str> {
     match signal {
         TypeSignatureMatch::Unifiable => Some("単一化可能"),
         TypeSignatureMatch::NotUnifiable => Some("単一化不能"),
-        TypeSignatureMatch::NotAsked => None,
-        TypeSignatureMatch::LspUnusable => Some("測れない (LSP サーバを使えない)"),
+        TypeSignatureMatch::Unavailable { reason } => semantics_unavailable_text_of(reason),
         TypeSignatureMatch::NoName => Some("測れない (チャンクが名前を持たない)"),
         TypeSignatureMatch::NoTypeThere => Some("測れない (サーバがその位置に型を持たない)"),
         TypeSignatureMatch::UnreadableHover => Some("測れない (hover の応答を読めない)"),
@@ -231,8 +230,11 @@ fn caller_domain_overlap_text_of(signal: &CallerDomainOverlap) -> Option<String>
         CallerDomainOverlap::Measured(measured) => {
             return Some(measured_caller_domains_text_of(measured));
         }
-        CallerDomainOverlap::NotAsked => return None,
-        CallerDomainOverlap::LspUnusable => "LSP サーバを使えない",
+        CallerDomainOverlap::Unavailable { reason } => {
+            let unavailable = semantics_unavailable_text_of(*reason)?;
+
+            return Some(format!("呼び出し元ドメインの重なりを{unavailable}"));
+        }
         CallerDomainOverlap::NoName => "チャンクが名前を持たない",
         CallerDomainOverlap::NoReferences => "参照元が 1 件も返らない",
         CallerDomainOverlap::UnreadableReferences => "読めない URI が混じっている",
@@ -243,6 +245,28 @@ fn caller_domain_overlap_text_of(signal: &CallerDomainOverlap) -> Option<String>
     Some(format!(
         "呼び出し元ドメインの重なりを測れない ({unmeasured})"
     ))
+}
+
+/// Stage 2 へ届かなかったことを表す文。
+///
+/// **尋ねていないだけなら `None`** を返し、行ごと出さない。空欄やダミーで埋めると、
+/// 読む側は測った結果としてそれを読む
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+///
+/// 頭を「測れない」「尋ねていない」に揃えてあるのは、呼び出し元ドメイン側が
+/// `…の重なりを` の後ろに続けて使うため。
+fn semantics_unavailable_text_of(reason: SemanticsUnavailable) -> Option<&'static str> {
+    match reason {
+        SemanticsUnavailable::NotAsked => None,
+        SemanticsUnavailable::NotACandidate => {
+            Some("尋ねていない (構造が似ておらず候補ペアではない)")
+        }
+        SemanticsUnavailable::DocumentUnopenable => Some("測れない (サーバに開かせる形にできない)"),
+        SemanticsUnavailable::WorkspaceRootUndecidable => {
+            Some("測れない (ワークスペースの根を決められない)")
+        }
+        SemanticsUnavailable::LspUnusable => Some("測れない (LSP サーバを使えない)"),
+    }
 }
 
 /// 測れた重なりと、両側のドメインごとの件数。
@@ -621,7 +645,9 @@ mod tests {
     fn test_text_of_reports_the_type_signature_with_the_direction_it_leaned() {
         let text = text_of_accidental_duplication_with_semantics(
             TypeSignatureMatch::NotUnifiable,
-            CallerDomainOverlap::NotAsked,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
         );
 
         assert!(
@@ -635,8 +661,12 @@ mod tests {
         // 対照として構造類似度は測れている。測れた値と測れなかったことが
         // 同じ出方をすると、読者が両者を区別できない
         let text = text_of_accidental_duplication_with_semantics(
-            TypeSignatureMatch::LspUnusable,
-            CallerDomainOverlap::LspUnusable,
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable,
+            },
         );
 
         assert!(
@@ -656,12 +686,61 @@ mod tests {
     }
 
     #[test]
+    fn test_text_of_with_an_undecidable_workspace_root_does_not_blame_the_lsp_server() {
+        // 対照は上のテスト（サーバを使えない場合）。**尋ねる前に止まった理由を
+        // 「LSP サーバを使えない」に畳むと、利用者が直す先を取り違える**
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::WorkspaceRootUndecidable,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::WorkspaceRootUndecidable,
+            },
+        );
+
+        assert!(
+            text.contains("型シグネチャ: 測れない (ワークスペースの根を決められない)"),
+            "尋ねる前に止まった理由がそのまま出る: {text}"
+        );
+        assert!(
+            !text.contains("LSP サーバを使えない"),
+            "サーバのせいにしない: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_of_a_pair_below_the_threshold_says_it_did_not_ask() {
+        // 尋ねなかったこと自体は出す。行ごと消すと、読む側は Stage 2 が
+        // 効いたのか効かなかったのかを区別できない
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotACandidate,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotACandidate,
+            },
+        );
+
+        assert!(
+            text.contains("型シグネチャ: 尋ねていない (構造が似ておらず候補ペアではない)")
+                && text.contains(
+                    "呼び出し元ドメインの重なりを尋ねていない (構造が似ておらず候補ペアではない)"
+                ),
+            "尋ねなかった理由が両方の行に出る: {text}"
+        );
+    }
+
+    #[test]
     fn test_text_of_without_asking_the_lsp_omits_the_stage2_lines() {
         // 対照は上のテスト。**尋ねていないことと測れなかったことを同じ出方にしない**。
         // 空欄やダミーで埋めると、読む側は測った結果としてそれを読む
         let text = text_of_accidental_duplication_with_semantics(
-            TypeSignatureMatch::NotAsked,
-            CallerDomainOverlap::NotAsked,
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
         );
 
         assert!(
@@ -677,7 +756,9 @@ mod tests {
     #[test]
     fn test_text_of_reports_how_many_references_each_caller_domain_has() {
         let text = text_of_accidental_duplication_with_semantics(
-            TypeSignatureMatch::NotAsked,
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
             callers_in_separate_domains(),
         );
 

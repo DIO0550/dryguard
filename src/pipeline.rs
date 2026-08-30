@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::classification::signal::{
-    CallerDomainOverlap, ImportOverlap, MeasuredCallerDomains, Signals, StructuralSimilarity,
-    TypeSignatureMatch,
+    CallerDomainOverlap, ImportOverlap, MeasuredCallerDomains, SemanticsUnavailable, Signals,
+    StructuralSimilarity, TypeSignatureMatch,
 };
 use crate::classification::{Classification, classification_of, is_structurally_similar};
 use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
@@ -29,6 +29,31 @@ use crate::syntax::module_distance::ModuleDistance;
 use crate::syntax::tree::{Grammar, ParseError, SyntaxTree};
 use crate::threshold::Threshold;
 
+/// 比較する 2 箇所から切り出したチャンクと、その元になったファイルの中身。
+///
+/// **中身まで持つ**のは、Stage 2 が Stage 1 と同じ版をサーバへ見せるため。
+/// 読み直すと、間で編集されたときに構造のシグナルと意味のシグナルが別の版から出て、
+/// 覚えてある名前の位置が別の識別子を指すことすらある。読む回数が 1 回で済む利点もある。
+#[derive(Debug)]
+pub struct ChunkPair {
+    chunk_a: Chunk,
+    source_a: String,
+    chunk_b: Chunk,
+    source_b: String,
+}
+
+impl ChunkPair {
+    /// 先に指定されたほうのチャンク。
+    pub fn chunk_a(&self) -> &Chunk {
+        &self.chunk_a
+    }
+
+    /// 後に指定されたほうのチャンク。
+    pub fn chunk_b(&self) -> &Chunk {
+        &self.chunk_b
+    }
+}
+
 /// 比較する 2 箇所から、チャンクの組を取り出す。
 ///
 /// # Errors
@@ -38,15 +63,23 @@ use crate::threshold::Threshold;
 pub fn chunk_pair_of(
     location_a: &Location,
     location_b: &Location,
-) -> Result<(Chunk, Chunk), ChunkPairError> {
-    Ok((chunk_at(location_a)?, chunk_at(location_b)?))
+) -> Result<ChunkPair, ChunkPairError> {
+    let (chunk_a, source_a) = chunk_at(location_a)?;
+    let (chunk_b, source_b) = chunk_at(location_b)?;
+
+    Ok(ChunkPair {
+        chunk_a,
+        source_a,
+        chunk_b,
+        source_b,
+    })
 }
 
-/// その位置のファイルを読んで、指定行を含む関数を切り出す。
+/// その位置のファイルを読んで、指定行を含む関数と、読んだ中身を返す。
 ///
 /// パースはファイルにつき 1 回にする。チャンクの範囲も import の集合も同じ木から
 /// 採るので、ソースを渡す形のままだと 1 箇所につき 2 回パースすることになる。
-fn chunk_at(location: &Location) -> Result<Chunk, ChunkPairError> {
+fn chunk_at(location: &Location) -> Result<(Chunk, String), ChunkPairError> {
     let grammar =
         Grammar::of_path(location.path()).ok_or_else(|| ChunkPairError::UnreadableExtension {
             location: location.clone(),
@@ -66,10 +99,13 @@ fn chunk_at(location: &Location) -> Result<Chunk, ChunkPairError> {
         }
     })?;
 
-    Chunk::find_enclosing(location, &tree).map_err(|cause| ChunkPairError::ChunkingFailed {
-        location: location.clone(),
-        cause,
-    })
+    let chunk =
+        Chunk::find_enclosing(location, &tree).map_err(|cause| ChunkPairError::ChunkingFailed {
+            location: location.clone(),
+            cause,
+        })?;
+
+    Ok((chunk, source))
 }
 
 /// チャンクの組から、判定の材料になるシグナルを測る。
@@ -105,9 +141,9 @@ fn import_overlap_of(chunk_a: &Chunk, chunk_b: &Chunk) -> ImportOverlap {
 
 /// 候補ペアについて、Stage 1 と Stage 2 の両方を測った結果。
 ///
-/// LSP サーバを使えなかった理由を一緒に持つ。シグナルの側は
-/// [`TypeSignatureMatch::LspUnusable`] としか言えないが、**利用者が環境を直すには、
-/// 見つからないのか握手に失敗したのかまで要る**
+/// Stage 2 へ届かなかった理由を一緒に持つ。シグナルの側は
+/// [`SemanticsUnavailable`] のどれかとしか言えないが、**利用者が環境を直すには、
+/// サーバが見つからないのか握手に失敗したのかまで要る**
 /// (`rules/coding.md`「失敗を握りつぶして既定値へフォールバックしない」)。
 #[derive(Debug)]
 pub struct MeasuredPair {
@@ -121,34 +157,76 @@ impl MeasuredPair {
         &self.signals
     }
 
-    /// Stage 2 を尋ねられなかった理由。尋ねられたときは `None`。
+    /// Stage 2 を尋ねられなかった理由。尋ねられた / そもそも尋ねなかったときは `None`。
     pub fn semantics_error(&self) -> Option<&SemanticsError> {
         self.semantics_error.as_ref()
     }
 }
 
-/// 候補ペアを Stage 1 で測り、Stage 2 を LSP に尋ねて重ねる。
+/// ペアを Stage 1 で測り、候補ペアなら Stage 2 を LSP に尋ねて重ねる。
 ///
-/// `server` は起こす LSP サーバの指定。TypeScript なら [`ServerCommand::typescript`]。
+/// `structural_similarity_threshold` は候補ペアと見なす構造類似度の下限、
+/// `server` は起こす LSP サーバの指定（TypeScript なら [`ServerCommand::typescript`]）。
+///
+/// **候補ペアでなければサーバを起こさない。** 構造が似ていないペアの判定は Stage 2 で
+/// 変わらないので、起動とインデックスの待ち時間だけが増える
+/// （`docs/dryguard-plan.md`「候補ペアに対してだけ問い合わせる」）。
+/// 尋ねなかったことは [`SemanticsUnavailable::NotACandidate`] として出る。
 ///
 /// **サーバを使えなくても失敗にしない。** Stage 1 のシグナルだけで判定でき、
-/// 尋ねられなかったことはシグナルと [`MeasuredPair::semantics_error`] に出る
+/// 届かなかったことはシグナルと [`MeasuredPair::semantics_error`] に出る
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
-pub fn measured_pair_of(chunk_a: &Chunk, chunk_b: &Chunk, server: &ServerCommand) -> MeasuredPair {
-    let signals = signals_of(chunk_a, chunk_b);
+pub fn measured_pair_of(
+    pair: &ChunkPair,
+    structural_similarity_threshold: Threshold,
+    server: &ServerCommand,
+) -> MeasuredPair {
+    let signals = signals_of(&pair.chunk_a, &pair.chunk_b);
 
-    match semantics_of(chunk_a, chunk_b, server) {
+    if !is_structurally_similar(
+        signals.structural_similarity(),
+        structural_similarity_threshold,
+    ) {
+        return MeasuredPair {
+            signals: unavailable_semantics_added_to(signals, SemanticsUnavailable::NotACandidate),
+            semantics_error: None,
+        };
+    }
+
+    match semantics_of(pair, server) {
         Ok((type_signature_match, caller_domain_overlap)) => MeasuredPair {
             signals: signals.with_semantics(type_signature_match, caller_domain_overlap),
             semantics_error: None,
         },
         Err(cause) => MeasuredPair {
-            signals: signals.with_semantics(
-                TypeSignatureMatch::LspUnusable,
-                CallerDomainOverlap::LspUnusable,
-            ),
+            signals: unavailable_semantics_added_to(signals, unavailable_of(&cause)),
             semantics_error: Some(cause),
         },
+    }
+}
+
+/// 両方の Stage 2 シグナルを、同じ「届かなかった理由」で重ねる。
+///
+/// 2 つを別々の理由にしないのは、**サーバに尋ねる前に止まるので片方だけ取れることが
+/// ないため**（`classification::signal::SemanticsUnavailable`）。
+fn unavailable_semantics_added_to(signals: Signals, reason: SemanticsUnavailable) -> Signals {
+    signals.with_semantics(
+        TypeSignatureMatch::Unavailable { reason },
+        CallerDomainOverlap::Unavailable { reason },
+    )
+}
+
+/// 失敗を、シグナルが持てる理由に直す。
+///
+/// **すべてを「LSP サーバを使えない」に畳まない。** 根を決められないのと
+/// サーバが入っていないのとでは**利用者が直す先が違う**ので、
+/// [`SemanticsError`] のバリアントを 1 対 1 で写す
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+fn unavailable_of(cause: &SemanticsError) -> SemanticsUnavailable {
+    match cause {
+        SemanticsError::Document(_) => SemanticsUnavailable::DocumentUnopenable,
+        SemanticsError::Workspace(_) => SemanticsUnavailable::WorkspaceRootUndecidable,
+        SemanticsError::Client(_) => SemanticsUnavailable::LspUnusable,
     }
 }
 
@@ -159,23 +237,29 @@ pub fn measured_pair_of(chunk_a: &Chunk, chunk_b: &Chunk, server: &ServerCommand
 ///
 /// # Errors
 ///
-/// ファイルを読み直せない / 開かせる形にできない / 根を決められない /
-/// サーバを起こせない / 会話が失敗したとき。
+/// 開かせる形にできない / 根を決められない / サーバを起こせない / 会話が失敗したとき。
 fn semantics_of(
-    chunk_a: &Chunk,
-    chunk_b: &Chunk,
+    pair: &ChunkPair,
     server: &ServerCommand,
 ) -> Result<(TypeSignatureMatch, CallerDomainOverlap), SemanticsError> {
-    let document_a = document_of(chunk_a)?;
-    let document_b = document_of(chunk_b)?;
-    let root =
-        WorkspaceRoot::enclosing(&[chunk_a.path().to_path_buf(), chunk_b.path().to_path_buf()])
-            .map_err(SemanticsError::Workspace)?;
+    let document_a = document_of(&pair.chunk_a, &pair.source_a)?;
+    let document_b = document_of(&pair.chunk_b, &pair.source_b)?;
+    let root = WorkspaceRoot::enclosing(&[
+        pair.chunk_a.path().to_path_buf(),
+        pair.chunk_b.path().to_path_buf(),
+    ])
+    .map_err(SemanticsError::Workspace)?;
 
     let client = Client::start(server).map_err(SemanticsError::Client)?;
     let mut session = client.handshake(&root).map_err(SemanticsError::Client)?;
 
-    let measured = measured_semantics_of(&mut session, chunk_a, &document_a, chunk_b, &document_b);
+    let measured = measured_semantics_of(
+        &mut session,
+        &pair.chunk_a,
+        &document_a,
+        &pair.chunk_b,
+        &document_b,
+    );
     let shutdown = session.shutdown();
 
     // 会話の失敗を先に出す。終了の失敗で上書きすると、何が起きたのかが入れ替わる。
@@ -231,19 +315,15 @@ fn measured_semantics_of(
 
 /// そのチャンクのファイルを、サーバに開かせる形にする。
 ///
+/// `source` は**そのチャンクを切り出したときに読んだ中身**（[`ChunkPair`] が持つ）。
 /// チャンクの範囲だけでは足りない。**サーバは位置を行と列で受け取る**ので、
 /// ファイル全体と同じ中身を見せていないと別の場所を指すことになる。
 ///
 /// # Errors
 ///
-/// ファイルを読めない / 開かせる形にできないとき。
-fn document_of(chunk: &Chunk) -> Result<SourceDocument, SemanticsError> {
-    let text = source_of(chunk.path()).map_err(|cause| SemanticsError::SourceUnreadable {
-        path: chunk.path().to_path_buf(),
-        cause,
-    })?;
-
-    SourceDocument::new(chunk.path(), text).map_err(SemanticsError::Document)
+/// 開かせる形にできないとき。
+fn document_of(chunk: &Chunk, source: &str) -> Result<SourceDocument, SemanticsError> {
+    SourceDocument::new(chunk.path(), source.to_owned()).map_err(SemanticsError::Document)
 }
 
 /// 両側の型シグネチャから、単一化できるかのシグナルにする。
@@ -310,18 +390,12 @@ fn caller_domain_overlap_of(
 
 /// Stage 2 を尋ねられなかった理由。
 ///
-/// **1 つにまとめない。** サーバが入っていないのと、根を決められないのと、
-/// ファイルを読み直せないのとで**利用者が直す先が違う**
+/// **1 つにまとめない。** サーバが入っていないのと、根を決められないのとで
+/// **利用者が直す先が違う**
 /// (`rules/coding.md`「エラー型は原因ごとにバリアントを分ける」)。
+/// `classification::signal::SemanticsUnavailable` のバリアントと 1 対 1 で対応する。
 #[derive(Debug)]
 pub enum SemanticsError {
-    /// サーバに渡すためにファイルを読み直せなかった。
-    SourceUnreadable {
-        /// 読めなかったファイル。
-        path: PathBuf,
-        /// 読めなかった理由。
-        cause: io::Error,
-    },
     /// サーバに開かせる形にできなかった。
     Document(DocumentError),
     /// ワークスペースの根を決められなかった。
@@ -333,11 +407,6 @@ pub enum SemanticsError {
 impl fmt::Display for SemanticsError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SourceUnreadable { path, cause } => write!(
-                formatter,
-                "{} を LSP サーバへ渡すために読み直せません: {cause}",
-                path.display()
-            ),
             Self::Document(cause) => write!(formatter, "{cause}"),
             Self::Workspace(cause) => write!(formatter, "{cause}"),
             Self::Client(cause) => write!(formatter, "{cause}"),
@@ -348,7 +417,6 @@ impl fmt::Display for SemanticsError {
 impl Error for SemanticsError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::SourceUnreadable { cause, .. } => Some(cause),
             Self::Document(cause) => Some(cause),
             Self::Workspace(cause) => Some(cause),
             Self::Client(cause) => Some(cause),
@@ -785,6 +853,35 @@ mod tests {
 
     fn measured(value: f64) -> Similarity {
         Similarity::new(value).expect("テストが渡す値は 0.0-1.0")
+    }
+
+    /// 尋ねる前に止まった理由が、シグナルの側でも別々のままかを見る。
+    ///
+    /// **例外的に内部の関数を直接呼ぶ。** 根を決められない / 開かせる形にできないは
+    /// Windows のパスでしか起きない（別ドライブに共通の祖先が無い・UNC を URI に
+    /// できない。Issue #112）ので、**この対応付けを外から通せる入力が Linux に無い**。
+    /// 対応付けを固定しないまま置くと、すべてが「LSP サーバを使えない」に畳まれても
+    /// 気づけない（`rules/testing.md`「assert は『落ちうるか』で見る」）。
+    #[test]
+    fn test_unavailable_of_keeps_each_setup_failure_apart() {
+        let reasons = [
+            unavailable_of(&SemanticsError::Workspace(WorkspaceError::NoPaths)),
+            unavailable_of(&SemanticsError::Document(
+                DocumentError::UnreadableExtension {
+                    path: PathBuf::from("notes.md"),
+                },
+            )),
+            unavailable_of(&SemanticsError::Client(ClientError::PipesNotWired)),
+        ];
+
+        assert_eq!(
+            reasons,
+            [
+                SemanticsUnavailable::WorkspaceRootUndecidable,
+                SemanticsUnavailable::DocumentUnopenable,
+                SemanticsUnavailable::LspUnusable,
+            ]
+        );
     }
 
     /// ファイルを読まずにチャンクを作る。

@@ -26,8 +26,8 @@ impl Signals {
     /// Stage 1 で測った 3 つのシグナルをまとめる。
     ///
     /// Stage 2 の 2 つは「LSP に尋ねていない」になる。**これは既定値ではなく、
-    /// 尋ねていないという実際の状態**で、尋ねようとして使えなかった
-    /// （[`TypeSignatureMatch::LspUnusable`]）とは別物
+    /// 尋ねていないという実際の状態**で、尋ねようとして届かなかった
+    /// （[`SemanticsUnavailable::LspUnusable`] など）とは別物
     /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
     pub fn new(
         structural_similarity: StructuralSimilarity,
@@ -38,8 +38,12 @@ impl Signals {
             structural_similarity,
             import_overlap,
             module_distance,
-            type_signature_match: TypeSignatureMatch::NotAsked,
-            caller_domain_overlap: CallerDomainOverlap::NotAsked,
+            type_signature_match: TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            caller_domain_overlap: CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
         }
     }
 
@@ -107,6 +111,33 @@ pub enum ImportOverlap {
     NoImports,
 }
 
+/// Stage 2 へ届かなかった理由。
+///
+/// **どちらの Stage 2 シグナルも同じ理由で欠ける。** サーバに尋ねる前に止まるので、
+/// 片方だけが取れることはない。1 つの型を両方が持つことで、理由を足したときに
+/// 同じバリアントを 2 箇所へ書き足さずに済む。
+///
+/// **1 つにまとめない。** サーバを使えないのと、根を決められないのと、
+/// 候補ペアでないから尋ねていないのとで**利用者が次にすることが違う**
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+/// `pipeline::SemanticsError` のバリアントと 1 対 1 で対応する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticsUnavailable {
+    /// LSP に尋ねていない（Stage 1 のシグナルだけで組み立てた）。
+    NotAsked,
+    /// 構造が似ておらず候補ペアではないので尋ねなかった。
+    ///
+    /// 似ていないペアの判定は Stage 2 で変わらないので、**サーバを起こす前に降りる**
+    /// (`docs/dryguard-plan.md`「候補ペアに対してだけ問い合わせる」)。
+    NotACandidate,
+    /// サーバに開かせる形にできなかった。
+    DocumentUnopenable,
+    /// ワークスペースの根を決められなかった。
+    WorkspaceRootUndecidable,
+    /// LSP サーバを使えなかった（起動できない / 握手できない / 会話が途切れた）。
+    LspUnusable,
+}
+
 /// 型シグネチャが単一化できるかのシグナル（Stage 2）。
 ///
 /// **取れなかった理由を 1 つにまとめない。** どれなのかで**利用者が次に試すことが違う**
@@ -118,10 +149,11 @@ pub enum TypeSignatureMatch {
     Unifiable,
     /// 重ならない。
     NotUnifiable,
-    /// LSP に尋ねていない。
-    NotAsked,
-    /// LSP サーバを使えなかった（起動できない / 握手できない / 会話が途切れた）。
-    LspUnusable,
+    /// サーバの答えまで届かなかった。
+    Unavailable {
+        /// 届かなかった理由。
+        reason: SemanticsUnavailable,
+    },
     /// どちらかのチャンクが名前を持たず、尋ねる位置を決められなかった。
     NoName,
     /// サーバがその位置に型を持たなかった。
@@ -143,10 +175,11 @@ pub enum TypeSignatureMatch {
 pub enum CallerDomainOverlap {
     /// 両側の呼び出し元が取れた。
     Measured(MeasuredCallerDomains),
-    /// LSP に尋ねていない。
-    NotAsked,
-    /// LSP サーバを使えなかった（起動できない / 握手できない / 会話が途切れた）。
-    LspUnusable,
+    /// サーバの答えまで届かなかった。
+    Unavailable {
+        /// 届かなかった理由。
+        reason: SemanticsUnavailable,
+    },
     /// どちらかのチャンクが名前を持たず、尋ねる位置を決められなかった。
     NoName,
     /// どちらかのチャンクに参照元が 1 件も返らなかった。

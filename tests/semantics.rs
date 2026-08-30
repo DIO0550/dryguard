@@ -100,7 +100,7 @@ fn type_signature_of(session: &mut Session, chunk: &Chunk) -> TypeSignature {
 
 /// 2 箇所のチャンクの型シグネチャが単一化できるか、実サーバに尋ねて確かめる。
 fn unifiable(location_a: &Location, location_b: &Location) -> bool {
-    let Ok((chunk_a, chunk_b)) = chunk_pair_of(location_a, location_b) else {
+    let Ok(pair) = chunk_pair_of(location_a, location_b) else {
         panic!("テストが渡す位置はどちらも関数の中を指している");
     };
 
@@ -108,8 +108,8 @@ fn unifiable(location_a: &Location, location_b: &Location) -> bool {
         location_a.path().to_path_buf(),
         location_b.path().to_path_buf(),
     ]);
-    let signature_a = type_signature_of(&mut session, &chunk_a);
-    let signature_b = type_signature_of(&mut session, &chunk_b);
+    let signature_a = type_signature_of(&mut session, pair.chunk_a());
+    let signature_b = type_signature_of(&mut session, pair.chunk_b());
     let unifiable = signature_a.is_unifiable_with(&signature_b);
 
     if session.shutdown().is_err() {
@@ -183,7 +183,7 @@ fn reference_file_names(reference_paths: &[PathBuf]) -> BTreeSet<String> {
 
 /// 2 箇所のチャンクの呼び出し元ドメインがどれだけ重なるか、実サーバに尋ねて測る。
 fn caller_domain_overlap(location_a: &Location, location_b: &Location) -> f64 {
-    let Ok((chunk_a, chunk_b)) = chunk_pair_of(location_a, location_b) else {
+    let Ok(pair) = chunk_pair_of(location_a, location_b) else {
         panic!("テストが渡す位置はどちらも関数の中を指している");
     };
 
@@ -191,8 +191,8 @@ fn caller_domain_overlap(location_a: &Location, location_b: &Location) -> f64 {
         location_a.path().to_path_buf(),
         location_b.path().to_path_buf(),
     ]);
-    let domains_a = caller_domains_of(&mut session, &chunk_a);
-    let domains_b = caller_domains_of(&mut session, &chunk_b);
+    let domains_a = caller_domains_of(&mut session, pair.chunk_a());
+    let domains_b = caller_domains_of(&mut session, pair.chunk_b());
     let overlap = domains_a.jaccard(&domains_b).value();
 
     if session.shutdown().is_err() {
@@ -239,7 +239,7 @@ fn test_caller_domains_asked_after_a_type_signature_are_still_complete() {
     // 読み込み中に計算された答え（呼び出し元が欠けている）を受け取る
     let discounts_an_invoice = fixture("references/src/billing/discount.ts", 5);
     let reorders_stock = fixture("references/src/inventory/reorder.ts", 5);
-    let Ok((chunk, _)) = chunk_pair_of(&discounts_an_invoice, &reorders_stock) else {
+    let Ok(pair) = chunk_pair_of(&discounts_an_invoice, &reorders_stock) else {
         panic!("テストが渡す位置はどちらも関数の中を指している");
     };
 
@@ -248,8 +248,8 @@ fn test_caller_domains_asked_after_a_type_signature_are_still_complete() {
         discounts_an_invoice.path().to_path_buf(),
         reorders_stock.path().to_path_buf(),
     ]);
-    let _signature = type_signature_of(&mut session, &chunk);
-    let reference_paths = reference_paths_of(&mut session, &chunk);
+    let _signature = type_signature_of(&mut session, pair.chunk_a());
+    let reference_paths = reference_paths_of(&mut session, pair.chunk_a());
     if session.shutdown().is_err() {
         panic!("サーバを終わらせられる");
     }
@@ -284,11 +284,15 @@ fn accidental_duplication_pair() -> (Location, Location) {
 
 /// 2 箇所を切り出して、実サーバに Stage 2 を尋ねるところまで。
 fn measured_with_an_lsp(location_a: &Location, location_b: &Location) -> MeasuredPair {
-    let Ok((chunk_a, chunk_b)) = chunk_pair_of(location_a, location_b) else {
+    let Ok(pair) = chunk_pair_of(location_a, location_b) else {
         panic!("テストが渡す位置はどちらも関数の中を指している");
     };
 
-    let measured = measured_pair_of(&chunk_a, &chunk_b, &ServerCommand::typescript());
+    let measured = measured_pair_of(
+        &pair,
+        DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+        &ServerCommand::typescript(),
+    );
     if let Some(error) = measured.semantics_error() {
         panic!("実サーバには尋ねられる: {error}");
     }

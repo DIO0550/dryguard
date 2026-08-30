@@ -254,8 +254,7 @@ fn type_signature_lean_of(signal: TypeSignatureMatch) -> Lean {
     match signal {
         TypeSignatureMatch::Unifiable => Lean::TowardExtract,
         TypeSignatureMatch::NotUnifiable => Lean::TowardDoNotExtract,
-        TypeSignatureMatch::NotAsked
-        | TypeSignatureMatch::LspUnusable
+        TypeSignatureMatch::Unavailable { .. }
         | TypeSignatureMatch::NoName
         | TypeSignatureMatch::NoTypeThere
         | TypeSignatureMatch::UnreadableHover
@@ -324,8 +323,8 @@ mod tests {
 
     use crate::classification::reason::{Lean, Reason};
     use crate::classification::signal::{
-        CallerDomainOverlap, ImportOverlap, MeasuredCallerDomains, Signals, StructuralSimilarity,
-        TypeSignatureMatch,
+        CallerDomainOverlap, ImportOverlap, MeasuredCallerDomains, SemanticsUnavailable, Signals,
+        StructuralSimilarity, TypeSignatureMatch,
     };
     use crate::classification::verdict::Verdict;
     use crate::semantics::caller_domain::CallerDomains;
@@ -535,7 +534,9 @@ mod tests {
         // 候補として出さずに人へ回す
         let signals = signals_of_a_shared_domain().with_semantics(
             TypeSignatureMatch::NotUnifiable,
-            CallerDomainOverlap::NotAsked,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
         );
 
         let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
@@ -546,8 +547,12 @@ mod tests {
     #[test]
     fn test_classification_of_a_shared_domain_whose_type_signatures_unify_is_extract_candidate() {
         // 対照は上のテスト。型シグネチャ以外はすべて同じ
-        let signals = signals_of_a_shared_domain()
-            .with_semantics(TypeSignatureMatch::Unifiable, CallerDomainOverlap::NotAsked);
+        let signals = signals_of_a_shared_domain().with_semantics(
+            TypeSignatureMatch::Unifiable,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
 
         let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
 
@@ -559,8 +564,12 @@ mod tests {
         // サーバを使えないことを「単一化できない」と同じ扱いにすると、環境が悪いだけで
         // 候補が REVIEW に落ちる。上の 2 つと同じ入力で、Stage 2 だけを取れなくしてある
         let signals = signals_of_a_shared_domain().with_semantics(
-            TypeSignatureMatch::LspUnusable,
-            CallerDomainOverlap::LspUnusable,
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable,
+            },
         );
 
         let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
@@ -577,7 +586,12 @@ mod tests {
             ImportOverlap::NoImports,
             separate_directories(),
         )
-        .with_semantics(TypeSignatureMatch::NotAsked, callers_in_separate_domains());
+        .with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            callers_in_separate_domains(),
+        );
 
         let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
 
@@ -589,8 +603,12 @@ mod tests {
         // 置き場所と依存先は別ドメインと言っているのに、使っているのは同じドメイン。
         // **観測で置き換えず、食い違いとして人へ回す**
         // (`rules/naming.md`「置き場所の代理指標を、使われ方の観測で置き換えない」)
-        let signals = signals_of_separate_domains()
-            .with_semantics(TypeSignatureMatch::NotAsked, callers_in_the_same_domain());
+        let signals = signals_of_separate_domains().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            callers_in_the_same_domain(),
+        );
 
         let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
 
@@ -600,8 +618,12 @@ mod tests {
     #[test]
     fn test_classification_of_callers_in_separate_domains_against_a_shared_placement_is_review() {
         // 上と逆向きの食い違い。依存先は共有しているが、使っているドメインは分かれている
-        let signals = signals_of_a_shared_domain()
-            .with_semantics(TypeSignatureMatch::NotAsked, callers_in_separate_domains());
+        let signals = signals_of_a_shared_domain().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            callers_in_separate_domains(),
+        );
 
         let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
 
@@ -610,8 +632,12 @@ mod tests {
 
     #[test]
     fn test_classification_of_unifiable_type_signatures_leans_that_reason_toward_extract() {
-        let signals = signals_of_a_shared_domain()
-            .with_semantics(TypeSignatureMatch::Unifiable, CallerDomainOverlap::NotAsked);
+        let signals = signals_of_a_shared_domain().with_semantics(
+            TypeSignatureMatch::Unifiable,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
 
         let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
 
@@ -632,7 +658,9 @@ mod tests {
     fn test_classification_of_type_signatures_that_do_not_unify_leans_that_reason_the_other_way() {
         let signals = signals_of_a_shared_domain().with_semantics(
             TypeSignatureMatch::NotUnifiable,
-            CallerDomainOverlap::NotAsked,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
         );
 
         let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
@@ -660,13 +688,17 @@ mod tests {
             leans(
                 &classification,
                 &Reason::TypeSignatureMatch {
-                    signal: TypeSignatureMatch::NotAsked,
+                    signal: TypeSignatureMatch::Unavailable {
+                        reason: SemanticsUnavailable::NotAsked
+                    },
                     lean: Lean::Neither,
                 }
             ) && leans(
                 &classification,
                 &Reason::CallerDomainOverlap {
-                    signal: CallerDomainOverlap::NotAsked,
+                    signal: CallerDomainOverlap::Unavailable {
+                        reason: SemanticsUnavailable::NotAsked
+                    },
                     lean: Lean::Neither,
                 }
             ),
@@ -678,8 +710,12 @@ mod tests {
     #[test]
     fn test_classification_of_callers_in_separate_domains_leans_that_reason_toward_do_not_extract()
     {
-        let signals = signals_of_separate_domains()
-            .with_semantics(TypeSignatureMatch::NotAsked, callers_in_separate_domains());
+        let signals = signals_of_separate_domains().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            callers_in_separate_domains(),
+        );
 
         let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
 
@@ -699,8 +735,12 @@ mod tests {
     #[test]
     fn test_classification_of_callers_sharing_a_domain_leans_that_reason_toward_extract() {
         // 対照は上のテスト。呼び出し元のドメインだけが違う
-        let signals = signals_of_separate_domains()
-            .with_semantics(TypeSignatureMatch::NotAsked, callers_in_the_same_domain());
+        let signals = signals_of_separate_domains().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            callers_in_the_same_domain(),
+        );
 
         let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
 
@@ -724,8 +764,12 @@ mod tests {
             caller_domains(&["src/report/monthly.ts", "src/billing/invoice.ts"]),
             caller_domains(&["src/report/daily.ts"]),
         ));
-        let signals =
-            signals_of_separate_domains().with_semantics(TypeSignatureMatch::NotAsked, callers);
+        let signals = signals_of_separate_domains().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            callers,
+        );
 
         let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
 

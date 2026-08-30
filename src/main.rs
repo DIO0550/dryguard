@@ -45,20 +45,20 @@ fn report_compare(
     location_b: &Location,
     options: &CommonOptions,
 ) -> ExitCode {
-    let (chunk_a, chunk_b) = match chunk_pair_of(location_a, location_b) {
-        Ok(chunks) => chunks,
+    let pair = match chunk_pair_of(location_a, location_b) {
+        Ok(pair) => pair,
         Err(error) => {
             eprintln!("{error}");
             return ExitCode::FAILURE;
         }
     };
 
-    let measured = measured_pair_of(&chunk_a, &chunk_b, &ServerCommand::typescript());
+    let threshold = threshold_of(options);
+    let measured = measured_pair_of(&pair, threshold, &ServerCommand::typescript());
     if let Some(error) = measured.semantics_error() {
         eprintln!("型シグネチャと呼び出し元を測れません: {error}");
     }
 
-    let threshold = threshold_of(options);
     let classification = classification_of(measured.signals(), threshold);
 
     println!(
