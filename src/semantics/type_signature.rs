@@ -689,6 +689,11 @@ fn declared_type_names_of(spelling: &str) -> BTreeSet<String> {
 /// その語が、どこかで宣言された型の名前か。空の語と、数字で始まる語は名前ではない。
 ///
 /// `following` はその語の後ろに続く綴り。メンバーや引数の名前を見分けるのに使う。
+///
+/// **印は名前の直後にあるものだけを見る。** 空白を跨いで探すと、条件型
+/// （`T extends U ? Local : number`）の `:` をメンバーの印と読み、**分岐に書かれた型名を
+/// 数え落とす**。サーバが返す綴りではメンバーの印が名前に続けて書かれる（`id: string`）ので、
+/// 直後だけを見ても取りこぼさない。
 fn names_a_declared_type(identifier: &str, following: &str) -> bool {
     if identifier.is_empty() || identifier.starts_with(|first: char| first.is_ascii_digit()) {
         return false;
@@ -700,10 +705,9 @@ fn names_a_declared_type(identifier: &str, following: &str) -> bool {
         return false;
     }
 
-    let after = following.trim_start();
     !VETTED_MEMBER_MARKERS
         .iter()
-        .any(|marker| after.starts_with(marker))
+        .any(|marker| following.starts_with(marker))
 }
 
 /// その位置に置くときの型の綴り。括弧が要るなら括ってから返す。
@@ -2109,6 +2113,22 @@ mod tests {
         .expect("テストが渡す綴りは読み取れる");
 
         assert!(billing.is_unifiable_with(&report));
+    }
+
+    #[test]
+    fn test_two_signatures_naming_types_in_a_conditional_branch_are_not_unifiable() {
+        // 条件型の `:` はメンバーの印ではない。空白を跨いで印を探すと `Local` を
+        // メンバーの名前として読み飛ばし、**この Issue が消したかった偽陽性が残る**
+        let billing = signature_declaring(
+            "function pick<T>(value: T extends string ? Local : number): void",
+            &[declared("Local", "/repo/src/billing/local.ts", 1)],
+        );
+        let report = signature_declaring(
+            "function pick<T>(value: T extends string ? Local : number): void",
+            &[declared("Local", "/repo/src/report/local.ts", 1)],
+        );
+
+        assert!(!billing.is_unifiable_with(&report));
     }
 
     #[test]
