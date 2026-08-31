@@ -653,6 +653,43 @@ mod tests {
         assert!(!provides_hover(&capabilities));
     }
 
+    /// そのサーバができることとして typeDefinition だけを宣言した capabilities。
+    fn capabilities_declaring_type_definition(
+        type_definition_provider: Option<TypeDefinitionProviderCapability>,
+    ) -> ServerCapabilities {
+        ServerCapabilities {
+            type_definition_provider,
+            ..ServerCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn test_provides_type_definition_with_a_server_that_declares_it_is_true() {
+        let capabilities = capabilities_declaring_type_definition(Some(
+            TypeDefinitionProviderCapability::Simple(true),
+        ));
+
+        assert!(provides_type_definition(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_type_definition_with_a_server_that_turned_it_off_is_false() {
+        // 対照は上のテスト。**宣言はあるが無効**という形で、`is_some()` で見ていると
+        // typeDefinition を切ったサーバへ要求を送ってしまう
+        let capabilities = capabilities_declaring_type_definition(Some(
+            TypeDefinitionProviderCapability::Simple(false),
+        ));
+
+        assert!(!provides_type_definition(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_type_definition_with_a_server_that_does_not_declare_it_is_false() {
+        let capabilities = capabilities_declaring_type_definition(None);
+
+        assert!(!provides_type_definition(&capabilities));
+    }
+
     /// そのサーバができることとして references だけを宣言した capabilities。
     fn capabilities_declaring_references(
         references_provider: Option<OneOf<bool, lsp_types::ReferencesOptions>>,

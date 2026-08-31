@@ -7,12 +7,11 @@
 
 use std::collections::BTreeSet;
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-
-use std::ffi::OsStr;
 
 use crate::syntax::tree::Grammar;
 
