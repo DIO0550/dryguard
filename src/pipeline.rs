@@ -439,7 +439,7 @@ fn resolved_type_signature_outcome_of(
     open_declaring_documents(session, &declarations)?;
     let resolved = resolved_types_of(session, &declarations)?;
 
-    type_signature_outcome_of(session, document, position, &resolved)
+    type_signature_outcome_of(session, document, position, &resolved, &declarations)
 }
 
 /// 型が宣言されているファイルを開かせる。
@@ -1127,7 +1127,7 @@ mod tests {
     /// 正規化できた型シグネチャ。
     fn normalized(signature_text: &str) -> TypeSignatureOutcome {
         let signature =
-            TypeSignature::from_signature_text(signature_text, &ResolvedTypes::default())
+            TypeSignature::from_signature_text(signature_text, &ResolvedTypes::default(), &[])
                 .expect("テストが渡す綴りは読み取れる");
 
         TypeSignatureOutcome::Normalized(signature)

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use lsp_types::{GotoDefinitionResponse, Location, LocationLink, Uri};
 
-use super::uri::{self, UriPathError};
+use super::uri::{self, PathUriError, UriPathError};
 use crate::source_position::SourcePosition;
 
 /// 型が宣言されている場所。ファイルと、その中の 1 点。
@@ -27,6 +27,24 @@ pub struct DeclarationSite {
 }
 
 impl DeclarationSite {
+    /// 宣言があるファイルと、その中の 1 点から作る。
+    ///
+    /// **URI はパスから導く。** 2 つを別々に受け取ると、互いに食い違った組を作れてしまう
+    /// (`rules/coding.md`「生成時に検証し、不正な値を存在させない」)。応答から作る側
+    /// （[`outcome_of`]）はサーバが返した URI の綴りをそのまま持つので、ここは通らない。
+    ///
+    /// # Errors
+    ///
+    /// `path` を `file:` URI にできないとき（絶対パスでない・`.` / `..` が残っている・
+    /// `file:` URI で表せない前置きを持つ）。
+    pub fn new(path: &Path, position: SourcePosition) -> Result<Self, PathUriError> {
+        Ok(Self {
+            uri: uri::file_uri_of(path)?,
+            path: path.to_path_buf(),
+            position,
+        })
+    }
+
     /// 宣言があるファイル。開かせる相手を決めるのに使う。
     pub fn path(&self) -> &Path {
         &self.path

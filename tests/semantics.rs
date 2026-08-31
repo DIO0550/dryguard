@@ -79,8 +79,9 @@ fn session_over(paths: &[PathBuf]) -> Session {
 
 /// そのチャンクの型シグネチャを、サーバに尋ねて正規化したもの。
 ///
-/// **型名は解決しない。** ここで見たいのは返った綴りを正規化して比べるところまでで、
-/// 解決まで含めた形は `measured_with_an_lsp` を使うテストが見る。
+/// **型名は解決せず、宣言も辿らない。** ここで見たいのは返った綴りを正規化して
+/// 比べるところまでで、解決と宣言の突き合わせまで含めた形は
+/// `measured_with_an_lsp` を使うテストが見る。
 fn type_signature_of(session: &mut Session, chunk: &Chunk) -> TypeSignature {
     let document = document(chunk.path());
     if session.open_document(&document).is_err() {
@@ -97,7 +98,7 @@ fn type_signature_of(session: &mut Session, chunk: &Chunk) -> TypeSignature {
         panic!("名前の位置には hover が答える: {}", chunk.path().display());
     };
     let Some(signature) =
-        TypeSignature::from_signature_text(&signature_text, &ResolvedTypes::default())
+        TypeSignature::from_signature_text(&signature_text, &ResolvedTypes::default(), &[])
     else {
         panic!("サーバが返した綴りは読み取れる: {signature_text}");
     };
@@ -441,6 +442,40 @@ fn test_compare_with_an_lsp_does_not_unify_two_generic_aliases_of_different_type
     assert_eq!(
         measured.signals().type_signature_match(),
         TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_does_not_unify_two_interfaces_of_different_types_spelled_alike() {
+    // どちらのファイルも自分だけの `interface User` を export していて、中身は別物
+    // （`{ invoiceId: string }` と `{ rowCount: number }`）。**hover はどちらも `User` と
+    // 返す**ので、綴りだけを比べると別ドメインの 2 つが単一化可能に出る
+    let labels_an_invoice_user = fixture("references/src/billing/user.ts", 5);
+    let labels_a_report_user = fixture("references/src/report/user.ts", 5);
+
+    let measured = measured_with_an_lsp(&labels_an_invoice_user, &labels_a_report_user);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_unifies_two_functions_taking_one_interface_from_separate_domains() {
+    // 対照は上のテスト。**綴りが同じことを拒んでいるのではなく、指している記号が別な
+    // ことを拒んでいる。** こちらは report 側が billing の `User` を輸入していて、
+    // 書かれたファイルは違っても宣言は 1 つ
+    let labels_an_invoice_user = fixture("references/src/billing/user.ts", 5);
+    let labels_an_imported_user = fixture("references/src/report/imported.ts", 3);
+
+    let measured = measured_with_an_lsp(&labels_an_invoice_user, &labels_an_imported_user);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
     );
 }
 

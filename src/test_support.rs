@@ -9,6 +9,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::line_number::LineNumber;
+use crate::lsp::DeclarationSite;
+use crate::source_position::SourcePosition;
 
 /// このリポジトリの中のパス。
 ///
@@ -26,4 +28,18 @@ pub(crate) fn repository_path(relative: &str) -> PathBuf {
 /// `number` が 0 のとき。テストが 0 行目を渡すのは、テスト自体の書き間違い。
 pub(crate) fn line(number: usize) -> LineNumber {
     LineNumber::new(number).expect("テストが渡す行番号は 1 以上")
+}
+
+/// 型が宣言されている場所。行の先頭を指す。
+///
+/// 実在しないパスでよい（`file:` URI にするだけで、開きはしない）。
+///
+/// # Panics
+///
+/// `path` が絶対パスでないとき。相対パスは `file:` URI にできないので、
+/// テストが渡すのは書き間違い。
+pub(crate) fn declaration_site(path: &str, number: usize) -> DeclarationSite {
+    let position = SourcePosition::from_preceding_text(line(number), "");
+
+    DeclarationSite::new(Path::new(path), position).expect("テストが渡すパスは絶対パス")
 }

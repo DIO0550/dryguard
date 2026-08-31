@@ -13,7 +13,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use crate::lsp::{ClientError, HoverOutcome, Session, SourceDocument};
-use crate::semantics::resolved_type::ResolvedTypes;
+use crate::semantics::resolved_type::{ResolvedTypes, TypeDeclaration};
 use crate::source_position::SourcePosition;
 
 /// 付け替えた型変数の綴りの前置き。
@@ -165,7 +165,8 @@ pub enum TypeSignatureOutcome {
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
 /// `Chunk::name_position` が指す識別子の位置。`resolved` は
-/// `semantics::resolved_type` が集めた型エイリアスの右辺。
+/// `semantics::resolved_type` が集めた型エイリアスの右辺、`declarations` は
+/// 同じく集めた型名ごとの宣言の場所。
 ///
 /// # Errors
 ///
@@ -177,9 +178,12 @@ pub fn type_signature_outcome_of(
     document: &SourceDocument,
     position: SourcePosition,
     resolved: &ResolvedTypes,
+    declarations: &[TypeDeclaration],
 ) -> Result<TypeSignatureOutcome, ClientError> {
     let outcome = match session.hover(document, position)? {
-        HoverOutcome::Answered(signature_text) => normalized_outcome_of(&signature_text, resolved),
+        HoverOutcome::Answered(signature_text) => {
+            normalized_outcome_of(&signature_text, resolved, declarations)
+        }
         HoverOutcome::NoAnswer => TypeSignatureOutcome::NoTypeThere,
         HoverOutcome::Unreadable => TypeSignatureOutcome::UnreadableHover,
         HoverOutcome::NotSupported => TypeSignatureOutcome::HoverNotProvided,
@@ -189,8 +193,14 @@ pub fn type_signature_outcome_of(
 }
 
 /// 綴りを正規化した結果。読み解けなければ、その旨。
-fn normalized_outcome_of(signature_text: &str, resolved: &ResolvedTypes) -> TypeSignatureOutcome {
-    let Some(signature) = TypeSignature::from_signature_text(signature_text, resolved) else {
+fn normalized_outcome_of(
+    signature_text: &str,
+    resolved: &ResolvedTypes,
+    declarations: &[TypeDeclaration],
+) -> TypeSignatureOutcome {
+    let Some(signature) =
+        TypeSignature::from_signature_text(signature_text, resolved, declarations)
+    else {
         return TypeSignatureOutcome::UnreadableSignature;
     };
 
@@ -211,6 +221,15 @@ pub struct TypeSignature {
     parameters: Vec<Parameter>,
     /// 戻り値の型。
     return_type: String,
+    /// 綴りに残った型名が、それぞれどこで宣言されているか。**名前順**。
+    ///
+    /// **綴りは書いた人の位置に依存する。** 別々のモジュールが同じ局所名で構造の違う型を
+    /// export していると、hover はどちらも `User` と返す。綴りだけを比べると、
+    /// 構造も依存ドメインも違う 2 つが単一化可能に出る（偽陽性）。
+    ///
+    /// **並びを名前で固定する。** サーバが答えた順のままだと、同じ 2 つが尋ねた順で
+    /// 等しくなったりならなかったりする。
+    declarations: Vec<TypeDeclaration>,
 }
 
 impl TypeSignature {
@@ -228,7 +247,15 @@ impl TypeSignature {
     /// **差し込むのは読む前。** シグネチャ全体がエイリアスに置き換わる形
     /// （`const aliased: Handler`）は引数リストを持たないので、読んだ後に差し込む形では
     /// **この綴りが入口に入れない**（`None` になる）。
-    pub fn from_signature_text(text: &str, resolved: &ResolvedTypes) -> Option<Self> {
+    ///
+    /// `declarations` は `semantics::resolved_type` が集めた型名ごとの宣言の場所。
+    /// **持ち回すのは、差し込んだ後の綴りに残った名前の分だけ**
+    /// （[`remaining_declarations_of`]）。
+    pub fn from_signature_text(
+        text: &str,
+        resolved: &ResolvedTypes,
+        declarations: &[TypeDeclaration],
+    ) -> Option<Self> {
         let flattened = flattened(&substituted(text, resolved));
         let split = SplitSignature::from_signature_text(&flattened)?;
 
@@ -252,6 +279,7 @@ impl TypeSignature {
                 .map(|parameter| parameter.renamed(&placeholders))
                 .collect(),
             return_type: placeholders.renamed(&return_type),
+            declarations: remaining_declarations_of(&flattened, declarations),
         })
     }
 
@@ -259,9 +287,37 @@ impl TypeSignature {
     ///
     /// 引数名と型変数名の違いは正規化の時点で消えているので、ここでは形が同じかを見る。
     /// 呼び出しの仕方・引数の渡し方と型・制約・型変数の既定の型が違えば重ならない。
+    ///
+    /// **綴りが同じでも、そこに残った型名が別の記号を指していれば重ならない**
+    /// （[`TypeSignature::declarations`]）。片側でしか宣言を辿れていないときも同じで、
+    /// **確かめられていないものを重なる側へ倒さない**。
     pub fn is_unifiable_with(&self, other: &Self) -> bool {
         self == other
     }
+}
+
+/// 綴りに残った型名の宣言だけを、名前順に選び出す。
+///
+/// `spelling` は解決した綴りを差し込んだ後のシグネチャ、`declarations` は
+/// そのチャンクのシグネチャに書かれた型名について尋ねた宣言。
+///
+/// **見るのは差し込んだ後の綴り。** 差し込みで消えた名前まで持つと、どちらも `number` に
+/// 開かれた 2 つが宣言の場所の違いで別物になり、**エイリアスを開いた意味が消える**。
+fn remaining_declarations_of(
+    spelling: &str,
+    declarations: &[TypeDeclaration],
+) -> Vec<TypeDeclaration> {
+    // 名前順の集合から引く。**並びを宣言の側に任せない**（型名が書かれた順のままだと、
+    // 同じ 2 つが並びの違いで等しくなくなる余地が残る）。
+    declared_type_names_of(spelling)
+        .iter()
+        .filter_map(|name| {
+            declarations
+                .iter()
+                .find(|declaration| declaration.name() == name.as_str())
+        })
+        .cloned()
+        .collect()
 }
 
 /// 呼び出しの仕方。
@@ -582,19 +638,32 @@ fn push_resolved(
 /// 単一化可能と出る**（偽陽性）。`Local[]` でも `{ x: Local }` でも同じことが起きるので、
 /// 綴りの形ではなく**名前が残っているかどうか**で見る。
 ///
-/// 名前として数えないのは 2 つ。メンバーや引数の名前（後ろに [`VETTED_MEMBER_MARKERS`] が
-/// 続く）と、[`PREDEFINED_TYPES`] / [`TYPE_OPERATORS`] / [`BOOLEAN_LITERALS`] に載っている語。
+/// 数える相手は [`declared_type_names_of`] が決める。
 ///
-/// **引用符を含む綴りは、名前を数える前に外す。** 走査は引用符の中を見ないので、
-/// そこに残った名前を見落とす（[`QUOTE_MARKS`]）。
+/// **引用符を含む綴りは、名前を数える前に外す。** 引用符の中は宣言の場所に依存する意味を
+/// 運ぶのに、**識別子として現れないことがある**（`typeof import("./")`）ので、
+/// 名前を数えるだけでは掬えない（[`QUOTE_MARKS`]）。
 ///
 /// **Why not（残った名前もその宣言まで辿る）**: 辿るには宣言のあるファイルを
 /// 構文木にするところから始まり、綴りではなく位置で差し込む形になる（Issue #133）。
 fn is_site_independent(spelling: &str) -> bool {
-    if spelling.contains(QUOTE_MARKS) {
-        return false;
-    }
+    let hides_names_in_quotes = spelling.contains(QUOTE_MARKS);
+    let holds_a_declared_name = !declared_type_names_of(spelling).is_empty();
 
+    !hides_names_in_quotes && !holds_a_declared_name
+}
+
+/// その綴りに残っている、どこかで宣言された型の名前。1 つも無ければ空。
+///
+/// 名前として数えないのは 2 つ。メンバーや引数の名前（後ろに [`VETTED_MEMBER_MARKERS`] が
+/// 続く）と、[`PREDEFINED_TYPES`] / [`TYPE_OPERATORS`] / [`BOOLEAN_LITERALS`] に載っている語。
+///
+/// **引用符の中も見る。** テンプレートリテラル型の補間（`` `${Local}` ``）に残った名前も
+/// 宣言を辿る相手なので、飛ばすと別々のモジュールの綴りが同じものとして重なる。
+/// 代わりに文字列リテラル型の中の語まで数えるが、**これを使う側はどちらも
+/// 宣言が返った型名しか相手にしない**ので、綴りが偶然一致したときに倒れる向きは偽陰性。
+fn declared_type_names_of(spelling: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
     let mut identifier = String::new();
 
     for (index, character) in spelling.char_indices() {
@@ -605,12 +674,16 @@ fn is_site_independent(spelling: &str) -> bool {
 
         let following = spelling.get(index..).unwrap_or_default();
         if names_a_declared_type(&identifier, following) {
-            return false;
+            names.insert(identifier.clone());
         }
         identifier.clear();
     }
 
-    !names_a_declared_type(&identifier, "")
+    if names_a_declared_type(&identifier, "") {
+        names.insert(identifier);
+    }
+
+    names
 }
 
 /// その語が、どこかで宣言された型の名前か。空の語と、数字で始まる語は名前ではない。
@@ -1119,6 +1192,8 @@ fn is_identifier_character(character: char) -> bool {
 mod tests {
     use super::*;
 
+    use crate::test_support::declaration_site;
+
     /// テストが渡す綴りは読み取れる前提で組み立てる。解決した型名は無い。
     fn signature(text: &str) -> TypeSignature {
         signature_with(text, &ResolvedTypes::default())
@@ -1126,7 +1201,19 @@ mod tests {
 
     /// 解決した型名を差し込んでから組み立てる。
     fn signature_with(text: &str, resolved: &ResolvedTypes) -> TypeSignature {
-        TypeSignature::from_signature_text(text, resolved).expect("テストが渡す綴りは読み取れる")
+        TypeSignature::from_signature_text(text, resolved, &[])
+            .expect("テストが渡す綴りは読み取れる")
+    }
+
+    /// 綴りに書かれた型名の宣言まで持たせて組み立てる。
+    fn signature_declaring(text: &str, declarations: &[TypeDeclaration]) -> TypeSignature {
+        TypeSignature::from_signature_text(text, &ResolvedTypes::default(), declarations)
+            .expect("テストが渡す綴りは読み取れる")
+    }
+
+    /// 型名 1 つ分の宣言。
+    fn declared(name: &str, path: &str, line: usize) -> TypeDeclaration {
+        TypeDeclaration::new(name.to_owned(), declaration_site(path, line))
     }
 
     /// 型名 1 つ分の解決。
@@ -1389,7 +1476,11 @@ mod tests {
     fn test_a_signature_without_a_parameter_list_cannot_be_read() {
         // 型エイリアスなど、関数でないものへの hover はこの形で返る
         assert_eq!(
-            TypeSignature::from_signature_text("type UserId = string", &ResolvedTypes::default()),
+            TypeSignature::from_signature_text(
+                "type UserId = string",
+                &ResolvedTypes::default(),
+                &[]
+            ),
             None
         );
     }
@@ -1399,7 +1490,8 @@ mod tests {
         assert_eq!(
             TypeSignature::from_signature_text(
                 "function decl(a: string)",
-                &ResolvedTypes::default()
+                &ResolvedTypes::default(),
+                &[]
             ),
             None
         );
@@ -1412,7 +1504,8 @@ mod tests {
         assert_eq!(
             TypeSignature::from_signature_text(
                 "function decl(a, b: string): void",
-                &ResolvedTypes::default()
+                &ResolvedTypes::default(),
+                &[]
             ),
             None
         );
@@ -1485,7 +1578,8 @@ mod tests {
         assert_eq!(
             TypeSignature::from_signature_text(
                 "const halveAmount: Scaling",
-                &ResolvedTypes::default()
+                &ResolvedTypes::default(),
+                &[]
             ),
             None
         );
@@ -1946,5 +2040,106 @@ mod tests {
         assert!(aliased.is_unifiable_with(&signature(
             "function other(table: Map<string, number>): void"
         )));
+    }
+
+    #[test]
+    fn test_two_signatures_naming_types_declared_in_separate_files_are_not_unifiable() {
+        // `interface` は hover が構造を展開しないので、綴りは両側とも `User` になる。
+        // **綴りだけを見ると別ドメインの 2 つが単一化可能に出る**（偽陽性）
+        let billing = signature_declaring(
+            "function labelUser(value: User): string",
+            &[declared("User", "/repo/src/billing/user.ts", 1)],
+        );
+        let report = signature_declaring(
+            "function labelUser(value: User): string",
+            &[declared("User", "/repo/src/report/user.ts", 1)],
+        );
+
+        assert!(!billing.is_unifiable_with(&report));
+    }
+
+    #[test]
+    fn test_two_signatures_naming_one_type_declared_in_one_file_are_unifiable() {
+        // 対照は上のテスト。**綴りが同じことを拒んでいるのではなく、指している記号が
+        // 別なことを拒んでいる。** 輸入して使う側は書かれたファイルが違っても同じ記号
+        let declaring = signature_declaring(
+            "function labelUser(value: User): string",
+            &[declared("User", "/repo/src/billing/user.ts", 1)],
+        );
+        let importing = signature_declaring(
+            "function labelImported(value: User): string",
+            &[declared("User", "/repo/src/billing/user.ts", 1)],
+        );
+
+        assert!(declaring.is_unifiable_with(&importing));
+    }
+
+    #[test]
+    fn test_two_signatures_naming_types_declared_at_separate_points_in_one_file_are_not_unifiable()
+    {
+        // 同じファイルに同じ綴りの宣言が 2 つ置ける（宣言のマージ）。ファイルだけで
+        // 記号を決めると、その 2 つが同じものになる
+        let first = signature_declaring(
+            "function labelUser(value: User): string",
+            &[declared("User", "/repo/src/billing/user.ts", 1)],
+        );
+        let second = signature_declaring(
+            "function labelUser(value: User): string",
+            &[declared("User", "/repo/src/billing/user.ts", 9)],
+        );
+
+        assert!(!first.is_unifiable_with(&second));
+    }
+
+    #[test]
+    fn test_a_type_name_opened_into_a_predefined_type_does_not_carry_its_declaration() {
+        // 差し込みで消えた名前まで持つと、**どちらも `number` に開かれた 2 つが
+        // 宣言の場所の違いで別物になる**（エイリアスを開いた意味が消える）
+        let billing = TypeSignature::from_signature_text(
+            "function scaleAmount(amount: Amount): Amount",
+            &resolving("Amount", "number"),
+            &[declared("Amount", "/repo/src/billing/money.ts", 1)],
+        )
+        .expect("テストが渡す綴りは読み取れる");
+        let report = TypeSignature::from_signature_text(
+            "function scaleTotal(total: Amount): Amount",
+            &resolving("Amount", "number"),
+            &[declared("Amount", "/repo/src/report/money.ts", 1)],
+        )
+        .expect("テストが渡す綴りは読み取れる");
+
+        assert!(billing.is_unifiable_with(&report));
+    }
+
+    #[test]
+    fn test_a_declaration_of_a_name_the_spelling_does_not_hold_is_not_compared() {
+        // 対照は上のテスト。そちらは差し込みで消えた名前で、こちらは最初から
+        // 綴りに現れない名前。**尋ねた型名を全部持つ形では、どちらも比較に混じる**
+        let holding = signature_declaring(
+            "function count(value: string): number",
+            &[declared("User", "/repo/src/billing/user.ts", 1)],
+        );
+
+        assert!(holding.is_unifiable_with(&signature("function size(text: string): number")));
+    }
+
+    #[test]
+    fn test_a_signature_whose_declaration_came_back_is_not_unifiable_with_one_whose_did_not() {
+        // 片側でしか宣言を辿れていない。**確かめられていないものを重なる側へ倒さない**
+        let located = signature_declaring(
+            "function labelUser(value: User): string",
+            &[declared("User", "/repo/src/billing/user.ts", 1)],
+        );
+
+        assert!(!located.is_unifiable_with(&signature("function labelUser(value: User): string")));
+    }
+
+    #[test]
+    fn test_two_signatures_whose_declarations_did_not_come_back_compare_their_spellings() {
+        // 対照は上のテスト。両側とも材料が無いので、**材料が無いことを「別の記号である
+        // 証拠」にしない**（どの型名も開けない状態は `TypeSignatureOutcome` の側が出す）
+        let unlocated = signature("function labelUser(value: User): string");
+
+        assert!(unlocated.is_unifiable_with(&signature("function nameUser(value: User): string")));
     }
 }
