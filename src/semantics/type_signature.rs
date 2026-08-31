@@ -97,6 +97,13 @@ const PREDEFINED_TYPES: [&str; 12] = [
 /// 倒れる向きは偽陰性になる（[`is_site_independent`] がこの向きを保つ）。
 const TYPE_OPERATORS: [&str; 5] = ["keyof", "readonly", "infer", "extends", VALUE_OPERATOR];
 
+/// 識別子として読まれるリテラル型。
+///
+/// リテラル型のうち、**綴りが識別子の形をしているのはこの 2 つだけ**。文字列リテラル型
+/// (`"a"`) と数値リテラル型 (`42`) は識別子として読まれないので、ここに並べる相手にならない
+/// （[`is_site_independent`] は識別子だけを見る）。
+const BOOLEAN_LITERALS: [&str; 2] = ["true", "false"];
+
 /// サーバに型シグネチャを尋ねた結果。
 ///
 /// **「取れなかった」を 1 つにまとめない。** どれなのかで**利用者が次に試すことが違う**
@@ -580,7 +587,10 @@ fn names_a_declared_type(identifier: &str, following: &str) -> bool {
     if identifier.is_empty() || identifier.starts_with(|first: char| first.is_ascii_digit()) {
         return false;
     }
-    if PREDEFINED_TYPES.contains(&identifier) || TYPE_OPERATORS.contains(&identifier) {
+    let names_the_language = PREDEFINED_TYPES.contains(&identifier)
+        || TYPE_OPERATORS.contains(&identifier)
+        || BOOLEAN_LITERALS.contains(&identifier);
+    if names_the_language {
         return false;
     }
 
@@ -1761,6 +1771,29 @@ mod tests {
         );
 
         assert!(!boxed.is_unifiable_with(&wrapped));
+    }
+
+    #[test]
+    fn test_an_alias_opening_onto_a_boolean_literal_is_substituted() {
+        // `true` / `false` はリテラル型で、宣言を辿らずに意味が決まる。型名として
+        // 数えると、書き下した綴りとの比較が止まる
+        let enabled = signature_with(
+            "function pick(x: Enabled): void",
+            &resolving("Enabled", "true"),
+        );
+
+        assert!(enabled.is_unifiable_with(&signature("function other(x: true): void")));
+    }
+
+    #[test]
+    fn test_an_alias_opening_onto_a_declared_type_is_still_not_substituted() {
+        // 対照は上のテスト。リテラル型を通したことで、宣言された型名まで通っていないか
+        let boxed = signature_with(
+            "function pick(x: Boxed): void",
+            &resolving("Boxed", "Local"),
+        );
+
+        assert!(!boxed.is_unifiable_with(&signature("function other(x: Local): void")));
     }
 
     #[test]
