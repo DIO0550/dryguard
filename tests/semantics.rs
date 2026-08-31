@@ -23,6 +23,7 @@ use dryguard::lsp::{
 use dryguard::pipeline::{MeasuredPair, chunk_pair_of, measured_pair_of};
 use dryguard::report::text_of;
 use dryguard::semantics::caller_domain::CallerDomains;
+use dryguard::semantics::resolved_type::ResolvedTypes;
 use dryguard::semantics::type_signature::TypeSignature;
 use dryguard::syntax::chunk::Chunk;
 
@@ -77,6 +78,9 @@ fn session_over(paths: &[PathBuf]) -> Session {
 }
 
 /// そのチャンクの型シグネチャを、サーバに尋ねて正規化したもの。
+///
+/// **型名は解決しない。** ここで見たいのは返った綴りを正規化して比べるところまでで、
+/// 解決まで含めた形は `measured_with_an_lsp` を使うテストが見る。
 fn type_signature_of(session: &mut Session, chunk: &Chunk) -> TypeSignature {
     let document = document(chunk.path());
     if session.open_document(&document).is_err() {
@@ -92,7 +96,9 @@ fn type_signature_of(session: &mut Session, chunk: &Chunk) -> TypeSignature {
     let Ok(HoverOutcome::Answered(signature_text)) = session.hover(&document, position) else {
         panic!("名前の位置には hover が答える: {}", chunk.path().display());
     };
-    let Some(signature) = TypeSignature::from_signature_text(&signature_text) else {
+    let Some(signature) =
+        TypeSignature::from_signature_text(&signature_text, &ResolvedTypes::default())
+    else {
         panic!("サーバが返した綴りは読み取れる: {signature_text}");
     };
     signature
@@ -331,6 +337,106 @@ fn test_compare_with_an_lsp_finds_the_accidental_duplication_not_unifiable() {
     let (discounts_an_invoice, reorders_stock) = accidental_duplication_pair();
 
     let measured = measured_with_an_lsp(&discounts_an_invoice, &reorders_stock);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_opens_a_type_alias_written_on_a_parameter() {
+    // hover が返すのは `function scaleAmount(amount: Amount, factor: number): Amount` で、
+    // `Amount` は展開されない。解決しないと `(Amount, number) => Amount` と
+    // `(number, number) => number` になり、単一化不能と出る
+    let scales_an_amount = fixture("references/src/billing/scale.ts", 3);
+    let scales_a_total = fixture("references/src/report/total.ts", 1);
+
+    let measured = measured_with_an_lsp(&scales_an_amount, &scales_a_total);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_opens_a_type_alias_that_replaces_the_whole_signature() {
+    // 呼び出し可能なエイリアスで注釈すると、hover は `const halveAmount: Scaling` と
+    // 綴り全体をエイリアス名 1 語で返す。**引数リストが無いので、解決を綴りを読む前に
+    // 差し込まないと入口に入れない**（`from_signature_text` が `None` を返す）
+    let halves_an_amount = fixture("references/src/billing/scale.ts", 7);
+    let halves_a_total = fixture("references/src/report/total.ts", 5);
+
+    let measured = measured_with_an_lsp(&halves_an_amount, &halves_a_total);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_opens_a_type_alias_declared_outside_the_pair_root() {
+    // 候補ペアが同じディレクトリにあると、根はそのディレクトリになる。エイリアスは
+    // 兄弟ディレクトリで宣言されているので、**根の下だけを開かせる形では解決できない**
+    let scales_by_rate = fixture("references/src/report/scaled.ts", 3);
+    let scales_by_number = fixture("references/src/report/scaled.ts", 7);
+
+    let measured = measured_with_an_lsp(&scales_by_rate, &scales_by_number);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_opens_a_type_alias_declared_by_a_dependency() {
+    // `PropertyKey` は `lib.es5.d.ts`（約 1 MB・依存の置き場の下）で
+    // `string | number | symbol` として宣言されている。開かせる相手を絞ると、
+    // 書き下した綴りと比べる側が解決できない
+    let keyed_by_property = fixture("references/src/report/keyed.ts", 1);
+    let keyed_by_union = fixture("references/src/report/keyed.ts", 5);
+
+    let measured = measured_with_an_lsp(&keyed_by_property, &keyed_by_union);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_does_not_unify_two_aliases_of_different_types_spelled_alike() {
+    // どちらのファイルも自分だけの `Local` を宣言していて、中身は別物
+    // （`{ amount: number }` と `{ label: string }`）。**`interface` は hover が
+    // 構造を展開しない**ので、宣言の綴りは両側とも `type ... = Local` になる
+    let boxed = fixture("references/src/billing/boxed.ts", 7);
+    let wrapped = fixture("references/src/inventory/boxed.ts", 7);
+
+    let measured = measured_with_an_lsp(&boxed, &wrapped);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_does_not_unify_two_generic_aliases_of_different_types_spelled_alike() {
+    // 対照は 1 つ上のテスト。**総称型の参照でも同じことが起きる**。どちらのファイルも
+    // 自分だけの `interface Local<T>` を宣言していて、開いた綴りは両側とも `Local<string>`
+    let charged = fixture("references/src/billing/generic.ts", 7);
+    let tagged = fixture("references/src/inventory/generic.ts", 8);
+
+    let measured = measured_with_an_lsp(&charged, &tagged);
 
     assert_eq!(
         measured.signals().type_signature_match(),

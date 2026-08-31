@@ -78,12 +78,16 @@ if structurally_similar && domains_differ { ... }
 | `document` | サーバに開かせるソースファイル 1 つ分。URI・`language id`・中身の組 |
 | `language id` | LSP がサーバに伝える言語の名前（`typescript` / `typescriptreact`） |
 | `hover` | ソースの 1 点を指して、そこにある名前の型を尋ねる問い合わせ |
+| `type definition` | ソースの 1 点を指して、そこに書かれた型がどこで宣言されているかを尋ねる問い合わせ |
+| `declaration site` | `type definition` が返す宣言の場所。ファイルと、その中の 1 点 |
 | `references` | ソースの 1 点を指して、そこにある名前を使っているところを尋ねる問い合わせ |
 | `reference` | `references` が返す 1 件。**その名前を使っている側**のファイルの位置 |
 | `caller domain` | 参照元が属する `domain`。ドメインごとの件数を持つ |
 | `progress` | サーバが自分で始めた作業（プロジェクトの読み込みなど）。作成の要求と、終わりの通知で挟まれる |
 | `source position` | ファイルの中の 1 点。行と、**UTF-16 のコード単位で数えた**列 |
 | `signature text` | hover が返した型の綴りそのもの。**正規化前** |
+| `type reference` | チャンクのシグネチャに書かれた型名 1 つ分と、その位置。**解決前** |
+| `resolved type` | その型名が指していた型の綴り。**解決後** |
 | `type signature` | 引数名を落とし、型変数を出現順に付け替えた形。**正規化後**。比較はこれで行う |
 | `unifiable` | 2 つの `type signature` が同じ型構造に重なること（単一化可能） |
 
@@ -109,6 +113,12 @@ JSON が壊れているのは違う話）。1 語で呼ぶと、どちらの層�
 引数名が違うだけのペアが別物になる**（`specifier` と `module path` を分けているのと同じ形）。
 サーバが返す綴りには宣言形（`function decl(a: string): number`）と値形
 （`const arrow: (a: string) => number`）があり、**同じ型でも書かれ方が 2 通りある**。
+
+**`type reference` と `resolved type` を混ぜない。** どちらも型を指す綴りだが、
+書かれた型名は**書いた人の位置に依存する**（輸入した `Amount` は、どのファイルの `Amount` かを
+綴りだけでは言えない）。**綴りのまま比べると、同じ型を指す `Amount` と `number` が別物になる**
+（`specifier` と `module path` を分けているのと同じ形）。集めるのは `syntax`、
+解決するのは `semantics` と、持ち場も分かれる。
 
 **`module distance` と `caller domain` を混ぜない。** どちらもディレクトリで測るが、
 前者は**そのチャンク自身がどこに置かれているか**、後者は**実際に誰が使っているか**。

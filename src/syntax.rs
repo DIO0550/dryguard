@@ -13,6 +13,10 @@
 //!
 //! 構造類似度は構文木を正規化したトークン列の重なりで出す（`token`）。
 //! 正規化の粒度もそこが持つ。
+//!
+//! シグネチャに書かれた型名とその位置は `type_reference` が集める。**その名前が何を
+//! 指しているかは尋ねない**（尋ねるのは `semantics`）。ここが決めるのは、どこを指して
+//! 尋ねればよいかまで。
 
 pub mod chunk;
 pub mod import;
@@ -20,3 +24,4 @@ pub mod line_range;
 pub mod module_distance;
 pub mod token;
 pub mod tree;
+pub mod type_reference;

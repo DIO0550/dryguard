@@ -6,6 +6,7 @@
 //!
 //! | モジュール | 持つもの |
 //! |---|---|
+//! | `resolved_type` | シグネチャに書かれた型名を、それが指す型の綴りへ解決する |
 //! | `type_signature` | hover に尋ね、返った綴りを単一化の可否を比べられる形へ直す |
 //! | `caller_domain` | references に尋ね、参照元がどのドメインに属するかを数える |
 //!
@@ -16,4 +17,5 @@
 //! 呼び出し先（callHierarchy）の収集はこの後の Phase で足す。
 
 pub mod caller_domain;
+pub mod resolved_type;
 pub mod type_signature;

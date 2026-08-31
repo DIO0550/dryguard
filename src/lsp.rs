@@ -12,6 +12,7 @@
 //! | `workspace` | サーバに見せるワークスペースの根 |
 //! | `document` | サーバに開かせるソースファイル |
 //! | `hover` | hover の応答から型の綴りを取り出す |
+//! | `type_definition` | typeDefinition の応答から型の宣言の場所を取り出す |
 //! | `references` | references の応答から参照元のファイルを取り出す |
 //! | ここ | サーバの起動・パイプの配線・終了 |
 //!
@@ -26,6 +27,7 @@ pub(crate) mod framing;
 pub(crate) mod hover;
 pub(crate) mod message;
 pub(crate) mod references;
+pub(crate) mod type_definition;
 pub(crate) mod uri;
 pub(crate) mod workspace;
 
@@ -34,7 +36,9 @@ use std::fmt;
 use std::io::{self, BufReader};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
-use lsp_types::{HoverProviderCapability, OneOf, ServerCapabilities};
+use lsp_types::{
+    HoverProviderCapability, OneOf, ServerCapabilities, TypeDefinitionProviderCapability,
+};
 
 use crate::source_position::SourcePosition;
 use connection::Connection;
@@ -45,6 +49,8 @@ pub use document::{DocumentError, SourceDocument};
 // 外から読める形で出す。
 pub use hover::HoverOutcome;
 pub use references::ReferencesOutcome;
+// 型の宣言の場所は、開かせる相手を決める材料として `pipeline` が読む。
+pub use type_definition::{DeclarationSite, TypeDefinitionOutcome};
 pub use workspace::{WorkspaceError, WorkspaceRoot};
 
 // 失敗を読むための型だけを外へ出す。[`ClientError`] が抱えている以上、
@@ -233,6 +239,62 @@ impl Session {
             .map_err(ClientError::Conversation)
     }
 
+    /// 開かせたファイルの、指定位置に書かれた型が宣言されている場所を尋ねる。
+    ///
+    /// `position` は `TypeReference::position` が指す型名の位置。宣言が返ったのか、
+    /// 無かったのか、読めなかったのかは [`TypeDefinitionOutcome`] が分けて持つ。
+    ///
+    /// **typeDefinition を提供していないサーバには送らない**
+    /// （[`TypeDefinitionOutcome::NotSupported`]）。hover と同じ理由で、送ると
+    /// **シグナルが取れないだけの話が往復の失敗になる**。
+    ///
+    /// 先に [`Session::open_document`] で開かせておく。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、往復が失敗したとき、
+    /// 応答を typeDefinition の結果として読めないとき。
+    pub fn type_definition(
+        &mut self,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<TypeDefinitionOutcome, ClientError> {
+        if !provides_type_definition(&self.capabilities) {
+            return Ok(TypeDefinitionOutcome::NotSupported);
+        }
+
+        self.client
+            .connection
+            .type_definition(document, position)
+            .map_err(ClientError::Conversation)
+    }
+
+    /// 宣言の場所を指して、そこにある名前の型の綴りを尋ねる。
+    ///
+    /// `site` は [`Session::type_definition`] が返した場所。型エイリアスの右辺は、
+    /// **使用側ではなく宣言の位置へ尋ねないと返らない**（使用側では `import Amount`
+    /// としか返らない）。
+    ///
+    /// **宣言のあるファイルは先に開かせておく。** 開かせていないと、サーバは綴りを
+    /// 持たない応答を返す（[`HoverOutcome::Unreadable`] になる）。
+    ///
+    /// # Errors
+    ///
+    /// 往復が失敗したとき、応答を hover の結果として読めないとき。
+    pub fn hover_at_declaration(
+        &mut self,
+        site: &DeclarationSite,
+    ) -> Result<HoverOutcome, ClientError> {
+        if !provides_hover(&self.capabilities) {
+            return Ok(HoverOutcome::NotSupported);
+        }
+
+        self.client
+            .connection
+            .hover_at_declaration(site)
+            .map_err(ClientError::Conversation)
+    }
+
     /// 開かせたファイルの、指定位置にある名前を参照しているところを尋ねる。
     ///
     /// `position` は `Chunk::name_position` が指す識別子の位置。参照元が返ったのか、
@@ -327,6 +389,20 @@ fn provides_hover(capabilities: &ServerCapabilities) -> bool {
     matches!(
         capabilities.hover_provider,
         Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
+    )
+}
+
+/// そのサーバが typeDefinition に答えるか。
+///
+/// hover と同じく**有無ではなく中身を見る**。無効を表す `Simple(false)` も
+/// 「宣言はある」ので、`is_some()` で見ると typeDefinition を切ったサーバへ送ってしまう。
+fn provides_type_definition(capabilities: &ServerCapabilities) -> bool {
+    matches!(
+        capabilities.type_definition_provider,
+        Some(
+            TypeDefinitionProviderCapability::Simple(true)
+                | TypeDefinitionProviderCapability::Options(_)
+        )
     )
 }
 
@@ -575,6 +651,43 @@ mod tests {
         let capabilities = capabilities_declaring_hover(None);
 
         assert!(!provides_hover(&capabilities));
+    }
+
+    /// そのサーバができることとして typeDefinition だけを宣言した capabilities。
+    fn capabilities_declaring_type_definition(
+        type_definition_provider: Option<TypeDefinitionProviderCapability>,
+    ) -> ServerCapabilities {
+        ServerCapabilities {
+            type_definition_provider,
+            ..ServerCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn test_provides_type_definition_with_a_server_that_declares_it_is_true() {
+        let capabilities = capabilities_declaring_type_definition(Some(
+            TypeDefinitionProviderCapability::Simple(true),
+        ));
+
+        assert!(provides_type_definition(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_type_definition_with_a_server_that_turned_it_off_is_false() {
+        // 対照は上のテスト。**宣言はあるが無効**という形で、`is_some()` で見ていると
+        // typeDefinition を切ったサーバへ要求を送ってしまう
+        let capabilities = capabilities_declaring_type_definition(Some(
+            TypeDefinitionProviderCapability::Simple(false),
+        ));
+
+        assert!(!provides_type_definition(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_type_definition_with_a_server_that_does_not_declare_it_is_false() {
+        let capabilities = capabilities_declaring_type_definition(None);
+
+        assert!(!provides_type_definition(&capabilities));
     }
 
     /// そのサーバができることとして references だけを宣言した capabilities。

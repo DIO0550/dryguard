@@ -13,6 +13,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use crate::lsp::{ClientError, HoverOutcome, Session, SourceDocument};
+use crate::semantics::resolved_type::ResolvedTypes;
 use crate::source_position::SourcePosition;
 
 /// 付け替えた型変数の綴りの前置き。
@@ -38,6 +39,99 @@ const CONSTRUCTOR_KEYWORD: &str = "constructor";
 /// 構築シグネチャの値形を導く語（`new (value: string) => Result`）。
 const NEW_KEYWORD: &str = "new";
 
+/// 括弧で括られていなければ、周りの印に負ける演算子。
+///
+/// 関数型の `=>` は、深さ 0 の `=` として現れる（`>` は矢印の一部なので
+/// [`SignatureScan`] が閉じ括弧として数えない）。
+const UNGROUPED_TYPE_OPERATORS: [char; 3] = ['|', '&', '='];
+
+/// 型の手前に来る区切り。
+///
+/// `>` は関数型の矢印（`(a: T) => U` の `U` の手前）、`[` はタプルの始まり。
+/// **型名の直後の `[` は配列の印**なので、後ろの一覧（[`TYPE_BOUNDARY_AFTER`]）には入れない。
+const TYPE_BOUNDARY_BEFORE: [char; 6] = [':', ',', '(', '<', '>', '['];
+
+/// 型の後ろに来る区切り。
+const TYPE_BOUNDARY_AFTER: [char; 6] = [',', ')', '>', ';', '}', ']'];
+
+/// メンバーや引数の名前の後ろに続く印。
+///
+/// 型の綴りでは、名前の後ろにだけこれらが続く。`(` と `<` はメソッドの名前
+/// （`{ ID(): X }` / `{ ID<T>(): X }`）、`?` の付く形は省略できるメンバー。
+///
+/// **`?` だけでは足りない。** 条件型（`T extends U ? X : Y`）の `?` と見分けが付かない。
+///
+/// **`<` が型名の後ろに来るのは総称型（`Box<User>`）だけ**で、そのときは型引数を取る
+/// エイリアスなので開く対象に入っていない（[`ResolvedTypes`] へ入らない）。
+const MEMBER_MARKERS: [&str; 5] = [":", "?:", "(", "?(", "<"];
+
+/// 後ろに値の名前を取る演算子。
+///
+/// `typeof x` の `x` は**値の名前**で、型の名前ではない。同じ綴りの型エイリアスがあると
+/// 差し替えが `typeof string` という綴りを作る（TypeScript では型と値が別の名前空間なので、
+/// 同じ綴りが両方にありうる）。
+const VALUE_OPERATOR: &str = "typeof";
+
+/// どこで書かれても同じ型を指す綴り。
+///
+/// TypeScript の文法が持つ組み込みの型で、**宣言を辿らずに意味が決まる**。
+/// tree-sitter が `predefined_type` として扱う一覧と同じもの。
+const PREDEFINED_TYPES: [&str; 12] = [
+    "any",
+    "bigint",
+    "boolean",
+    "never",
+    "null",
+    "number",
+    "object",
+    "string",
+    "symbol",
+    "undefined",
+    "unknown",
+    "void",
+];
+
+/// 型の綴りの中で、型名ではなく型の作り方を表す語。
+///
+/// **一覧から漏れた語は型名として扱われる。** 漏れると差し込みを見送るだけなので、
+/// 倒れる向きは偽陰性になる（[`is_site_independent`] がこの向きを保つ）。
+const TYPE_OPERATORS: [&str; 5] = ["keyof", "readonly", "infer", "extends", VALUE_OPERATOR];
+
+/// 識別子として読まれるリテラル型。
+///
+/// リテラル型のうち、**綴りが識別子の形をしているのはこの 2 つだけ**。文字列リテラル型
+/// (`"a"`) と数値リテラル型 (`42`) は識別子として読まれないので、ここに並べる相手にならない
+/// （[`is_site_independent`] は識別子だけを見る）。
+const BOOLEAN_LITERALS: [&str; 2] = ["true", "false"];
+
+/// 綴りを検証するときに、メンバーや引数の名前と見なす印。
+///
+/// [`MEMBER_MARKERS`] から `<` を外したもの。**差し込む側と検証する側で `<` の意味が違う**。
+/// 差し込む先の綴りに `X<…>` が現れるのはメソッド名だけだが（型引数を取るエイリアスは
+/// 開く対象に入らない）、**検証する相手は開いた後の綴り**で、そこには総称型の参照
+/// (`Local<string>`) が現れる。それは宣言を辿る相手なので、見逃すと**別々のモジュールの
+/// `Local<string>` が同じ綴りとして重なる**。
+///
+/// **Why not（型引数の中身を読んで見分ける）**: メソッド名か総称型かは `<` の後ろが
+/// 型変数の宣言かどうかで決まり、読むには型そのものの構文解析が要る。
+/// 取りこぼす側（差し込みを見送る = 偽陰性）に倒した。
+const VETTED_MEMBER_MARKERS: [&str; 4] = [":", "?:", "(", "?("];
+
+/// 引用符の始まり。
+///
+/// **綴りを検証する側は引用符の中を見ない**（識別子の走査が [`QuoteState`] で飛ばす）。
+/// ところが引用符の中は**宣言の場所に依存する意味を運べる** —— テンプレートリテラル型の
+/// 補間 (`` `${Local}` ``) と、`typeof import("./local")` の指定子がこれ。中を読まずに
+/// 通すと、別々のモジュールの綴りが同じものとして重なる。
+///
+/// **Why not（補間と指定子をそれぞれ見分ける）**: 見分ける形を足しても、
+/// 引用符の中を見ない限り次の形で同じことが起きる。**見ない場所を無くすのではなく、
+/// 見ない場所を持つ綴りごと差し込みの対象から外す。**
+///
+/// 代償は、文字列リテラル型のエイリアス (`type Mode = "on" | "off"`) が開かれなくなること。
+/// 倒れる向きは偽陰性。
+const QUOTE_MARKS: [char; 3] = ['"', '\'', '`'];
+
 /// サーバに型シグネチャを尋ねた結果。
 ///
 /// **「取れなかった」を 1 つにまとめない。** どれなのかで**利用者が次に試すことが違う**
@@ -55,12 +149,23 @@ pub enum TypeSignatureOutcome {
     UnreadableSignature,
     /// サーバが hover を提供していない。
     HoverNotProvided,
+    /// サーバが typeDefinition を提供していないので、型名を 1 つも開けなかった。
+    ///
+    /// **綴りのまま比べた結果を出さない。** 開けていれば重なったかもしれないので、
+    /// 「単一化不能」として出すと確かめられなかったことを答えにしてしまう。
+    TypeDefinitionNotProvided,
+    /// 宣言の場所は返ったが、`lsp` がパスとして読めなかった。
+    ///
+    /// **サーバは宣言を持っている。** 読めないのはこちら側の穴なので、宣言が無いのとは
+    /// 分けて出す。
+    UnreadableTypeDefinition,
 }
 
 /// その位置にある名前の型を尋ねて、正規化した形にする。
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
-/// `Chunk::name_position` が指す識別子の位置。
+/// `Chunk::name_position` が指す識別子の位置。`resolved` は
+/// `semantics::resolved_type` が集めた型エイリアスの右辺。
 ///
 /// # Errors
 ///
@@ -71,9 +176,10 @@ pub fn type_signature_outcome_of(
     session: &mut Session,
     document: &SourceDocument,
     position: SourcePosition,
+    resolved: &ResolvedTypes,
 ) -> Result<TypeSignatureOutcome, ClientError> {
     let outcome = match session.hover(document, position)? {
-        HoverOutcome::Answered(signature_text) => normalized_outcome_of(&signature_text),
+        HoverOutcome::Answered(signature_text) => normalized_outcome_of(&signature_text, resolved),
         HoverOutcome::NoAnswer => TypeSignatureOutcome::NoTypeThere,
         HoverOutcome::Unreadable => TypeSignatureOutcome::UnreadableHover,
         HoverOutcome::NotSupported => TypeSignatureOutcome::HoverNotProvided,
@@ -83,8 +189,8 @@ pub fn type_signature_outcome_of(
 }
 
 /// 綴りを正規化した結果。読み解けなければ、その旨。
-fn normalized_outcome_of(signature_text: &str) -> TypeSignatureOutcome {
-    let Some(signature) = TypeSignature::from_signature_text(signature_text) else {
+fn normalized_outcome_of(signature_text: &str, resolved: &ResolvedTypes) -> TypeSignatureOutcome {
+    let Some(signature) = TypeSignature::from_signature_text(signature_text, resolved) else {
         return TypeSignatureOutcome::UnreadableSignature;
     };
 
@@ -113,12 +219,17 @@ impl TypeSignature {
     /// `text` は正規化前の綴り（`lsp` の `Session::hover` が返すもの）。サーバごとに
     /// 宣言形（`function decl(a: string): number`）と値形
     /// （`const arrow: (a: string) => number`）の 2 通りがあり、どちらも同じ形へ直す。
+    /// `resolved` は型エイリアスの右辺で、綴りを読む前に差し込む。
     ///
     /// 引数リストと戻り値の型を読み取れない綴りでは `None`。**空の引数リストで
     /// 埋めない**ので、後段は「引数が無い関数」と「読めなかった」を区別できる
     /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
-    pub fn from_signature_text(text: &str) -> Option<Self> {
-        let flattened = flattened(text);
+    ///
+    /// **差し込むのは読む前。** シグネチャ全体がエイリアスに置き換わる形
+    /// （`const aliased: Handler`）は引数リストを持たないので、読んだ後に差し込む形では
+    /// **この綴りが入口に入れない**（`None` になる）。
+    pub fn from_signature_text(text: &str, resolved: &ResolvedTypes) -> Option<Self> {
+        let flattened = flattened(&substituted(text, resolved));
         let split = SplitSignature::from_signature_text(&flattened)?;
 
         let return_type = normalized_type(split.return_type()?)?;
@@ -325,6 +436,239 @@ fn flattened(text: &str) -> String {
     flattened
 }
 
+/// 型名を、解決後の綴りへ差し替えた文字列。
+///
+/// 差し替えは**識別子の単位**で行う。部分一致で差し替えると、`Amount` が
+/// `AmountRate` の中まで書き換える。
+///
+/// **引用符の中は差し替えない。** 文字列リテラル型 `"Amount"` を書き換えると
+/// 別の型になる（[`flattened`] が引用符の中の空白を畳まないのと同じ理由）。
+fn substituted(text: &str, resolved: &ResolvedTypes) -> String {
+    let mut substituted = String::new();
+    let mut identifier = String::new();
+    let mut quote = QuoteState::new();
+    let mut preceded = Preceded::Nothing;
+
+    for (index, character) in text.char_indices() {
+        let inside_quotes = quote.is_inside(character);
+        if !inside_quotes && is_identifier_character(character) {
+            identifier.push(character);
+            continue;
+        }
+
+        let placement = Placement {
+            preceded: preceded.clone(),
+            following: text.get(index..).unwrap_or_default(),
+        };
+        push_resolved(&mut substituted, &identifier, resolved, &placement);
+
+        // 識別子が終わったことを覚えてから、区切りの文字で上書きする。空白は覚えない
+        // （`keyof Maybe` の `Maybe` から見た直前は、空白ではなく `keyof` そのもの）。
+        if !identifier.is_empty() {
+            preceded = Preceded::Word(identifier.clone());
+        }
+        identifier.clear();
+        substituted.push(character);
+
+        if !character.is_whitespace() {
+            preceded = Preceded::Separator(character);
+        }
+    }
+    let placement = Placement {
+        preceded,
+        following: "",
+    };
+    push_resolved(&mut substituted, &identifier, resolved, &placement);
+
+    substituted
+}
+
+/// 綴りの中で、その名前が置かれている位置の前後。
+///
+/// **型名なのかも、括弧が要るかも、前後で決まる。** 2 つを別々に持ち回すと、
+/// 片方だけを見て判断する枝が生えやすい。
+struct Placement<'text> {
+    /// その名前の直前にあったもの。
+    preceded: Preceded,
+    /// その名前の後ろに続く綴り。綴りの末尾なら空。
+    following: &'text str,
+}
+
+/// 名前の直前にあったもの。
+///
+/// **区切りの文字と識別子を分けて持つ。** 識別子を「最後の 1 文字」に潰すと、
+/// `keyof` と `typeof` を見分けられない（どちらも `f` で終わる）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Preceded {
+    /// 綴りの先頭。
+    Nothing,
+    /// 区切りの文字。
+    Separator(char),
+    /// 識別子。前置きの型演算子（`keyof`）や、値を取る `typeof` がこれ。
+    Word(String),
+}
+
+impl Placement<'_> {
+    /// その名前が型ではなく、メンバーや引数の名前か。
+    ///
+    /// 型の綴りでは、名前の後ろにだけ [`MEMBER_MARKERS`] が続く。`{ ID: ID }` の左側、
+    /// `{ ID(): ID }` のメソッド名、`(value: T)` の `value` がこれで、**差し替えると
+    /// 型でないものを型で置き換える**ことになる。
+    fn names_a_member(&self) -> bool {
+        let following = self.following.trim_start();
+
+        MEMBER_MARKERS
+            .iter()
+            .any(|marker| following.starts_with(marker))
+    }
+
+    /// その名前が型ではなく、値を指しているか。
+    ///
+    /// `typeof x` の `x` がこれ。**TypeScript は型と値で名前空間が別**なので、
+    /// 同じ綴りの型エイリアスがあっても、ここを差し替えると型でないものを置き換えることになる。
+    fn names_a_value(&self) -> bool {
+        matches!(&self.preceded, Preceded::Word(word) if word == VALUE_OPERATOR)
+    }
+
+    /// 前後が型の区切りで、括弧を足さなくても 1 つのまとまりとして読めるか。
+    ///
+    /// 直前が識別子で終わっていれば挟まれていない。前置きの型演算子（`keyof` /
+    /// `readonly` / `infer`）がこれで、**`keyof A | B` は `(keyof A) | B` と読まれる**。
+    fn is_bounded(&self) -> bool {
+        let bounded_before = match &self.preceded {
+            Preceded::Nothing => true,
+            Preceded::Separator(character) => TYPE_BOUNDARY_BEFORE.contains(character),
+            Preceded::Word(_) => false,
+        };
+        let bounded_after = self
+            .following
+            .trim_start()
+            .chars()
+            .next()
+            .is_none_or(|character| TYPE_BOUNDARY_AFTER.contains(&character));
+
+        bounded_before && bounded_after
+    }
+}
+
+/// 識別子 1 つ分を、解決後の綴り（解決できていなければそのまま）で書き足す。
+fn push_resolved(
+    target: &mut String,
+    identifier: &str,
+    resolved: &ResolvedTypes,
+    placement: &Placement<'_>,
+) {
+    let names_a_type = !placement.names_a_member() && !placement.names_a_value();
+    let opened = resolved
+        .resolved_of(identifier)
+        .filter(|_| names_a_type)
+        .filter(|spelling| is_site_independent(spelling));
+    let Some(spelling) = opened else {
+        target.push_str(identifier);
+        return;
+    };
+
+    target.push_str(&grouped_spelling_of(spelling, placement));
+}
+
+/// その綴りが、どこに書かれていても同じ型を指すか。
+///
+/// 開いた綴りに**別の場所で宣言された名前が残る**ことがある。サーバは型エイリアスを
+/// 辿って展開するが、`interface` / `class` はそこで止まり、`type Boxed = Local` の
+/// ように名前のまま返る（typescript-language-server 6.0.0 で実測）。
+///
+/// **残った名前は、その宣言のあるファイルでしか意味が決まらない。** 別々のモジュールが
+/// それぞれの `Local` を宣言していると、どちらも `Local` に開かれて**別の型が
+/// 単一化可能と出る**（偽陽性）。`Local[]` でも `{ x: Local }` でも同じことが起きるので、
+/// 綴りの形ではなく**名前が残っているかどうか**で見る。
+///
+/// 名前として数えないのは 2 つ。メンバーや引数の名前（後ろに [`VETTED_MEMBER_MARKERS`] が
+/// 続く）と、[`PREDEFINED_TYPES`] / [`TYPE_OPERATORS`] / [`BOOLEAN_LITERALS`] に載っている語。
+///
+/// **引用符を含む綴りは、名前を数える前に外す。** 走査は引用符の中を見ないので、
+/// そこに残った名前を見落とす（[`QUOTE_MARKS`]）。
+///
+/// **Why not（残った名前もその宣言まで辿る）**: 辿るには宣言のあるファイルを
+/// 構文木にするところから始まり、綴りではなく位置で差し込む形になる（Issue #133）。
+fn is_site_independent(spelling: &str) -> bool {
+    if spelling.contains(QUOTE_MARKS) {
+        return false;
+    }
+
+    let mut identifier = String::new();
+
+    for (index, character) in spelling.char_indices() {
+        if is_identifier_character(character) {
+            identifier.push(character);
+            continue;
+        }
+
+        let following = spelling.get(index..).unwrap_or_default();
+        if names_a_declared_type(&identifier, following) {
+            return false;
+        }
+        identifier.clear();
+    }
+
+    !names_a_declared_type(&identifier, "")
+}
+
+/// その語が、どこかで宣言された型の名前か。空の語と、数字で始まる語は名前ではない。
+///
+/// `following` はその語の後ろに続く綴り。メンバーや引数の名前を見分けるのに使う。
+fn names_a_declared_type(identifier: &str, following: &str) -> bool {
+    if identifier.is_empty() || identifier.starts_with(|first: char| first.is_ascii_digit()) {
+        return false;
+    }
+    let names_the_language = PREDEFINED_TYPES.contains(&identifier)
+        || TYPE_OPERATORS.contains(&identifier)
+        || BOOLEAN_LITERALS.contains(&identifier);
+    if names_the_language {
+        return false;
+    }
+
+    let after = following.trim_start();
+    !VETTED_MEMBER_MARKERS
+        .iter()
+        .any(|marker| after.starts_with(marker))
+}
+
+/// その位置に置くときの型の綴り。括弧が要るなら括ってから返す。
+///
+/// **Why**: `type Maybe = string | undefined` を `Maybe[]` の位置へそのまま差し込むと
+/// `string | undefined[]` になり、`(string | undefined)[]` とは別の型を指す。
+/// 呼び出し可能なエイリアスでは**倒れる向きが偽陽性**になり、`Handler | null` が
+/// 「共用体を返す関数」として読める。
+///
+/// **Why not（常に括る）**: `Amount` が `(number)` になり、書き下した `number` と
+/// 別の綴りになる。**エイリアスを開いた側だけが単一化できなくなる。**
+fn grouped_spelling_of(spelling: &str, placement: &Placement<'_>) -> String {
+    if placement.is_bounded() || !is_compound_type(spelling) {
+        return spelling.to_owned();
+    }
+
+    format!("({spelling})")
+}
+
+/// その型の綴りが、括弧の外で組み合わさっているか。
+///
+/// **深さ 0 に空白があれば組み合わさっている。** 前置きの型演算子（`keyof Model`）や
+/// 条件型（`A extends B ? C : D`）は演算子の一覧に載らないが、どれも語を空白で
+/// つないだ形になる。演算子を列挙すると**漏れた 1 つが黙って偽陽性を作る**。
+///
+/// 深さ 0 だけを見るのは、`Map<string, A | B>` や `{ id: string }` のように
+/// **括弧の中で組み合わさっている型は、それ自体が 1 つのまとまりとして置ける**ため。
+/// 既に括られている綴り（`(A | B)`）も深さ 0 には何も無いので、二重に括らない。
+fn is_compound_type(spelling: &str) -> bool {
+    let scan = SignatureScan::new(spelling);
+    let joined_by_space = scan.has_top_level_whitespace();
+    let joined_by_operator = UNGROUPED_TYPE_OPERATORS
+        .iter()
+        .any(|operator| scan.top_level_index_of(*operator).is_some());
+
+    joined_by_space || joined_by_operator
+}
+
 /// 引用符の中にいるかどうかを、文字を 1 つずつ読みながら追う。
 ///
 /// 畳む側（[`flattened`]）と深さを数える側（[`SignatureScan`]）が同じ判断を要るので、
@@ -444,6 +788,13 @@ impl<'text> SignatureScan<'text> {
             .iter()
             .find(|scanned| scanned.character == separator && scanned.depth == 0)
             .map(|scanned| scanned.index)
+    }
+
+    /// 深さ 0 に空白があるか。
+    fn has_top_level_whitespace(&self) -> bool {
+        self.characters
+            .iter()
+            .any(|scanned| scanned.depth == 0 && scanned.character.is_whitespace())
     }
 
     /// 深さ 0 にある最後の `target` の位置。無ければ `None`。
@@ -768,9 +1119,19 @@ fn is_identifier_character(character: char) -> bool {
 mod tests {
     use super::*;
 
-    /// テストが渡す綴りは読み取れる前提で組み立てる。
+    /// テストが渡す綴りは読み取れる前提で組み立てる。解決した型名は無い。
     fn signature(text: &str) -> TypeSignature {
-        TypeSignature::from_signature_text(text).expect("テストが渡す綴りは読み取れる")
+        signature_with(text, &ResolvedTypes::default())
+    }
+
+    /// 解決した型名を差し込んでから組み立てる。
+    fn signature_with(text: &str, resolved: &ResolvedTypes) -> TypeSignature {
+        TypeSignature::from_signature_text(text, resolved).expect("テストが渡す綴りは読み取れる")
+    }
+
+    /// 型名 1 つ分の解決。
+    fn resolving(name: &str, spelling: &str) -> ResolvedTypes {
+        ResolvedTypes::new([(name.to_owned(), spelling.to_owned())])
     }
 
     fn unifiable(one: &str, other: &str) -> bool {
@@ -1028,7 +1389,7 @@ mod tests {
     fn test_a_signature_without_a_parameter_list_cannot_be_read() {
         // 型エイリアスなど、関数でないものへの hover はこの形で返る
         assert_eq!(
-            TypeSignature::from_signature_text("type UserId = string"),
+            TypeSignature::from_signature_text("type UserId = string", &ResolvedTypes::default()),
             None
         );
     }
@@ -1036,7 +1397,10 @@ mod tests {
     #[test]
     fn test_a_signature_without_a_return_type_cannot_be_read() {
         assert_eq!(
-            TypeSignature::from_signature_text("function decl(a: string)"),
+            TypeSignature::from_signature_text(
+                "function decl(a: string)",
+                &ResolvedTypes::default()
+            ),
             None
         );
     }
@@ -1046,7 +1410,10 @@ mod tests {
         // 名前だけの引数からは型を取り出せない。空の型で埋めると、
         // 型注釈の無い引数どうしが「同じ型」として重なる
         assert_eq!(
-            TypeSignature::from_signature_text("function decl(a, b: string): void"),
+            TypeSignature::from_signature_text(
+                "function decl(a, b: string): void",
+                &ResolvedTypes::default()
+            ),
             None
         );
     }
@@ -1074,5 +1441,510 @@ mod tests {
             "function labelled(label: \"a, b\", count: number): void",
             "function other(name: \"a, b\", total: number): void"
         ));
+    }
+
+    #[test]
+    fn test_a_signature_using_a_type_alias_is_unifiable_with_one_written_out() {
+        // hover は `Amount` を展開しないので、解決を差し込まないと
+        // `(Amount, number) => Amount` と `(number, number) => number` になる
+        let aliased = signature_with(
+            "function scaleAmount(amount: Amount, factor: number): Amount",
+            &resolving("Amount", "number"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function scaleTotal(total: number, factor: number): number"
+        )));
+    }
+
+    #[test]
+    fn test_a_signature_using_an_unresolved_type_alias_is_not_unifiable_with_one_written_out() {
+        // 対照は上のテスト。同じ綴りを解決なしで読む。解決が効いているかを見る
+        assert!(!unifiable(
+            "function scaleAmount(amount: Amount, factor: number): Amount",
+            "function scaleTotal(total: number, factor: number): number"
+        ));
+    }
+
+    #[test]
+    fn test_a_signature_that_is_nothing_but_an_alias_is_read_after_the_alias_is_opened() {
+        // 引数リストを持たない綴り。読んだ後に差し込む形では入口に入れない
+        let aliased = signature_with(
+            "const halveAmount: Scaling",
+            &resolving("Scaling", "(amount: number) => number"),
+        );
+
+        assert!(
+            aliased.is_unifiable_with(&signature("const halveTotal: (total: number) => number"))
+        );
+    }
+
+    #[test]
+    fn test_a_signature_that_is_nothing_but_an_unresolved_alias_cannot_be_read() {
+        // 対照は上のテスト。解決が無ければ引数リストが見つからない
+        assert_eq!(
+            TypeSignature::from_signature_text(
+                "const halveAmount: Scaling",
+                &ResolvedTypes::default()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_a_type_name_inside_a_string_literal_type_is_not_substituted() {
+        // 文字列リテラル型の中身は型の一部。差し替えると別の型になる
+        let literal = signature_with(
+            "function labelled(label: \"Amount\"): void",
+            &resolving("Amount", "number"),
+        );
+
+        assert!(!literal.is_unifiable_with(&signature("function other(name: \"number\"): void")));
+    }
+
+    #[test]
+    fn test_a_name_that_only_starts_with_a_resolved_type_name_is_not_substituted() {
+        // 部分一致で差し替えると `Amount` が `AmountRate` の中まで書き換える
+        let longer = signature_with(
+            "function scale(rate: AmountRate): void",
+            &resolving("Amount", "number"),
+        );
+
+        assert!(!longer.is_unifiable_with(&signature("function other(rate: numberRate): void")));
+    }
+
+    #[test]
+    fn test_an_opened_alias_keeps_its_precedence_inside_an_array_type() {
+        // `Maybe[]` へ `string | undefined` をそのまま差し込むと `string | undefined[]`
+        // になり、`(string | undefined)[]` とは別の型を指す
+        let aliased = signature_with(
+            "function pick(values: Maybe[]): void",
+            &resolving("Maybe", "string | undefined"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function other(items: (string | undefined)[]): void"
+        )));
+    }
+
+    #[test]
+    fn test_an_opened_alias_standing_on_its_own_is_not_wrapped() {
+        // 対照は上のテスト。括弧を常に足すと、書き下した綴りと別物になる
+        let aliased = signature_with(
+            "function pick(value: Maybe): void",
+            &resolving("Maybe", "string | undefined"),
+        );
+
+        assert!(
+            aliased.is_unifiable_with(&signature("function other(item: string | undefined): void"))
+        );
+    }
+
+    #[test]
+    fn test_an_opened_alias_of_a_single_type_is_not_wrapped_inside_an_array_type() {
+        // 括弧が要るのは組み合わさった型だけ。`number` を包むと `(number)[]` になり、
+        // 書き下した `number[]` と別物になる
+        let aliased = signature_with(
+            "function pick(values: Amount[]): void",
+            &resolving("Amount", "number"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature("function other(items: number[]): void")));
+    }
+
+    #[test]
+    fn test_an_opened_callable_alias_inside_an_array_type_is_not_read_as_a_function() {
+        // `Handler[]` は関数型の配列。包まないと「number の配列を返す関数」になり、
+        // **別の型なのに単一化可能と出る**（倒れる向きが偽陽性）
+        let aliased = signature_with(
+            "function pick(values: Handler[]): void",
+            &resolving("Handler", "(value: string) => number"),
+        );
+
+        assert!(!aliased.is_unifiable_with(&signature(
+            "function other(items: (value: string) => number[]): void"
+        )));
+    }
+
+    #[test]
+    fn test_an_opened_callable_alias_keeps_its_precedence_inside_a_union() {
+        // `Handler | null` へ `() => string` をそのまま差し込むと `() => string | null`
+        // になり、**共用体を返す関数**という別の型として読める
+        let aliased = signature_with(
+            "function pick(handler: Handler | null): void",
+            &resolving("Handler", "() => string"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function other(callback: (() => string) | null): void"
+        )));
+    }
+
+    #[test]
+    fn test_an_opened_callable_alias_inside_a_union_is_not_read_as_returning_it() {
+        // 対照は上のテスト。括らないほうの読み方と重ならないことを見る（偽陽性の側）
+        let aliased = signature_with(
+            "function pick(handler: Handler | null): void",
+            &resolving("Handler", "() => string"),
+        );
+
+        assert!(!aliased.is_unifiable_with(&signature(
+            "function other(callback: () => string | null): void"
+        )));
+    }
+
+    #[test]
+    fn test_an_opened_alias_after_a_union_bar_is_wrapped_too() {
+        // 括弧が要るかは後ろだけでは決まらない。手前が区切りでなければ同じく要る
+        let aliased = signature_with(
+            "function pick(handler: null | Handler): void",
+            &resolving("Handler", "() => string"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function other(callback: null | (() => string)): void"
+        )));
+    }
+
+    #[test]
+    fn test_an_opened_alias_inside_a_generic_argument_is_not_wrapped() {
+        // 型引数の中は区切りに挟まれているので括弧は要らない。括ると書き下した綴りと
+        // 別物になる
+        let aliased = signature_with(
+            "function mapped(lookup: Map<string, Maybe>): void",
+            &resolving("Maybe", "string | undefined"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function other(table: Map<string, string | undefined>): void"
+        )));
+    }
+
+    #[test]
+    fn test_a_member_name_that_matches_a_resolved_type_name_is_not_substituted() {
+        // オブジェクト型のキーは型ではない。差し替えると `{ string: string }` になる
+        let aliased = signature_with(
+            "function pick(value: { ID: ID }): void",
+            &resolving("ID", "string"),
+        );
+
+        assert!(
+            aliased.is_unifiable_with(&signature("function other(value: { ID: string }): void"))
+        );
+    }
+
+    #[test]
+    fn test_an_optional_member_name_that_matches_a_resolved_type_name_is_not_substituted() {
+        // 省略できるメンバーは `?:` で続く。`?` だけを見ると条件型の `?` と区別が付かない
+        let aliased = signature_with(
+            "function pick(value: { ID?: ID }): void",
+            &resolving("ID", "string"),
+        );
+
+        assert!(
+            aliased.is_unifiable_with(&signature("function other(value: { ID?: string }): void"))
+        );
+    }
+
+    #[test]
+    fn test_a_method_name_that_matches_a_resolved_type_name_is_not_substituted() {
+        // メソッド名の後ろは `:` ではなく `(`。名前まで差し替えると
+        // `{ string(): string }` になる
+        let aliased = signature_with(
+            "function pick(value: { ID(): ID }): void",
+            &resolving("ID", "string"),
+        );
+
+        assert!(
+            aliased.is_unifiable_with(&signature("function other(value: { ID(): string }): void"))
+        );
+    }
+
+    #[test]
+    fn test_a_generic_method_name_that_matches_a_resolved_type_name_is_not_substituted() {
+        // 総称メソッドの名前の後ろは `<`。型名が `<` を伴うのは総称型のときだけで、
+        // そちらは開く対象に入っていない
+        let aliased = signature_with(
+            "function pick(value: { ID<T>(x: T): ID }): void",
+            &resolving("ID", "string"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function other(value: { ID<T>(x: T): string }): void"
+        )));
+    }
+
+    #[test]
+    fn test_an_opened_alias_after_a_type_operator_keyword_is_wrapped() {
+        // `keyof Maybe` へ `string | number` をそのまま差し込むと
+        // `keyof string | number` になり、TypeScript は `(keyof string) | number` と読む
+        let aliased = signature_with(
+            "function pick(key: keyof Maybe): void",
+            &resolving("Maybe", "string | number"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function other(key: keyof (string | number)): void"
+        )));
+    }
+
+    #[test]
+    fn test_an_opened_alias_after_a_type_operator_keyword_is_not_read_as_binding_tighter() {
+        // 対照は上のテスト。括らない読み方と重ならないことを見る（偽陽性の側）
+        let aliased = signature_with(
+            "function pick(key: keyof Maybe): void",
+            &resolving("Maybe", "string | number"),
+        );
+
+        assert!(!aliased.is_unifiable_with(&signature(
+            "function other(key: keyof string | number): void"
+        )));
+    }
+
+    #[test]
+    fn test_a_value_named_like_a_resolved_type_is_not_substituted() {
+        // `typeof ID` の `ID` は値の名前。TypeScript は型と値で名前空間が別なので、
+        // 同じ綴りが両方にありうる。差し替えると `typeof string` という綴りになる
+        let aliased = signature_with(
+            "function pick(x: ID, y: typeof ID): void",
+            &resolving("ID", "string"),
+        );
+
+        assert!(
+            aliased.is_unifiable_with(&signature("function other(a: string, b: typeof ID): void"))
+        );
+    }
+
+    #[test]
+    fn test_an_opened_alias_whose_body_starts_with_a_type_operator_is_wrapped() {
+        // `type Keys = keyof string` を `Keys[]` の位置へそのまま差し込むと
+        // `keyof string[]` になり、TypeScript は `keyof (string[])` と読む
+        let aliased = signature_with(
+            "function pick(keys: Keys[]): void",
+            &resolving("Keys", "keyof string"),
+        );
+
+        assert!(
+            aliased.is_unifiable_with(&signature("function other(keys: (keyof string)[]): void"))
+        );
+    }
+
+    #[test]
+    fn test_an_opened_alias_whose_body_starts_with_a_type_operator_is_not_read_as_an_array_of_it() {
+        // 対照は上のテスト。括らない読み方と重ならないことを見る（偽陽性の側）
+        let aliased = signature_with(
+            "function pick(keys: Keys[]): void",
+            &resolving("Keys", "keyof string"),
+        );
+
+        assert!(
+            !aliased.is_unifiable_with(&signature("function other(keys: keyof string[]): void"))
+        );
+    }
+
+    #[test]
+    fn test_an_already_grouped_alias_body_is_not_wrapped_again() {
+        // 括弧の中で組み合わさっている綴りは、それ自体が 1 つのまとまり。
+        // 二重に括ると書き下した綴りと別物になる
+        let aliased = signature_with(
+            "function pick(value: Grouped[]): void",
+            &resolving("Grouped", "(string | number)"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function other(value: (string | number)[]): void"
+        )));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_the_same_declared_type_name_are_not_unifiable() {
+        // `interface` の後ろでは hover が展開を止め、右辺は名前のまま返る。
+        // 別々のモジュールがそれぞれの `Local` を宣言していると、綴りだけを見て
+        // 差し込んだ結果が重なる（偽陽性）
+        let boxed = signature_with(
+            "function labelBoxed(value: Boxed): string",
+            &resolving("Boxed", "Local"),
+        );
+        let wrapped = signature_with(
+            "function labelWrapped(value: Wrapped): string",
+            &resolving("Wrapped", "Local"),
+        );
+
+        assert!(!boxed.is_unifiable_with(&wrapped));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_the_same_predefined_type_are_unifiable() {
+        // 対照は上のテスト。組み込みの型は宣言を辿らずに意味が決まるので、
+        // 同じ綴りに開かれたら同じ型を指している
+        let boxed = signature_with(
+            "function labelBoxed(value: Boxed): string",
+            &resolving("Boxed", "number"),
+        );
+        let wrapped = signature_with(
+            "function labelWrapped(value: Wrapped): string",
+            &resolving("Wrapped", "number"),
+        );
+
+        assert!(boxed.is_unifiable_with(&wrapped));
+    }
+
+    #[test]
+    fn test_two_aliases_holding_the_same_declared_type_name_inside_are_not_unifiable() {
+        // 名前が残るのは右辺全体のときだけではない。`{ x: Local }` の中に 1 つ残っても
+        // 同じことが起きるので、綴りの形ではなく名前が残っているかどうかで見る
+        let boxed = signature_with(
+            "function labelBoxed(value: Boxed): string",
+            &resolving("Boxed", "{ x: Local }"),
+        );
+        let wrapped = signature_with(
+            "function labelWrapped(value: Wrapped): string",
+            &resolving("Wrapped", "{ x: Local }"),
+        );
+
+        assert!(!boxed.is_unifiable_with(&wrapped));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_the_same_template_literal_are_not_unifiable() {
+        // 補間の中の `Local` は宣言を辿る相手。走査は引用符の中を見ないので、
+        // 通すと別々のモジュールの綴りが重なる
+        let first = signature_with(
+            "function a(x: First): void",
+            &resolving("First", "`${Local}`"),
+        );
+        let second = signature_with(
+            "function b(y: Second): void",
+            &resolving("Second", "`${Local}`"),
+        );
+
+        assert!(!first.is_unifiable_with(&second));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_the_same_import_query_are_not_unifiable() {
+        // 指定子は宣言の場所に依存するのに、**識別子を 1 つも残さない**。
+        // `import` は後ろが `(` なのでメンバー名として読まれ、走査には掛からない
+        let first = signature_with(
+            "function a(x: First): void",
+            &resolving("First", "typeof import(\"./local\")"),
+        );
+        let second = signature_with(
+            "function b(y: Second): void",
+            &resolving("Second", "typeof import(\"./local\")"),
+        );
+
+        assert!(!first.is_unifiable_with(&second));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_an_import_query_without_a_name_are_not_unifiable() {
+        // 指定子が識別子を 1 つも含まない形。**引用符の中を覗いて名前を探す形では
+        // 素通りする**ので、引用符を含む綴りごと外していることがここで効く
+        let first = signature_with(
+            "function a(x: First): void",
+            &resolving("First", "typeof import(\"./\")"),
+        );
+        let second = signature_with(
+            "function b(y: Second): void",
+            &resolving("Second", "typeof import(\"./\")"),
+        );
+
+        assert!(!first.is_unifiable_with(&second));
+    }
+
+    #[test]
+    fn test_an_alias_opening_onto_a_string_literal_type_is_not_substituted() {
+        // 引用符を含む綴りを丸ごと外した代償。文字列リテラル型はどこで書かれても
+        // 同じ型を指すが、**引用符の中を見ない走査ではそれを言い切れない**
+        let mode = signature_with(
+            "function pick(x: Mode): void",
+            &resolving("Mode", "\"on\" | \"off\""),
+        );
+
+        assert!(!mode.is_unifiable_with(&signature("function other(x: \"on\" | \"off\"): void")));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_the_same_generic_type_reference_are_not_unifiable() {
+        // `Local<string>` の `Local` は宣言を辿る相手。`<` が続くのをメソッド名の印と
+        // 読むと検証をすり抜け、別々のモジュールの `Local` が同じ綴りとして重なる
+        let first = signature_with(
+            "function a(x: First): void",
+            &resolving("First", "Local<string>"),
+        );
+        let second = signature_with(
+            "function b(y: Second): void",
+            &resolving("Second", "Local<string>"),
+        );
+
+        assert!(!first.is_unifiable_with(&second));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_the_same_generic_of_predefined_types_are_unifiable() {
+        // 対照は上のテスト。総称型そのものを拒んでいるのではなく、**宣言を辿る名前が
+        // 残っていること**を拒んでいる
+        let first = signature_with(
+            "function a(x: First): void",
+            &resolving("First", "{ value: string; }"),
+        );
+        let second = signature_with(
+            "function b(y: Second): void",
+            &resolving("Second", "{ value: string; }"),
+        );
+
+        assert!(first.is_unifiable_with(&second));
+    }
+
+    #[test]
+    fn test_an_alias_opening_onto_a_boolean_literal_is_substituted() {
+        // `true` / `false` はリテラル型で、宣言を辿らずに意味が決まる。型名として
+        // 数えると、書き下した綴りとの比較が止まる
+        let enabled = signature_with(
+            "function pick(x: Enabled): void",
+            &resolving("Enabled", "true"),
+        );
+
+        assert!(enabled.is_unifiable_with(&signature("function other(x: true): void")));
+    }
+
+    #[test]
+    fn test_an_alias_opening_onto_a_declared_type_is_still_not_substituted() {
+        // 対照は上のテスト。リテラル型を通したことで、宣言された型名まで通っていないか
+        let boxed = signature_with(
+            "function pick(x: Boxed): void",
+            &resolving("Boxed", "Local"),
+        );
+
+        assert!(!boxed.is_unifiable_with(&signature("function other(x: Local): void")));
+    }
+
+    #[test]
+    fn test_an_alias_naming_only_members_and_predefined_types_is_substituted() {
+        // メンバーの名前（後ろが `:`）と引数の名前は、宣言を辿る相手ではない。
+        // これを型名と数えると、書き下した綴りとの比較がまるごと止まる
+        let shaped = signature_with(
+            "function labelShaped(value: Shape): string",
+            &resolving("Shape", "{ readonly amount: number; }"),
+        );
+
+        assert!(shaped.is_unifiable_with(&signature(
+            "function other(value: { readonly amount: number; }): string"
+        )));
+    }
+
+    #[test]
+    fn test_a_type_alias_opened_into_a_generic_argument_is_substituted_there_too() {
+        // 総称型の中の型名も比較の対象に残る（`test_signatures_differing_inside_a_
+        // generic_argument_are_not_unifiable`）ので、差し替えもそこまで届く必要がある
+        let aliased = signature_with(
+            "function mapped(lookup: Map<string, Amount>): void",
+            &resolving("Amount", "number"),
+        );
+
+        assert!(aliased.is_unifiable_with(&signature(
+            "function other(table: Map<string, number>): void"
+        )));
     }
 }

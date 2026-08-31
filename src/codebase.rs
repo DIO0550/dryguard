@@ -7,6 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -108,11 +109,14 @@ fn entries_of(directory: &Path) -> Result<Vec<fs::DirEntry>, CodebaseError> {
 
 /// そのディレクトリが走査の対象外か。
 fn is_excluded(directory: &Path) -> bool {
-    directory.file_name().is_some_and(|name| {
-        EXCLUDED_DIRECTORY_NAMES
-            .iter()
-            .any(|excluded| name == *excluded)
-    })
+    directory.file_name().is_some_and(is_excluded_name)
+}
+
+/// その名前が、走査から外すディレクトリの名前か。
+fn is_excluded_name(name: &OsStr) -> bool {
+    EXCLUDED_DIRECTORY_NAMES
+        .iter()
+        .any(|excluded| name == *excluded)
 }
 
 /// コードベースを走査できなかった理由。

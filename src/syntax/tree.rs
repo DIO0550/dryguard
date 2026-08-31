@@ -13,6 +13,9 @@ use std::path::Path;
 
 use tree_sitter::{Node, Parser};
 
+use crate::line_number::LineNumber;
+use crate::source_position::SourcePosition;
+
 /// ソースを読むのに使う grammar。
 ///
 /// TypeScript と TSX は tree-sitter では別の grammar で、**片方で兼ねられない**。
@@ -117,6 +120,26 @@ impl<'source> SyntaxTree<'source> {
     pub fn source(&self) -> &'source str {
         self.source
     }
+}
+
+/// そのノードの先頭が置かれている位置。バイト範囲が文字の境界に乗っていなければ `None`。
+///
+/// `source` はそのノードを含むファイル全体のソース。列を UTF-16 のコード単位で数え直すのに、
+/// 行の先頭からノードの手前までの文字列が要る（[`SourcePosition::from_preceding_text`]）。
+///
+/// **歩き方と同じく、位置の数え直しもここ 1 箇所に置く。** チャンクの名前
+/// （`syntax::chunk`）と型名（`syntax::type_reference`）がどちらも同じ数え直しを要る。
+pub(super) fn source_position_of(node: Node<'_>, source: &str) -> Option<SourcePosition> {
+    let start = node.start_byte();
+    let line_start = source
+        .get(..start)?
+        .rfind('\n')
+        .map_or(0, |index| index + '\n'.len_utf8());
+
+    Some(SourcePosition::from_preceding_text(
+        LineNumber::from_index(node.start_position().row),
+        source.get(line_start..start)?,
+    ))
 }
 
 /// 構文木を作れなかった理由。

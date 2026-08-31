@@ -23,7 +23,11 @@ use crate::lsp::{
     WorkspaceRoot,
 };
 use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outcome_of};
+use crate::semantics::resolved_type::{
+    TypeDeclaration, TypeDeclarationsOutcome, resolved_types_of, type_declarations_of,
+};
 use crate::semantics::type_signature::{TypeSignatureOutcome, type_signature_outcome_of};
+use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks};
 use crate::syntax::module_distance::ModuleDistance;
 use crate::syntax::tree::{Grammar, ParseError, SyntaxTree};
@@ -370,6 +374,7 @@ fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
 /// hover を先に送るのは、**references が先の作業の落ち着きを待つ**ため
 /// （順序を入れ替えると、読み込み中に計算された答えを受け取る。
 /// `tests/semantics.rs` の `test_caller_domains_asked_after_a_type_signature_are_still_complete`）。
+/// 型名の解決も hover と同じ側に置くので、references は最後のまま。
 ///
 /// **1 つが落ちても残りを尋ねる。** 途中で降りると、取れていたシグナルまで
 /// 「測れない」に化ける（[`AskedSemantics`]）。
@@ -400,11 +405,85 @@ fn asked_semantics_of(
     };
 
     asked_semantics_of_outcomes(
-        type_signature_outcome_of(session, document_a, position_a),
-        type_signature_outcome_of(session, document_b, position_b),
+        resolved_type_signature_outcome_of(session, chunk_a, document_a, position_a),
+        resolved_type_signature_outcome_of(session, chunk_b, document_b, position_b),
         caller_domains_outcome_of(session, document_a, position_a),
         caller_domains_outcome_of(session, document_b, position_b),
     )
+}
+
+/// そのチャンクの型シグネチャを、**書かれた型名を解決してから**尋ねる。
+///
+/// hover が返す綴りは書かれた型名のままで、型エイリアスは展開されない。
+/// 先に型名の宣言を辿って右辺を集め、綴りへ差し込んでから読む
+/// （`semantics::resolved_type`）。
+///
+/// # Errors
+///
+/// 往復が失敗したとき。
+fn resolved_type_signature_outcome_of(
+    session: &mut Session,
+    chunk: &Chunk,
+    document: &SourceDocument,
+    position: SourcePosition,
+) -> Result<TypeSignatureOutcome, ClientError> {
+    let declarations = match type_declarations_of(session, document, chunk.type_references())? {
+        TypeDeclarationsOutcome::Located(declarations) => declarations,
+        TypeDeclarationsOutcome::TypeDefinitionNotProvided => {
+            return Ok(TypeSignatureOutcome::TypeDefinitionNotProvided);
+        }
+        TypeDeclarationsOutcome::UnreadableTypeDefinition => {
+            return Ok(TypeSignatureOutcome::UnreadableTypeDefinition);
+        }
+    };
+    open_declaring_documents(session, &declarations)?;
+    let resolved = resolved_types_of(session, &declarations)?;
+
+    type_signature_outcome_of(session, document, position, &resolved)
+}
+
+/// 型が宣言されているファイルを開かせる。
+///
+/// **開かせないと宣言の綴りが返らない。** サーバは開かせていないファイルへの hover に
+/// 綴りを持たない応答を返す（typescript-language-server 6.0.0 で実測）。
+///
+/// **どこで宣言されていても開かせる。** 依存の置き場で宣言されたエイリアス
+/// （`lib.es5.d.ts` の `PropertyKey` など）も、書き下した綴りと比べる側から見れば
+/// 開く価値は同じ。**開く相手を絞ると、絞った分だけ偽陰性が残る。**
+///
+/// **Why not（大きいファイルを避けて絞る）**: `Date` が解決される `lib.es5.d.ts` は
+/// 約 1 MB あるが、**開かせても `compare` の実測は 1.120 秒で、開かせない場合と
+/// 変わらなかった**。避ける理由になるコストが出ていない。
+///
+/// **Why not（ワークスペースの根の下だけを開かせる）**: 根は候補ペアの 2 ファイルから
+/// 決まるので、**同じディレクトリにある 2 つを比べると根がそのディレクトリになる**。
+/// 兄弟ディレクトリで宣言されたエイリアスが解決できず、この Issue が直したかった
+/// 偽陰性がそのまま残る。
+///
+/// 読めなかったファイルは飛ばす。**その型名が解決されないまま残るだけ**で、
+/// 比較は綴りのまま続く（今までと同じ形）。
+///
+/// # Errors
+///
+/// 開かせる要求の送信が失敗したとき。
+fn open_declaring_documents(
+    session: &mut Session,
+    declarations: &[TypeDeclaration],
+) -> Result<(), ClientError> {
+    for declaration in declarations {
+        let path = declaration.site().path();
+
+        let Ok(text) = source_of(path) else {
+            continue;
+        };
+        let Ok(document) = SourceDocument::new(path, text) else {
+            continue;
+        };
+
+        session.open_document(&document)?;
+    }
+
+    Ok(())
 }
 
 /// 4 つの問い合わせの結果を、シグナルと落ちた理由にまとめる。
@@ -497,6 +576,14 @@ fn type_signature_match_of(
         | (_, TypeSignatureOutcome::UnreadableSignature) => TypeSignatureMatch::UnreadableSignature,
         (TypeSignatureOutcome::HoverNotProvided, _)
         | (_, TypeSignatureOutcome::HoverNotProvided) => TypeSignatureMatch::HoverNotProvided,
+        (TypeSignatureOutcome::TypeDefinitionNotProvided, _)
+        | (_, TypeSignatureOutcome::TypeDefinitionNotProvided) => {
+            TypeSignatureMatch::TypeDefinitionNotProvided
+        }
+        (TypeSignatureOutcome::UnreadableTypeDefinition, _)
+        | (_, TypeSignatureOutcome::UnreadableTypeDefinition) => {
+            TypeSignatureMatch::UnreadableTypeDefinition
+        }
     }
 }
 
@@ -999,6 +1086,7 @@ mod tests {
 
     use crate::classification::DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
     use crate::classification::verdict::Verdict;
+    use crate::semantics::resolved_type::ResolvedTypes;
     use crate::semantics::type_signature::TypeSignature;
     use crate::similarity::Similarity;
     use crate::test_support::line;
@@ -1038,10 +1126,56 @@ mod tests {
 
     /// 正規化できた型シグネチャ。
     fn normalized(signature_text: &str) -> TypeSignatureOutcome {
-        let signature = TypeSignature::from_signature_text(signature_text)
-            .expect("テストが渡す綴りは読み取れる");
+        let signature =
+            TypeSignature::from_signature_text(signature_text, &ResolvedTypes::default())
+                .expect("テストが渡す綴りは読み取れる");
 
         TypeSignatureOutcome::Normalized(signature)
+    }
+
+    #[test]
+    fn test_asked_semantics_do_not_call_a_pair_not_unifiable_without_type_definition() {
+        // 型名を 1 つも開けていないので、綴りのまま比べた結果は答えにならない
+        let asked = asked_semantics_of_outcomes(
+            Ok(TypeSignatureOutcome::TypeDefinitionNotProvided),
+            Ok(normalized("function sumOf(amounts: number[]): number")),
+            Ok(CallerDomainsOutcome::NoReferences),
+            Ok(CallerDomainsOutcome::NoReferences),
+        );
+
+        assert_eq!(
+            asked.type_signature_match,
+            TypeSignatureMatch::TypeDefinitionNotProvided
+        );
+    }
+
+    #[test]
+    fn test_asked_semantics_call_a_pair_not_unifiable_when_both_signatures_were_read() {
+        // 対照は上のテスト。どちらも読めていれば、重ならないことを言い切ってよい
+        let asked = asked_semantics_of_outcomes(
+            Ok(normalized("function totalOf(values: string[]): number")),
+            Ok(normalized("function sumOf(amounts: number[]): number")),
+            Ok(CallerDomainsOutcome::NoReferences),
+            Ok(CallerDomainsOutcome::NoReferences),
+        );
+
+        assert_eq!(asked.type_signature_match, TypeSignatureMatch::NotUnifiable);
+    }
+
+    #[test]
+    fn test_asked_semantics_do_not_call_a_pair_not_unifiable_with_an_unreadable_type_definition() {
+        // 宣言は返っているが読めていない。開けていれば重なったかもしれない
+        let asked = asked_semantics_of_outcomes(
+            Ok(TypeSignatureOutcome::UnreadableTypeDefinition),
+            Ok(normalized("function sumOf(amounts: number[]): number")),
+            Ok(CallerDomainsOutcome::NoReferences),
+            Ok(CallerDomainsOutcome::NoReferences),
+        );
+
+        assert_eq!(
+            asked.type_signature_match,
+            TypeSignatureMatch::UnreadableTypeDefinition
+        );
     }
 
     /// hover は答えたが references が落ちた、4 つの問い合わせの結果。

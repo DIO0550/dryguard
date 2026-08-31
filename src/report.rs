@@ -219,6 +219,12 @@ fn type_signature_text_of(signal: TypeSignatureMatch) -> Option<&'static str> {
         TypeSignatureMatch::UnreadableHover => Some("測れない (hover の応答を読めない)"),
         TypeSignatureMatch::UnreadableSignature => Some("測れない (返った綴りを読み解けない)"),
         TypeSignatureMatch::HoverNotProvided => Some("測れない (サーバが hover を提供していない)"),
+        TypeSignatureMatch::TypeDefinitionNotProvided => {
+            Some("測れない (サーバが typeDefinition を提供していない)")
+        }
+        TypeSignatureMatch::UnreadableTypeDefinition => {
+            Some("測れない (typeDefinition の応答を読めない)")
+        }
     }
 }
 
@@ -653,6 +659,44 @@ mod tests {
         assert!(
             text.contains("  型シグネチャ: 単一化不能 → 共通化しない側\n"),
             "測った値と傾きが 1 行で読める: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_without_type_definition_says_so_instead_of_calling_the_pair_not_unifiable() {
+        // 対照は上のテスト（単一化不能と言い切る場合）。**型名を 1 つも開けていないのに
+        // 「単一化不能」と出すと、確かめられなかったことが答えとして読まれる**
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::TypeDefinitionNotProvided,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (サーバが typeDefinition を提供していない) → どちらでもない"
+            ),
+            "開けなかったことが理由として出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_an_unreadable_type_definition_says_so_instead_of_blaming_the_server() {
+        // 対照は 1 つ上のテスト（サーバが提供していない場合）。**サーバは宣言を持っており、
+        // 読めないのはこちら側の穴**なので、直す先が違う
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::UnreadableTypeDefinition,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (typeDefinition の応答を読めない) → どちらでもない"
+            ),
+            "読めなかったことが理由として出る: {text}"
         );
     }
 

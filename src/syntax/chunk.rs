@@ -20,7 +20,8 @@ use crate::source_position::SourcePosition;
 use crate::syntax::import::ImportSet;
 use crate::syntax::line_range::LineRange;
 use crate::syntax::token::TokenSequence;
-use crate::syntax::tree::SyntaxTree;
+use crate::syntax::tree::{SyntaxTree, source_position_of};
+use crate::syntax::type_reference::{TypeReference, type_references_of};
 
 /// 比較の単位。関数・メソッド 1 つ分のソースと、それがどこにあったか。
 ///
@@ -35,6 +36,7 @@ pub struct Chunk {
     path: PathBuf,
     lines: LineRange,
     name_position: Option<SourcePosition>,
+    type_references: Vec<TypeReference>,
     source: String,
     tokens: Option<TokenSequence>,
     imports: Option<ImportSet>,
@@ -75,6 +77,7 @@ impl Chunk {
             location.path().to_path_buf(),
             lines,
             name_position_of(enclosing, tree.source()),
+            type_references_of(enclosing, tree.source()),
             source_of_lines(tree.source(), lines),
             TokenSequence::from_node(enclosing),
             ImportSet::from_tree(tree, location.path()),
@@ -91,6 +94,7 @@ impl Chunk {
         path: PathBuf,
         lines: LineRange,
         name_position: Option<SourcePosition>,
+        type_references: Vec<TypeReference>,
         source: String,
         tokens: Option<TokenSequence>,
         imports: Option<ImportSet>,
@@ -99,6 +103,7 @@ impl Chunk {
             path,
             lines,
             name_position,
+            type_references,
             source,
             tokens,
             imports,
@@ -125,6 +130,17 @@ impl Chunk {
     /// 「取れなかったシグナルを既定値で埋めない」)。
     pub fn name_position(&self) -> Option<SourcePosition> {
         self.name_position
+    }
+
+    /// このチャンクのシグネチャに書かれた型名。1 つも書かれていなければ空。
+    ///
+    /// **解決前の綴りと位置だけ**を持つ。その名前が何を指しているかを尋ねるのは
+    /// `semantics` の担当で、ここが決めるのはどこを指して尋ねればよいかまで。
+    ///
+    /// 空を `None` にしないのは、**集められなかったという状態が無い**ため。
+    /// キーワードの型だけで書かれたシグネチャでは、書かれていないことが空で表される。
+    pub fn type_references(&self) -> &[TypeReference] {
+        &self.type_references
     }
 
     /// 切り出したソース。行の区切りは改行 1 文字。
@@ -191,6 +207,7 @@ impl FileChunks {
                 path.to_path_buf(),
                 lines,
                 name_position_of(node, tree.source()),
+                type_references_of(node, tree.source()),
                 source_of_lines(tree.source(), lines),
                 TokenSequence::from_node(node),
                 imports.clone(),
@@ -293,21 +310,9 @@ fn innermost_chunk_node<'tree>(
 
 /// そのチャンクの名前が置かれている位置。名前が無ければ `None`。
 ///
-/// `source` はそのノードを含むファイル全体のソース。列を UTF-16 のコード単位で
-/// 数え直すのに、名前が載っている行の先頭からの文字列が要る
-/// (`SourcePosition::from_preceding_text`)。
+/// `source` はそのノードを含むファイル全体のソース。
 fn name_position_of(node: Node<'_>, source: &str) -> Option<SourcePosition> {
-    let name = name_node_of(node)?;
-    let start = name.start_byte();
-    let line_start = source
-        .get(..start)?
-        .rfind('\n')
-        .map_or(0, |index| index + '\n'.len_utf8());
-
-    Some(SourcePosition::from_preceding_text(
-        LineNumber::from_index(name.start_position().row),
-        source.get(line_start..start)?,
-    ))
+    source_position_of(name_node_of(node)?, source)
 }
 
 /// そのチャンクの名前になっている識別子のノード。無名なら `None`。
@@ -972,5 +977,164 @@ function broken() {
         let chunk = chunk_at(non_ascii_before_the_name, "a.ts:1").expect("切り出せる");
 
         assert_eq!(name_position_of_chunk(&chunk), Some((1, 28)));
+    }
+
+    /// そのチャンクのシグネチャに書かれた型名の綴り。
+    fn type_names_of(chunk: &Chunk) -> Vec<&str> {
+        chunk
+            .type_references()
+            .iter()
+            .map(TypeReference::name)
+            .collect()
+    }
+
+    #[test]
+    fn test_chunk_type_references_cover_the_parameters_and_the_return_type() {
+        let annotated =
+            "export function scale(amount: Amount, rate: Rate): Total {\n  return amount;\n}\n";
+
+        let chunk = chunk_at(annotated, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Amount", "Rate", "Total"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_leave_out_the_keyword_types() {
+        // 対照として名前の付いた型を 1 つ置く。キーワードの型まで集めると、
+        // 尋ねる相手が居ない名前へ問い合わせを送ることになる
+        let mixed =
+            "export function scale(amount: number, rate: Rate): string {\n  return \"\";\n}\n";
+
+        let chunk = chunk_at(mixed, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Rate"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_leave_out_the_type_variables_it_declares() {
+        // 型変数を解決するとファイルごとに違う結果になり、総称型どうしが
+        // 単一化できなくなる。対照として制約に書かれた型名を 1 つ置く
+        let generic =
+            "export function pick<T extends Amount>(items: T[]): T {\n  return items[0];\n}\n";
+
+        let chunk = chunk_at(generic, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Amount"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_leave_out_a_type_variable_declared_inside_the_signature() {
+        // 内側の `<T>` が外側の綴りを覆う形。外側だけを解決すると、差し込みが
+        // 内側の宣言まで書き換えて `<number>(x: number) => number` になる。
+        // 対照として、覆われていない型名を 1 つ置く
+        let shadowed =
+            "export function run(a: T, rate: Rate, cb: <T>(x: T) => T): void {\n  cb(a);\n}\n";
+
+        let chunk = chunk_at(shadowed, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Rate"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_leave_out_a_name_bound_by_a_mapped_type() {
+        // `[K in "a"]` の `K` はこのシグネチャの中でだけ意味を持つ。外側の同じ綴りを
+        // 解決すると、差し込みが `{ [string in "a"]: string }` を作る。
+        // 対照として、束縛されていない型名を 1 つ置く
+        let mapped = "export function pick(x: K, m: { [K in \"a\"]: K }, rate: Rate): void {\n  return;\n}\n";
+
+        let chunk = chunk_at(mapped, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Rate"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_keep_the_constraint_of_a_mapped_type() {
+        // 対照は上のテスト。`[K in Keys]` の `Keys` は制約であって束縛ではない
+        let constrained =
+            "export function pick(m: { [K in Keys]: number }): void {\n  return;\n}\n";
+
+        let chunk = chunk_at(constrained, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Keys"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_name_the_same_type_only_once() {
+        // 尋ねる先は綴りごとに 1 箇所でよい。畳まないと同じ名前へ 2 度送る
+        let repeated =
+            "export function scale(amount: Amount, other: Amount): Amount {\n  return amount;\n}\n";
+
+        let chunk = chunk_at(repeated, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Amount"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_of_an_anonymous_chunk_cover_the_annotation_it_is_assigned_to() {
+        // 無名のチャンクでは hover が代入先の名前を指すので、返る綴りは
+        // `const aliased: Handler`。注釈を集めないと、この形は解決できない
+        let assigned = "export const aliased: Handler = (value) => value.length;\n";
+
+        let chunk = chunk_at(assigned, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Handler"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_of_a_named_chunk_leave_out_the_annotation_it_is_assigned_to() {
+        // 対照は上のテスト。自分の名前を持つので hover は関数自身の型を返し、
+        // 代入先の注釈は綴りに現れない
+        let named =
+            "const named: Formatter = function inner(value: Text): Text {\n  return value;\n};\n";
+
+        let chunk = chunk_at(named, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Text"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_cover_the_arguments_of_a_generic_type() {
+        // 総称型は名前と型引数が同じ部分木にいる。名前で止めると型引数を数え落とす
+        let nested = "export function unwrap(box: Box<User>): User {\n  return box.value;\n}\n";
+
+        let chunk = chunk_at(nested, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Box", "User"]);
+    }
+
+    #[test]
+    fn test_chunk_type_reference_points_at_the_name_in_the_source() {
+        // 位置がずれると、サーバは別の識別子について答える
+        let annotated = "export function scale(amount: Amount): number {\n  return amount;\n}\n";
+
+        let chunk = chunk_at(annotated, "a.ts:1").expect("切り出せる");
+
+        let reference = chunk
+            .type_references()
+            .first()
+            .expect("型名が 1 つ書かれている");
+        assert_eq!(reference.position().line(), line(1));
+        assert_eq!(reference.position().character(), 30);
+    }
+
+    #[test]
+    fn test_chunk_type_references_leave_out_the_leaf_of_a_qualified_type_name() {
+        // `money.Amount` の `Amount` だけを解決すると、差し込みが `money.number` を作る。
+        // 対照として修飾されていない型名を 1 つ置く
+        let qualified =
+            "export function scale(amount: money.Amount, rate: Rate): number {\n  return 0;\n}\n";
+
+        let chunk = chunk_at(qualified, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Rate"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_of_a_signature_written_with_keyword_types_only_are_empty() {
+        let plain = "export function scale(amount: number): number {\n  return amount;\n}\n";
+
+        let chunk = chunk_at(plain, "a.ts:1").expect("切り出せる");
+
+        assert!(chunk.type_references().is_empty());
     }
 }

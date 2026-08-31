@@ -59,6 +59,21 @@ impl SourcePosition {
             character: self.character as u32,
         }
     }
+
+    /// サーバが返した位置から作る。
+    ///
+    /// 行を 1 始まりに直す。列はそのまま採る。**LSP が `Position` の列を UTF-16 の
+    /// コード単位と定めている**ので、この型の数え方と同じで、数え直しは要らない。
+    ///
+    /// **Why not（列の数値を受け取る入口を置く）**: `Position` でしか受け取らないので、
+    /// バイトで数えた列を渡せる余地が残らない。[`SourcePosition::from_preceding_text`]
+    /// が行の文字列を要求しているのと同じ理由。
+    pub fn from_lsp_position(position: Position) -> Self {
+        Self {
+            line: LineNumber::from_index(position.line as usize),
+            character: position.character as usize,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -97,5 +112,31 @@ mod tests {
         let position = SourcePosition::from_preceding_text(line(1), "// 🦀 ");
 
         assert_eq!(position.character(), 6);
+    }
+
+    #[test]
+    fn test_source_position_from_a_server_position_counts_lines_from_one() {
+        // LSP の行は 0 始まり。直さずに持つと、1 行手前を指して尋ね直すことになる
+        let position = SourcePosition::from_lsp_position(Position::new(4, 12));
+
+        assert_eq!(position.line(), line(5));
+    }
+
+    #[test]
+    fn test_source_position_from_a_server_position_keeps_the_column_as_it_is() {
+        // 列は LSP も UTF-16 のコード単位で数える。数え直すと別の位置になる
+        let position = SourcePosition::from_lsp_position(Position::new(4, 12));
+
+        assert_eq!(position.character(), 12);
+    }
+
+    #[test]
+    fn test_source_position_survives_a_round_trip_through_the_server_form() {
+        let position = SourcePosition::from_preceding_text(line(3), "const 請求 = ");
+
+        assert_eq!(
+            SourcePosition::from_lsp_position(position.to_lsp_position()),
+            position
+        );
     }
 }
