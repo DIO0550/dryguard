@@ -430,6 +430,22 @@ fn test_compare_with_an_lsp_does_not_unify_two_aliases_of_different_types_spelle
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_does_not_unify_two_generic_aliases_of_different_types_spelled_alike() {
+    // 対照は 1 つ上のテスト。**総称型の参照でも同じことが起きる**。どちらのファイルも
+    // 自分だけの `interface Local<T>` を宣言していて、開いた綴りは両側とも `Local<string>`
+    let charged = fixture("references/src/billing/generic.ts", 7);
+    let tagged = fixture("references/src/inventory/generic.ts", 8);
+
+    let measured = measured_with_an_lsp(&charged, &tagged);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_an_lsp_measures_a_total_caller_domain_overlap_for_the_shared_utility_pair() {
     // ディレクトリは utils と report で分かれているが、どちらも report/monthly.ts から
     // 呼ばれている。**置き場所ではなく実際に誰が使っているか**を見ているのがここ

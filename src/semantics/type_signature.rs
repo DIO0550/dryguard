@@ -104,6 +104,19 @@ const TYPE_OPERATORS: [&str; 5] = ["keyof", "readonly", "infer", "extends", VALU
 /// （[`is_site_independent`] は識別子だけを見る）。
 const BOOLEAN_LITERALS: [&str; 2] = ["true", "false"];
 
+/// 綴りを検証するときに、メンバーや引数の名前と見なす印。
+///
+/// [`MEMBER_MARKERS`] から `<` を外したもの。**差し込む側と検証する側で `<` の意味が違う**。
+/// 差し込む先の綴りに `X<…>` が現れるのはメソッド名だけだが（型引数を取るエイリアスは
+/// 開く対象に入らない）、**検証する相手は開いた後の綴り**で、そこには総称型の参照
+/// (`Local<string>`) が現れる。それは宣言を辿る相手なので、見逃すと**別々のモジュールの
+/// `Local<string>` が同じ綴りとして重なる**。
+///
+/// **Why not（型引数の中身を読んで見分ける）**: メソッド名か総称型かは `<` の後ろが
+/// 型変数の宣言かどうかで決まり、読むには型そのものの構文解析が要る。
+/// 取りこぼす側（差し込みを見送る = 偽陰性）に倒した。
+const VETTED_MEMBER_MARKERS: [&str; 4] = [":", "?:", "(", "?("];
+
 /// サーバに型シグネチャを尋ねた結果。
 ///
 /// **「取れなかった」を 1 つにまとめない。** どれなのかで**利用者が次に試すことが違う**
@@ -594,11 +607,10 @@ fn names_a_declared_type(identifier: &str, following: &str) -> bool {
         return false;
     }
 
-    let placement = Placement {
-        preceded: Preceded::Nothing,
-        following,
-    };
-    !placement.names_a_member()
+    let after = following.trim_start();
+    !VETTED_MEMBER_MARKERS
+        .iter()
+        .any(|marker| after.starts_with(marker))
 }
 
 /// その位置に置くときの型の綴り。括弧が要るなら括ってから返す。
@@ -1771,6 +1783,38 @@ mod tests {
         );
 
         assert!(!boxed.is_unifiable_with(&wrapped));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_the_same_generic_type_reference_are_not_unifiable() {
+        // `Local<string>` の `Local` は宣言を辿る相手。`<` が続くのをメソッド名の印と
+        // 読むと検証をすり抜け、別々のモジュールの `Local` が同じ綴りとして重なる
+        let first = signature_with(
+            "function a(x: First): void",
+            &resolving("First", "Local<string>"),
+        );
+        let second = signature_with(
+            "function b(y: Second): void",
+            &resolving("Second", "Local<string>"),
+        );
+
+        assert!(!first.is_unifiable_with(&second));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_the_same_generic_of_predefined_types_are_unifiable() {
+        // 対照は上のテスト。総称型そのものを拒んでいるのではなく、**宣言を辿る名前が
+        // 残っていること**を拒んでいる
+        let first = signature_with(
+            "function a(x: First): void",
+            &resolving("First", "{ value: string; }"),
+        );
+        let second = signature_with(
+            "function b(y: Second): void",
+            &resolving("Second", "{ value: string; }"),
+        );
+
+        assert!(first.is_unifiable_with(&second));
     }
 
     #[test]
