@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 use lsp_types::{GotoDefinitionResponse, Location, LocationLink, Uri};
 
-use super::uri::{self, PathUriError, UriPathError};
+#[cfg(test)]
+use super::uri::PathUriError;
+use super::uri::{self, UriPathError};
 use crate::source_position::SourcePosition;
 
 /// 型が宣言されている場所。ファイルと、その中の 1 点。
@@ -33,11 +35,18 @@ impl DeclarationSite {
     /// (`rules/coding.md`「生成時に検証し、不正な値を存在させない」)。応答から作る側
     /// （[`outcome_of`]）はサーバが返した URI の綴りをそのまま持つので、ここは通らない。
     ///
+    /// **本番はここを通らないので、テストのビルドにだけ置く。** 宣言の場所は必ず応答から
+    /// 作られるべきもので、組み立てる口を公開 API に残すと**検証を通っていない場所が
+    /// 外から作れる**（`rules/architecture.md`「`pub` は最小限にする」）。`pub(crate)` に
+    /// するだけでは本番のビルドで `dead_code` になり、それを黙らせるのは
+    /// `rules/coding.md`「lint 抑制を足さない」に反する。
+    ///
     /// # Errors
     ///
     /// `path` を `file:` URI にできないとき（絶対パスでない・`.` / `..` が残っている・
     /// `file:` URI で表せない前置きを持つ）。
-    pub fn new(path: &Path, position: SourcePosition) -> Result<Self, PathUriError> {
+    #[cfg(test)]
+    pub(crate) fn new(path: &Path, position: SourcePosition) -> Result<Self, PathUriError> {
         Ok(Self {
             uri: uri::file_uri_of(path)?,
             path: path.to_path_buf(),
