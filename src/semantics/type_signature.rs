@@ -271,6 +271,17 @@ impl TypeSignature {
                 .chain(std::iter::once(return_type.as_str())),
         );
 
+        // 型が書かれる場所だけを渡す。綴り全体を渡すと、正規化で落ちる関数の名前
+        // （`function Amount<T>(…)`）を型名として数える。
+        let remaining = remaining_declarations_of(
+            declared
+                .iter()
+                .flat_map(DeclaredTypeParameter::annotated_types)
+                .chain(parameters.iter().map(Parameter::annotated_type))
+                .chain(std::iter::once(return_type.as_str())),
+            declarations,
+        );
+
         Some(Self {
             kind: split.kind(),
             type_parameters: placeholders.type_parameters(&declared),
@@ -279,7 +290,7 @@ impl TypeSignature {
                 .map(|parameter| parameter.renamed(&placeholders))
                 .collect(),
             return_type: placeholders.renamed(&return_type),
-            declarations: remaining_declarations_of(&flattened, declarations),
+            declarations: remaining,
         })
     }
 
@@ -296,20 +307,29 @@ impl TypeSignature {
     }
 }
 
-/// 綴りに残った型名の宣言だけを、名前順に選び出す。
+/// 比較に残る型の綴りに現れる型名の宣言だけを、名前順に選び出す。
 ///
-/// `spelling` は解決した綴りを差し込んだ後のシグネチャ、`declarations` は
-/// そのチャンクのシグネチャに書かれた型名について尋ねた宣言。
+/// `types` は正規化後に残る型の綴り（型変数の制約と既定の型・引数の型・戻り値の型）、
+/// `declarations` はそのチャンクのシグネチャに書かれた型名について尋ねた宣言。
 ///
 /// **見るのは差し込んだ後の綴り。** 差し込みで消えた名前まで持つと、どちらも `number` に
 /// 開かれた 2 つが宣言の場所の違いで別物になり、**エイリアスを開いた意味が消える**。
-fn remaining_declarations_of(
-    spelling: &str,
+///
+/// **Why not（シグネチャ全体の綴りを渡す）**: そこには正規化で落ちる関数の名前が
+/// 含まれる。名前が型名と同じ綴りで型引数を取ると（`function Amount<T>(…)`）、
+/// **比較には残らない綴りを根拠に別物と答える**ことになる。
+fn remaining_declarations_of<'a>(
+    types: impl Iterator<Item = &'a str>,
     declarations: &[TypeDeclaration],
 ) -> Vec<TypeDeclaration> {
+    let mut remaining = BTreeSet::new();
+    for spelling in types {
+        remaining.extend(declared_type_names_of(spelling));
+    }
+
     // 名前順の集合から引く。**並びを宣言の側に任せない**（型名が書かれた順のままだと、
     // 同じ 2 つが並びの違いで等しくなくなる余地が残る）。
-    declared_type_names_of(spelling)
+    remaining
         .iter()
         .filter_map(|name| {
             declarations
@@ -1059,6 +1079,16 @@ impl DeclaredTypeParameter {
                 .map(|(_, constraint)| constraint.trim().to_owned()),
             default,
         })
+    }
+
+    /// この宣言に書かれた型の綴り（制約と既定の型）。どちらも無ければ空。
+    ///
+    /// **名前は入らない。** 型変数の名前はこのシグネチャの中でだけ意味を持つので、
+    /// 宣言を辿る相手ではない（`syntax::type_reference` が集める側でも外している）。
+    fn annotated_types(&self) -> impl Iterator<Item = &str> {
+        [self.constraint.as_deref(), self.default.as_deref()]
+            .into_iter()
+            .flatten()
     }
 }
 
@@ -2107,6 +2137,27 @@ mod tests {
         .expect("テストが渡す綴りは読み取れる");
         let report = TypeSignature::from_signature_text(
             "function scaleTotal(total: Amount): Amount",
+            &resolving("Amount", "number"),
+            &[declared("Amount", "/repo/src/report/money.ts", 1)],
+        )
+        .expect("テストが渡す綴りは読み取れる");
+
+        assert!(billing.is_unifiable_with(&report));
+    }
+
+    #[test]
+    fn test_a_type_name_left_only_in_the_declaration_prefix_does_not_carry_its_declaration() {
+        // 対照は上のテスト。**関数の名前は正規化で落ちる**のに、綴り全体を走査すると
+        // 型名として数えてしまう（`Amount<T>` の `<` はメソッド名の印ではないため）。
+        // 型を書く場所だけを見る形なら、差し込みで消えた `Amount` はどこにも残らない
+        let billing = TypeSignature::from_signature_text(
+            "function Amount<T>(value: Amount): T",
+            &resolving("Amount", "number"),
+            &[declared("Amount", "/repo/src/billing/money.ts", 1)],
+        )
+        .expect("テストが渡す綴りは読み取れる");
+        let report = TypeSignature::from_signature_text(
+            "function Amount<T>(value: Amount): T",
             &resolving("Amount", "number"),
             &[declared("Amount", "/repo/src/report/money.ts", 1)],
         )
