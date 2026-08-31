@@ -413,6 +413,23 @@ fn test_compare_with_an_lsp_opens_a_type_alias_declared_by_a_dependency() {
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_does_not_unify_two_aliases_of_different_types_spelled_alike() {
+    // どちらのファイルも自分だけの `Local` を宣言していて、中身は別物
+    // （`{ amount: number }` と `{ label: string }`）。**`interface` は hover が
+    // 構造を展開しない**ので、宣言の綴りは両側とも `type ... = Local` になる
+    let boxed = fixture("references/src/billing/boxed.ts", 7);
+    let wrapped = fixture("references/src/inventory/boxed.ts", 7);
+
+    let measured = measured_with_an_lsp(&boxed, &wrapped);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_an_lsp_measures_a_total_caller_domain_overlap_for_the_shared_utility_pair() {
     // ディレクトリは utils と report で分かれているが、どちらも report/monthly.ts から
     // 呼ばれている。**置き場所ではなく実際に誰が使っているか**を見ているのがここ
