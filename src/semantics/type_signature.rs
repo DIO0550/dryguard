@@ -117,6 +117,21 @@ const BOOLEAN_LITERALS: [&str; 2] = ["true", "false"];
 /// 取りこぼす側（差し込みを見送る = 偽陰性）に倒した。
 const VETTED_MEMBER_MARKERS: [&str; 4] = [":", "?:", "(", "?("];
 
+/// 引用符の始まり。
+///
+/// **綴りを検証する側は引用符の中を見ない**（識別子の走査が [`QuoteState`] で飛ばす）。
+/// ところが引用符の中は**宣言の場所に依存する意味を運べる** —— テンプレートリテラル型の
+/// 補間 (`` `${Local}` ``) と、`typeof import("./local")` の指定子がこれ。中を読まずに
+/// 通すと、別々のモジュールの綴りが同じものとして重なる。
+///
+/// **Why not（補間と指定子をそれぞれ見分ける）**: 見分ける形を足しても、
+/// 引用符の中を見ない限り次の形で同じことが起きる。**見ない場所を無くすのではなく、
+/// 見ない場所を持つ綴りごと差し込みの対象から外す。**
+///
+/// 代償は、文字列リテラル型のエイリアス (`type Mode = "on" | "off"`) が開かれなくなること。
+/// 倒れる向きは偽陰性。
+const QUOTE_MARKS: [char; 3] = ['"', '\'', '`'];
+
 /// サーバに型シグネチャを尋ねた結果。
 ///
 /// **「取れなかった」を 1 つにまとめない。** どれなのかで**利用者が次に試すことが違う**
@@ -567,18 +582,23 @@ fn push_resolved(
 /// 単一化可能と出る**（偽陽性）。`Local[]` でも `{ x: Local }` でも同じことが起きるので、
 /// 綴りの形ではなく**名前が残っているかどうか**で見る。
 ///
-/// 名前として数えないのは 2 つ。メンバーや引数の名前（後ろに [`MEMBER_MARKERS`] が続く）と、
-/// [`PREDEFINED_TYPES`] / [`TYPE_OPERATORS`] に載っている語。
+/// 名前として数えないのは 2 つ。メンバーや引数の名前（後ろに [`VETTED_MEMBER_MARKERS`] が
+/// 続く）と、[`PREDEFINED_TYPES`] / [`TYPE_OPERATORS`] / [`BOOLEAN_LITERALS`] に載っている語。
+///
+/// **引用符を含む綴りは、名前を数える前に外す。** 走査は引用符の中を見ないので、
+/// そこに残った名前を見落とす（[`QUOTE_MARKS`]）。
 ///
 /// **Why not（残った名前もその宣言まで辿る）**: 辿るには宣言のあるファイルを
 /// 構文木にするところから始まり、綴りではなく位置で差し込む形になる（Issue #133）。
 fn is_site_independent(spelling: &str) -> bool {
+    if spelling.contains(QUOTE_MARKS) {
+        return false;
+    }
+
     let mut identifier = String::new();
-    let mut quote = QuoteState::new();
 
     for (index, character) in spelling.char_indices() {
-        let inside_quotes = quote.is_inside(character);
-        if !inside_quotes && is_identifier_character(character) {
+        if is_identifier_character(character) {
             identifier.push(character);
             continue;
         }
@@ -1783,6 +1803,66 @@ mod tests {
         );
 
         assert!(!boxed.is_unifiable_with(&wrapped));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_the_same_template_literal_are_not_unifiable() {
+        // 補間の中の `Local` は宣言を辿る相手。走査は引用符の中を見ないので、
+        // 通すと別々のモジュールの綴りが重なる
+        let first = signature_with(
+            "function a(x: First): void",
+            &resolving("First", "`${Local}`"),
+        );
+        let second = signature_with(
+            "function b(y: Second): void",
+            &resolving("Second", "`${Local}`"),
+        );
+
+        assert!(!first.is_unifiable_with(&second));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_the_same_import_query_are_not_unifiable() {
+        // 指定子は宣言の場所に依存するのに、**識別子を 1 つも残さない**。
+        // `import` は後ろが `(` なのでメンバー名として読まれ、走査には掛からない
+        let first = signature_with(
+            "function a(x: First): void",
+            &resolving("First", "typeof import(\"./local\")"),
+        );
+        let second = signature_with(
+            "function b(y: Second): void",
+            &resolving("Second", "typeof import(\"./local\")"),
+        );
+
+        assert!(!first.is_unifiable_with(&second));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_an_import_query_without_a_name_are_not_unifiable() {
+        // 指定子が識別子を 1 つも含まない形。**引用符の中を覗いて名前を探す形では
+        // 素通りする**ので、引用符を含む綴りごと外していることがここで効く
+        let first = signature_with(
+            "function a(x: First): void",
+            &resolving("First", "typeof import(\"./\")"),
+        );
+        let second = signature_with(
+            "function b(y: Second): void",
+            &resolving("Second", "typeof import(\"./\")"),
+        );
+
+        assert!(!first.is_unifiable_with(&second));
+    }
+
+    #[test]
+    fn test_an_alias_opening_onto_a_string_literal_type_is_not_substituted() {
+        // 引用符を含む綴りを丸ごと外した代償。文字列リテラル型はどこで書かれても
+        // 同じ型を指すが、**引用符の中を見ない走査ではそれを言い切れない**
+        let mode = signature_with(
+            "function pick(x: Mode): void",
+            &resolving("Mode", "\"on\" | \"off\""),
+        );
+
+        assert!(!mode.is_unifiable_with(&signature("function other(x: \"on\" | \"off\"): void")));
     }
 
     #[test]
