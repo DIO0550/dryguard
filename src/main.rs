@@ -78,16 +78,24 @@ fn report_compare(
 /// 走査そのものが始められなかったときだけ終了コードを 1 にする。読めなかった
 /// 1 ファイルで全体を失敗にすると、出せていた候補ペアまで捨てることになる
 /// （飛ばしたものは出力に残る）。
+///
+/// **LSP サーバを使えなくても失敗にしない。** 理由を stderr へ回す分担は
+/// [`report_compare`] と同じ（stdout は判定の出力に保つ）。
 fn report_scan(root: &Path, options: &CommonOptions) -> ExitCode {
     let threshold = threshold_of(options);
 
-    let scan = match scan_of(root, threshold) {
+    let scan = match scan_of(root, threshold, &ServerCommand::typescript()) {
         Ok(scan) => scan,
         Err(error) => {
             eprintln!("{error}");
             return ExitCode::FAILURE;
         }
     };
+    if let Some(error) = scan.semantics_error() {
+        // **どのシグナルが取れなかったかはここで言わない。** 候補ペアごとに
+        // 効いたシグナルが違うので、数え上げると判定の根拠と食い違う。
+        eprintln!("LSP への問い合わせが最後まで通りませんでした: {error}");
+    }
 
     println!("{}", scan_text_of(&scan, threshold));
 

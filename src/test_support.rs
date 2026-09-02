@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::line_number::LineNumber;
-use crate::lsp::DeclarationSite;
+use crate::lsp::{DeclarationSite, ServerCommand};
 use crate::source_position::SourcePosition;
 
 /// このリポジトリの中のパス。
@@ -28,6 +28,15 @@ pub(crate) fn repository_path(relative: &str) -> PathBuf {
 /// `number` が 0 のとき。テストが 0 行目を渡すのは、テスト自体の書き間違い。
 pub(crate) fn line(number: usize) -> LineNumber {
     LineNumber::new(number).expect("テストが渡す行番号は 1 以上")
+}
+
+/// 起動できない LSP サーバの指定。
+///
+/// **モックではなく実物の失敗**を使う（`rules/testing.md`「モックは使わない」）。
+/// 実行ファイルが無いので `Client::start` が `ServerNotFound` で落ち、
+/// **サーバが入っている環境でも入っていない環境でも同じ経路を通る**。
+pub(crate) fn missing_server() -> ServerCommand {
+    ServerCommand::new("dryguard-no-such-language-server", Vec::new())
 }
 
 /// 型が宣言されている場所。行の先頭を指す。

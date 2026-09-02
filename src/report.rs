@@ -330,7 +330,7 @@ mod tests {
     use crate::pipeline::{Scan, scan_of};
     use crate::similarity::Similarity;
     use crate::syntax::module_distance::ModuleDistance;
-    use crate::test_support::line;
+    use crate::test_support::{line, missing_server};
     use crate::threshold::Threshold;
 
     fn location(path: &str, number: usize) -> Location {
@@ -511,13 +511,18 @@ mod tests {
     ///
     /// カレントディレクトリではなくマニフェストの位置から組み立てる
     /// （テストの実行位置に依存させない）。
+    ///
+    /// **起動できないサーバを渡す。** 実サーバを要する形にすると、サーバの入っていない
+    /// 開発機で出力が変わる（`rules/testing.md`「LSP を要するテストは、飛ばしたことが
+    /// 分かる形にする」）。
     fn scan_of_fixture(relative_path: &str, threshold: Threshold) -> Scan {
         let root = PathBuf::from(format!(
             "{}/tests/fixtures/{relative_path}",
             env!("CARGO_MANIFEST_DIR")
         ));
 
-        scan_of(&root, threshold).expect("フィクスチャのディレクトリは走査できる")
+        scan_of(&root, threshold, &missing_server())
+            .expect("フィクスチャのディレクトリは走査できる")
     }
 
     /// 候補ペアが 1 組だけ出るフィクスチャの text。
