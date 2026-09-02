@@ -4,10 +4,12 @@
 //! `syntax` は I/O を持たないので、読んだ結果を渡す形になる
 //! （rules/coding.md 禁止事項 / rules/architecture.md「3 ステージのパイプライン」）。
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
@@ -665,10 +667,14 @@ impl Error for SemanticsError {
 /// コードベース全体を走査して、候補ペアを判定する。
 ///
 /// `root` は走査を始めるディレクトリ、`structural_similarity_threshold` は
-/// 候補ペアとして拾う構造類似度の下限。
+/// 候補ペアとして拾う構造類似度の下限、`server` は起こす LSP サーバの指定。
 ///
 /// 読めなかったファイルと切り出せなかった関数は、走査を止めずに結果へ残す。
 /// **1 ファイルのために全体を落とすと、他のペアの判定まで失われる**。
+///
+/// **候補ペアが 1 組も無ければサーバを起こさない**（[`scan_semantics_of`]）。
+/// サーバを使えなくても失敗にしないのは [`measured_pair_of`] と同じで、
+/// 届かなかったことはシグナルと [`Scan::semantics_error`] に出る。
 ///
 /// # Errors
 ///
@@ -676,6 +682,7 @@ impl Error for SemanticsError {
 pub fn scan_of(
     root: &Path,
     structural_similarity_threshold: Threshold,
+    server: &ServerCommand,
 ) -> Result<Scan, CodebaseError> {
     let paths = typescript_paths_of(root)?;
     let file_count = paths.len();
@@ -683,16 +690,16 @@ pub fn scan_of(
     // ファイルごとの読み込み・パース・切り出しは互いに独立なので並列に回す。
     // 結果は `paths` と同じ並びで返るので、まとめ直しを順に行えば出力の並びは
     // 逐次で回したときと変わらない
-    let chunked_files: Vec<Result<FileChunks, SkippedFile>> =
+    let chunked_files: Vec<Result<ChunkedFile, SkippedFile>> =
         paths.par_iter().map(|path| file_chunks_of(path)).collect();
 
-    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut chunks: Vec<ScannedChunk> = Vec::new();
     let mut skipped_files = Vec::new();
     let mut unchunkable = Vec::new();
 
     for (path, chunked_file) in paths.iter().zip(chunked_files) {
-        let file_chunks = match chunked_file {
-            Ok(file_chunks) => file_chunks,
+        let chunked_file = match chunked_file {
+            Ok(chunked_file) => chunked_file,
             Err(skipped) => {
                 skipped_files.push(skipped);
                 continue;
@@ -700,17 +707,29 @@ pub fn scan_of(
         };
 
         unchunkable.extend(
-            file_chunks
+            chunked_file
+                .chunks
                 .unparsable_starts()
                 .iter()
                 .map(|start| Location::new(path.clone(), *start)),
         );
-        chunks.extend(file_chunks.chunks().iter().cloned());
+        chunks.extend(
+            chunked_file
+                .chunks
+                .chunks()
+                .iter()
+                .cloned()
+                .map(|chunk| ScannedChunk {
+                    chunk,
+                    source: Arc::clone(&chunked_file.source),
+                }),
+        );
     }
 
     Ok(scan_of_chunks(
         &chunks,
         structural_similarity_threshold,
+        server,
         ScanInputs {
             file_count,
             skipped_files,
@@ -719,15 +738,38 @@ pub fn scan_of(
     ))
 }
 
+/// 1 つのファイルから切り出したチャンクと、その元になったファイルの中身。
+struct ChunkedFile {
+    chunks: FileChunks,
+    source: Arc<str>,
+}
+
+/// 走査で切り出したチャンク 1 つと、それを切り出したファイルの中身。
+///
+/// **中身まで持つ**理由は [`ChunkPair`] と同じで、Stage 2 が Stage 1 と同じ版を
+/// サーバへ見せるため。候補ペアが決まるのは全ファイルを比べ終わった後なので、
+/// **走査の間ずっと持ち続ける**ことになる。
+///
+/// 中身はファイル 1 つにつき 1 本を共有する。チャンクごとに複製すると、
+/// 1 ファイルから N 個切り出したときに同じ中身が N 本残る。
+struct ScannedChunk {
+    chunk: Chunk,
+    source: Arc<str>,
+}
+
 /// そのファイルを読んで、中にある関数・メソッドをすべて切り出す。
 ///
 /// `path` は [`typescript_paths_of`] が集めたファイル。
+///
+/// 読んだ中身も一緒に返す。**Stage 2 で読み直さない**ため
+/// （読み直すと、間で編集されたときに構造のシグナルと意味のシグナルが別の版から出る。
+/// [`ScannedChunk`]）。
 ///
 /// # Errors
 ///
 /// 拡張子から grammar を選べない / ファイルを読めない / 構文木にできないとき。
 /// **飛ばす理由をそのまま返す**ので、呼び出し側は 1 ファイルのために走査を止めずに済む。
-fn file_chunks_of(path: &Path) -> Result<FileChunks, SkippedFile> {
+fn file_chunks_of(path: &Path) -> Result<ChunkedFile, SkippedFile> {
     let grammar = Grammar::of_path(path).ok_or_else(|| SkippedFile::UnreadableExtension {
         path: path.to_path_buf(),
     })?;
@@ -737,14 +779,21 @@ fn file_chunks_of(path: &Path) -> Result<FileChunks, SkippedFile> {
         cause,
     })?;
 
-    let tree = SyntaxTree::from_source(&source, grammar).map_err(|cause| {
-        SkippedFile::SourceUnparsable {
-            path: path.to_path_buf(),
-            cause,
-        }
-    })?;
+    let chunks = {
+        let tree = SyntaxTree::from_source(&source, grammar).map_err(|cause| {
+            SkippedFile::SourceUnparsable {
+                path: path.to_path_buf(),
+                cause,
+            }
+        })?;
 
-    Ok(FileChunks::from_tree(&tree, path))
+        FileChunks::from_tree(&tree, path)
+    };
+
+    Ok(ChunkedFile {
+        chunks,
+        source: Arc::from(source),
+    })
 }
 
 /// 走査で集めた、チャンク以外の材料。
@@ -762,16 +811,25 @@ struct ScanInputs {
 /// **先頭のチャンクほど比べる相手が多い**ので、区間を等分せず rayon の作業盗みに任せる。
 ///
 /// 結果はチャンクの並び順で返るので、候補ペアの並びは逐次で回したときと変わらない。
+///
+/// Stage 2 は候補ペアが出そろってから 1 度だけ尋ねる（[`scan_semantics_of`]）。
+/// **並列に回すのは Stage 1 まで**で、サーバとの会話は 1 本のセッションを順に使う。
 fn scan_of_chunks(
-    chunks: &[Chunk],
+    chunks: &[ScannedChunk],
     structural_similarity_threshold: Threshold,
+    server: &ServerCommand,
     inputs: ScanInputs,
 ) -> Scan {
     let compared: Vec<ComparedPairs> = chunks
         .par_iter()
         .enumerate()
-        .map(|(index, chunk)| {
-            ComparedPairs::from_chunk(chunk, &chunks[index + 1..], structural_similarity_threshold)
+        .map(|(index, scanned)| {
+            ComparedPairs::from_chunk(
+                index,
+                scanned,
+                &chunks[index + 1..],
+                structural_similarity_threshold,
+            )
         })
         .collect();
 
@@ -783,9 +841,22 @@ fn scan_of_chunks(
         .iter()
         .map(|compared| compared.pruned_pair_count)
         .sum();
-    let candidate_pairs = compared
+    let candidates: Vec<StructuralCandidate> = compared
         .into_iter()
-        .flat_map(|compared| compared.candidate_pairs)
+        .flat_map(|compared| compared.candidates)
+        .collect();
+
+    let semantics = scan_semantics_of(chunks, &asked_chunk_indices_of(&candidates), server);
+    let candidate_pairs = candidates
+        .into_iter()
+        .map(|candidate| {
+            candidate_pair_of(
+                chunks,
+                &semantics,
+                candidate,
+                structural_similarity_threshold,
+            )
+        })
         .collect();
 
     Scan {
@@ -796,7 +867,19 @@ fn scan_of_chunks(
         pruned_pair_count,
         skipped_files: inputs.skipped_files,
         unchunkable: inputs.unchunkable,
+        semantics_error: semantics.into_error(),
     }
+}
+
+/// 構造類似度だけで拾ったペアと、そこまでに測ったシグナル。
+///
+/// Stage 2 を重ねて [`CandidatePair`] になる。位置ではなく**チャンクの添字**で持つのは、
+/// Stage 2 が同じチャンクへ 2 度尋ねないために、ペアをまたいで同じチャンクだと
+/// 分かる必要があるため。
+struct StructuralCandidate {
+    chunk_a: usize,
+    chunk_b: usize,
+    signals: Signals,
 }
 
 /// 1 つのチャンクを、それより後ろのチャンクすべてと比べた結果。
@@ -804,38 +887,45 @@ fn scan_of_chunks(
 /// 候補ペアと比べた数を一緒に持つ。**比べた数は候補ペアの一覧から数え直せない**
 /// （閾値に届かなかった組も、入れ子で比べなかった組も一覧には出ない）。
 struct ComparedPairs {
-    candidate_pairs: Vec<CandidatePair>,
+    candidates: Vec<StructuralCandidate>,
     compared_pair_count: usize,
     pruned_pair_count: usize,
 }
 
 impl ComparedPairs {
-    /// `chunk` を `following`（並びの中でそれより後ろにあるチャンク）すべてと比べる。
+    /// `scanned` を `following`（並びの中でそれより後ろにあるチャンク）すべてと比べる。
+    ///
+    /// `index` は `scanned` がチャンクの並びの何番目か。`following` はその次から始まるので、
+    /// 相手の添字は `index + 1 + <その中での位置>`。
     ///
     /// 候補かどうかは [`is_structurally_similar`] に聞く。**同じ条件をここに書き直すと、
     /// 判定が「似ている」と見なす範囲と候補に拾う範囲が黙ってずれる**
     /// (`rules/architecture.md`「判定は 1 箇所にだけ置く」)。
     fn from_chunk(
-        chunk: &Chunk,
-        following: &[Chunk],
+        index: usize,
+        scanned: &ScannedChunk,
+        following: &[ScannedChunk],
         structural_similarity_threshold: Threshold,
     ) -> Self {
-        let mut candidate_pairs = Vec::new();
+        let chunk = &scanned.chunk;
+        let mut candidates = Vec::new();
         let mut compared_pair_count = 0;
         let mut pruned_pair_count = 0;
 
-        for other in following {
-            if is_nested(chunk, other) {
+        for (offset, other) in following.iter().enumerate() {
+            let other_chunk = &other.chunk;
+
+            if is_nested(chunk, other_chunk) {
                 continue;
             }
             compared_pair_count += 1;
 
-            if is_ruled_out_by_ceiling(chunk, other, structural_similarity_threshold) {
+            if is_ruled_out_by_ceiling(chunk, other_chunk, structural_similarity_threshold) {
                 pruned_pair_count += 1;
                 continue;
             }
 
-            let signals = signals_of(chunk, other);
+            let signals = signals_of(chunk, other_chunk);
             if !is_structurally_similar(
                 signals.structural_similarity(),
                 structural_similarity_threshold,
@@ -843,19 +933,424 @@ impl ComparedPairs {
                 continue;
             }
 
-            candidate_pairs.push(CandidatePair {
-                location_a: start_of(chunk),
-                location_b: start_of(other),
-                classification: classification_of(&signals, structural_similarity_threshold),
+            candidates.push(StructuralCandidate {
+                chunk_a: index,
+                chunk_b: index + 1 + offset,
+                signals,
             });
         }
 
         Self {
-            candidate_pairs,
+            candidates,
             compared_pair_count,
             pruned_pair_count,
         }
     }
+}
+
+/// 候補ペアに Stage 2 を重ねて判定する。
+fn candidate_pair_of(
+    chunks: &[ScannedChunk],
+    semantics: &ScanSemantics,
+    candidate: StructuralCandidate,
+    structural_similarity_threshold: Threshold,
+) -> CandidatePair {
+    let signals = signals_with_semantics_of(
+        candidate.signals,
+        &semantics.per_chunk[candidate.chunk_a],
+        &semantics.per_chunk[candidate.chunk_b],
+    );
+
+    CandidatePair {
+        location_a: start_of(&chunks[candidate.chunk_a].chunk),
+        location_b: start_of(&chunks[candidate.chunk_b].chunk),
+        classification: classification_of(&signals, structural_similarity_threshold),
+    }
+}
+
+/// Stage 1 のシグナルに、両側のチャンクへ尋ねた Stage 2 を重ねる。
+///
+/// **片方でも尋ねられていなければ、その理由を両方のシグナルに出す。** 比べる相手が
+/// 無いので測れておらず、取れなかった理由をそのまま出す
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+fn signals_with_semantics_of(
+    signals: Signals,
+    semantics_a: &ChunkSemantics,
+    semantics_b: &ChunkSemantics,
+) -> Signals {
+    match (semantics_a, semantics_b) {
+        (
+            ChunkSemantics::Asked {
+                type_signature: signature_a,
+                caller_domains: callers_a,
+            },
+            ChunkSemantics::Asked {
+                type_signature: signature_b,
+                caller_domains: callers_b,
+            },
+        ) => signals.with_semantics(
+            asked_type_signature_match_of(signature_a, signature_b),
+            asked_caller_domain_overlap_of(callers_a, callers_b),
+        ),
+        (ChunkSemantics::Unavailable { reason }, _)
+        | (_, ChunkSemantics::Unavailable { reason }) => signals.with_semantics(
+            TypeSignatureMatch::Unavailable { reason: *reason },
+            CallerDomainOverlap::Unavailable { reason: *reason },
+        ),
+        (ChunkSemantics::NoName, _) | (_, ChunkSemantics::NoName) => {
+            signals.with_semantics(TypeSignatureMatch::NoName, CallerDomainOverlap::NoName)
+        }
+        (ChunkSemantics::NotACandidate, _) | (_, ChunkSemantics::NotACandidate) => signals
+            .with_semantics(
+                TypeSignatureMatch::Unavailable {
+                    reason: SemanticsUnavailable::NotACandidate,
+                },
+                CallerDomainOverlap::Unavailable {
+                    reason: SemanticsUnavailable::NotACandidate,
+                },
+            ),
+    }
+}
+
+/// 候補ペアに現れるチャンクの添字。**同じチャンクは 1 つにまとまる。**
+///
+/// 1 つのチャンクは複数の候補ペアに現れるので、ペアごとに尋ねると同じ問い合わせを
+/// 何度も送ることになる（`docs/dryguard-plan.md`「候補ペアに対してだけ問い合わせる」）。
+fn asked_chunk_indices_of(candidates: &[StructuralCandidate]) -> BTreeSet<usize> {
+    candidates
+        .iter()
+        .flat_map(|candidate| [candidate.chunk_a, candidate.chunk_b])
+        .collect()
+}
+
+/// 走査した全チャンクについて、Stage 2 に尋ねた結果。
+///
+/// チャンクと同じ並びで**全数**を持つ。ペアを組むときに添字で引き当てられるので、
+/// 「尋ねたはずのチャンクが見つからない」という状態を作らずに済む
+/// (`rules/coding.md`「不正な状態を型で表現できなくする」)。
+struct ScanSemantics {
+    per_chunk: Vec<ChunkSemantics>,
+    setup_error: Option<SemanticsError>,
+}
+
+impl ScanSemantics {
+    /// どのチャンクにも尋ねていない形。
+    fn not_asked(chunk_count: usize) -> Self {
+        Self {
+            per_chunk: (0..chunk_count)
+                .map(|_| ChunkSemantics::NotACandidate)
+                .collect(),
+            setup_error: None,
+        }
+    }
+
+    /// 尋ねた結果を採らない形。`asked` のチャンクだけが取れなかった理由を持つ。
+    ///
+    /// **尋ねる前に止まったときと、終わらせるのに失敗したときの両方で使う。**
+    /// 異常終了したサーバの答えを採らないのは [`semantics_of`] と同じ理由。
+    fn from_failure(chunk_count: usize, asked: &BTreeSet<usize>, cause: SemanticsError) -> Self {
+        let reason = unavailable_of(&cause);
+
+        Self {
+            per_chunk: (0..chunk_count)
+                .map(|index| {
+                    if asked.contains(&index) {
+                        return ChunkSemantics::Unavailable { reason };
+                    }
+                    ChunkSemantics::NotACandidate
+                })
+                .collect(),
+            setup_error: Some(cause),
+        }
+    }
+
+    /// Stage 2 を尋ねられなかった理由。尋ねられた / そもそも尋ねなかったときは `None`。
+    ///
+    /// **先に落ちたものを出す**（後の失敗で上書きすると、何が起きたのかが入れ替わる）。
+    /// [`asked_scan_semantics_of`] は型シグネチャをすべて送ってから参照元を送るので、**チャンクを
+    /// 1 つずつ見て 2 つの結果を確かめる形にすると、尋ねた順と食い違う**（チャンク 0 の
+    /// 参照元が、チャンク 1 の型シグネチャより先に落ちたことになってしまう）。
+    ///
+    /// 取り出すのに自分を消費するのは、`ClientError` を複製できないため。
+    fn into_error(self) -> Option<SemanticsError> {
+        if self.setup_error.is_some() {
+            return self.setup_error;
+        }
+
+        let mut first_signature_error = None;
+        let mut first_caller_error = None;
+        for semantics in self.per_chunk {
+            let ChunkSemantics::Asked {
+                type_signature,
+                caller_domains,
+            } = semantics
+            else {
+                continue;
+            };
+
+            first_signature_error = first_signature_error.or_else(|| type_signature.err());
+            first_caller_error = first_caller_error.or_else(|| caller_domains.err());
+        }
+
+        first_signature_error
+            .or(first_caller_error)
+            .map(SemanticsError::Client)
+    }
+}
+
+/// 1 つのチャンクについて、Stage 2 に尋ねた結果。
+///
+/// 落ちた理由そのものは持たない形（`Unavailable`）と、往復の失敗を持つ形（`Asked`）が
+/// 混ざるのは、**尋ねる前に止まる失敗は走査全体で 1 度しか起きない**ため。
+/// セッションは走査につき 1 本なので、起動や握手に失敗すれば候補ペアの全チャンクが同時に落ちる。
+enum ChunkSemantics {
+    /// 候補ペアに現れないので尋ねていない。
+    NotACandidate,
+    /// 尋ねる前に止まった / 尋ねた結果を採らなかった。
+    Unavailable {
+        /// 取れなかった理由。
+        reason: SemanticsUnavailable,
+    },
+    /// 名前を持たず、尋ねる位置を決められなかった。
+    NoName,
+    /// 尋ねた。
+    Asked {
+        /// 型シグネチャを尋ねた結果。
+        type_signature: Result<TypeSignatureOutcome, ClientError>,
+        /// 参照元を尋ねた結果。
+        caller_domains: Result<CallerDomainsOutcome, ClientError>,
+    },
+}
+
+/// 候補ペアに現れるチャンクへ、Stage 2 のシグナルを尋ねる。
+///
+/// **サーバは走査につき 1 度だけ起こす。** 候補ペアごとに起こすと、起動と握手と
+/// プロジェクトの読み込みが候補ペアの数だけ走る（`tests/corpus/src` で 65 回）。
+///
+/// 根は**候補ペアに現れるファイルだけ**から決める。走査の根をそのまま渡すと、
+/// 開かせないファイルまで含む位置をサーバに見せることになる
+/// （`docs/dryguard-plan.md`「Stage 2: 意味情報収集」）。
+/// 根が tsconfig.json より下に来るコードベースで参照元が一部しか返らない話は Issue #125。
+///
+/// **候補ペアが 1 組も無ければサーバを起こさない**。似ていないペアの判定は Stage 2 で
+/// 変わらないので、起動と読み込みの待ち時間だけが増える。
+fn scan_semantics_of(
+    chunks: &[ScannedChunk],
+    asked: &BTreeSet<usize>,
+    server: &ServerCommand,
+) -> ScanSemantics {
+    if asked.is_empty() {
+        return ScanSemantics::not_asked(chunks.len());
+    }
+
+    let documents = match documents_of(chunks, asked) {
+        Ok(documents) => documents,
+        Err(cause) => return ScanSemantics::from_failure(chunks.len(), asked, cause),
+    };
+    let root = match WorkspaceRoot::enclosing(&asked_paths_of(chunks, asked)) {
+        Ok(root) => root,
+        Err(cause) => {
+            return ScanSemantics::from_failure(
+                chunks.len(),
+                asked,
+                SemanticsError::Workspace(cause),
+            );
+        }
+    };
+
+    let client = match Client::start(server) {
+        Ok(client) => client,
+        Err(cause) => {
+            return ScanSemantics::from_failure(chunks.len(), asked, SemanticsError::Client(cause));
+        }
+    };
+    let mut session = match client.handshake(&root) {
+        Ok(session) => session,
+        Err(cause) => {
+            return ScanSemantics::from_failure(chunks.len(), asked, SemanticsError::Client(cause));
+        }
+    };
+
+    let semantics = asked_scan_semantics_of(&mut session, chunks, asked, &documents);
+
+    // **答えを受け取っていても、異常終了したサーバの答えは採らない**（[`semantics_of`]）。
+    if let Err(cause) = session.shutdown() {
+        return ScanSemantics::from_failure(chunks.len(), asked, SemanticsError::Client(cause));
+    }
+
+    semantics
+}
+
+/// 候補ペアに現れるファイルを、サーバに開かせる形にしたもの。
+///
+/// **ファイル 1 つにつき 1 本**にして、チャンクの側は添字で指す。`SourceDocument` は
+/// 中身を自分の `String` に持つので、チャンクごとに作ると 1 ファイルから N 個
+/// 切り出したときに同じ中身が N 本残る（[`ScannedChunk`] が `Arc` で避けているのと
+/// 同じ膨らみが、開かせる側で戻ってしまう）。
+struct AskedDocuments {
+    documents: Vec<SourceDocument>,
+    /// `asked` と同じ並び。そのチャンクの中身を持つ [`AskedDocuments::documents`] の添字。
+    document_of_chunk: Vec<usize>,
+}
+
+/// 候補ペアに現れるチャンクのファイルを、サーバに開かせる形にする。
+///
+/// 同じファイルから切り出したチャンクは、同じドキュメントを指す。
+///
+/// # Errors
+///
+/// どれか 1 つでも開かせる形にできないとき。
+fn documents_of(
+    chunks: &[ScannedChunk],
+    asked: &BTreeSet<usize>,
+) -> Result<AskedDocuments, SemanticsError> {
+    let mut documents = Vec::new();
+    let mut document_of_chunk = Vec::with_capacity(asked.len());
+    let mut document_of_path: BTreeMap<&Path, usize> = BTreeMap::new();
+
+    for &index in asked {
+        let scanned = &chunks[index];
+        let path = scanned.chunk.path();
+
+        let document_index = match document_of_path.get(path) {
+            Some(&document_index) => document_index,
+            None => {
+                let document_index = documents.len();
+
+                documents.push(document_of(&scanned.chunk, &scanned.source)?);
+                document_of_path.insert(path, document_index);
+                document_index
+            }
+        };
+        document_of_chunk.push(document_index);
+    }
+
+    Ok(AskedDocuments {
+        documents,
+        document_of_chunk,
+    })
+}
+
+/// 候補ペアに現れるチャンクが属するファイル。ワークスペースの根を決める材料。
+fn asked_paths_of(chunks: &[ScannedChunk], asked: &BTreeSet<usize>) -> Vec<PathBuf> {
+    asked
+        .iter()
+        .map(|&index| chunks[index].chunk.path().to_path_buf())
+        .collect()
+}
+
+/// 開かせたドキュメントに、チャンクごとの hover と references を尋ねる。
+///
+/// **hover をすべて先に送る。** references は先の作業の落ち着きを待つので
+/// （`tests/semantics.rs` の `test_caller_domains_asked_after_a_type_signature_are_still_complete`）、
+/// 1 チャンクずつ交互に送ると読み込み中に計算された答えを受け取る。
+///
+/// **1 つが落ちても残りを尋ねる。** 途中で降りると、取れていたシグナルまで
+/// 「測れない」に化ける（[`AskedSemantics`]）。
+fn asked_scan_semantics_of(
+    session: &mut Session,
+    chunks: &[ScannedChunk],
+    asked: &BTreeSet<usize>,
+    documents: &AskedDocuments,
+) -> ScanSemantics {
+    // 開かせられなければ 1 つも尋ねられないので、ここは降りてよい。
+    for document in &documents.documents {
+        if let Err(cause) = session.open_document(document) {
+            return ScanSemantics::from_failure(chunks.len(), asked, SemanticsError::Client(cause));
+        }
+    }
+
+    let askable = askable_chunks_of(chunks, asked, documents);
+    let signatures: Vec<Result<TypeSignatureOutcome, ClientError>> = askable
+        .iter()
+        .map(|askable| {
+            resolved_type_signature_outcome_of(
+                session,
+                &chunks[askable.index].chunk,
+                askable.document,
+                askable.position,
+            )
+        })
+        .collect();
+    let callers: Vec<Result<CallerDomainsOutcome, ClientError>> = askable
+        .iter()
+        .map(|askable| caller_domains_outcome_of(session, askable.document, askable.position))
+        .collect();
+
+    ScanSemantics {
+        per_chunk: per_chunk_semantics_of(chunks.len(), asked, &askable, signatures, callers),
+        setup_error: None,
+    }
+}
+
+/// 尋ねる位置が決まったチャンク。
+///
+/// 名前を持たないチャンクはここに入らない。**サーバの失敗ではない**ので、
+/// 尋ねずに [`ChunkSemantics::NoName`] として残す。
+struct AskableChunk<'a> {
+    index: usize,
+    document: &'a SourceDocument,
+    position: SourcePosition,
+}
+
+/// 候補ペアに現れるチャンクのうち、尋ねる位置が決まったもの。
+fn askable_chunks_of<'a>(
+    chunks: &[ScannedChunk],
+    asked: &BTreeSet<usize>,
+    documents: &'a AskedDocuments,
+) -> Vec<AskableChunk<'a>> {
+    asked
+        .iter()
+        .zip(&documents.document_of_chunk)
+        .filter_map(|(&index, &document_index)| {
+            chunks[index]
+                .chunk
+                .name_position()
+                .map(|position| AskableChunk {
+                    index,
+                    document: &documents.documents[document_index],
+                    position,
+                })
+        })
+        .collect()
+}
+
+/// 尋ねた結果を、チャンクと同じ並びに戻す。
+///
+/// `signatures` と `callers` は `askable` と同じ並び。
+fn per_chunk_semantics_of(
+    chunk_count: usize,
+    asked: &BTreeSet<usize>,
+    askable: &[AskableChunk<'_>],
+    signatures: Vec<Result<TypeSignatureOutcome, ClientError>>,
+    callers: Vec<Result<CallerDomainsOutcome, ClientError>>,
+) -> Vec<ChunkSemantics> {
+    let mut per_chunk: Vec<ChunkSemantics> = (0..chunk_count)
+        .map(|index| unasked_chunk_semantics_of(index, asked))
+        .collect();
+
+    for (askable, (type_signature, caller_domains)) in
+        askable.iter().zip(signatures.into_iter().zip(callers))
+    {
+        per_chunk[askable.index] = ChunkSemantics::Asked {
+            type_signature,
+            caller_domains,
+        };
+    }
+
+    per_chunk
+}
+
+/// 尋ねなかったチャンクの結果。
+///
+/// 候補ペアに現れなければ「尋ねていない」。現れるのにここに残るのは、
+/// **名前が無くて尋ねる位置を決められなかった**チャンクだけ
+/// （尋ねたチャンクは [`per_chunk_semantics_of`] が置き換える）。
+fn unasked_chunk_semantics_of(index: usize, asked: &BTreeSet<usize>) -> ChunkSemantics {
+    if asked.contains(&index) {
+        return ChunkSemantics::NoName;
+    }
+    ChunkSemantics::NotACandidate
 }
 
 /// 突き合わせるまでもなく、構造類似度が閾値に届かないと分かるペアか。
@@ -909,12 +1404,25 @@ pub struct Scan {
     pruned_pair_count: usize,
     skipped_files: Vec<SkippedFile>,
     unchunkable: Vec<Location>,
+    semantics_error: Option<SemanticsError>,
 }
 
 impl Scan {
     /// 構造類似度が閾値に届いたペアと、その判定。列挙した順に並ぶ。
     pub fn candidate_pairs(&self) -> &[CandidatePair] {
         &self.candidate_pairs
+    }
+
+    /// Stage 2 を尋ねられなかった理由。尋ねられた / そもそも尋ねなかったときは `None`。
+    ///
+    /// **どのシグナルが取れなかったかはここに出ない。** それは候補ペアごとの判定の根拠が
+    /// 1 つずつ持つ。ここが持つのは、シグナルの側が [`SemanticsUnavailable`] としか
+    /// 言えない分——**利用者が環境を直すのに要る、サーバが見つからないのか
+    /// 握手に失敗したのか**——だけ（[`MeasuredPair::semantics_error`] と同じ）。
+    ///
+    /// セッションは走査につき 1 本なので、理由も 1 つでよい。
+    pub fn semantics_error(&self) -> Option<&SemanticsError> {
+        self.semantics_error.as_ref()
     }
 
     /// 走査の対象になった TypeScript ファイルの数。
@@ -1089,7 +1597,7 @@ mod tests {
     use crate::semantics::resolved_type::ResolvedTypes;
     use crate::semantics::type_signature::TypeSignature;
     use crate::similarity::Similarity;
-    use crate::test_support::line;
+    use crate::test_support::{line, missing_server};
 
     fn measured(value: f64) -> Similarity {
         Similarity::new(value).expect("テストが渡す値は 0.0-1.0")
@@ -1284,6 +1792,133 @@ mod tests {
         assert_eq!(signals.module_distance().steps(), 2);
     }
 
+    /// 尋ねた 2 つの結果を持つチャンク。
+    fn asked(
+        type_signature: Result<TypeSignatureOutcome, ClientError>,
+        caller_domains: Result<CallerDomainsOutcome, ClientError>,
+    ) -> ChunkSemantics {
+        ChunkSemantics::Asked {
+            type_signature,
+            caller_domains,
+        }
+    }
+
+    /// 名前で見分けられる往復の失敗。
+    fn failure(name: &str) -> ClientError {
+        ClientError::ServerNotFound {
+            program: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn test_scan_semantics_report_the_failure_that_was_asked_first() {
+        // **例外的に内部の型を直接組み立てる。** 「後ろのチャンクの hover だけが落ち、
+        // 先のチャンクの references も落ちる」という往復は、実サーバに起こさせられない。
+        // 型シグネチャをすべて送ってから参照元を送る順番（`asked_scan_semantics_of`）が
+        // 理由の出し方に効いていることを、ここで固定する
+        let semantics = ScanSemantics {
+            per_chunk: vec![
+                asked(
+                    Ok(TypeSignatureOutcome::NoTypeThere),
+                    Err(failure("later-references")),
+                ),
+                asked(
+                    Err(failure("earlier-hover")),
+                    Ok(CallerDomainsOutcome::NoReferences),
+                ),
+            ],
+            setup_error: None,
+        };
+
+        let error = semantics.into_error().map(|error| error.to_string());
+
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|text| text.contains("earlier-hover")),
+            "先に送った型シグネチャの失敗が出る: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_scan_semantics_report_a_caller_domain_failure_when_every_type_signature_answered() {
+        // 対照は上のテスト。型シグネチャが 1 つも落ちていなければ、参照元の失敗が出る
+        let semantics = ScanSemantics {
+            per_chunk: vec![
+                asked(
+                    Ok(TypeSignatureOutcome::NoTypeThere),
+                    Err(failure("only-references")),
+                ),
+                asked(
+                    Ok(TypeSignatureOutcome::NoTypeThere),
+                    Ok(CallerDomainsOutcome::NoReferences),
+                ),
+            ],
+            setup_error: None,
+        };
+
+        let error = semantics.into_error().map(|error| error.to_string());
+
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|text| text.contains("only-references")),
+            "参照元の失敗が出る: {error:?}"
+        );
+    }
+
+    /// 1 つのファイルに関数が 2 つ（1 行目と 5 行目）。
+    const TWO_FUNCTIONS: &str = "export function first(value: number): string {\n\
+                                 \x20 return String(value);\n\
+                                 }\n\
+                                 \n\
+                                 export function second(value: number): string {\n\
+                                 \x20 return String(value + 1);\n\
+                                 }\n";
+
+    /// そのファイルから切り出した、指定行を含むチャンクの並び。
+    fn scanned_chunks_of(path: &str, lines: &[usize]) -> Vec<ScannedChunk> {
+        let source: Arc<str> = Arc::from(TWO_FUNCTIONS);
+
+        lines
+            .iter()
+            .map(|&number| ScannedChunk {
+                chunk: chunk_of(path, number, &source),
+                source: Arc::clone(&source),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_documents_of_two_chunks_in_one_file_share_one_document() {
+        // `SourceDocument` は中身を自分の `String` に持つので、チャンクごとに作ると
+        // 1 ファイルから N 個切り出したときに同じ中身が N 本残る
+        let chunks = scanned_chunks_of("src/utils/format.ts", &[1, 5]);
+
+        let documents = documents_of(&chunks, &BTreeSet::from([0, 1]))
+            .expect("テストが渡すパスは開かせる形にできる");
+
+        assert_eq!(documents.documents.len(), 1, "ファイル 1 つにつき 1 本");
+        assert_eq!(
+            documents.document_of_chunk,
+            vec![0, 0],
+            "どちらのチャンクも同じドキュメントを指す"
+        );
+    }
+
+    #[test]
+    fn test_documents_of_chunks_in_separate_files_keep_one_document_each() {
+        // 対照は上のテスト。畳みすぎると、別のファイルのチャンクが他人の中身を指す
+        let mut chunks = scanned_chunks_of("src/utils/format.ts", &[1]);
+        chunks.extend(scanned_chunks_of("src/report/render.ts", &[5]));
+
+        let documents = documents_of(&chunks, &BTreeSet::from([0, 1]))
+            .expect("テストが渡すパスは開かせる形にできる");
+
+        assert_eq!(documents.documents.len(), 2, "ファイルごとに 1 本");
+        assert_eq!(documents.document_of_chunk, vec![0, 1]);
+    }
+
     /// `tests/fixtures/` 配下のディレクトリ。
     ///
     /// カレントディレクトリではなくマニフェストの位置から組み立てる
@@ -1296,12 +1931,18 @@ mod tests {
     }
 
     /// 既定の閾値で走査した結果。
+    ///
+    /// **起動できないサーバを渡す。** 実サーバを要する形にすると、サーバの入っていない
+    /// 開発機で結果が変わる（`rules/testing.md`「LSP を要するテストは、飛ばしたことが
+    /// 分かる形にする」）。実サーバでの走査は `tests/scan.rs` が `#[ignore]` 付きで見る。
     fn scan_of_fixture(relative_path: &str) -> Scan {
-        scan_of(
-            &fixture(relative_path),
-            DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
-        )
-        .expect("フィクスチャのディレクトリは走査できる")
+        scan_with_threshold_of_fixture(relative_path, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD)
+    }
+
+    /// 渡した閾値で走査した結果。
+    fn scan_with_threshold_of_fixture(relative_path: &str, threshold: Threshold) -> Scan {
+        scan_of(&fixture(relative_path), threshold, &missing_server())
+            .expect("フィクスチャのディレクトリは走査できる")
     }
 
     #[test]
@@ -1420,7 +2061,11 @@ mod tests {
     fn test_scan_of_a_missing_directory_reports_the_root_it_was_given() {
         let root = fixture("scan/missing");
 
-        let result = scan_of(&root, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let result = scan_of(
+            &root,
+            DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+            &missing_server(),
+        );
 
         let Err(CodebaseError::RootNotADirectory { root: reported }) = result else {
             panic!("ディレクトリでない根は RootNotADirectory になる");

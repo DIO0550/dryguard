@@ -7,15 +7,25 @@
 //! 入力は `tests/corpus/`。**業務アプリとして先に書いて判定を後から見た**もので
 //! （`tests/corpus/README.md`）、`compare` が 2 箇所を名指しで見ているのと同じペアを
 //! **総当たりの中から拾えるか**をここで見る。
+//!
+//! 実サーバを要するテストには `#[ignore]` を付ける。サーバの入っていない開発機で
+//! 黙って通さないため（rules/testing.md「LSP を要するテストは、飛ばしたことが
+//! 分かる形にする」）。それ以外は**起動できないサーバ**を渡して、LSP を使えない環境の
+//! 経路を通す。
 
 use std::path::{Path, PathBuf};
 
 use dryguard::classification::DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
 use dryguard::classification::verdict::Verdict;
+use dryguard::lsp::ServerCommand;
 use dryguard::pipeline::{CandidatePair, Scan, scan_of};
 use dryguard::report::scan_text_of;
 
-/// `tests/corpus/src/` を既定の閾値で走査した結果。
+mod common;
+
+use common::missing_server;
+
+/// `tests/corpus/src/` を既定の閾値で走査した結果。LSP は使えない。
 ///
 /// カレントディレクトリではなくマニフェストの位置から組み立てる
 /// （テストの実行位置に依存させない）。
@@ -24,10 +34,18 @@ use dryguard::report::scan_text_of;
 /// `#[test]` の関数と `#[cfg(test)]` のモジュールしか見ないため。統合テストの
 /// ヘルパー関数はそのどちらでもなく、`expect` は本番コードと同じく落とされる。
 fn scan_of_corpus() -> Scan {
-    let root = PathBuf::from(format!("{}/tests/corpus/src", env!("CARGO_MANIFEST_DIR")));
+    scan_of_root(&corpus_root(), &missing_server())
+}
 
-    let Ok(scan) = scan_of(&root, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD) else {
-        panic!("コーパスのディレクトリは走査できる");
+/// `tests/corpus/src/` のパス。
+fn corpus_root() -> PathBuf {
+    PathBuf::from(format!("{}/tests/corpus/src", env!("CARGO_MANIFEST_DIR")))
+}
+
+/// そのディレクトリを既定の閾値で走査した結果。
+fn scan_of_root(root: &Path, server: &ServerCommand) -> Scan {
+    let Ok(scan) = scan_of(root, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, server) else {
+        panic!("テストが渡す根は走査できる: {}", root.display());
     };
     scan
 }
@@ -167,13 +185,167 @@ fn test_scan_of_a_directory_without_typescript_finds_nothing_to_compare() {
     // 対照はコーパスの走査。docs/ には TypeScript が無いので、候補も比較も出ない
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs");
 
-    let Ok(scan) = scan_of(&root, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD) else {
-        panic!("docs はディレクトリなので走査できる");
-    };
+    let scan = scan_of_root(&root, &missing_server());
 
     assert_eq!(scan.file_count(), 0);
     assert_eq!(scan.compared_pair_count(), 0);
     assert!(scan.candidate_pairs().is_empty());
+}
+
+#[test]
+fn test_scan_without_an_lsp_server_reports_why_the_stage2_signals_are_missing() {
+    // 対照は Stage 1 の根拠（依存先の重なり）。**測れた値と測れなかったことが
+    // 同じ出方をすると、読者が両者を区別できない**
+    let scan = scan_of_corpus();
+
+    let text = scan_text_of(&scan, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+    assert!(
+        scan.semantics_error().is_some(),
+        "尋ねられなかったことが理由として残る"
+    );
+    assert!(
+        text.contains("型シグネチャ: 測れない (LSP サーバを使えない)")
+            && text.contains("呼び出し元ドメインの重なりを測れない (LSP サーバを使えない)"),
+        "候補ペアごとに、Stage 2 が効かなかった理由が出る: {text}"
+    );
+    assert!(
+        text.contains("依存先の重なり"),
+        "Stage 1 の根拠はそのまま出る: {text}"
+    );
+}
+
+#[test]
+fn test_scan_without_an_lsp_server_keeps_the_verdict_the_stage1_signals_reach() {
+    // サーバを使えないことで判定が動くと、**環境の差で結果が変わる**。
+    // 対照は上のテストで、同じ走査に「測れない」の行は出ている
+    let scan = scan_of_corpus();
+
+    assert_eq!(
+        verdict_of(&scan, "billing/dunning.ts:10", "inventory/warehouse.ts:18"),
+        Some(Verdict::DoNotExtract)
+    );
+}
+
+#[test]
+fn test_scan_without_candidate_pairs_does_not_start_the_lsp_server() {
+    // 候補ペアでないペアの判定は Stage 2 で変わらないので、起こすだけ待たされる
+    // （`docs/dryguard-plan.md`「候補ペアに対してだけ問い合わせる」）。
+    // **起動できないサーバを渡しているので、起こしていれば理由が付く。**
+    // 対照は上の 2 つで、同じコーパス全体を走査すると理由が付く
+    let scan = scan_of_root(&corpus_root().join("shared"), &missing_server());
+
+    assert!(
+        scan.candidate_pairs().is_empty(),
+        "閾値に届くペアが無いディレクトリを選んでいる: {}",
+        scan.candidate_pairs().len()
+    );
+    assert!(
+        scan.compared_pair_count() > 0,
+        "比べてはいる（そもそもペアが無いのではない）"
+    );
+    assert!(
+        scan.semantics_error().is_none(),
+        "サーバを起こしていない: {:?}",
+        scan.semantics_error().map(ToString::to_string)
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_scan_with_an_lsp_finds_a_candidate_pair_sharing_a_utility_unifiable() {
+    // 対照は下のテストで、**同じ走査の中の別の 1 組**が単一化不能と出る
+    // （片方だけでは、実装が全部同じ答えを返しても通る）
+    let scan = scan_of_root(&references_root(), &ServerCommand::typescript());
+
+    assert!(
+        scan.semantics_error().is_none(),
+        "実サーバには尋ねられる: {:?}",
+        scan.semantics_error().map(ToString::to_string)
+    );
+    let text = pair_text_of(&scan, "report/dateHelper.ts:3", "utils/formatDate.ts:3");
+    assert!(
+        text.as_deref()
+            .is_some_and(|text| text.contains("型シグネチャ: 単一化可能 → 共通化する側")),
+        "同じ道具立ての上に書かれた 2 つは重なる: {text:?}"
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_scan_with_an_lsp_finds_the_accidental_duplication_not_unifiable() {
+    // 対照は上のテスト。構造は同じ（1.00）だが、受け取る型が別ドメインのもの
+    let scan = scan_of_root(&references_root(), &ServerCommand::typescript());
+
+    let text = pair_text_of(&scan, "billing/discount.ts:5", "inventory/reorder.ts:5");
+    assert!(
+        text.as_deref()
+            .is_some_and(|text| text.contains("型シグネチャ: 単一化不能 → 共通化しない側")),
+        "別ドメインの型を受け取る 2 つは重ならない: {text:?}"
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_scan_with_an_lsp_counts_the_caller_domains_of_the_accidental_duplication() {
+    // 対照は下のテスト。**同じ走査の中の別の 1 組**は呼び出し元を共有している
+    let scan = scan_of_root(&references_root(), &ServerCommand::typescript());
+
+    let text = pair_text_of(&scan, "billing/discount.ts:5", "inventory/reorder.ts:5");
+    assert!(
+        text.as_deref().is_some_and(|text| {
+            text.contains("呼び出し元ドメインの重なり 0.00 (")
+                && text.contains("/billing ")
+                && text.contains("/inventory ")
+        }),
+        "重なりの値と、両側の分布が出る: {text:?}"
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_scan_with_an_lsp_finds_the_shared_utility_called_from_one_domain() {
+    // 対照は上のテスト。呼び出し元のドメインだけが違う
+    let scan = scan_of_root(&references_root(), &ServerCommand::typescript());
+
+    let text = pair_text_of(&scan, "report/dateHelper.ts:3", "utils/formatDate.ts:3");
+    assert!(
+        text.as_deref()
+            .is_some_and(|text| text.contains("呼び出し元ドメインの重なり 1.00 (")),
+        "同じドメインから呼ばれていることが出る: {text:?}"
+    );
+}
+
+/// `tests/fixtures/references/src/` のパス。
+///
+/// LSP 向けのフィクスチャ（候補ペアの共通の祖先に tsconfig.json がある）を走査の根にする。
+fn references_root() -> PathBuf {
+    PathBuf::from(format!(
+        "{}/tests/fixtures/references/src",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+}
+
+/// そのペアについて出力に出た区切り。候補に出ていなければ `None`。
+///
+/// **シグナルを直接覗かず、利用者が見るのと同じものを見る**
+/// （rules/testing.md「振る舞いをテストする」）。
+fn pair_text_of(scan: &Scan, one: &str, other: &str) -> Option<String> {
+    let pair = scan
+        .candidate_pairs()
+        .iter()
+        .find(|pair| is_pair_of(pair, one, other))?;
+    let heading = format!(
+        "[{}] {} <-> {}",
+        pair.classification().verdict(),
+        pair.location_a(),
+        pair.location_b()
+    );
+
+    scan_text_of(scan, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD)
+        .split("\n\n")
+        .find(|block| block.starts_with(&heading))
+        .map(ToOwned::to_owned)
 }
 
 #[test]
