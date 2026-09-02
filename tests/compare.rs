@@ -20,12 +20,15 @@ use dryguard::classification::signal::{
 use dryguard::classification::verdict::Verdict;
 use dryguard::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
 use dryguard::location::Location;
-use dryguard::lsp::ServerCommand;
 use dryguard::pipeline::{
     ChunkPairError, MeasuredPair, chunk_pair_of, measured_pair_of, signals_of,
 };
 use dryguard::report::text_of;
 use dryguard::similarity::Similarity;
+
+mod common;
+
+use common::missing_server;
 
 /// `tests/fixtures/` 配下の位置。
 ///
@@ -292,15 +295,6 @@ fn test_compare_of_similar_functions_in_separate_domains_reports_the_verdict_and
         text.contains("提案: 偶発的な重複の可能性が高い。共通化せず分離を維持する。"),
         "ラベルに対する提案が出る: {text}"
     );
-}
-
-/// 起動できない LSP サーバの指定。
-///
-/// **モックではなく実物の失敗**を使う（`rules/testing.md`「モックは使わない」）。
-/// 実行ファイルが無いので `Client::start` が `ServerNotFound` で落ち、
-/// **サーバが入っている環境でも入っていない環境でも同じ経路を通る**。
-fn missing_server() -> ServerCommand {
-    ServerCommand::new("dryguard-no-such-language-server", Vec::new())
 }
 
 /// 2 箇所を実ファイルから切り出して、起動できないサーバで Stage 2 を尋ねるところまで。
