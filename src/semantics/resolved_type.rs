@@ -41,6 +41,11 @@ pub struct TypeDeclaration {
 }
 
 impl TypeDeclaration {
+    /// 型名と、その宣言が置かれている場所から作る。
+    pub fn new(name: String, site: DeclarationSite) -> Self {
+        Self { name, site }
+    }
+
     /// ソースに書かれた型名の綴り。
     pub fn name(&self) -> &str {
         &self.name
@@ -55,9 +60,9 @@ impl TypeDeclaration {
 /// 型名から、解決後の綴りへの対応。
 ///
 /// **入るのは型エイリアスだけ。** `interface` / `class` / `enum` は hover が
-/// `interface User` としか返さず、置き換える先の綴りが無い。
-/// それらを綴りのまま比べると、同じ局所名で別の型を指す 2 つが単一化可能に出る
-/// （定義の場所で見分ける話は Issue #131）。
+/// `interface User` としか返さず、置き換える先の綴りが無い。それらは綴りのまま
+/// 比較へ進むので、**同じ局所名で別の型を指す 2 つを見分けるのは綴りではなく
+/// [`TypeDeclaration`] の側**（`semantics::type_signature` が宣言の場所で突き合わせる）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedTypes {
     by_name: HashMap<String, String>,
@@ -121,10 +126,9 @@ pub fn type_declarations_of(
 
     for reference in type_references {
         match session.type_definition(document, reference.position())? {
-            TypeDefinitionOutcome::Answered(site) => declarations.push(TypeDeclaration {
-                name: reference.name().to_owned(),
-                site,
-            }),
+            TypeDefinitionOutcome::Answered(site) => {
+                declarations.push(TypeDeclaration::new(reference.name().to_owned(), site));
+            }
             TypeDefinitionOutcome::NotSupported => {
                 return Ok(TypeDeclarationsOutcome::TypeDefinitionNotProvided);
             }
