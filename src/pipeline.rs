@@ -4,7 +4,7 @@
 //! `syntax` は I/O を持たないので、読んだ結果を渡す形になる
 //! （rules/coding.md 禁止事項 / rules/architecture.md「3 ステージのパイプライン」）。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -1067,7 +1067,9 @@ impl ScanSemantics {
     /// Stage 2 を尋ねられなかった理由。尋ねられた / そもそも尋ねなかったときは `None`。
     ///
     /// **先に落ちたものを出す**（後の失敗で上書きすると、何が起きたのかが入れ替わる）。
-    /// 順番はチャンクの並び順で、1 つのチャンクの中では型シグネチャを先に見る。
+    /// [`asked_chunks_of`] は型シグネチャをすべて送ってから参照元を送るので、**チャンクを
+    /// 1 つずつ見て 2 つの結果を確かめる形にすると、尋ねた順と食い違う**（チャンク 0 の
+    /// 参照元が、チャンク 1 の型シグネチャより先に落ちたことになってしまう）。
     ///
     /// 取り出すのに自分を消費するのは、`ClientError` を複製できないため。
     fn into_error(self) -> Option<SemanticsError> {
@@ -1075,7 +1077,24 @@ impl ScanSemantics {
             return self.setup_error;
         }
 
-        self.per_chunk.into_iter().find_map(chunk_error_of)
+        let mut first_signature_error = None;
+        let mut first_caller_error = None;
+        for semantics in self.per_chunk {
+            let ChunkSemantics::Asked {
+                type_signature,
+                caller_domains,
+            } = semantics
+            else {
+                continue;
+            };
+
+            first_signature_error = first_signature_error.or_else(|| type_signature.err());
+            first_caller_error = first_caller_error.or_else(|| caller_domains.err());
+        }
+
+        first_signature_error
+            .or(first_caller_error)
+            .map(SemanticsError::Client)
     }
 }
 
@@ -1101,22 +1120,6 @@ enum ChunkSemantics {
         /// 参照元を尋ねた結果。
         caller_domains: Result<CallerDomainsOutcome, ClientError>,
     },
-}
-
-/// そのチャンクで落ちた理由。落ちていなければ `None`。
-fn chunk_error_of(semantics: ChunkSemantics) -> Option<SemanticsError> {
-    let ChunkSemantics::Asked {
-        type_signature,
-        caller_domains,
-    } = semantics
-    else {
-        return None;
-    };
-
-    type_signature
-        .err()
-        .or_else(|| caller_domains.err())
-        .map(SemanticsError::Client)
 }
 
 /// 候補ペアに現れるチャンクへ、Stage 2 のシグナルを尋ねる。
@@ -1178,12 +1181,21 @@ fn scan_semantics_of(
     semantics
 }
 
+/// 候補ペアに現れるファイルを、サーバに開かせる形にしたもの。
+///
+/// **ファイル 1 つにつき 1 本**にして、チャンクの側は添字で指す。`SourceDocument` は
+/// 中身を自分の `String` に持つので、チャンクごとに作ると 1 ファイルから N 個
+/// 切り出したときに同じ中身が N 本残る（[`ScannedChunk`] が `Arc` で避けているのと
+/// 同じ膨らみが、開かせる側で戻ってしまう）。
+struct AskedDocuments {
+    documents: Vec<SourceDocument>,
+    /// `asked` と同じ並び。そのチャンクの中身を持つ [`AskedDocuments::documents`] の添字。
+    document_of_chunk: Vec<usize>,
+}
+
 /// 候補ペアに現れるチャンクのファイルを、サーバに開かせる形にする。
 ///
-/// 並びは `asked` と同じ。**チャンクごとに 1 つ作る**ので、同じファイルから 2 つ
-/// 切り出していれば同じ中身が 2 本になるが、`Session::open_document` は URI で畳むので
-/// サーバが見るのは 1 つ。ファイルごとにまとめると引き当てに `Option` が要る
-/// （`rules/coding.md`「不正な状態を型で表現できなくする」）ので、そちらを採らない。
+/// 同じファイルから切り出したチャンクは、同じドキュメントを指す。
 ///
 /// # Errors
 ///
@@ -1191,11 +1203,32 @@ fn scan_semantics_of(
 fn documents_of(
     chunks: &[ScannedChunk],
     asked: &BTreeSet<usize>,
-) -> Result<Vec<SourceDocument>, SemanticsError> {
-    asked
-        .iter()
-        .map(|&index| document_of(&chunks[index].chunk, &chunks[index].source))
-        .collect()
+) -> Result<AskedDocuments, SemanticsError> {
+    let mut documents = Vec::new();
+    let mut document_of_chunk = Vec::with_capacity(asked.len());
+    let mut document_of_path: BTreeMap<&Path, usize> = BTreeMap::new();
+
+    for &index in asked {
+        let scanned = &chunks[index];
+        let path = scanned.chunk.path();
+
+        let document_index = match document_of_path.get(path) {
+            Some(&document_index) => document_index,
+            None => {
+                let document_index = documents.len();
+
+                documents.push(document_of(&scanned.chunk, &scanned.source)?);
+                document_of_path.insert(path, document_index);
+                document_index
+            }
+        };
+        document_of_chunk.push(document_index);
+    }
+
+    Ok(AskedDocuments {
+        documents,
+        document_of_chunk,
+    })
 }
 
 /// 候補ペアに現れるチャンクが属するファイル。ワークスペースの根を決める材料。
@@ -1218,10 +1251,10 @@ fn asked_chunks_of(
     session: &mut Session,
     chunks: &[ScannedChunk],
     asked: &BTreeSet<usize>,
-    documents: &[SourceDocument],
+    documents: &AskedDocuments,
 ) -> ScanSemantics {
     // 開かせられなければ 1 つも尋ねられないので、ここは降りてよい。
-    for document in documents {
+    for document in &documents.documents {
         if let Err(cause) = session.open_document(document) {
             return ScanSemantics::from_failure(chunks.len(), asked, SemanticsError::Client(cause));
         }
@@ -1264,18 +1297,18 @@ struct AskableChunk<'a> {
 fn askable_chunks_of<'a>(
     chunks: &[ScannedChunk],
     asked: &BTreeSet<usize>,
-    documents: &'a [SourceDocument],
+    documents: &'a AskedDocuments,
 ) -> Vec<AskableChunk<'a>> {
     asked
         .iter()
-        .zip(documents)
-        .filter_map(|(&index, document)| {
+        .zip(&documents.document_of_chunk)
+        .filter_map(|(&index, &document_index)| {
             chunks[index]
                 .chunk
                 .name_position()
                 .map(|position| AskableChunk {
                     index,
-                    document,
+                    document: &documents.documents[document_index],
                     position,
                 })
         })
@@ -1757,6 +1790,133 @@ mod tests {
         let signals = signals_of(&chunk_a, &chunk_b);
 
         assert_eq!(signals.module_distance().steps(), 2);
+    }
+
+    /// 尋ねた 2 つの結果を持つチャンク。
+    fn asked(
+        type_signature: Result<TypeSignatureOutcome, ClientError>,
+        caller_domains: Result<CallerDomainsOutcome, ClientError>,
+    ) -> ChunkSemantics {
+        ChunkSemantics::Asked {
+            type_signature,
+            caller_domains,
+        }
+    }
+
+    /// 名前で見分けられる往復の失敗。
+    fn failure(name: &str) -> ClientError {
+        ClientError::ServerNotFound {
+            program: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn test_scan_semantics_report_the_failure_that_was_asked_first() {
+        // **例外的に内部の型を直接組み立てる。** 「後ろのチャンクの hover だけが落ち、
+        // 先のチャンクの references も落ちる」という往復は、実サーバに起こさせられない。
+        // 型シグネチャをすべて送ってから参照元を送る順番（`asked_chunks_of`）が
+        // 理由の出し方に効いていることを、ここで固定する
+        let semantics = ScanSemantics {
+            per_chunk: vec![
+                asked(
+                    Ok(TypeSignatureOutcome::NoTypeThere),
+                    Err(failure("later-references")),
+                ),
+                asked(
+                    Err(failure("earlier-hover")),
+                    Ok(CallerDomainsOutcome::NoReferences),
+                ),
+            ],
+            setup_error: None,
+        };
+
+        let error = semantics.into_error().map(|error| error.to_string());
+
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|text| text.contains("earlier-hover")),
+            "先に送った型シグネチャの失敗が出る: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_scan_semantics_report_a_caller_domain_failure_when_every_type_signature_answered() {
+        // 対照は上のテスト。型シグネチャが 1 つも落ちていなければ、参照元の失敗が出る
+        let semantics = ScanSemantics {
+            per_chunk: vec![
+                asked(
+                    Ok(TypeSignatureOutcome::NoTypeThere),
+                    Err(failure("only-references")),
+                ),
+                asked(
+                    Ok(TypeSignatureOutcome::NoTypeThere),
+                    Ok(CallerDomainsOutcome::NoReferences),
+                ),
+            ],
+            setup_error: None,
+        };
+
+        let error = semantics.into_error().map(|error| error.to_string());
+
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|text| text.contains("only-references")),
+            "参照元の失敗が出る: {error:?}"
+        );
+    }
+
+    /// 1 つのファイルに関数が 2 つ（1 行目と 5 行目）。
+    const TWO_FUNCTIONS: &str = "export function first(value: number): string {\n\
+                                 \x20 return String(value);\n\
+                                 }\n\
+                                 \n\
+                                 export function second(value: number): string {\n\
+                                 \x20 return String(value + 1);\n\
+                                 }\n";
+
+    /// そのファイルから切り出した、指定行を含むチャンクの並び。
+    fn scanned_chunks_of(path: &str, lines: &[usize]) -> Vec<ScannedChunk> {
+        let source: Arc<str> = Arc::from(TWO_FUNCTIONS);
+
+        lines
+            .iter()
+            .map(|&number| ScannedChunk {
+                chunk: chunk_of(path, number, &source),
+                source: Arc::clone(&source),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_documents_of_two_chunks_in_one_file_share_one_document() {
+        // `SourceDocument` は中身を自分の `String` に持つので、チャンクごとに作ると
+        // 1 ファイルから N 個切り出したときに同じ中身が N 本残る
+        let chunks = scanned_chunks_of("src/utils/format.ts", &[1, 5]);
+
+        let documents = documents_of(&chunks, &BTreeSet::from([0, 1]))
+            .expect("テストが渡すパスは開かせる形にできる");
+
+        assert_eq!(documents.documents.len(), 1, "ファイル 1 つにつき 1 本");
+        assert_eq!(
+            documents.document_of_chunk,
+            vec![0, 0],
+            "どちらのチャンクも同じドキュメントを指す"
+        );
+    }
+
+    #[test]
+    fn test_documents_of_chunks_in_separate_files_keep_one_document_each() {
+        // 対照は上のテスト。畳みすぎると、別のファイルのチャンクが他人の中身を指す
+        let mut chunks = scanned_chunks_of("src/utils/format.ts", &[1]);
+        chunks.extend(scanned_chunks_of("src/report/render.ts", &[5]));
+
+        let documents = documents_of(&chunks, &BTreeSet::from([0, 1]))
+            .expect("テストが渡すパスは開かせる形にできる");
+
+        assert_eq!(documents.documents.len(), 2, "ファイルごとに 1 本");
+        assert_eq!(documents.document_of_chunk, vec![0, 1]);
     }
 
     /// `tests/fixtures/` 配下のディレクトリ。
