@@ -1067,7 +1067,7 @@ impl ScanSemantics {
     /// Stage 2 を尋ねられなかった理由。尋ねられた / そもそも尋ねなかったときは `None`。
     ///
     /// **先に落ちたものを出す**（後の失敗で上書きすると、何が起きたのかが入れ替わる）。
-    /// [`asked_chunks_of`] は型シグネチャをすべて送ってから参照元を送るので、**チャンクを
+    /// [`asked_scan_semantics_of`] は型シグネチャをすべて送ってから参照元を送るので、**チャンクを
     /// 1 つずつ見て 2 つの結果を確かめる形にすると、尋ねた順と食い違う**（チャンク 0 の
     /// 参照元が、チャンク 1 の型シグネチャより先に落ちたことになってしまう）。
     ///
@@ -1171,7 +1171,7 @@ fn scan_semantics_of(
         }
     };
 
-    let semantics = asked_chunks_of(&mut session, chunks, asked, &documents);
+    let semantics = asked_scan_semantics_of(&mut session, chunks, asked, &documents);
 
     // **答えを受け取っていても、異常終了したサーバの答えは採らない**（[`semantics_of`]）。
     if let Err(cause) = session.shutdown() {
@@ -1247,7 +1247,7 @@ fn asked_paths_of(chunks: &[ScannedChunk], asked: &BTreeSet<usize>) -> Vec<PathB
 ///
 /// **1 つが落ちても残りを尋ねる。** 途中で降りると、取れていたシグナルまで
 /// 「測れない」に化ける（[`AskedSemantics`]）。
-fn asked_chunks_of(
+fn asked_scan_semantics_of(
     session: &mut Session,
     chunks: &[ScannedChunk],
     asked: &BTreeSet<usize>,
@@ -1814,7 +1814,7 @@ mod tests {
     fn test_scan_semantics_report_the_failure_that_was_asked_first() {
         // **例外的に内部の型を直接組み立てる。** 「後ろのチャンクの hover だけが落ち、
         // 先のチャンクの references も落ちる」という往復は、実サーバに起こさせられない。
-        // 型シグネチャをすべて送ってから参照元を送る順番（`asked_chunks_of`）が
+        // 型シグネチャをすべて送ってから参照元を送る順番（`asked_scan_semantics_of`）が
         // 理由の出し方に効いていることを、ここで固定する
         let semantics = ScanSemantics {
             per_chunk: vec![
