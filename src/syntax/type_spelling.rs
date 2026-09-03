@@ -77,7 +77,7 @@ const COMPOSING_TYPE_KINDS: [&str; 2] = ["union_type", "intersection_type"];
 ///
 /// **Why not（括弧が要る位置を列挙する）**: 配列・共用体・`keyof` と、要る位置は
 /// 綴りの形の数だけある。**確かめる形なら、その一覧が要らない。**
-pub fn substituted_spelling_of(
+pub(crate) fn substituted_spelling_of(
     spelling: &str,
     opened: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
@@ -148,13 +148,12 @@ fn needs_grouping(plain: &str, placed: Range<usize>) -> bool {
     let Ok(tree) = SyntaxTree::from_source(plain, Grammar::TypeScript) else {
         return true;
     };
-
-    let nodes = tree.named_descendants();
-    if nodes.iter().any(is_broken) {
+    if tree.has_error() {
         return true;
     }
 
-    let placed = nodes
+    let placed = tree
+        .named_descendants()
         .into_iter()
         .find(|node| node.start_byte() == placed.start && node.end_byte() == placed.end);
     let Some(placed) = placed else {
@@ -185,10 +184,10 @@ fn spliced(text: &str, span: Range<usize>, replacement: &str) -> String {
 /// 綴りそのものの範囲だけに絞る。
 fn type_name_spans_of(wrapped: &str) -> Option<Vec<Range<usize>>> {
     let tree = SyntaxTree::from_source(wrapped, Grammar::TypeScript).ok()?;
-    let nodes = tree.named_descendants();
-    if nodes.iter().any(is_broken) {
+    if tree.has_error() {
         return None;
     }
+    let nodes = tree.named_descendants();
 
     let spelling = SPELLING_PREFIX.len()..wrapped.len().saturating_sub(SPELLING_SUFFIX.len());
     let bound = bound_names_of(&nodes, wrapped);
@@ -268,11 +267,6 @@ fn is_bound(node: Node<'_>) -> bool {
 
     let mut cursor = parent.walk();
     parent.named_children(&mut cursor).next() == Some(node)
-}
-
-/// そのノードが、木の壊れている印か。
-fn is_broken(node: &Node<'_>) -> bool {
-    node.is_error() || node.is_missing()
 }
 
 #[cfg(test)]
@@ -519,6 +513,24 @@ mod tests {
     #[test]
     fn test_a_spelling_that_does_not_read_as_a_type_cannot_be_substituted() {
         assert_eq!(substituted_spelling_of("=> )(", opening_nothing), None);
+    }
+
+    #[test]
+    fn test_a_spelling_missing_a_closing_token_cannot_be_substituted() {
+        // 欠けた字句は名前を持たないノードとして残るので、名前付きだけを歩いても
+        // 見つからない。対照は下のテスト（同じ形で閉じているもの）
+        assert_eq!(
+            substituted_spelling_of("Map<string", opening("Amount", "number")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_a_spelling_missing_a_closing_parenthesis_cannot_be_substituted() {
+        assert_eq!(
+            substituted_spelling_of("(a: Amount => void", opening("Amount", "number")),
+            None
+        );
     }
 
     #[test]
