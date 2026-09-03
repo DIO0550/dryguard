@@ -134,11 +134,27 @@ fn annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
 }
 
 /// その部分木にある型名のノードを、書かれた順に返す。
+///
+/// **修飾された型名は 1 つとして数える。** `money.Amount` を末尾の `Amount` として集めると、
+/// 解決した綴りを差し込んだ先が `money.number` になる（差し込む側は綴り全体を
+/// 1 つの型名として置き換える）。
 fn type_identifiers_of(node: Node<'_>) -> Vec<Node<'_>> {
-    nodes_of_kind(node, TYPE_IDENTIFIER_KIND)
+    let mut named: Vec<Node<'_>> = Vec::new();
+
+    for found in nodes_of_kind(node, TYPE_IDENTIFIER_KIND)
         .into_iter()
-        .filter(|found| !is_qualified_leaf(*found))
-        .collect()
+        .chain(nodes_of_kind(node, NESTED_TYPE_IDENTIFIER_KIND))
+    {
+        if is_qualified_leaf(found) {
+            continue;
+        }
+        named.push(found);
+    }
+
+    // 2 つの種別を別々に歩いたので、ソースに書かれた順へ戻す。
+    named.sort_by_key(|found| found.start_byte());
+
+    named
 }
 
 /// その部分木にある、指定した種別のノードを書かれた順に返す。
@@ -167,12 +183,28 @@ fn push_nodes_of_kind<'tree>(node: Node<'tree>, kind: &str, found: &mut Vec<Node
 
 /// そのノードが、修飾された型名の末尾か（`money.Amount` の `Amount`）。
 ///
-/// **Why（末尾だけを解決しない）**: 解決して差し込むと、置き換わるのは末尾だけなので
-/// `money.number` という綴りができる。まとめて置き換えるには修飾ごと持つ必要があり、
-/// それは差し込みが識別子の単位で行われる形とぶつかる。
+/// 末尾は修飾ごと数えるので、単独では集めない。**尋ねる位置としては使う**
+/// （[`asked_node_of`]）。
 fn is_qualified_leaf(node: Node<'_>) -> bool {
     node.parent()
         .is_some_and(|parent| parent.kind() == NESTED_TYPE_IDENTIFIER_KIND)
+}
+
+/// その型名について尋ねるときに指すノード。
+///
+/// **修飾された型名では末尾を指す。** 先頭（`money.Amount` の `money`）は名前空間なので、
+/// そこへ `typeDefinition` を送っても型の宣言は返らない。
+fn asked_node_of(node: Node<'_>) -> Node<'_> {
+    if node.kind() != NESTED_TYPE_IDENTIFIER_KIND {
+        return node;
+    }
+
+    let mut cursor = node.walk();
+    let tail = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == TYPE_IDENTIFIER_KIND);
+
+    tail.unwrap_or(node)
 }
 
 /// そのシグネチャの中で束縛された型の名前。束縛が無ければ空。
@@ -236,10 +268,13 @@ fn push_name(bound: &mut BTreeSet<String>, node: Option<Node<'_>>, source: &str)
 
 /// 型名のノード 1 つを、綴りと位置の組にする。
 ///
+/// **綴りは書かれたまま、位置は尋ねる先。** 修飾された型名では 2 つが別のノードから来る
+/// （[`asked_node_of`]）。
+///
 /// バイト範囲が文字の境界に乗っていなければ `None`。
 fn type_reference_of(node: Node<'_>, source: &str) -> Option<TypeReference> {
     Some(TypeReference {
         name: source.get(node.byte_range())?.to_owned(),
-        position: source_position_of(node, source)?,
+        position: source_position_of(asked_node_of(node), source)?,
     })
 }
