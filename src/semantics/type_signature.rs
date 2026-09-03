@@ -236,8 +236,8 @@ impl TypeSignature {
         // 差し込みは型 1 つ分の綴りに対して行うので、接頭辞を落として関数型へ組み直す。
         // 接頭辞が持っていた呼び出しの仕方だけを先に取る。
         let kind = written.kind();
-        let substituted = substituted(&written.to_function_type()?, resolved);
-        let split = SplitSignature::from_signature_text(&substituted)?;
+        let opened = opened_spelling_of(&written.to_function_type()?, resolved)?;
+        let split = SplitSignature::from_signature_text(&opened)?;
 
         let return_type = normalized_type(split.return_type()?)?;
         let parameters = split.parameters()?;
@@ -492,20 +492,21 @@ fn flattened(text: &str) -> String {
     flattened
 }
 
-/// 型 1 つ分の綴りに書かれた型名を、解決後の綴りへ差し替えた文字列。
+/// 型 1 つ分の綴りに書かれた型名を、解決後の綴りへ開いた文字列。
+/// 型として読めない綴りでは `None`。
 ///
 /// **どこが型名かは構文木が決める**（`syntax::type_spelling`）。綴りを識別子の単位で歩くと、
 /// メンバー名・メソッド名・`typeof` の後ろの値の名前まで同じ顔をするので、
 /// **差し替えない位置を出た形ごとに数え上げる**ことになる。
 ///
-/// **型として読めない綴りでは差し替えない。** どこが型名かを確かめられないまま綴りを
-/// 書き換えると、上の数え上げへ戻ることになる。**倒れる向きは偽陰性**で、
-/// エイリアスが開かれないまま比較へ進む（解決できなかった型名と同じ扱い）。
+/// **読めなかったことを綴りで埋めない。** 元の綴りへ落とすと、そこに何が書かれているかを
+/// 確かめられないまま比較へ進み、**確かめられなかったことを答えとして出す**ことになる
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
 ///
 /// **開いた綴りも畳んでから差し込む。** 宣言の hover は複数行で返ることがあり
 /// （`type Shape = {\n id: string;\n}`）、畳まずに差し込むと同じ型が書かれ方の違いで
 /// 別物になる（[`flattened`]）。
-fn substituted(spelling: &str, resolved: &ResolvedTypes) -> String {
+fn opened_spelling_of(spelling: &str, resolved: &ResolvedTypes) -> Option<String> {
     let opened = |name: &str| {
         resolved
             .resolved_of(name)
@@ -513,13 +514,17 @@ fn substituted(spelling: &str, resolved: &ResolvedTypes) -> String {
             .map(flattened)
     };
 
-    substituted_spelling_of(spelling, opened).unwrap_or_else(|| spelling.to_owned())
+    substituted_spelling_of(spelling, opened)
 }
 
 /// シグネチャ全体が 1 つの型名に置き換わっている綴りを、その型名を開いた形にする。
 ///
 /// `const aliased: Handler` は引数リストを持たないので、**開く前は
 /// [`SplitSignature`] が割れない**。割れた綴りには手を触れない。
+///
+/// **開けなければ元の綴りを返す。** ここで読めなかった綴りは割る側でも割れないので、
+/// [`TypeSignature::from_signature_text`] が `None` を返す。**読めなかったことは
+/// そこで出る**ので、この段で握りつぶしたことにはならない。
 ///
 /// **Why not（いつでも注釈を開いてから割る）**: 割れる綴りでは、引数と戻り値が
 /// それぞれ型 1 つ分として開かれる。手前でまとめて開くと同じ綴りを二度開くことになる。
@@ -534,8 +539,11 @@ fn opened_annotation_of(text: &str, resolved: &ResolvedTypes) -> String {
     let Some((named, annotated)) = annotated else {
         return text.to_owned();
     };
+    let Some(opened) = opened_spelling_of(annotated, resolved) else {
+        return text.to_owned();
+    };
 
-    format!("{named}{}", substituted(annotated, resolved))
+    format!("{named}{opened}")
 }
 
 /// その綴りが、どこに書かれていても同じ型を指すか。
@@ -1492,6 +1500,33 @@ mod tests {
                 &[]
             ),
             None
+        );
+    }
+
+    #[test]
+    fn test_a_signature_holding_a_spelling_that_does_not_read_as_a_type_cannot_be_read() {
+        // 型として読めない綴りの上では、どこが型名かを確かめられない。**綴りのまま比べた
+        // 結果を答えにしない**（`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」）
+        assert_eq!(
+            TypeSignature::from_signature_text(
+                "function broken(x: { id string }): void",
+                &ResolvedTypes::default(),
+                &[]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_a_signature_holding_the_same_shape_written_correctly_is_read() {
+        // 対照は上のテスト。違うのはメンバーの `:` 1 文字だけ
+        assert!(
+            TypeSignature::from_signature_text(
+                "function whole(x: { id: string }): void",
+                &ResolvedTypes::default(),
+                &[]
+            )
+            .is_some()
         );
     }
 
