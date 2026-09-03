@@ -114,7 +114,7 @@ impl<'source> SyntaxTree<'source> {
     /// **根から見る。** 欠けた字句は名前を持たないノードとして木に残ることがあり
     /// （`Map<string` の閉じ `>`）、[`SyntaxTree::named_descendants`] は
     /// **名前付きだけを返す**ので、そこを歩いても見つからない。
-    pub fn has_error(&self) -> bool {
+    pub(crate) fn has_error(&self) -> bool {
         self.tree.root_node().has_error()
     }
 
