@@ -28,4 +28,4 @@ pub mod module_distance;
 pub mod token;
 pub mod tree;
 pub mod type_reference;
-pub mod type_spelling;
+pub(crate) mod type_spelling;
