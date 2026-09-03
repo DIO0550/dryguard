@@ -46,6 +46,11 @@ const TYPE_PARAMETERS_FIELD: &str = "type_parameters";
 /// 型変数の宣言と同じく、**その綴りはこのシグネチャの中でだけ意味を持つ**。
 const MAPPED_TYPE_CLAUSE_KIND: &str = "mapped_type_clause";
 
+/// 条件型が型を捕まえる印を表すノードの種別（`infer U`）。
+///
+/// 捕まえた名前も、**その綴りはこのシグネチャの中でだけ意味を持つ**。
+const INFER_TYPE_KIND: &str = "infer_type";
+
 /// 名前を載せるフィールド。
 const NAME_FIELD: &str = "name";
 
@@ -215,8 +220,9 @@ fn asked_node_of(node: Node<'_>) -> Node<'_> {
 
 /// そのシグネチャの中で束縛された型の名前。束縛が無ければ空。
 ///
-/// 束縛は 2 通りある。型変数の宣言（`<T>`）と、マップ型の束縛（`[K in "a"]`）。
-/// **どちらもその綴りはこのシグネチャの中でだけ意味を持つ**ので、解決の対象にしない。
+/// 束縛は 3 通りある。型変数の宣言（`<T>`）・マップ型の束縛（`[K in "a"]`）・
+/// 条件型が捕まえる名前（`infer U`）。
+/// **どれもその綴りはこのシグネチャの中でだけ意味を持つ**ので、解決の対象にしない。
 ///
 /// **Why（束縛された名前を尋ねない）**: 束縛はチャンクごとに別のものなので、
 /// 解決するとファイルごとに違う結果になる。`pickFirst<T>` と `head<U>` が
@@ -251,16 +257,27 @@ fn bound_type_names_of(node: Node<'_>, source: &str) -> BTreeSet<String> {
 
         for clause in nodes_of_kind(annotated, MAPPED_TYPE_CLAUSE_KIND) {
             // 束縛されるのは先頭の型名だけ。`[K in Keys]` の `Keys` は制約なので残す。
-            let mut cursor = clause.walk();
-            let binder = clause
-                .named_children(&mut cursor)
-                .next()
-                .filter(|child| child.kind() == TYPE_IDENTIFIER_KIND);
-            push_name(&mut bound, binder, source);
+            push_name(&mut bound, first_type_identifier_of(clause), source);
+        }
+
+        for inferred in nodes_of_kind(annotated, INFER_TYPE_KIND) {
+            push_name(&mut bound, first_type_identifier_of(inferred), source);
         }
     }
 
     bound
+}
+
+/// その束縛が捕まえた型名のノード。捕まえていなければ `None`。
+///
+/// **先頭の 1 つだけが束縛。** `[K in Keys]` の `Keys` も `infer U extends X` の `X` も
+/// 制約なので、集める側に残る。
+fn first_type_identifier_of(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+
+    node.named_children(&mut cursor)
+        .next()
+        .filter(|child| child.kind() == TYPE_IDENTIFIER_KIND)
 }
 
 /// そのノードが覆う綴りを、束縛された名前として書き足す。ノードが無ければ何もしない。

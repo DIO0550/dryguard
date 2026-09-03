@@ -1048,6 +1048,18 @@ function broken() {
     }
 
     #[test]
+    fn test_chunk_type_references_leave_out_a_name_captured_by_infer() {
+        // `infer U` の `U` はこのシグネチャの中でだけ意味を持つ。尋ねると宣言の場所が
+        // その束縛になり、**同じ形の 2 つが別のファイルにあるだけで単一化できなくなる**。
+        // 対照として、束縛されていない型名を 1 つ置く
+        let inferred = "export function unwrap<T>(x: T extends Promise<infer U> ? U : never, rate: Rate): void {\n  return;\n}\n";
+
+        let chunk = chunk_at(inferred, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Promise", "Rate"]);
+    }
+
+    #[test]
     fn test_chunk_type_references_keep_the_constraint_of_a_mapped_type() {
         // 対照は上のテスト。`[K in Keys]` の `Keys` は制約であって束縛ではない
         let constrained =
