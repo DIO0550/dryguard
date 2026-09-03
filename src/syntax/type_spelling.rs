@@ -252,16 +252,16 @@ fn is_qualified_leaf(node: Node<'_>) -> bool {
 ///
 /// 束縛は 3 通り。型変数の宣言（`<T>`）・マップ型の束縛（`[K in Keys]`）・`infer U`。
 /// **どれも先頭の型名だけが束縛**で、続く制約（`<T extends Amount>` の `Amount`、
-/// `[K in Keys]` の `Keys`）は差し替えの相手に残る。
+/// `[K in Keys]` の `Keys`、`infer U extends X` の `X`）は差し替えの相手に残る。
+/// 制約も infer の束縛も同じ `infer_type` の直下に並ぶので、先頭かどうかで見分ける。
 fn is_bound(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-
-    if parent.kind() == INFER_TYPE_KIND {
-        return true;
-    }
-    if !matches!(parent.kind(), TYPE_PARAMETER_KIND | MAPPED_TYPE_CLAUSE_KIND) {
+    if !matches!(
+        parent.kind(),
+        TYPE_PARAMETER_KIND | MAPPED_TYPE_CLAUSE_KIND | INFER_TYPE_KIND
+    ) {
         return false;
     }
 
@@ -389,6 +389,19 @@ mod tests {
                 opening("U", "string")
             ),
             Some("T extends Promise<infer U> ? U : never".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_the_constraint_of_an_infer_binding_is_substituted() {
+        // `infer U extends X` の `U` と `X` はどちらも infer_type の直下だが、束縛は先頭の
+        // `U` だけ。制約 `X` は差し替えの相手に残る
+        assert_eq!(
+            substituted_spelling_of(
+                "T extends Promise<infer U extends X> ? U : never",
+                opening("X", "string")
+            ),
+            Some("T extends Promise<infer U extends string> ? U : never".to_owned())
         );
     }
 

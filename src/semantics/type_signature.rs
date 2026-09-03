@@ -1879,6 +1879,20 @@ mod tests {
     }
 
     #[test]
+    fn test_an_alias_on_an_infer_constraint_is_opened() {
+        // `infer U extends Amount` の `Amount` は束縛ではなく制約なので開く。
+        // 捕まえた `U` は開かない（束縛）
+        let constrained = signature_with(
+            "function unwrap<T>(x: T extends Promise<infer U extends Amount> ? U : never): void",
+            &resolving("Amount", "number"),
+        );
+
+        assert!(constrained.is_unifiable_with(&signature(
+            "function other<A>(y: A extends Promise<infer U extends number> ? U : never): void"
+        )));
+    }
+
+    #[test]
     fn test_a_qualified_value_name_after_typeof_is_not_opened() {
         // `.` を挟んだ先も値の名前。TypeScript は型と値で名前空間が別
         let queried = signature_with(
