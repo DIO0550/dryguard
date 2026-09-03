@@ -15,6 +15,7 @@ use std::fmt;
 use crate::lsp::{ClientError, HoverOutcome, Session, SourceDocument};
 use crate::semantics::resolved_type::{ResolvedTypes, TypeDeclaration};
 use crate::source_position::SourcePosition;
+use crate::syntax::type_spelling::substituted_spelling_of;
 
 /// 付け替えた型変数の綴りの前置き。
 ///
@@ -39,37 +40,10 @@ const CONSTRUCTOR_KEYWORD: &str = "constructor";
 /// 構築シグネチャの値形を導く語（`new (value: string) => Result`）。
 const NEW_KEYWORD: &str = "new";
 
-/// 括弧で括られていなければ、周りの印に負ける演算子。
-///
-/// 関数型の `=>` は、深さ 0 の `=` として現れる（`>` は矢印の一部なので
-/// [`SignatureScan`] が閉じ括弧として数えない）。
-const UNGROUPED_TYPE_OPERATORS: [char; 3] = ['|', '&', '='];
-
-/// 型の手前に来る区切り。
-///
-/// `>` は関数型の矢印（`(a: T) => U` の `U` の手前）、`[` はタプルの始まり。
-/// **型名の直後の `[` は配列の印**なので、後ろの一覧（[`TYPE_BOUNDARY_AFTER`]）には入れない。
-const TYPE_BOUNDARY_BEFORE: [char; 6] = [':', ',', '(', '<', '>', '['];
-
-/// 型の後ろに来る区切り。
-const TYPE_BOUNDARY_AFTER: [char; 6] = [',', ')', '>', ';', '}', ']'];
-
-/// メンバーや引数の名前の後ろに続く印。
-///
-/// 型の綴りでは、名前の後ろにだけこれらが続く。`(` と `<` はメソッドの名前
-/// （`{ ID(): X }` / `{ ID<T>(): X }`）、`?` の付く形は省略できるメンバー。
-///
-/// **`?` だけでは足りない。** 条件型（`T extends U ? X : Y`）の `?` と見分けが付かない。
-///
-/// **`<` が型名の後ろに来るのは総称型（`Box<User>`）だけ**で、そのときは型引数を取る
-/// エイリアスなので開く対象に入っていない（[`ResolvedTypes`] へ入らない）。
-const MEMBER_MARKERS: [&str; 5] = [":", "?:", "(", "?(", "<"];
-
 /// 後ろに値の名前を取る演算子。
 ///
-/// `typeof x` の `x` は**値の名前**で、型の名前ではない。同じ綴りの型エイリアスがあると
-/// 差し替えが `typeof string` という綴りを作る（TypeScript では型と値が別の名前空間なので、
-/// 同じ綴りが両方にありうる）。
+/// `typeof x` の `x` は**値の名前**で、型の名前ではない。開いた綴りに残った名前を
+/// 数えるとき、これを型名と数えると宣言を辿れない名前を待つことになる。
 const VALUE_OPERATOR: &str = "typeof";
 
 /// どこで書かれても同じ型を指す綴り。
@@ -104,13 +78,11 @@ const TYPE_OPERATORS: [&str; 5] = ["keyof", "readonly", "infer", "extends", VALU
 /// （[`is_site_independent`] は識別子だけを見る）。
 const BOOLEAN_LITERALS: [&str; 2] = ["true", "false"];
 
-/// 綴りを検証するときに、メンバーや引数の名前と見なす印。
+/// 開いた綴りを検証するときに、メンバーや引数の名前と見なす印。
 ///
-/// [`MEMBER_MARKERS`] から `<` を外したもの。**差し込む側と検証する側で `<` の意味が違う**。
-/// 差し込む先の綴りに `X<…>` が現れるのはメソッド名だけだが（型引数を取るエイリアスは
-/// 開く対象に入らない）、**検証する相手は開いた後の綴り**で、そこには総称型の参照
-/// (`Local<string>`) が現れる。それは宣言を辿る相手なので、見逃すと**別々のモジュールの
-/// `Local<string>` が同じ綴りとして重なる**。
+/// **`<` は入れない。** 検証する相手は開いた後の綴りで、そこには総称型の参照
+/// (`Local<string>`) が現れる。それは宣言を辿る相手なので、メソッド名の印として
+/// 見逃すと**別々のモジュールの `Local<string>` が同じ綴りとして重なる**。
 ///
 /// **Why not（型引数の中身を読んで見分ける）**: メソッド名か総称型かは `<` の後ろが
 /// 型変数の宣言かどうかで決まり、読むには型そのものの構文解析が要る。
@@ -244,9 +216,11 @@ impl TypeSignature {
     /// 埋めない**ので、後段は「引数が無い関数」と「読めなかった」を区別できる
     /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
     ///
-    /// **差し込むのは読む前。** シグネチャ全体がエイリアスに置き換わる形
-    /// （`const aliased: Handler`）は引数リストを持たないので、読んだ後に差し込む形では
-    /// **この綴りが入口に入れない**（`None` になる）。
+    /// **差し込むのは割った後。** どこが型名かを構文木で決めるには綴りが型として読める
+    /// 必要があり、`(method)` などの接頭辞が付いたままでは読めない
+    /// （[`SplitSignature::to_function_type`]）。ただしシグネチャ全体がエイリアスに
+    /// 置き換わる形（`const aliased: Handler`）は引数リストを持たず**割れない**ので、
+    /// そこだけ割る前に開く（[`opened_annotation_of`]）。
     ///
     /// `declarations` は `semantics::resolved_type` が集めた型名ごとの宣言の場所。
     /// **持ち回すのは、差し込んだ後の綴りに残った名前の分だけ**
@@ -256,8 +230,14 @@ impl TypeSignature {
         resolved: &ResolvedTypes,
         declarations: &[TypeDeclaration],
     ) -> Option<Self> {
-        let flattened = flattened(&substituted(text, resolved));
-        let split = SplitSignature::from_signature_text(&flattened)?;
+        let opened = opened_annotation_of(&flattened(text), resolved);
+        let written = SplitSignature::from_signature_text(&opened)?;
+
+        // 差し込みは型 1 つ分の綴りに対して行うので、接頭辞を落として関数型へ組み直す。
+        // 接頭辞が持っていた呼び出しの仕方だけを先に取る。
+        let kind = written.kind();
+        let opened = opened_spelling_of(&written.to_function_type()?, resolved)?;
+        let split = SplitSignature::from_signature_text(&opened)?;
 
         let return_type = normalized_type(split.return_type()?)?;
         let parameters = split.parameters()?;
@@ -283,7 +263,7 @@ impl TypeSignature {
         );
 
         Some(Self {
-            kind: split.kind(),
+            kind,
             type_parameters: placeholders.type_parameters(&declared),
             parameters: parameters
                 .iter()
@@ -512,139 +492,58 @@ fn flattened(text: &str) -> String {
     flattened
 }
 
-/// 型名を、解決後の綴りへ差し替えた文字列。
+/// 型 1 つ分の綴りに書かれた型名を、解決後の綴りへ開いた文字列。
+/// 型として読めない綴りでは `None`。
 ///
-/// 差し替えは**識別子の単位**で行う。部分一致で差し替えると、`Amount` が
-/// `AmountRate` の中まで書き換える。
+/// **どこが型名かは構文木が決める**（`syntax::type_spelling`）。綴りを識別子の単位で歩くと、
+/// メンバー名・メソッド名・`typeof` の後ろの値の名前まで同じ顔をするので、
+/// **差し替えない位置を出た形ごとに数え上げる**ことになる。
 ///
-/// **引用符の中は差し替えない。** 文字列リテラル型 `"Amount"` を書き換えると
-/// 別の型になる（[`flattened`] が引用符の中の空白を畳まないのと同じ理由）。
-fn substituted(text: &str, resolved: &ResolvedTypes) -> String {
-    let mut substituted = String::new();
-    let mut identifier = String::new();
-    let mut quote = QuoteState::new();
-    let mut preceded = Preceded::Nothing;
-
-    for (index, character) in text.char_indices() {
-        let inside_quotes = quote.is_inside(character);
-        if !inside_quotes && is_identifier_character(character) {
-            identifier.push(character);
-            continue;
-        }
-
-        let placement = Placement {
-            preceded: preceded.clone(),
-            following: text.get(index..).unwrap_or_default(),
-        };
-        push_resolved(&mut substituted, &identifier, resolved, &placement);
-
-        // 識別子が終わったことを覚えてから、区切りの文字で上書きする。空白は覚えない
-        // （`keyof Maybe` の `Maybe` から見た直前は、空白ではなく `keyof` そのもの）。
-        if !identifier.is_empty() {
-            preceded = Preceded::Word(identifier.clone());
-        }
-        identifier.clear();
-        substituted.push(character);
-
-        if !character.is_whitespace() {
-            preceded = Preceded::Separator(character);
-        }
-    }
-    let placement = Placement {
-        preceded,
-        following: "",
-    };
-    push_resolved(&mut substituted, &identifier, resolved, &placement);
-
-    substituted
-}
-
-/// 綴りの中で、その名前が置かれている位置の前後。
+/// **読めなかったことを綴りで埋めない。** 元の綴りへ落とすと、そこに何が書かれているかを
+/// 確かめられないまま比較へ進み、**確かめられなかったことを答えとして出す**ことになる
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
 ///
-/// **型名なのかも、括弧が要るかも、前後で決まる。** 2 つを別々に持ち回すと、
-/// 片方だけを見て判断する枝が生えやすい。
-struct Placement<'text> {
-    /// その名前の直前にあったもの。
-    preceded: Preceded,
-    /// その名前の後ろに続く綴り。綴りの末尾なら空。
-    following: &'text str,
-}
-
-/// 名前の直前にあったもの。
-///
-/// **区切りの文字と識別子を分けて持つ。** 識別子を「最後の 1 文字」に潰すと、
-/// `keyof` と `typeof` を見分けられない（どちらも `f` で終わる）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Preceded {
-    /// 綴りの先頭。
-    Nothing,
-    /// 区切りの文字。
-    Separator(char),
-    /// 識別子。前置きの型演算子（`keyof`）や、値を取る `typeof` がこれ。
-    Word(String),
-}
-
-impl Placement<'_> {
-    /// その名前が型ではなく、メンバーや引数の名前か。
-    ///
-    /// 型の綴りでは、名前の後ろにだけ [`MEMBER_MARKERS`] が続く。`{ ID: ID }` の左側、
-    /// `{ ID(): ID }` のメソッド名、`(value: T)` の `value` がこれで、**差し替えると
-    /// 型でないものを型で置き換える**ことになる。
-    fn names_a_member(&self) -> bool {
-        let following = self.following.trim_start();
-
-        MEMBER_MARKERS
-            .iter()
-            .any(|marker| following.starts_with(marker))
-    }
-
-    /// その名前が型ではなく、値を指しているか。
-    ///
-    /// `typeof x` の `x` がこれ。**TypeScript は型と値で名前空間が別**なので、
-    /// 同じ綴りの型エイリアスがあっても、ここを差し替えると型でないものを置き換えることになる。
-    fn names_a_value(&self) -> bool {
-        matches!(&self.preceded, Preceded::Word(word) if word == VALUE_OPERATOR)
-    }
-
-    /// 前後が型の区切りで、括弧を足さなくても 1 つのまとまりとして読めるか。
-    ///
-    /// 直前が識別子で終わっていれば挟まれていない。前置きの型演算子（`keyof` /
-    /// `readonly` / `infer`）がこれで、**`keyof A | B` は `(keyof A) | B` と読まれる**。
-    fn is_bounded(&self) -> bool {
-        let bounded_before = match &self.preceded {
-            Preceded::Nothing => true,
-            Preceded::Separator(character) => TYPE_BOUNDARY_BEFORE.contains(character),
-            Preceded::Word(_) => false,
-        };
-        let bounded_after = self
-            .following
-            .trim_start()
-            .chars()
-            .next()
-            .is_none_or(|character| TYPE_BOUNDARY_AFTER.contains(&character));
-
-        bounded_before && bounded_after
-    }
-}
-
-/// 識別子 1 つ分を、解決後の綴り（解決できていなければそのまま）で書き足す。
-fn push_resolved(
-    target: &mut String,
-    identifier: &str,
-    resolved: &ResolvedTypes,
-    placement: &Placement<'_>,
-) {
-    let names_a_type = !placement.names_a_member() && !placement.names_a_value();
-    let opened = resolved
-        .resolved_of(identifier)
-        .filter(|_| names_a_type)
-        .filter(|spelling| is_site_independent(spelling));
-    let Some(spelling) = opened else {
-        target.push_str(identifier);
-        return;
+/// **開いた綴りも畳んでから差し込む。** 宣言の hover は複数行で返ることがあり
+/// （`type Shape = {\n id: string;\n}`）、畳まずに差し込むと同じ型が書かれ方の違いで
+/// 別物になる（[`flattened`]）。
+fn opened_spelling_of(spelling: &str, resolved: &ResolvedTypes) -> Option<String> {
+    let opened = |name: &str| {
+        resolved
+            .resolved_of(name)
+            .filter(|opened| is_site_independent(opened))
+            .map(flattened)
     };
 
-    target.push_str(&grouped_spelling_of(spelling, placement));
+    substituted_spelling_of(spelling, opened)
+}
+
+/// シグネチャ全体が 1 つの型名に置き換わっている綴りを、その型名を開いた形にする。
+///
+/// `const aliased: Handler` は引数リストを持たないので、**開く前は
+/// [`SplitSignature`] が割れない**。割れた綴りには手を触れない。
+///
+/// **開けなければ元の綴りを返す。** ここで読めなかった綴りは割る側でも割れないので、
+/// [`TypeSignature::from_signature_text`] が `None` を返す。**読めなかったことは
+/// そこで出る**ので、この段で握りつぶしたことにはならない。
+///
+/// **Why not（いつでも注釈を開いてから割る）**: 割れる綴りでは、引数と戻り値が
+/// それぞれ型 1 つ分として開かれる。手前でまとめて開くと同じ綴りを二度開くことになる。
+fn opened_annotation_of(text: &str, resolved: &ResolvedTypes) -> String {
+    if SplitSignature::from_signature_text(text).is_some() {
+        return text.to_owned();
+    }
+
+    let annotated = SignatureScan::new(text)
+        .top_level_index_of(':')
+        .and_then(|separator| Some((text.get(..=separator)?, text.get(separator + 1..)?)));
+    let Some((named, annotated)) = annotated else {
+        return text.to_owned();
+    };
+    let Some(opened) = opened_spelling_of(annotated, resolved) else {
+        return text.to_owned();
+    };
+
+    format!("{named}{opened}")
 }
 
 /// その綴りが、どこに書かれていても同じ型を指すか。
@@ -728,42 +627,6 @@ fn names_a_declared_type(identifier: &str, following: &str) -> bool {
     !VETTED_MEMBER_MARKERS
         .iter()
         .any(|marker| following.starts_with(marker))
-}
-
-/// その位置に置くときの型の綴り。括弧が要るなら括ってから返す。
-///
-/// **Why**: `type Maybe = string | undefined` を `Maybe[]` の位置へそのまま差し込むと
-/// `string | undefined[]` になり、`(string | undefined)[]` とは別の型を指す。
-/// 呼び出し可能なエイリアスでは**倒れる向きが偽陽性**になり、`Handler | null` が
-/// 「共用体を返す関数」として読める。
-///
-/// **Why not（常に括る）**: `Amount` が `(number)` になり、書き下した `number` と
-/// 別の綴りになる。**エイリアスを開いた側だけが単一化できなくなる。**
-fn grouped_spelling_of(spelling: &str, placement: &Placement<'_>) -> String {
-    if placement.is_bounded() || !is_compound_type(spelling) {
-        return spelling.to_owned();
-    }
-
-    format!("({spelling})")
-}
-
-/// その型の綴りが、括弧の外で組み合わさっているか。
-///
-/// **深さ 0 に空白があれば組み合わさっている。** 前置きの型演算子（`keyof Model`）や
-/// 条件型（`A extends B ? C : D`）は演算子の一覧に載らないが、どれも語を空白で
-/// つないだ形になる。演算子を列挙すると**漏れた 1 つが黙って偽陽性を作る**。
-///
-/// 深さ 0 だけを見るのは、`Map<string, A | B>` や `{ id: string }` のように
-/// **括弧の中で組み合わさっている型は、それ自体が 1 つのまとまりとして置ける**ため。
-/// 既に括られている綴り（`(A | B)`）も深さ 0 には何も無いので、二重に括らない。
-fn is_compound_type(spelling: &str) -> bool {
-    let scan = SignatureScan::new(spelling);
-    let joined_by_space = scan.has_top_level_whitespace();
-    let joined_by_operator = UNGROUPED_TYPE_OPERATORS
-        .iter()
-        .any(|operator| scan.top_level_index_of(*operator).is_some());
-
-    joined_by_space || joined_by_operator
 }
 
 /// 引用符の中にいるかどうかを、文字を 1 つずつ読みながら追う。
@@ -887,13 +750,6 @@ impl<'text> SignatureScan<'text> {
             .map(|scanned| scanned.index)
     }
 
-    /// 深さ 0 に空白があるか。
-    fn has_top_level_whitespace(&self) -> bool {
-        self.characters
-            .iter()
-            .any(|scanned| scanned.depth == 0 && scanned.character.is_whitespace())
-    }
-
     /// 深さ 0 にある最後の `target` の位置。無ければ `None`。
     fn last_top_level_index_of(&self, target: char) -> Option<usize> {
         self.characters
@@ -999,18 +855,7 @@ impl<'text> SplitSignature<'text> {
 
     /// 引数リストの手前に書かれた型変数の宣言。宣言が無ければ空。
     fn declared_type_parameters(&self) -> Vec<DeclaredTypeParameter> {
-        let prefix = self.prefix.trim_end();
-        if !prefix.ends_with('>') {
-            return Vec::new();
-        }
-
-        // 深さ 0 にある最後の `<` が、末尾の `>` の相手。`Map<string, X>` のような
-        // 入れ子は深さで外れ、`Foo<A>.bar<T>` のように 2 組並んでも後ろが選ばれる。
-        let Some(open) = SignatureScan::new(prefix).last_top_level_index_of('<') else {
-            return Vec::new();
-        };
-
-        let Some(declarations) = prefix.get(open + 1..prefix.len() - '>'.len_utf8()) else {
+        let Some(declarations) = self.type_parameter_list() else {
             return Vec::new();
         };
 
@@ -1019,6 +864,45 @@ impl<'text> SplitSignature<'text> {
             .into_iter()
             .filter_map(DeclaredTypeParameter::from_text)
             .collect()
+    }
+
+    /// 引数リストの手前に書かれた型変数の宣言の綴り。`<` と `>` は含めない。
+    ///
+    /// 宣言が無ければ `None`。
+    fn type_parameter_list(&self) -> Option<&'text str> {
+        let prefix = self.prefix.trim_end();
+        if !prefix.ends_with('>') {
+            return None;
+        }
+
+        // 深さ 0 にある最後の `<` が、末尾の `>` の相手。`Map<string, X>` のような
+        // 入れ子は深さで外れ、`Foo<A>.bar<T>` のように 2 組並んでも後ろが選ばれる。
+        let open = SignatureScan::new(prefix).last_top_level_index_of('<')?;
+
+        prefix.get(open + 1..prefix.len() - '>'.len_utf8())
+    }
+
+    /// 割った 3 つを、型 1 つ分として読める関数型の綴りへ組み直す。
+    /// 戻り値の型を読み取れなければ `None`。
+    ///
+    /// **接頭辞は捨てる。** `(method)` や `constructor` は型の綴りではないので、
+    /// 型として読ませる形には残せない。**そこにある情報は呼び出しの仕方だけ**なので、
+    /// [`SplitSignature::kind`] で先に取っておく。
+    ///
+    /// **Why（型として読める形へ直す）**: 型名の差し替えは構文木で位置を決めるので、
+    /// 綴りが型として読めることが要る（`syntax::type_spelling`）。宣言形と値形の
+    /// 2 通りをここで 1 つの形へ寄せると、差し替えは 1 度で済む。
+    fn to_function_type(&self) -> Option<String> {
+        let declarations = match self.type_parameter_list() {
+            Some(declarations) => format!("<{declarations}>"),
+            None => String::new(),
+        };
+
+        Some(format!(
+            "{declarations}({}) => {}",
+            self.parameter_list,
+            self.return_type()?
+        ))
     }
 }
 
@@ -1620,6 +1504,33 @@ mod tests {
     }
 
     #[test]
+    fn test_a_signature_holding_a_spelling_that_does_not_read_as_a_type_cannot_be_read() {
+        // 型として読めない綴りの上では、どこが型名かを確かめられない。**綴りのまま比べた
+        // 結果を答えにしない**（`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」）
+        assert_eq!(
+            TypeSignature::from_signature_text(
+                "function broken(x: { id string }): void",
+                &ResolvedTypes::default(),
+                &[]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_a_signature_holding_the_same_shape_written_correctly_is_read() {
+        // 対照は上のテスト。違うのはメンバーの `:` 1 文字だけ
+        assert!(
+            TypeSignature::from_signature_text(
+                "function whole(x: { id: string }): void",
+                &ResolvedTypes::default(),
+                &[]
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
     fn test_a_type_name_inside_a_string_literal_type_is_not_substituted() {
         // 文字列リテラル型の中身は型の一部。差し替えると別の型になる
         let literal = signature_with(
@@ -1881,6 +1792,116 @@ mod tests {
 
         assert!(aliased.is_unifiable_with(&signature(
             "function other(value: (string | number)[]): void"
+        )));
+    }
+
+    #[test]
+    fn test_a_signature_using_a_qualified_type_alias_is_unifiable_with_one_written_out() {
+        let qualified = signature_with(
+            "function scale(amount: money.Amount): void",
+            &resolving("money.Amount", "number"),
+        );
+
+        assert!(qualified.is_unifiable_with(&signature("function other(a: number): void")));
+    }
+
+    #[test]
+    fn test_a_signature_using_an_unresolved_qualified_type_alias_is_not_unifiable_with_one_written_out()
+     {
+        // 対照は上のテスト。同じ綴りを解決なしで読む
+        assert!(!unifiable(
+            "function scale(amount: money.Amount): void",
+            "function other(a: number): void"
+        ));
+    }
+
+    #[test]
+    fn test_a_type_alias_interpolated_into_a_template_literal_type_is_opened() {
+        // バッククォートの中でも `${…}` の中は型が書かれる場所
+        let interpolated = signature_with(
+            "function tagged(value: `${Amount}`): void",
+            &resolving("Amount", "number"),
+        );
+
+        assert!(
+            interpolated.is_unifiable_with(&signature("function other(value: `${number}`): void"))
+        );
+    }
+
+    #[test]
+    fn test_a_word_inside_a_string_literal_type_is_still_not_opened() {
+        // 対照は上のテスト。補間の中とリテラルの文字そのものを分ける
+        let literal = signature_with(
+            "function labelled(label: \"Amount\"): void",
+            &resolving("Amount", "number"),
+        );
+
+        assert!(!literal.is_unifiable_with(&signature("function other(name: \"number\"): void")));
+    }
+
+    #[test]
+    fn test_a_type_alias_whose_name_holds_a_combining_mark_is_opened() {
+        // 分解された `É`（`E` + U+0301）。識別子を英数字で切ると結合文字のところで切れる
+        let decomposed = signature_with(
+            "function scale(amount: Ame\u{0301}unt): void",
+            &resolving("Ame\u{0301}unt", "number"),
+        );
+
+        assert!(decomposed.is_unifiable_with(&signature("function other(a: number): void")));
+    }
+
+    #[test]
+    fn test_a_type_name_in_the_true_branch_of_a_conditional_type_is_opened() {
+        // 後ろに続く `:` は条件型の区切りで、メンバーの印ではない
+        let conditional = signature_with(
+            "function pick<T>(x: T extends number ? ID : never): void",
+            &resolving("ID", "string"),
+        );
+
+        assert!(conditional.is_unifiable_with(&signature(
+            "function other<U>(y: U extends number ? string : never): void"
+        )));
+    }
+
+    #[test]
+    fn test_a_name_bound_by_infer_is_not_opened() {
+        // 外側に同じ綴りのエイリアスがあると、差し替えが `infer string` を作る
+        let inferred = signature_with(
+            "function unwrap<T>(x: T extends Promise<infer U> ? U : never): void",
+            &resolving("U", "string"),
+        );
+
+        // 捕まえた名前は型変数の宣言ではないので付け替えの対象に入らない。
+        // 綴りをそのまま突き合わせる相手を置く
+        assert!(inferred.is_unifiable_with(&signature(
+            "function other<A>(y: A extends Promise<infer U> ? U : never): void"
+        )));
+    }
+
+    #[test]
+    fn test_an_alias_on_an_infer_constraint_is_opened() {
+        // `infer U extends Amount` の `Amount` は束縛ではなく制約なので開く。
+        // 捕まえた `U` は開かない（束縛）
+        let constrained = signature_with(
+            "function unwrap<T>(x: T extends Promise<infer U extends Amount> ? U : never): void",
+            &resolving("Amount", "number"),
+        );
+
+        assert!(constrained.is_unifiable_with(&signature(
+            "function other<A>(y: A extends Promise<infer U extends number> ? U : never): void"
+        )));
+    }
+
+    #[test]
+    fn test_a_qualified_value_name_after_typeof_is_not_opened() {
+        // `.` を挟んだ先も値の名前。TypeScript は型と値で名前空間が別
+        let queried = signature_with(
+            "function pick(x: ns.ID, y: typeof ns.ID): void",
+            &resolving("ns.ID", "string"),
+        );
+
+        assert!(queried.is_unifiable_with(&signature(
+            "function other(a: string, b: typeof ns.ID): void"
         )));
     }
 

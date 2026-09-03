@@ -1048,6 +1048,18 @@ function broken() {
     }
 
     #[test]
+    fn test_chunk_type_references_leave_out_a_name_captured_by_infer() {
+        // `infer U` の `U` はこのシグネチャの中でだけ意味を持つ。尋ねると宣言の場所が
+        // その束縛になり、**同じ形の 2 つが別のファイルにあるだけで単一化できなくなる**。
+        // 対照として、束縛されていない型名を 1 つ置く
+        let inferred = "export function unwrap<T>(x: T extends Promise<infer U> ? U : never, rate: Rate): void {\n  return;\n}\n";
+
+        let chunk = chunk_at(inferred, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Promise", "Rate"]);
+    }
+
+    #[test]
     fn test_chunk_type_references_keep_the_constraint_of_a_mapped_type() {
         // 対照は上のテスト。`[K in Keys]` の `Keys` は制約であって束縛ではない
         let constrained =
@@ -1118,15 +1130,31 @@ function broken() {
     }
 
     #[test]
-    fn test_chunk_type_references_leave_out_the_leaf_of_a_qualified_type_name() {
-        // `money.Amount` の `Amount` だけを解決すると、差し込みが `money.number` を作る。
+    fn test_chunk_type_references_hold_a_qualified_type_name_as_one_spelling() {
+        // 末尾の `Amount` だけを集めると、差し込みが `money.number` を作る。
         // 対照として修飾されていない型名を 1 つ置く
         let qualified =
             "export function scale(amount: money.Amount, rate: Rate): number {\n  return 0;\n}\n";
 
         let chunk = chunk_at(qualified, "a.ts:1").expect("切り出せる");
 
-        assert_eq!(type_names_of(&chunk), vec!["Rate"]);
+        assert_eq!(type_names_of(&chunk), vec!["money.Amount", "Rate"]);
+    }
+
+    #[test]
+    fn test_a_qualified_type_name_is_asked_about_at_its_leaf() {
+        // 先頭の `money` は名前空間で、そこへ尋ねても型の宣言は返らない
+        let qualified = "export function scale(amount: money.Amount): number {\n  return 0;\n}\n";
+
+        let chunk = chunk_at(qualified, "a.ts:1").expect("切り出せる");
+        let asked = chunk
+            .type_references()
+            .first()
+            .expect("型名が 1 つある")
+            .position();
+
+        // `money.` の分だけ後ろを指す
+        assert_eq!(asked.character(), 36);
     }
 
     #[test]

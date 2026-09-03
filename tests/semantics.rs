@@ -364,6 +364,23 @@ fn test_compare_with_an_lsp_opens_a_type_alias_written_on_a_parameter() {
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_opens_a_qualified_type_alias() {
+    // hover は `money.Amount` と修飾ごと返す。**尋ねる先は末尾の `Amount`**（先頭の
+    // `money` は名前空間なので宣言が返らない）で、**差し替えるのは修飾ごと**
+    // （末尾だけだと `money.number` という綴りになる）
+    let scales_a_qualified_amount = fixture("references/src/billing/qualified.ts", 5);
+    let scales_a_total = fixture("references/src/report/total.ts", 1);
+
+    let measured = measured_with_an_lsp(&scales_a_qualified_amount, &scales_a_total);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_an_lsp_opens_a_type_alias_that_replaces_the_whole_signature() {
     // 呼び出し可能なエイリアスで注釈すると、hover は `const halveAmount: Scaling` と
     // 綴り全体をエイリアス名 1 語で返す。**引数リストが無いので、解決を綴りを読む前に

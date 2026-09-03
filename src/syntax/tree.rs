@@ -109,6 +109,15 @@ impl<'source> SyntaxTree<'source> {
         nodes
     }
 
+    /// 木のどこかに壊れた場所が残っているか。
+    ///
+    /// **根から見る。** 欠けた字句は名前を持たないノードとして木に残ることがあり
+    /// （`Map<string` の閉じ `>`）、[`SyntaxTree::named_descendants`] は
+    /// **名前付きだけを返す**ので、そこを歩いても見つからない。
+    pub(crate) fn has_error(&self) -> bool {
+        self.tree.root_node().has_error()
+    }
+
     /// そのノードが覆っているソースのテキスト。
     ///
     /// ノードのバイト範囲が文字の境界に乗っていないときは `None`。

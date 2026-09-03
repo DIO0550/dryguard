@@ -86,6 +86,7 @@ if structurally_similar && domains_differ { ... }
 | `progress` | サーバが自分で始めた作業（プロジェクトの読み込みなど）。作成の要求と、終わりの通知で挟まれる |
 | `source position` | ファイルの中の 1 点。行と、**UTF-16 のコード単位で数えた**列 |
 | `signature text` | hover が返した型の綴りそのもの。**正規化前** |
+| `type spelling` | 型 1 つ分の綴り。`signature text` を割った先の 1 つ（引数の型・戻り値の型・制約） |
 | `type reference` | チャンクのシグネチャに書かれた型名 1 つ分と、その位置。**解決前** |
 | `resolved type` | その型名が指していた型の綴り。**解決後** |
 | `type signature` | 引数名を落とし、型変数を出現順に付け替えた形。**正規化後**。比較はこれで行う |
@@ -113,6 +114,11 @@ JSON が壊れているのは違う話）。1 語で呼ぶと、どちらの層�
 引数名が違うだけのペアが別物になる**（`specifier` と `module path` を分けているのと同じ形）。
 サーバが返す綴りには宣言形（`function decl(a: string): number`）と値形
 （`const arrow: (a: string) => number`）があり、**同じ型でも書かれ方が 2 通りある**。
+
+**`signature text` と `type spelling` を混ぜない。** どちらも綴りだが、`signature text` は
+1 つの関数の型全体で、接頭辞（`(method)` / `constructor`）が付くことがあり**型としては読めない**。
+`type spelling` は型 1 つ分なので、**型として構文解析できる**。差し込みが型名の位置を
+構文木で決められるのは後者だけ（`syntax::type_spelling`）。
 
 **`type reference` と `resolved type` を混ぜない。** どちらも型を指す綴りだが、
 書かれた型名は**書いた人の位置に依存する**（輸入した `Amount` は、どのファイルの `Amount` かを

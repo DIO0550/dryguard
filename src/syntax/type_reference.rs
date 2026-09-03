@@ -4,6 +4,12 @@
 //! 指しているかを尋ねるのは `semantics` の担当で、ここが決めるのは**どこを指して
 //! 尋ねればよいか**まで。`syntax` が LSP を知らない形は保つ
 //! （`rules/architecture.md`「依存方向のルール」）。
+//!
+//! **解決できるのはソースに書かれた型名だけ。** 戻り値の注釈を省いた関数では、
+//! hover の綴りに推論された型名が現れる（`function inferred(): Result`）のに、
+//! **構文木のどこにもその名前が無い**。宣言を尋ねる `typeDefinition` は
+//! **ソースの 1 点を指して**尋ねる問い合わせなので、書かれていない名前を指す位置を作れない。
+//! この線は集める側を変えても動かない。倒れる向きは偽陰性で、その型名は綴りのまま比べられる。
 
 use std::collections::BTreeSet;
 
@@ -39,6 +45,11 @@ const TYPE_PARAMETERS_FIELD: &str = "type_parameters";
 ///
 /// 型変数の宣言と同じく、**その綴りはこのシグネチャの中でだけ意味を持つ**。
 const MAPPED_TYPE_CLAUSE_KIND: &str = "mapped_type_clause";
+
+/// 条件型が型を捕まえる印を表すノードの種別（`infer U`）。
+///
+/// 捕まえた名前も、**その綴りはこのシグネチャの中でだけ意味を持つ**。
+const INFER_TYPE_KIND: &str = "infer_type";
 
 /// 名前を載せるフィールド。
 const NAME_FIELD: &str = "name";
@@ -134,11 +145,27 @@ fn annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
 }
 
 /// その部分木にある型名のノードを、書かれた順に返す。
+///
+/// **修飾された型名は 1 つとして数える。** `money.Amount` を末尾の `Amount` として集めると、
+/// 解決した綴りを差し込んだ先が `money.number` になる（差し込む側は綴り全体を
+/// 1 つの型名として置き換える）。
 fn type_identifiers_of(node: Node<'_>) -> Vec<Node<'_>> {
-    nodes_of_kind(node, TYPE_IDENTIFIER_KIND)
+    let mut named: Vec<Node<'_>> = Vec::new();
+
+    for found in nodes_of_kind(node, TYPE_IDENTIFIER_KIND)
         .into_iter()
-        .filter(|found| !is_qualified_leaf(*found))
-        .collect()
+        .chain(nodes_of_kind(node, NESTED_TYPE_IDENTIFIER_KIND))
+    {
+        if is_qualified_leaf(found) {
+            continue;
+        }
+        named.push(found);
+    }
+
+    // 2 つの種別を別々に歩いたので、ソースに書かれた順へ戻す。
+    named.sort_by_key(|found| found.start_byte());
+
+    named
 }
 
 /// その部分木にある、指定した種別のノードを書かれた順に返す。
@@ -167,18 +194,35 @@ fn push_nodes_of_kind<'tree>(node: Node<'tree>, kind: &str, found: &mut Vec<Node
 
 /// そのノードが、修飾された型名の末尾か（`money.Amount` の `Amount`）。
 ///
-/// **Why（末尾だけを解決しない）**: 解決して差し込むと、置き換わるのは末尾だけなので
-/// `money.number` という綴りができる。まとめて置き換えるには修飾ごと持つ必要があり、
-/// それは差し込みが識別子の単位で行われる形とぶつかる。
+/// 末尾は修飾ごと数えるので、単独では集めない。**尋ねる位置としては使う**
+/// （[`asked_node_of`]）。
 fn is_qualified_leaf(node: Node<'_>) -> bool {
     node.parent()
         .is_some_and(|parent| parent.kind() == NESTED_TYPE_IDENTIFIER_KIND)
 }
 
+/// その型名について尋ねるときに指すノード。
+///
+/// **修飾された型名では末尾を指す。** 先頭（`money.Amount` の `money`）は名前空間なので、
+/// そこへ `typeDefinition` を送っても型の宣言は返らない。
+fn asked_node_of(node: Node<'_>) -> Node<'_> {
+    if node.kind() != NESTED_TYPE_IDENTIFIER_KIND {
+        return node;
+    }
+
+    let mut cursor = node.walk();
+    let tail = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == TYPE_IDENTIFIER_KIND);
+
+    tail.unwrap_or(node)
+}
+
 /// そのシグネチャの中で束縛された型の名前。束縛が無ければ空。
 ///
-/// 束縛は 2 通りある。型変数の宣言（`<T>`）と、マップ型の束縛（`[K in "a"]`）。
-/// **どちらもその綴りはこのシグネチャの中でだけ意味を持つ**ので、解決の対象にしない。
+/// 束縛は 3 通りある。型変数の宣言（`<T>`）・マップ型の束縛（`[K in "a"]`）・
+/// 条件型が捕まえる名前（`infer U`）。
+/// **どれもその綴りはこのシグネチャの中でだけ意味を持つ**ので、解決の対象にしない。
 ///
 /// **Why（束縛された名前を尋ねない）**: 束縛はチャンクごとに別のものなので、
 /// 解決するとファイルごとに違う結果になる。`pickFirst<T>` と `head<U>` が
@@ -213,16 +257,27 @@ fn bound_type_names_of(node: Node<'_>, source: &str) -> BTreeSet<String> {
 
         for clause in nodes_of_kind(annotated, MAPPED_TYPE_CLAUSE_KIND) {
             // 束縛されるのは先頭の型名だけ。`[K in Keys]` の `Keys` は制約なので残す。
-            let mut cursor = clause.walk();
-            let binder = clause
-                .named_children(&mut cursor)
-                .next()
-                .filter(|child| child.kind() == TYPE_IDENTIFIER_KIND);
-            push_name(&mut bound, binder, source);
+            push_name(&mut bound, first_type_identifier_of(clause), source);
+        }
+
+        for inferred in nodes_of_kind(annotated, INFER_TYPE_KIND) {
+            push_name(&mut bound, first_type_identifier_of(inferred), source);
         }
     }
 
     bound
+}
+
+/// その束縛が捕まえた型名のノード。捕まえていなければ `None`。
+///
+/// **先頭の 1 つだけが束縛。** `[K in Keys]` の `Keys` も `infer U extends X` の `X` も
+/// 制約なので、集める側に残る。
+fn first_type_identifier_of(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+
+    node.named_children(&mut cursor)
+        .next()
+        .filter(|child| child.kind() == TYPE_IDENTIFIER_KIND)
 }
 
 /// そのノードが覆う綴りを、束縛された名前として書き足す。ノードが無ければ何もしない。
@@ -236,10 +291,13 @@ fn push_name(bound: &mut BTreeSet<String>, node: Option<Node<'_>>, source: &str)
 
 /// 型名のノード 1 つを、綴りと位置の組にする。
 ///
+/// **綴りは書かれたまま、位置は尋ねる先。** 修飾された型名では 2 つが別のノードから来る
+/// （[`asked_node_of`]）。
+///
 /// バイト範囲が文字の境界に乗っていなければ `None`。
 fn type_reference_of(node: Node<'_>, source: &str) -> Option<TypeReference> {
     Some(TypeReference {
         name: source.get(node.byte_range())?.to_owned(),
-        position: source_position_of(node, source)?,
+        position: source_position_of(asked_node_of(node), source)?,
     })
 }

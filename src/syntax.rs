@@ -17,6 +17,9 @@
 //! シグネチャに書かれた型名とその位置は `type_reference` が集める。**その名前が何を
 //! 指しているかは尋ねない**（尋ねるのは `semantics`）。ここが決めるのは、どこを指して
 //! 尋ねればよいかまで。
+//!
+//! 型 1 つ分の綴りの中で型名がどこに書かれているかは `type_spelling` が構文木から決める。
+//! **何に差し替えるかは知らない**ので、ここも LSP を知らないまま保たれる。
 
 pub mod chunk;
 pub mod import;
@@ -25,3 +28,4 @@ pub mod module_distance;
 pub mod token;
 pub mod tree;
 pub mod type_reference;
+pub(crate) mod type_spelling;
