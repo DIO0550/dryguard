@@ -100,7 +100,10 @@ fn type_signature_of(session: &mut Session, chunk: &Chunk) -> TypeSignature {
     let Some(signature) =
         TypeSignature::from_signature_text(&signature_text, &ResolvedTypes::default(), &[])
     else {
-        panic!("サーバが返した綴りは読み取れる: {signature_text}");
+        panic!(
+            "サーバが返した綴りは読み取れる: {}",
+            signature_text.as_str()
+        );
     };
     signature
 }

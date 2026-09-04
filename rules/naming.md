@@ -114,6 +114,7 @@ JSON が壊れているのは違う話）。1 語で呼ぶと、どちらの層�
 引数名が違うだけのペアが別物になる**（`specifier` と `module path` を分けているのと同じ形）。
 サーバが返す綴りには宣言形（`function decl(a: string): number`）と値形
 （`const arrow: (a: string) => number`）があり、**同じ型でも書かれ方が 2 通りある**。
+綴り側を `SignatureText` の newtype にしているのはこのため（`ModulePath` と同じ形）。
 
 **`signature text` と `type spelling` を混ぜない。** どちらも綴りだが、`signature text` は
 1 つの関数の型全体で、接頭辞（`(method)` / `constructor`）が付くことがあり**型としては読めない**。

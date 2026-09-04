@@ -47,7 +47,7 @@ use connection::Connection;
 pub use document::{DocumentError, SourceDocument};
 // hover / references の結果は「取れた / 取れなかった理由」を分けて持つので、
 // 外から読める形で出す。
-pub use hover::HoverOutcome;
+pub use hover::{HoverOutcome, SignatureText};
 pub use references::ReferencesOutcome;
 // 型の宣言の場所は、開かせる相手を決める材料として `pipeline` が読む。
 pub use type_definition::{DeclarationSite, TypeDefinitionOutcome};
@@ -540,7 +540,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use crate::codebase;
-    use crate::test_support::{line, repository_path};
+    use crate::test_support::{line, repository_path, signature_text};
     use lsp_types::HoverProviderCapability;
 
     /// 候補ペアのファイルとして開かせる fixture。
@@ -817,7 +817,9 @@ mod tests {
 
         assert_eq!(
             signature,
-            HoverOutcome::Answered("function applyDiscount(invoice: Invoice): number".to_owned())
+            HoverOutcome::Answered(signature_text(
+                "function applyDiscount(invoice: Invoice): number"
+            ))
         );
 
         session.shutdown().expect("終了できる");

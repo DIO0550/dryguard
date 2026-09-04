@@ -12,7 +12,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
-use crate::lsp::{ClientError, HoverOutcome, Session, SourceDocument};
+use crate::lsp::{ClientError, HoverOutcome, Session, SignatureText, SourceDocument};
 use crate::semantics::resolved_type::{ResolvedTypes, TypeDeclaration};
 use crate::source_position::SourcePosition;
 use crate::syntax::type_spelling::substituted_spelling_of;
@@ -166,7 +166,7 @@ pub fn type_signature_outcome_of(
 
 /// 綴りを正規化した結果。読み解けなければ、その旨。
 fn normalized_outcome_of(
-    signature_text: &str,
+    signature_text: &SignatureText,
     resolved: &ResolvedTypes,
     declarations: &[TypeDeclaration],
 ) -> TypeSignatureOutcome {
@@ -207,9 +207,8 @@ pub struct TypeSignature {
 impl TypeSignature {
     /// hover が返した綴りから組み立てる。
     ///
-    /// `text` は正規化前の綴り（`lsp` の `Session::hover` が返すもの）。サーバごとに
-    /// 宣言形（`function decl(a: string): number`）と値形
-    /// （`const arrow: (a: string) => number`）の 2 通りがあり、どちらも同じ形へ直す。
+    /// `text` は hover が返した綴り。サーバごとに宣言形（`function decl(a: string): number`）と
+    /// 値形（`const arrow: (a: string) => number`）の 2 通りがあり、どちらも同じ形へ直す。
     /// `resolved` は型エイリアスの右辺で、綴りを読む前に差し込む。
     ///
     /// 引数リストと戻り値の型を読み取れない綴りでは `None`。**空の引数リストで
@@ -226,18 +225,18 @@ impl TypeSignature {
     /// **持ち回すのは、差し込んだ後の綴りに残った名前の分だけ**
     /// （[`remaining_declarations_of`]）。
     pub fn from_signature_text(
-        text: &str,
+        text: &SignatureText,
         resolved: &ResolvedTypes,
         declarations: &[TypeDeclaration],
     ) -> Option<Self> {
-        let opened = opened_annotation_of(&flattened(text), resolved);
-        let written = SplitSignature::from_signature_text(&opened)?;
+        let opened = opened_annotation_of(&flattened(text.as_str()), resolved);
+        let written = SplitSignature::from_spelling(&opened)?;
 
         // 差し込みは型 1 つ分の綴りに対して行うので、接頭辞を落として関数型へ組み直す。
         // 接頭辞が持っていた呼び出しの仕方だけを先に取る。
         let kind = written.kind();
         let opened = opened_spelling_of(&written.to_function_type()?, resolved)?;
-        let split = SplitSignature::from_signature_text(&opened)?;
+        let split = SplitSignature::from_spelling(&opened)?;
 
         let return_type = normalized_type(split.return_type()?)?;
         let parameters = split.parameters()?;
@@ -529,7 +528,7 @@ fn opened_spelling_of(spelling: &str, resolved: &ResolvedTypes) -> Option<String
 /// **Why not（いつでも注釈を開いてから割る）**: 割れる綴りでは、引数と戻り値が
 /// それぞれ型 1 つ分として開かれる。手前でまとめて開くと同じ綴りを二度開くことになる。
 fn opened_annotation_of(text: &str, resolved: &ResolvedTypes) -> String {
-    if SplitSignature::from_signature_text(text).is_some() {
+    if SplitSignature::from_spelling(text).is_some() {
         return text.to_owned();
     }
 
@@ -788,10 +787,15 @@ impl<'text> SplitSignature<'text> {
     ///
     /// 引数リストとみなすのは、**閉じ括弧の後ろが `:` か `=>` になる最初の括弧組**。
     ///
+    /// `text` は綴りであれば何でもよい。[`SignatureText`] だけでなく、エイリアスを
+    /// 差し込んだ後の綴り・関数型へ組み直した綴り・型 1 つ分の綴り
+    /// （[`normalized_type`]）も受ける。**`signature text` に限らないので名前に出さない**
+    /// (`rules/naming.md`「名前と実体を一致させる」)。
+    ///
     /// **Why not（`(method)` などの接頭辞を列挙して剥がす）**: hover の接頭辞は
     /// `(method)` / `(property)` / `(local function)` / `function` / `const` と
     /// サーバごとに増える。列挙から漏れた 1 つが、黙って比較を壊す。
-    fn from_signature_text(text: &'text str) -> Option<Self> {
+    fn from_spelling(text: &'text str) -> Option<Self> {
         let scan = SignatureScan::new(text);
 
         for (position, scanned) in scan.characters.iter().enumerate() {
@@ -915,7 +919,7 @@ impl<'text> SplitSignature<'text> {
 /// 総称型や括弧に包まれた関数型（`Array<(a: string) => void>`）までは踏み込まない。
 /// そこまで見るには型そのものの構文解析が要る。
 fn normalized_type(text: &str) -> Option<String> {
-    let Some(split) = SplitSignature::from_signature_text(text) else {
+    let Some(split) = SplitSignature::from_spelling(text) else {
         return Some(text.to_owned());
     };
 
@@ -1110,7 +1114,7 @@ fn is_identifier_character(character: char) -> bool {
 mod tests {
     use super::*;
 
-    use crate::test_support::declaration_site;
+    use crate::test_support::{declaration_site, signature_text};
 
     /// テストが渡す綴りは読み取れる前提で組み立てる。解決した型名は無い。
     fn signature(text: &str) -> TypeSignature {
@@ -1119,14 +1123,18 @@ mod tests {
 
     /// 解決した型名を差し込んでから組み立てる。
     fn signature_with(text: &str, resolved: &ResolvedTypes) -> TypeSignature {
-        TypeSignature::from_signature_text(text, resolved, &[])
+        TypeSignature::from_signature_text(&signature_text(text), resolved, &[])
             .expect("テストが渡す綴りは読み取れる")
     }
 
     /// 綴りに書かれた型名の宣言まで持たせて組み立てる。
     fn signature_declaring(text: &str, declarations: &[TypeDeclaration]) -> TypeSignature {
-        TypeSignature::from_signature_text(text, &ResolvedTypes::default(), declarations)
-            .expect("テストが渡す綴りは読み取れる")
+        TypeSignature::from_signature_text(
+            &signature_text(text),
+            &ResolvedTypes::default(),
+            declarations,
+        )
+        .expect("テストが渡す綴りは読み取れる")
     }
 
     /// 型名 1 つ分の宣言。
@@ -1395,7 +1403,7 @@ mod tests {
         // 型エイリアスなど、関数でないものへの hover はこの形で返る
         assert_eq!(
             TypeSignature::from_signature_text(
-                "type UserId = string",
+                &signature_text("type UserId = string"),
                 &ResolvedTypes::default(),
                 &[]
             ),
@@ -1407,7 +1415,7 @@ mod tests {
     fn test_a_signature_without_a_return_type_cannot_be_read() {
         assert_eq!(
             TypeSignature::from_signature_text(
-                "function decl(a: string)",
+                &signature_text("function decl(a: string)"),
                 &ResolvedTypes::default(),
                 &[]
             ),
@@ -1421,7 +1429,7 @@ mod tests {
         // 型注釈の無い引数どうしが「同じ型」として重なる
         assert_eq!(
             TypeSignature::from_signature_text(
-                "function decl(a, b: string): void",
+                &signature_text("function decl(a, b: string): void"),
                 &ResolvedTypes::default(),
                 &[]
             ),
@@ -1495,7 +1503,7 @@ mod tests {
         // 対照は上のテスト。解決が無ければ引数リストが見つからない
         assert_eq!(
             TypeSignature::from_signature_text(
-                "const halveAmount: Scaling",
+                &signature_text("const halveAmount: Scaling"),
                 &ResolvedTypes::default(),
                 &[]
             ),
@@ -1509,7 +1517,7 @@ mod tests {
         // 結果を答えにしない**（`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」）
         assert_eq!(
             TypeSignature::from_signature_text(
-                "function broken(x: { id string }): void",
+                &signature_text("function broken(x: { id string }): void"),
                 &ResolvedTypes::default(),
                 &[]
             ),
@@ -1522,7 +1530,7 @@ mod tests {
         // 対照は上のテスト。違うのはメンバーの `:` 1 文字だけ
         assert!(
             TypeSignature::from_signature_text(
-                "function whole(x: { id: string }): void",
+                &signature_text("function whole(x: { id: string }): void"),
                 &ResolvedTypes::default(),
                 &[]
             )
@@ -2151,13 +2159,13 @@ mod tests {
         // 差し込みで消えた名前まで持つと、**どちらも `number` に開かれた 2 つが
         // 宣言の場所の違いで別物になる**（エイリアスを開いた意味が消える）
         let billing = TypeSignature::from_signature_text(
-            "function scaleAmount(amount: Amount): Amount",
+            &signature_text("function scaleAmount(amount: Amount): Amount"),
             &resolving("Amount", "number"),
             &[declared("Amount", "/repo/src/billing/money.ts", 1)],
         )
         .expect("テストが渡す綴りは読み取れる");
         let report = TypeSignature::from_signature_text(
-            "function scaleTotal(total: Amount): Amount",
+            &signature_text("function scaleTotal(total: Amount): Amount"),
             &resolving("Amount", "number"),
             &[declared("Amount", "/repo/src/report/money.ts", 1)],
         )
@@ -2172,13 +2180,13 @@ mod tests {
         // 型名として数えてしまう（`Amount<T>` の `<` はメソッド名の印ではないため）。
         // 型を書く場所だけを見る形なら、差し込みで消えた `Amount` はどこにも残らない
         let billing = TypeSignature::from_signature_text(
-            "function Amount<T>(value: Amount): T",
+            &signature_text("function Amount<T>(value: Amount): T"),
             &resolving("Amount", "number"),
             &[declared("Amount", "/repo/src/billing/money.ts", 1)],
         )
         .expect("テストが渡す綴りは読み取れる");
         let report = TypeSignature::from_signature_text(
-            "function Amount<T>(value: Amount): T",
+            &signature_text("function Amount<T>(value: Amount): T"),
             &resolving("Amount", "number"),
             &[declared("Amount", "/repo/src/report/money.ts", 1)],
         )

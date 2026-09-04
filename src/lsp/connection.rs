@@ -813,7 +813,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    use crate::test_support::{line, repository_path};
+    use crate::test_support::{line, repository_path, signature_text};
     use lsp_types::HoverProviderCapability;
 
     /// テストが渡すワークスペースの根。実在するディレクトリからしか作れない。
@@ -1178,7 +1178,7 @@ mod tests {
 
         assert_eq!(
             signature,
-            HoverOutcome::Answered("function decl(a: string): number".to_owned())
+            HoverOutcome::Answered(signature_text("function decl(a: string): number"))
         );
     }
 
