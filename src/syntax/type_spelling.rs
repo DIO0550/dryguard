@@ -85,7 +85,7 @@ pub(crate) fn substituted_spelling_of(
     opened: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
     let wrapped = wrapped(spelling);
-    let spans = type_name_spans_in_wrapped(&wrapped)?;
+    let spans = type_name_spans_in_wrapped(&wrapped, BoundNames::Excluded)?;
 
     // 後ろから差し替える。前から差し替えると、後ろの範囲が差し込んだ長さの分だけずれる。
     let mut substituted = wrapped;
@@ -103,27 +103,56 @@ pub(crate) fn substituted_spelling_of(
     unwrapped(&substituted)
 }
 
-/// 綴りに書かれた型名の範囲を、書かれた順に返す。型として読めない綴りでは `None`。
+/// 綴りの中で、差し替えてよい型名が書かれている範囲。型として読めない綴りでは `None`。
 ///
 /// 範囲は `spelling` の中の位置。[`substituted_spelling_of`] が差し替える位置と同じものを
-/// 返すので、**差し込む先を見る側と、開いた綴りを見る側が同じ判断で歩く**。
-///
-/// メンバー名・メソッド名・`typeof` の後ろの値の名前・文字列リテラル型の中身は、
-/// そもそも型名のノードにならない。束縛された名前と、修飾された型名の末尾は外してある。
+/// 返すので、**差し込む側と付け替える側が同じ判断で歩く**。
+/// 束縛された名前と、修飾された型名の末尾は外してある。
 ///
 /// **Why（範囲を返して差し込みは任せる）**: 付け替え後の綴り（`%0`）は型として読めず、
 /// [`substituted_spelling_of`] の括弧の要否を確かめる再パースが必ず失敗する。
 /// 綴り 1 つ分に収まる置き換えでは括弧が要らないので、位置だけを渡す。
+pub(crate) fn substitutable_type_name_spans_of(spelling: &str) -> Option<Vec<Range<usize>>> {
+    spans_in_spelling(spelling, BoundNames::Excluded)
+}
+
+/// 綴りに書かれた型名の範囲を、書かれた順に返す。型として読めない綴りでは `None`。
+///
+/// 範囲は `spelling` の中の位置。メンバー名・メソッド名・`typeof` の後ろの値の名前・
+/// 文字列リテラル型の中身は、そもそも型名のノードにならないので入らない。
+///
+/// **束縛された名前も返す**（[`substitutable_type_name_spans_of`] との違いはここだけ）。
 pub(crate) fn type_name_spans_of(spelling: &str) -> Option<Vec<Range<usize>>> {
+    spans_in_spelling(spelling, BoundNames::Included)
+}
+
+/// 綴りを包んで歩き、返った範囲を綴りの中の位置へ戻す。
+fn spans_in_spelling(spelling: &str, bound_names: BoundNames) -> Option<Vec<Range<usize>>> {
     let wrapped = wrapped(spelling);
     let prefix = SPELLING_PREFIX.len();
 
     Some(
-        type_name_spans_in_wrapped(&wrapped)?
+        type_name_spans_in_wrapped(&wrapped, bound_names)?
             .into_iter()
             .map(|span| span.start - prefix..span.end - prefix)
             .collect(),
     )
+}
+
+/// 束縛された名前を、返す範囲に含めるかどうか。
+///
+/// **外しすぎたときに倒れる向きが逆になる。** 差し替える側は外しすぎても差し込みを
+/// 見送るだけ（偽陰性）だが、宣言を辿る名前を数える側は外しすぎると
+/// **「辿る名前が残っていない」と答えてしまう**（偽陽性）。
+///
+/// 束縛は綴りごとに 1 つの集合で見ているので、同じ綴りの束縛が外側の名前を隠す
+/// （`(<Local>() => Local) & Local` の末尾の `Local`）。数える側はそれを外さない。
+#[derive(Clone, Copy)]
+enum BoundNames {
+    /// 差し替えの相手から外す。
+    Excluded,
+    /// 綴りに書かれた型名として数える。
+    Included,
 }
 
 /// その綴りが、モジュールの指定子を書いているか。型として読めない綴りでは `None`。
@@ -223,11 +252,13 @@ fn spliced(text: &str, span: Range<usize>, replacement: &str) -> String {
     spliced
 }
 
-/// 包んだ文の中で、差し替えてよい型名が書かれている範囲。読めない綴りでは `None`。
+/// 包んだ文の中で、型名が書かれている範囲。読めない綴りでは `None`。
+///
+/// `bound_names` が [`BoundNames::Excluded`] なら、束縛された名前は返さない。
 ///
 /// **前置きの中は返さない。** 包むために置いた `__` も型名のノードになるので、
 /// 綴りそのものの範囲だけに絞る。
-fn type_name_spans_in_wrapped(wrapped: &str) -> Option<Vec<Range<usize>>> {
+fn type_name_spans_in_wrapped(wrapped: &str, bound_names: BoundNames) -> Option<Vec<Range<usize>>> {
     let tree = SyntaxTree::from_source(wrapped, Grammar::TypeScript).ok()?;
     if tree.has_error() {
         return None;
@@ -235,7 +266,10 @@ fn type_name_spans_in_wrapped(wrapped: &str) -> Option<Vec<Range<usize>>> {
     let nodes = tree.named_descendants();
 
     let spelling = SPELLING_PREFIX.len()..wrapped.len().saturating_sub(SPELLING_SUFFIX.len());
-    let bound = bound_names_of(&nodes, wrapped);
+    let bound = match bound_names {
+        BoundNames::Excluded => bound_names_of(&nodes, wrapped),
+        BoundNames::Included => BTreeSet::new(),
+    };
     let mut spans: Vec<Range<usize>> = Vec::new();
 
     for node in nodes {
@@ -607,7 +641,17 @@ mod tests {
         );
     }
 
-    /// 綴りの中で型名が書かれている綴りを、書かれた順に。
+    /// 綴りの中で差し替えてよい型名の綴りを、書かれた順に。
+    fn substitutable_type_names_of(spelling: &str) -> Option<Vec<&str>> {
+        Some(
+            substitutable_type_name_spans_of(spelling)?
+                .into_iter()
+                .filter_map(|span| spelling.get(span))
+                .collect(),
+        )
+    }
+
+    /// 綴りに書かれた型名の綴りを、書かれた順に。
     fn type_names_of(spelling: &str) -> Option<Vec<&str>> {
         Some(
             type_name_spans_of(spelling)?
@@ -627,11 +671,25 @@ mod tests {
     }
 
     #[test]
-    fn test_the_type_names_of_a_spelling_leave_out_a_name_bound_inside_it() {
-        // 対照は上のテスト。`U` は捕まえたほうの名前で、外の宣言を指していない
+    fn test_the_substitutable_type_names_of_a_spelling_leave_out_a_name_bound_inside_it() {
+        // `U` は捕まえたほうの名前。差し替えると `infer string` のような綴りになる
         assert_eq!(
-            type_names_of("T extends Promise<infer U> ? U : never"),
+            substitutable_type_names_of("T extends Promise<infer U> ? U : never"),
             Some(vec!["T", "Promise"])
+        );
+    }
+
+    #[test]
+    fn test_the_type_names_of_a_spelling_hold_a_name_a_nested_binder_shadows() {
+        // 対照は上のテスト。束縛は綴りごとに 1 つの集合なので、差し替える側は
+        // 末尾の `Local` まで外す。**書かれた型名を数える側はそれを外さない**
+        assert_eq!(
+            substitutable_type_names_of("(<Local>() => Local) & Local"),
+            Some(vec![])
+        );
+        assert_eq!(
+            type_names_of("(<Local>() => Local) & Local"),
+            Some(vec!["Local", "Local", "Local"])
         );
     }
 
@@ -639,6 +697,7 @@ mod tests {
     fn test_the_type_names_of_a_spelling_that_does_not_read_as_a_type_are_not_returned() {
         // 空で返すと、型名が 1 つも無い綴りと区別が付かない
         assert_eq!(type_names_of("=> )("), None);
+        assert_eq!(substitutable_type_names_of("=> )("), None);
     }
 
     #[test]

@@ -16,7 +16,8 @@ use crate::lsp::{ClientError, HoverOutcome, Session, SignatureText, SourceDocume
 use crate::semantics::resolved_type::{ResolvedTypes, TypeDeclaration};
 use crate::source_position::SourcePosition;
 use crate::syntax::type_spelling::{
-    holds_a_specifier, substituted_spelling_of, type_name_spans_of,
+    holds_a_specifier, substitutable_type_name_spans_of, substituted_spelling_of,
+    type_name_spans_of,
 };
 
 /// 付け替えた型変数の綴りの前置き。
@@ -563,8 +564,13 @@ fn is_site_independent(spelling: &str) -> bool {
 /// その綴りに残っている、どこかで宣言された型の名前。型として読めない綴りでは `None`。
 ///
 /// **どこが型名かは構文木が決める**（`syntax::type_spelling`）。メンバー名・メソッド名・
-/// `typeof` の後ろの値の名前・文字列リテラル型の中身・その綴りの中で束縛された名前は、
-/// そもそも型名のノードにならない。数えないのは他に [`PREDEFINED_TYPES`] に載っている語だけ。
+/// `typeof` の後ろの値の名前・文字列リテラル型の中身は、そもそも型名のノードにならない。
+/// 数えないのは [`PREDEFINED_TYPES`] に載っている語だけ。
+///
+/// **束縛された名前も数える。** 束縛は綴りごとに 1 つの集合で見ているので、同じ綴りの
+/// 束縛が外側の名前を隠す（`(<Local>() => Local) & Local` の末尾の `Local`）。
+/// 外すと**辿る名前が残っていない**と答えてしまう（偽陽性）ので、
+/// 差し替える側とは別の一覧を使う。倒れる向きは偽陰性になる。
 ///
 /// **読めなかったことを空の集合で表さない。** 名前が 1 つも無いことと、名前を数えられな
 /// かったことは別で、[`is_site_independent`] が通すのは前者だけ。
@@ -972,7 +978,7 @@ impl Placeholders {
         let mut ordered: Vec<String> = Vec::new();
 
         for occurrence in occurrences {
-            for span in type_name_spans_of(occurrence)? {
+            for span in substitutable_type_name_spans_of(occurrence)? {
                 let Some(name) = occurrence.get(span) else {
                     continue;
                 };
@@ -1034,7 +1040,7 @@ impl Placeholders {
         let mut renamed = String::with_capacity(spelling.len());
         let mut copied = 0;
 
-        for span in type_name_spans_of(spelling)? {
+        for span in substitutable_type_name_spans_of(spelling)? {
             let placeholder = spelling
                 .get(span.clone())
                 .and_then(|name| self.by_name.get(name));
@@ -2255,6 +2261,22 @@ mod tests {
         );
 
         assert!(boxed.is_unifiable_with(&wrapped));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_a_name_shadowed_by_a_nested_binder_are_not_unifiable() {
+        // 末尾の `Local` は外で宣言された名前。綴りが束縛と同じというだけで外すと、
+        // 宣言を辿る名前が残っていないことになり、別々のモジュールの `Local` が重なる
+        let first = signature_with(
+            "function a(x: First): void",
+            &resolving("First", "(<Local>() => Local) & Local"),
+        );
+        let second = signature_with(
+            "function b(y: Second): void",
+            &resolving("Second", "(<Local>() => Local) & Local"),
+        );
+
+        assert!(!first.is_unifiable_with(&second));
     }
 
     #[test]
