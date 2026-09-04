@@ -43,6 +43,9 @@ const MAPPED_TYPE_CLAUSE_KIND: &str = "mapped_type_clause";
 /// 条件型が型を捕まえる印を表すノードの種別（`infer U`）。
 const INFER_TYPE_KIND: &str = "infer_type";
 
+/// モジュールの指定子を取る演算子を表すノードの種別（`import("./local")`）。
+const IMPORT_KIND: &str = "import";
+
 /// 差し込んだ綴りを括るときの括弧。
 const GROUP_OPEN: char = '(';
 
@@ -82,7 +85,7 @@ pub(crate) fn substituted_spelling_of(
     opened: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
     let wrapped = wrapped(spelling);
-    let spans = type_name_spans_of(&wrapped)?;
+    let spans = type_name_spans_in_wrapped(&wrapped)?;
 
     // 後ろから差し替える。前から差し替えると、後ろの範囲が差し込んだ長さの分だけずれる。
     let mut substituted = wrapped;
@@ -98,6 +101,48 @@ pub(crate) fn substituted_spelling_of(
     }
 
     unwrapped(&substituted)
+}
+
+/// 綴りに書かれた型名の範囲を、書かれた順に返す。型として読めない綴りでは `None`。
+///
+/// 範囲は `spelling` の中の位置。[`substituted_spelling_of`] が差し替える位置と同じものを
+/// 返すので、**差し込む先を見る側と、開いた綴りを見る側が同じ判断で歩く**。
+///
+/// メンバー名・メソッド名・`typeof` の後ろの値の名前・文字列リテラル型の中身は、
+/// そもそも型名のノードにならない。束縛された名前と、修飾された型名の末尾は外してある。
+///
+/// **Why（範囲を返して差し込みは任せる）**: 付け替え後の綴り（`%0`）は型として読めず、
+/// [`substituted_spelling_of`] の括弧の要否を確かめる再パースが必ず失敗する。
+/// 綴り 1 つ分に収まる置き換えでは括弧が要らないので、位置だけを渡す。
+pub(crate) fn type_name_spans_of(spelling: &str) -> Option<Vec<Range<usize>>> {
+    let wrapped = wrapped(spelling);
+    let prefix = SPELLING_PREFIX.len();
+
+    Some(
+        type_name_spans_in_wrapped(&wrapped)?
+            .into_iter()
+            .map(|span| span.start - prefix..span.end - prefix)
+            .collect(),
+    )
+}
+
+/// その綴りが、モジュールの指定子を書いているか。型として読めない綴りでは `None`。
+///
+/// `import("./local")` の指定子は**書いた人の位置から解決される**ので、同じ綴りが
+/// 別のモジュールの型を指しうる。指定子は型名のノードにならないため、
+/// [`type_name_spans_of`] では掬えない。
+pub(crate) fn holds_a_specifier(spelling: &str) -> Option<bool> {
+    let wrapped = wrapped(spelling);
+    let tree = SyntaxTree::from_source(&wrapped, Grammar::TypeScript).ok()?;
+    if tree.has_error() {
+        return None;
+    }
+
+    Some(
+        tree.named_descendants()
+            .into_iter()
+            .any(|node| node.kind() == IMPORT_KIND),
+    )
 }
 
 /// 型 1 つ分の綴りを、型として読める文へ包む。
@@ -182,7 +227,7 @@ fn spliced(text: &str, span: Range<usize>, replacement: &str) -> String {
 ///
 /// **前置きの中は返さない。** 包むために置いた `__` も型名のノードになるので、
 /// 綴りそのものの範囲だけに絞る。
-fn type_name_spans_of(wrapped: &str) -> Option<Vec<Range<usize>>> {
+fn type_name_spans_in_wrapped(wrapped: &str) -> Option<Vec<Range<usize>>> {
     let tree = SyntaxTree::from_source(wrapped, Grammar::TypeScript).ok()?;
     if tree.has_error() {
         return None;
@@ -560,5 +605,61 @@ mod tests {
             substituted_spelling_of("Map<Amount, Amount>", opening("Amount", "number")),
             Some("Map<number, number>".to_owned())
         );
+    }
+
+    /// 綴りの中で型名が書かれている綴りを、書かれた順に。
+    fn type_names_of(spelling: &str) -> Option<Vec<&str>> {
+        Some(
+            type_name_spans_of(spelling)?
+                .into_iter()
+                .filter_map(|span| spelling.get(span))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn test_the_type_names_of_a_spelling_leave_out_what_is_not_a_type_name() {
+        // メンバー名（`ID`）・組み込みの型（`string`）・文字列リテラル型の中身は型名ではない
+        assert_eq!(
+            type_names_of("{ ID: Local<string>; mode: \"Local\" }"),
+            Some(vec!["Local"])
+        );
+    }
+
+    #[test]
+    fn test_the_type_names_of_a_spelling_leave_out_a_name_bound_inside_it() {
+        // 対照は上のテスト。`U` は捕まえたほうの名前で、外の宣言を指していない
+        assert_eq!(
+            type_names_of("T extends Promise<infer U> ? U : never"),
+            Some(vec!["T", "Promise"])
+        );
+    }
+
+    #[test]
+    fn test_the_type_names_of_a_spelling_that_does_not_read_as_a_type_are_not_returned() {
+        // 空で返すと、型名が 1 つも無い綴りと区別が付かない
+        assert_eq!(type_names_of("=> )("), None);
+    }
+
+    #[test]
+    fn test_a_spelling_querying_an_imported_module_holds_a_specifier() {
+        assert_eq!(holds_a_specifier("typeof import(\"./local\")"), Some(true));
+    }
+
+    #[test]
+    fn test_a_spelling_naming_a_type_in_an_imported_module_holds_a_specifier() {
+        // `typeof` を伴わない書き方でも指定子は指定子
+        assert_eq!(holds_a_specifier("import(\"./local\").Thing"), Some(true));
+    }
+
+    #[test]
+    fn test_a_string_literal_type_holds_no_specifier() {
+        // 対照は上の 2 つ。引用符があることではなく、指定子であることを見ている
+        assert_eq!(holds_a_specifier("\"on\" | \"off\""), Some(false));
+    }
+
+    #[test]
+    fn test_a_spelling_that_does_not_read_as_a_type_cannot_be_asked_for_a_specifier() {
+        assert_eq!(holds_a_specifier("=> )("), None);
     }
 }
