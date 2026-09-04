@@ -71,7 +71,7 @@
 | `hook` | CI（`.github/workflows/`）・git hooks（`harness/githooks/`）・`.claude/hooks/`・`Cargo.toml` の `[lints.clippy]` |
 | `skill` | `.claude/skills/` の新しいスキル |
 | `観点` | 既存スキルの手順・観点 |
-| `rules` | `rules/` への追記・表現の修正 |
+| `rules` | `rules/` への追記・表現の修正 / `AGENTS.md` 本体への追記・表現の修正（`plan` の項目が pr-77 以来この扱い。`AGENTS.md` は `rules/*.md` を `@` import する規約の入口で、`rules/` 配下に置き場所が無い進め方・報告の話はここに置く） |
 
 ---
 
@@ -109,6 +109,7 @@
 | `ownership` | プラグイン `coding-standards`（所有権・借用の設計） |
 | `over-guard` | 過剰なブロック / フォールバック |
 | `plan` | 計画の誤り・不足 |
+| `unverified-claim` | AGENTS.md「記録・PR 本文に数値や主張を書く前に」/ `harness/records/README.md`「推測で埋めない」（記録・PR 本文・Issue コメント・コミットメッセージ・レビュー返信・通知に書いた数値や主張が、一次情報から出し直されていない。`plan` など他の分類に当たる指摘はそちらを優先し、`unverified-claim` はどれにも当たらない裏取り漏れに使う） |
 | `なし` | 既存の規約に対応が無い（= 規約の抜けの候補） |
 
 `分類: なし` が 10 件溜まったら語彙へ昇格させる。
