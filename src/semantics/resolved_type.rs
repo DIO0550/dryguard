@@ -163,7 +163,7 @@ pub fn resolved_types_of(
         else {
             continue;
         };
-        let Some(resolved) = resolved_type_of(&declared) else {
+        let Some(resolved) = resolved_type_of(declared.as_str()) else {
             continue;
         };
 

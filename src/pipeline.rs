@@ -1597,7 +1597,7 @@ mod tests {
     use crate::semantics::resolved_type::ResolvedTypes;
     use crate::semantics::type_signature::TypeSignature;
     use crate::similarity::Similarity;
-    use crate::test_support::{line, missing_server};
+    use crate::test_support::{line, missing_server, signature_text};
 
     fn measured(value: f64) -> Similarity {
         Similarity::new(value).expect("テストが渡す値は 0.0-1.0")
@@ -1633,10 +1633,13 @@ mod tests {
     }
 
     /// 正規化できた型シグネチャ。
-    fn normalized(signature_text: &str) -> TypeSignatureOutcome {
-        let signature =
-            TypeSignature::from_signature_text(signature_text, &ResolvedTypes::default(), &[])
-                .expect("テストが渡す綴りは読み取れる");
+    fn normalized(text: &str) -> TypeSignatureOutcome {
+        let signature = TypeSignature::from_signature_text(
+            &signature_text(text),
+            &ResolvedTypes::default(),
+            &[],
+        )
+        .expect("テストが渡す綴りは読み取れる");
 
         TypeSignatureOutcome::Normalized(signature)
     }

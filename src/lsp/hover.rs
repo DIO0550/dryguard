@@ -9,6 +9,39 @@ use lsp_types::{Hover, HoverContents};
 /// マークダウンのコードフェンスの印。
 const FENCE: &str = "```";
 
+/// hover が返した綴りそのもの。**正規化前**（`rules/naming.md` の `signature text`）。
+///
+/// **素の `String` で持ち回らない。** 正規化後の
+/// [`crate::semantics::type_signature::TypeSignature`] と混ぜても型では止まらず、
+/// `rules/naming.md`「`signature text` と `type signature` を混ぜない」が
+/// 文の上にしか無い状態になる（`payload` を `lsp::message` の `Payload` に
+/// したのと同じ形）。
+///
+/// **Why（宣言の綴りもこの型で受ける）**: hover は関数のシグネチャだけでなく
+/// 型エイリアスの宣言（`type Amount = number`）にも答える。どちらも
+/// 「hover が返した綴り・正規化前」で、分けるには [`HoverOutcome`] 自体を割ることになる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureText(String);
+
+impl SignatureText {
+    /// hover が返した綴りから作る。中身が空白しか無ければ `None`。
+    ///
+    /// **空の綴りを作れないようにする。** 通すと後段が「型が空だった」と読むが、
+    /// 実際には**サーバの答えをこちらが読み取れていない**
+    /// (`rules/coding.md`「生成時に検証し、不正な値を存在させない」)。
+    pub fn new(text: String) -> Option<Self> {
+        if text.trim().is_empty() {
+            return None;
+        }
+        Some(Self(text))
+    }
+
+    /// 綴りそのもの。正規化する側が読む。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// hover に尋ねた結果。
 ///
 /// **「取れなかった」を 1 つにまとめない。** 3 つのどれなのかで**利用者が次に試すことが
@@ -19,8 +52,8 @@ const FENCE: &str = "```";
 /// 同じ `None` になり、**後段も読者も区別できなかった**。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HoverOutcome {
-    /// 型の綴りが返った。**正規化前**（`rules/naming.md` の `signature text`）。
-    Answered(String),
+    /// 型の綴りが返った。
+    Answered(SignatureText),
     /// サーバはその位置に答えを持たない。名前でない位置を指した場合がこれ。
     NoAnswer,
     /// 答えは返ったが、dryguard が読める形ではない。
@@ -45,13 +78,13 @@ pub(super) fn outcome_of(hover: &Hover) -> HoverOutcome {
         return HoverOutcome::Unreadable;
     };
 
-    match fenced_text_of(&content.value) {
+    match fenced_text_of(&content.value).and_then(SignatureText::new) {
         Some(signature_text) => HoverOutcome::Answered(signature_text),
         None => HoverOutcome::Unreadable,
     }
 }
 
-/// 最初のコードフェンスの中身。中身が無ければ `None`。
+/// 最初のコードフェンスの中身。フェンスが 1 つも無ければ `None`。
 ///
 /// **フェンスの言語名は見ない。** typescript-language-server は `typescript`、
 /// rust-analyzer は `rust` と書くので、名前で選ぶとサーバごとの一覧を持つことになる。
@@ -67,13 +100,12 @@ fn fenced_text_of(markdown: &str) -> Option<String> {
     // 開きのフェンスの行そのものは中身ではない。無ければフェンスが 1 つも無かった。
     lines.next()?;
 
+    // 中身が空かどうかはここで見ない。綴りとして通せるかは [`SignatureText::new`] が
+    // 決める（検証の置き場所を 1 つにする）。
     let body: Vec<&str> = lines
         .take_while(|line| !line.trim_start().starts_with(FENCE))
         .collect();
 
-    if body.is_empty() {
-        return None;
-    }
     Some(body.join("\n"))
 }
 
@@ -81,6 +113,8 @@ fn fenced_text_of(markdown: &str) -> Option<String> {
 mod tests {
     use super::*;
     use lsp_types::{MarkedString, MarkupContent, MarkupKind};
+
+    use crate::test_support::signature_text;
 
     /// サーバが返す形の hover。
     fn markdown_hover(value: &str) -> Hover {
@@ -100,7 +134,7 @@ mod tests {
 
         assert_eq!(
             outcome_of(&hover),
-            HoverOutcome::Answered("function decl(a: string): number".to_owned())
+            HoverOutcome::Answered(signature_text("function decl(a: string): number"))
         );
     }
 
@@ -114,10 +148,9 @@ mod tests {
 
         assert_eq!(
             outcome_of(&hover),
-            HoverOutcome::Answered(
+            HoverOutcome::Answered(signature_text(
                 "function constrained<T extends {\n    id: string;\n}, U>(a: T, b: U): [T, U]"
-                    .to_owned()
-            )
+            ))
         );
     }
 
@@ -130,7 +163,7 @@ mod tests {
 
         assert_eq!(
             outcome_of(&hover),
-            HoverOutcome::Answered("function decl(a: string): number".to_owned())
+            HoverOutcome::Answered(signature_text("function decl(a: string): number"))
         );
     }
 
@@ -141,7 +174,7 @@ mod tests {
 
         assert_eq!(
             outcome_of(&hover),
-            HoverOutcome::Answered("fn decl(a: &str) -> usize".to_owned())
+            HoverOutcome::Answered(signature_text("fn decl(a: &str) -> usize"))
         );
     }
 
@@ -159,6 +192,32 @@ mod tests {
         let hover = markdown_hover("```typescript\n```");
 
         assert_eq!(outcome_of(&hover), HoverOutcome::Unreadable);
+    }
+
+    #[test]
+    fn test_hover_outcome_of_a_fence_holding_only_a_blank_line_is_not_read() {
+        // 対照は上のテスト。行が 1 つある分だけフェンスの「中身が無い」判定をすり抜ける
+        let hover = markdown_hover("```typescript\n\n```");
+
+        assert_eq!(outcome_of(&hover), HoverOutcome::Unreadable);
+    }
+
+    #[test]
+    fn test_signature_text_of_a_spelling_that_is_only_whitespace_cannot_be_made() {
+        // 対照は下のテスト。同じ空白を綴りの前後に付けただけの違い
+        assert_eq!(SignatureText::new("   ".to_owned()), None);
+    }
+
+    #[test]
+    fn test_signature_text_of_a_spelling_padded_with_whitespace_keeps_the_padding() {
+        // 前後の空白を落とすと、サーバが返した綴りと持っている綴りが食い違う。
+        // どう畳むかは綴りを読む側が決める
+        let padded = SignatureText::new("  function decl(): void  ".to_owned());
+
+        assert_eq!(
+            padded.map(|text| text.as_str().to_owned()),
+            Some("  function decl(): void  ".to_owned())
+        );
     }
 
     #[test]
