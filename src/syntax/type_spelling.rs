@@ -22,6 +22,13 @@ use crate::syntax::tree::{Grammar, SyntaxTree};
 /// 綴りが型として読めたかどうかが、包んだ文が読めたかどうかと一致する。
 const SPELLING_PREFIX: &str = "type __ = ";
 
+/// 戻り値の注釈としてしか書けない綴りを包むときの前置き。
+///
+/// **型述語（`value is User` / `asserts value`）は型ではない。** 関数の戻り値の位置に
+/// しか書けないので、エイリアスの右辺へ置くと読めない。引数を取らない関数型にすると
+/// 読めるようになり、述語の主語（`value`）は値の名前のノードになる。
+const RETURN_TYPE_PREFIX: &str = "type __ = () => ";
+
 /// 包むときの後置き。
 const SPELLING_SUFFIX: &str = ";";
 
@@ -45,6 +52,9 @@ const INFER_TYPE_KIND: &str = "infer_type";
 
 /// モジュールの指定子を取る演算子を表すノードの種別（`import("./local")`）。
 const IMPORT_KIND: &str = "import";
+
+/// 値の名前を尋ねる問い合わせを表すノードの種別（`typeof localValue`）。
+const TYPE_QUERY_KIND: &str = "type_query";
 
 /// 差し込んだ綴りを括るときの括弧。
 const GROUP_OPEN: char = '(';
@@ -84,11 +94,11 @@ pub(crate) fn substituted_spelling_of(
     spelling: &str,
     opened: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    let wrapped = wrapped(spelling);
+    let wrapped = wrapped(spelling)?;
     let spans = type_name_spans_in_wrapped(&wrapped, BoundNames::Excluded)?;
 
     // 後ろから差し替える。前から差し替えると、後ろの範囲が差し込んだ長さの分だけずれる。
-    let mut substituted = wrapped;
+    let mut substituted = wrapped.text;
     for span in spans.into_iter().rev() {
         let Some(name) = substituted.get(span.clone()) else {
             continue;
@@ -100,7 +110,7 @@ pub(crate) fn substituted_spelling_of(
         substituted = replaced(&substituted, span, &replacement);
     }
 
-    unwrapped(&substituted)
+    unwrapped(&substituted, wrapped.prefix)
 }
 
 /// 綴りの中で、差し替えてよい型名が書かれている範囲。型として読めない綴りでは `None`。
@@ -128,8 +138,8 @@ pub(crate) fn type_name_spans_of(spelling: &str) -> Option<Vec<Range<usize>>> {
 
 /// 綴りを包んで歩き、返った範囲を綴りの中の位置へ戻す。
 fn spans_in_spelling(spelling: &str, bound_names: BoundNames) -> Option<Vec<Range<usize>>> {
-    let wrapped = wrapped(spelling);
-    let prefix = SPELLING_PREFIX.len();
+    let wrapped = wrapped(spelling)?;
+    let prefix = wrapped.prefix;
 
     Some(
         type_name_spans_in_wrapped(&wrapped, bound_names)?
@@ -161,29 +171,67 @@ enum BoundNames {
 /// 別のモジュールの型を指しうる。指定子は型名のノードにならないため、
 /// [`type_name_spans_of`] では掬えない。
 pub(crate) fn holds_a_specifier(spelling: &str) -> Option<bool> {
-    let wrapped = wrapped(spelling);
-    let tree = SyntaxTree::from_source(&wrapped, Grammar::TypeScript).ok()?;
-    if tree.has_error() {
-        return None;
-    }
+    holds_a_node_of_kind(spelling, IMPORT_KIND)
+}
+
+/// その綴りが、値の名前を尋ねているか。型として読めない綴りでは `None`。
+///
+/// `typeof localValue` の `localValue` は**値の名前**で、型名のノードにならないので
+/// [`type_name_spans_of`] では掬えない。ところが**どの `localValue` かは書いた人の位置で
+/// 決まる**ので、別々のモジュールの同じ綴りは別の型を指す。
+pub(crate) fn holds_a_value_name(spelling: &str) -> Option<bool> {
+    holds_a_node_of_kind(spelling, TYPE_QUERY_KIND)
+}
+
+/// その綴りの中に、その種別のノードがあるか。型として読めない綴りでは `None`。
+fn holds_a_node_of_kind(spelling: &str, kind: &str) -> Option<bool> {
+    let wrapped = wrapped(spelling)?;
+    let tree = SyntaxTree::from_source(&wrapped.text, Grammar::TypeScript).ok()?;
 
     Some(
         tree.named_descendants()
             .into_iter()
-            .any(|node| node.kind() == IMPORT_KIND),
+            .any(|node| node.kind() == kind),
     )
 }
 
-/// 型 1 つ分の綴りを、型として読める文へ包む。
-fn wrapped(spelling: &str) -> String {
-    format!("{SPELLING_PREFIX}{spelling}{SPELLING_SUFFIX}")
+/// 綴りを包んで構文木にできた文と、そのとき使った前置きの長さ。
+struct Wrapped {
+    text: String,
+    prefix: usize,
 }
 
-/// 包んだ文から、型 1 つ分の綴りを取り出す。前置きと後置きが揃わなければ `None`。
-fn unwrapped(wrapped: &str) -> Option<String> {
+/// 綴りを、構文木にできる文へ包む。どの包み方でも読めなければ `None`。
+///
+/// **包み方が 2 つあるのは、型が書ける場所が 1 つではないため。** 型述語
+/// （`value is User`）は関数の戻り値の位置にしか書けず、エイリアスの右辺では読めない
+/// （[`RETURN_TYPE_PREFIX`]）。
+///
+/// **Why not（はじめから戻り値の位置で包む）**: そこは型 1 つ分だけが書ける場所ではなく、
+/// 型述語も通る。**綴りが型として読めたかどうかと、包んだ文が読めたかどうかが
+/// 一致しなくなる**ので、型として読める包み方を先に試す。
+fn wrapped(spelling: &str) -> Option<Wrapped> {
+    for prefix in [SPELLING_PREFIX, RETURN_TYPE_PREFIX] {
+        let text = format!("{prefix}{spelling}{SPELLING_SUFFIX}");
+        let readable =
+            SyntaxTree::from_source(&text, Grammar::TypeScript).is_ok_and(|tree| !tree.has_error());
+
+        if readable {
+            return Some(Wrapped {
+                text,
+                prefix: prefix.len(),
+            });
+        }
+    }
+
+    None
+}
+
+/// 包んだ文から、綴りを取り出す。前置きと後置きが揃わなければ `None`。
+fn unwrapped(wrapped: &str, prefix: usize) -> Option<String> {
     Some(
         wrapped
-            .strip_prefix(SPELLING_PREFIX)?
+            .get(prefix..)?
             .strip_suffix(SPELLING_SUFFIX)?
             .to_owned(),
     )
@@ -258,16 +306,20 @@ fn spliced(text: &str, span: Range<usize>, replacement: &str) -> String {
 ///
 /// **前置きの中は返さない。** 包むために置いた `__` も型名のノードになるので、
 /// 綴りそのものの範囲だけに絞る。
-fn type_name_spans_in_wrapped(wrapped: &str, bound_names: BoundNames) -> Option<Vec<Range<usize>>> {
-    let tree = SyntaxTree::from_source(wrapped, Grammar::TypeScript).ok()?;
+fn type_name_spans_in_wrapped(
+    wrapped: &Wrapped,
+    bound_names: BoundNames,
+) -> Option<Vec<Range<usize>>> {
+    let text = wrapped.text.as_str();
+    let tree = SyntaxTree::from_source(text, Grammar::TypeScript).ok()?;
     if tree.has_error() {
         return None;
     }
     let nodes = tree.named_descendants();
 
-    let spelling = SPELLING_PREFIX.len()..wrapped.len().saturating_sub(SPELLING_SUFFIX.len());
+    let spelling = wrapped.prefix..text.len().saturating_sub(SPELLING_SUFFIX.len());
     let bound = match bound_names {
-        BoundNames::Excluded => bound_names_of(&nodes, wrapped),
+        BoundNames::Excluded => bound_names_of(&nodes, text),
         BoundNames::Included => BTreeSet::new(),
     };
     let mut spans: Vec<Range<usize>> = Vec::new();
@@ -279,7 +331,7 @@ fn type_name_spans_in_wrapped(wrapped: &str, bound_names: BoundNames) -> Option<
         let already_covered = spans
             .last()
             .is_some_and(|taken| range.start < taken.end && taken.start <= range.start);
-        let names_the_binding = wrapped
+        let names_the_binding = text
             .get(range.clone())
             .is_some_and(|name| bound.contains(name));
 
@@ -709,6 +761,24 @@ mod tests {
     fn test_a_spelling_naming_a_type_in_an_imported_module_holds_a_specifier() {
         // `typeof` を伴わない書き方でも指定子は指定子
         assert_eq!(holds_a_specifier("import(\"./local\").Thing"), Some(true));
+    }
+
+    #[test]
+    fn test_a_type_predicate_is_read_in_its_return_annotation_context() {
+        // 型述語は関数の戻り値の位置にしか書けない。主語（`value`）は値の名前なので
+        // 型名にならず、絞る先の `User` だけが返る
+        assert_eq!(type_names_of("value is User"), Some(vec!["User"]));
+    }
+
+    #[test]
+    fn test_a_spelling_querying_a_value_holds_a_value_name() {
+        assert_eq!(holds_a_value_name("typeof localValue"), Some(true));
+    }
+
+    #[test]
+    fn test_a_spelling_naming_only_types_holds_no_value_name() {
+        // 対照は上のテスト。型名の側は値の名前として数えない
+        assert_eq!(holds_a_value_name("Local<string>"), Some(false));
     }
 
     #[test]
