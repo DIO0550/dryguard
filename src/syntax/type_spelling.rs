@@ -53,8 +53,33 @@ const INFER_TYPE_KIND: &str = "infer_type";
 /// モジュールの指定子を取る演算子を表すノードの種別（`import("./local")`）。
 const IMPORT_KIND: &str = "import";
 
-/// 値の名前を尋ねる問い合わせを表すノードの種別（`typeof localValue`）。
-const TYPE_QUERY_KIND: &str = "type_query";
+/// 型名 1 つを表さない、素の名前のノードの種別。
+///
+/// 型は `type_identifier` / `predefined_type` / `nested_type_identifier` になるので、
+/// **型の綴りの中に出る `identifier` は型名ではない**（値の名前か、その綴りの中で
+/// 束縛された名前）。
+const IDENTIFIER_KIND: &str = "identifier";
+
+/// 囲むクラスを指す型を表すノードの種別（`this`）。
+const THIS_TYPE_KIND: &str = "this_type";
+
+/// 型名でない名前が、その綴りの中でだけ意味を持つ場所のノードの種別。
+///
+/// 引数の名前（`(a: string) => void`）・タプルの要素の名前（`[first: string]`）・
+/// インデックスシグネチャの引数の名前（`{ [index: number]: string }`）・
+/// 型述語の主語（`value is User`）。**どれも外を指さない。**
+///
+/// **一覧にするのは外を指さないほう。** 外を指す形（値の名前・計算されたキー・
+/// モジュールの指定子）は文法が増えるたびに増えるが、こちらは名前が束縛される場所なので
+/// 閉じている。**一覧から漏れた形は site dependent の側へ倒れる**ので、
+/// 倒れる向きは偽陰性になる。
+const LOCAL_NAME_KINDS: [&str; 5] = [
+    "required_parameter",
+    "optional_parameter",
+    "rest_pattern",
+    "index_signature",
+    "type_predicate",
+];
 
 /// 差し込んだ綴りを括るときの括弧。
 const GROUP_OPEN: char = '(';
@@ -165,34 +190,42 @@ enum BoundNames {
     Included,
 }
 
-/// その綴りが、モジュールの指定子を書いているか。型として読めない綴りでは `None`。
+/// その綴りが、型の名前だけで書かれているか。型として読めない綴りでは `None`。
 ///
-/// `import("./local")` の指定子は**書いた人の位置から解決される**ので、同じ綴りが
-/// 別のモジュールの型を指しうる。指定子は型名のノードにならないため、
-/// [`type_name_spans_of`] では掬えない。
-pub(crate) fn holds_a_specifier(spelling: &str) -> Option<bool> {
-    holds_a_node_of_kind(spelling, IMPORT_KIND)
-}
-
-/// その綴りが、値の名前を尋ねているか。型として読めない綴りでは `None`。
+/// **型名にならないのに、指す先が書いた人の位置で決まる綴りがある。**
+/// 値の名前（`typeof localValue`）・オブジェクト型の計算されたキー
+/// （`{ [key]: string }`）・`this` 型（囲むクラスを指す）・モジュールの指定子
+/// （`import("./local")`）で、どれも [`type_name_spans_of`] では掬えない。
 ///
-/// `typeof localValue` の `localValue` は**値の名前**で、型名のノードにならないので
-/// [`type_name_spans_of`] では掬えない。ところが**どの `localValue` かは書いた人の位置で
-/// 決まる**ので、別々のモジュールの同じ綴りは別の型を指す。
-pub(crate) fn holds_a_value_name(spelling: &str) -> Option<bool> {
-    holds_a_node_of_kind(spelling, TYPE_QUERY_KIND)
-}
-
-/// その綴りの中に、その種別のノードがあるか。型として読めない綴りでは `None`。
-fn holds_a_node_of_kind(spelling: &str, kind: &str) -> Option<bool> {
+/// **見分けるのは「外を指す形」ではなく「中に留まる名前」。** 外を指す形は文法が
+/// 増えるたびに増えるが、型名でない名前が許される場所は閉じている
+/// （[`LOCAL_NAME_KINDS`]）。
+pub(crate) fn names_only_types(spelling: &str) -> Option<bool> {
     let wrapped = wrapped(spelling)?;
     let tree = SyntaxTree::from_source(&wrapped.text, Grammar::TypeScript).ok()?;
 
-    Some(
-        tree.named_descendants()
-            .into_iter()
-            .any(|node| node.kind() == kind),
-    )
+    let reaches_outside = tree
+        .named_descendants()
+        .into_iter()
+        .any(names_outside_the_type_namespace);
+
+    Some(!reaches_outside)
+}
+
+/// そのノードが、型の名前空間の外を指しているか。
+fn names_outside_the_type_namespace(node: Node<'_>) -> bool {
+    if matches!(node.kind(), THIS_TYPE_KIND | IMPORT_KIND) {
+        return true;
+    }
+    if node.kind() != IDENTIFIER_KIND {
+        return false;
+    }
+
+    let names_locally = node
+        .parent()
+        .is_some_and(|parent| LOCAL_NAME_KINDS.contains(&parent.kind()));
+
+    !names_locally
 }
 
 /// 綴りを包んで構文木にできた文と、そのとき使った前置きの長さ。
@@ -753,42 +786,65 @@ mod tests {
     }
 
     #[test]
-    fn test_a_spelling_querying_an_imported_module_holds_a_specifier() {
-        assert_eq!(holds_a_specifier("typeof import(\"./local\")"), Some(true));
-    }
-
-    #[test]
-    fn test_a_spelling_naming_a_type_in_an_imported_module_holds_a_specifier() {
-        // `typeof` を伴わない書き方でも指定子は指定子
-        assert_eq!(holds_a_specifier("import(\"./local\").Thing"), Some(true));
-    }
-
-    #[test]
     fn test_a_type_predicate_is_read_in_its_return_annotation_context() {
-        // 型述語は関数の戻り値の位置にしか書けない。主語（`value`）は値の名前なので
+        // 型述語は関数の戻り値の位置にしか書けない。主語（`value`）は引数の名前なので
         // 型名にならず、絞る先の `User` だけが返る
         assert_eq!(type_names_of("value is User"), Some(vec!["User"]));
     }
 
     #[test]
-    fn test_a_spelling_querying_a_value_holds_a_value_name() {
-        assert_eq!(holds_a_value_name("typeof localValue"), Some(true));
+    fn test_a_spelling_written_with_type_names_alone_names_only_types() {
+        assert_eq!(names_only_types("Local<string> | \"on\""), Some(true));
     }
 
     #[test]
-    fn test_a_spelling_naming_only_types_holds_no_value_name() {
-        // 対照は上のテスト。型名の側は値の名前として数えない
-        assert_eq!(holds_a_value_name("Local<string>"), Some(false));
+    fn test_a_spelling_naming_a_parameter_names_only_types() {
+        // 引数の名前・タプルの要素の名前・インデックスシグネチャの引数の名前・
+        // 型述語の主語は、その綴りの中でだけ意味を持つ
+        assert_eq!(names_only_types("(a: string) => void"), Some(true));
+        assert_eq!(names_only_types("[first: string]"), Some(true));
+        assert_eq!(names_only_types("{ [index: number]: string }"), Some(true));
+        assert_eq!(names_only_types("(a: unknown) => a is Local"), Some(true));
     }
 
     #[test]
-    fn test_a_string_literal_type_holds_no_specifier() {
-        // 対照は上の 2 つ。引用符があることではなく、指定子であることを見ている
-        assert_eq!(holds_a_specifier("\"on\" | \"off\""), Some(false));
+    fn test_a_spelling_querying_a_value_does_not_name_only_types() {
+        // 対照は上のテスト。同じ `identifier` でも、`typeof` の後ろは外の値を指す
+        assert_eq!(names_only_types("typeof localValue"), Some(false));
     }
 
     #[test]
-    fn test_a_spelling_that_does_not_read_as_a_type_cannot_be_asked_for_a_specifier() {
-        assert_eq!(holds_a_specifier("=> )("), None);
+    fn test_a_spelling_with_a_computed_key_does_not_name_only_types() {
+        // 計算されたキーは `unique symbol` の値を指す。別々のモジュールが同じ綴りの
+        // `key` を宣言していると、同じ綴りが別の型を指す
+        assert_eq!(names_only_types("{ [key]: string }"), Some(false));
+    }
+
+    #[test]
+    fn test_a_spelling_naming_the_enclosing_class_does_not_name_only_types() {
+        // `this` 型は囲むクラスを指すので、どこに書かれたかで意味が変わる
+        assert_eq!(names_only_types("this"), Some(false));
+    }
+
+    #[test]
+    fn test_a_spelling_querying_an_imported_module_does_not_name_only_types() {
+        assert_eq!(names_only_types("typeof import(\"./local\")"), Some(false));
+    }
+
+    #[test]
+    fn test_a_spelling_naming_a_type_in_an_imported_module_does_not_name_only_types() {
+        // `typeof` を伴わない書き方でも指定子は指定子
+        assert_eq!(names_only_types("import(\"./local\").Thing"), Some(false));
+    }
+
+    #[test]
+    fn test_a_string_literal_type_names_only_types() {
+        // 対照は上の 2 つ。引用符があることではなく、外を指すことを見ている
+        assert_eq!(names_only_types("\"on\" | \"off\""), Some(true));
+    }
+
+    #[test]
+    fn test_a_spelling_that_does_not_read_as_a_type_cannot_be_asked_what_it_names() {
+        assert_eq!(names_only_types("=> )("), None);
     }
 }

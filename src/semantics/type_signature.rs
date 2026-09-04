@@ -16,8 +16,7 @@ use crate::lsp::{ClientError, HoverOutcome, Session, SignatureText, SourceDocume
 use crate::semantics::resolved_type::{ResolvedTypes, TypeDeclaration};
 use crate::source_position::SourcePosition;
 use crate::syntax::type_spelling::{
-    holds_a_specifier, holds_a_value_name, substitutable_type_name_spans_of,
-    substituted_spelling_of, type_name_spans_of,
+    names_only_types, substitutable_type_name_spans_of, substituted_spelling_of, type_name_spans_of,
 };
 
 /// 付け替えた型変数の綴りの前置き。
@@ -539,10 +538,10 @@ fn opened_annotation_of(text: &str, resolved: &ResolvedTypes) -> String {
 ///
 /// 数える相手は [`declared_type_names_of`] が決める。
 ///
-/// **型名として書かれていない依存が 2 つある。** モジュールの指定子
-/// （`typeof import("./local")`）と、値の名前（`typeof localValue`）。どちらも
-/// 型名のノードにならないので名前を数えるだけでは掬えないのに、**指す先は書いた人の
-/// 位置で決まる**（`syntax::type_spelling` の `holds_a_specifier` / `holds_a_value_name`）。
+/// **型名にならない依存もある。** 値の名前（`typeof localValue`）・計算されたキー
+/// （`{ [key]: string }`）・モジュールの指定子（`import("./local")`）・`this` 型で、
+/// どれも名前を数えるだけでは掬えないのに**指す先は書いた人の位置で決まる**。
+/// そこは `syntax::type_spelling` の `names_only_types` が見る。
 ///
 /// **読めない綴りは通さない。** そこに何が書かれているかを確かめられていないので、
 /// 「名前が 1 つも無い」と同じには扱えない
@@ -551,16 +550,14 @@ fn opened_annotation_of(text: &str, resolved: &ResolvedTypes) -> String {
 /// **Why not（残った名前もその宣言まで辿る）**: 辿るには宣言のあるファイルを
 /// 構文木にするところから始まり、綴りではなく位置で差し込む形になる（Issue #133）。
 fn is_site_independent(spelling: &str) -> bool {
-    let (Some(names), Some(holds_a_specifier), Some(holds_a_value_name)) = (
-        declared_type_names_of(spelling),
-        holds_a_specifier(spelling),
-        holds_a_value_name(spelling),
-    ) else {
+    let (Some(names), Some(names_only_types)) =
+        (declared_type_names_of(spelling), names_only_types(spelling))
+    else {
         return false;
     };
     let holds_a_declared_name = !names.is_empty();
 
-    !holds_a_declared_name && !holds_a_specifier && !holds_a_value_name
+    !holds_a_declared_name && names_only_types
 }
 
 /// その綴りに残っている、どこかで宣言された型の名前。型として読めない綴りでは `None`。
@@ -2311,6 +2308,22 @@ mod tests {
         let second = signature_with(
             "function b(y: Second): void",
             &resolving("Second", "typeof localValue"),
+        );
+
+        assert!(!first.is_unifiable_with(&second));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_the_same_computed_key_are_not_unifiable() {
+        // 計算されたキーは `unique symbol` の値を指す。型名のノードにならないので、
+        // 通すと別々のモジュールの `key` を持つ 2 つが重なる
+        let first = signature_with(
+            "function a(x: First): void",
+            &resolving("First", "{ [key]: string }"),
+        );
+        let second = signature_with(
+            "function b(y: Second): void",
+            &resolving("Second", "{ [key]: string }"),
         );
 
         assert!(!first.is_unifiable_with(&second));
