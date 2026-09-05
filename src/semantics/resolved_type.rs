@@ -76,29 +76,131 @@ impl ResolvedTypes {
         }
     }
 
-    /// その型名の解決後の綴り。解決できていなければ `None`。
+    /// その型名の解決後の綴り。開けていなければ `None`。
     ///
-    /// `None` は「エイリアスではなかった」と「宣言まで届かなかった」の両方で返る。
-    /// **どちらでも綴りをそのまま比べる**ので、呼び出し側が分ける材料は要らない。
+    /// `None` は「エイリアスではなかった」と「開けなかった」の両方で返る。
+    /// **分けるのは [`TracedTypeNames::unopened_reason_of`] の側**で、ここは
+    /// 差し込む綴りがあるかだけを答える。
     pub fn resolved_of(&self, name: &str) -> Option<&str> {
         self.by_name.get(name).map(String::as_str)
     }
 }
 
-/// 型名の宣言を尋ねた結果。
+/// 型名 1 つを開けなかった理由。
 ///
-/// **サーバが typeDefinition を提供していないことを、宣言が無いのと同じにしない。**
-/// 前者では**どの型名も開けない**ので、綴りのまま比べた結果を「単一化不能」として
-/// 出すと、確かめられなかったことを確かめた答えとして出すことになる
-/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TypeDeclarationsOutcome {
-    /// 尋ね終えた。宣言の場所が返らなかった型名は入らない。
-    Located(Vec<TypeDeclaration>),
+/// **1 つにまとめない。** どれなのかで**利用者が次にすることが違う**（サーバを替える /
+/// そのファイルをプロジェクトに入れる / そのファイルを読めるようにする /
+/// そのチャンクを諦める / dryguard 側の穴）(`rules/coding.md`
+/// 「エラー型は原因ごとにバリアントを分ける」)。
+///
+/// **止まった段ではなく、次にすることで分ける。** typeDefinition の段だけで 3 通りの
+/// 対処に分かれるので、段でまとめると直す先が読めなくなる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnopenedReason {
     /// サーバが typeDefinition を提供していない。
     TypeDefinitionNotProvided,
+    /// サーバが宣言の場所を答えなかった。
+    ///
+    /// **宣言が無いとは限らない。** そのファイルをプロジェクトとして見ていないときにも
+    /// 空が返る（`lsp::TypeDefinitionOutcome::NoAnswer`）ので、サーバの答えとして読まない。
+    NoDeclarationSite,
     /// 宣言の場所は返ったが、パスとして読めない URI だった。
     UnreadableTypeDefinition,
+    /// 宣言のファイルを読めず、サーバに開かせられなかった。
+    UnreadableDeclaringDocument,
+    /// サーバが宣言の位置に綴りを持たなかった。
+    NoSpellingAtDeclaration,
+    /// 宣言の位置の hover の応答を `lsp` が読めなかった。
+    UnreadableDeclarationHover,
+    /// サーバが hover を提供していない。
+    HoverNotProvided,
+    /// 宣言は型エイリアスだが、右辺を差し込める形にできなかった。
+    ///
+    /// **サーバは右辺を返している。** 開けないのは dryguard 側の都合（型引数の当てはめが
+    /// 要る `type Box<T> = ...` など）なので、開く先が無い `interface` / `class` とは
+    /// 分けて出す。
+    UnopenableAlias,
+}
+
+/// 開けなかった型名 1 つと、その理由。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnopenedTypeName {
+    name: String,
+    reason: UnopenedReason,
+}
+
+impl UnopenedTypeName {
+    /// 開けなかった型名と、その理由から作る。
+    pub fn new(name: String, reason: UnopenedReason) -> Self {
+        Self { name, reason }
+    }
+
+    /// ソースに書かれた型名の綴り。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// 開けなかった理由。
+    pub fn reason(&self) -> UnopenedReason {
+        self.reason
+    }
+}
+
+/// シグネチャに書かれた型名を、宣言まで辿った結果。
+///
+/// 型名 1 つは、宣言の場所が取れた（[`TracedTypeNames::declared`]）・開いた綴りが取れた
+/// （[`TracedTypeNames::resolved`]）・開けなかった（[`TracedTypeNames::unopened_reason_of`]）の
+/// どれかに入る。
+///
+/// **3 つを 1 つの値で持つ。** 開けた型名は差し込みで綴りから消え、開けなかった型名は
+/// 綴りに残る。**比較に残る綴りに現れたのがどちらだったか**を同じ 1 つの入力から引けないと、
+/// 開けなかったことを答えに出すかどうかが決められない
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TracedTypeNames {
+    declared: Vec<TypeDeclaration>,
+    resolved: ResolvedTypes,
+    unopened: Vec<UnopenedTypeName>,
+}
+
+impl TracedTypeNames {
+    /// 宣言の場所が取れた型名と、そこで開けなかった型名から作る。
+    pub fn new(declared: Vec<TypeDeclaration>, unopened: Vec<UnopenedTypeName>) -> Self {
+        Self {
+            declared,
+            resolved: ResolvedTypes::default(),
+            unopened,
+        }
+    }
+
+    /// 後の段で開けなかった型名を足す。
+    pub fn with_unopened(mut self, unopened: Vec<UnopenedTypeName>) -> Self {
+        self.unopened.extend(unopened);
+        self
+    }
+
+    /// 開けた型名の綴りを持たせる。**足すのではなく置き換える**（開くのは 1 度だけ）。
+    pub fn with_resolved(self, resolved: ResolvedTypes) -> Self {
+        Self { resolved, ..self }
+    }
+
+    /// 宣言の場所が取れた型名。
+    pub fn declared(&self) -> &[TypeDeclaration] {
+        &self.declared
+    }
+
+    /// 開けた型名の、解決後の綴り。
+    pub fn resolved(&self) -> &ResolvedTypes {
+        &self.resolved
+    }
+
+    /// その型名を開けなかった理由。開けていれば `None`。
+    pub fn unopened_reason_of(&self, name: &str) -> Option<UnopenedReason> {
+        self.unopened
+            .iter()
+            .find(|unopened| unopened.name() == name)
+            .map(UnopenedTypeName::reason)
+    }
 }
 
 /// シグネチャに書かれた型名の宣言が、どこにあるかを尋ねる。
@@ -106,99 +208,165 @@ pub enum TypeDeclarationsOutcome {
 /// `document` は先に [`Session::open_document`] で開かせておく。`type_references` は
 /// `Chunk::type_references` が集めた型名。
 ///
-/// **宣言が返らなかった型名は落とす。** その型名が解決できないだけで、残りは解決できるので、
-/// 綴りのまま比較へ進む（今までと同じ形）。
-///
-/// **落とさないのは 2 つ。** サーバが typeDefinition を提供していないとき（どの型名も
-/// 開けない）と、返った URI をパスとして読めなかったとき（**サーバは宣言を持っており、
-/// 読めないのはこちら側の穴**）。どちらも、綴りのまま比べた結果を答えとして出さない
-/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+/// **宣言まで届かなかった型名を、ここでは落とさない。** 落とすかどうかは
+/// **比較に残る綴りに現れるか**で決まり、それが分かるのは正規化した後
+/// （`semantics::type_signature`）(`rules/architecture.md`
+/// 「取れなかったシグナルを既定値で埋めない」)。
 ///
 /// # Errors
 ///
 /// そのドキュメントを開かせていないとき、往復が失敗したとき。
-pub fn type_declarations_of(
+pub fn traced_type_names_of(
     session: &mut Session,
     document: &SourceDocument,
     type_references: &[TypeReference],
-) -> Result<TypeDeclarationsOutcome, ClientError> {
-    let mut declarations = Vec::new();
+) -> Result<TracedTypeNames, ClientError> {
+    let mut declared = Vec::new();
+    let mut unopened = Vec::new();
 
     for reference in type_references {
+        let name = reference.name().to_owned();
+
         match session.type_definition(document, reference.position())? {
             TypeDefinitionOutcome::Answered(site) => {
-                declarations.push(TypeDeclaration::new(reference.name().to_owned(), site));
+                declared.push(TypeDeclaration::new(name, site));
             }
-            TypeDefinitionOutcome::NotSupported => {
-                return Ok(TypeDeclarationsOutcome::TypeDefinitionNotProvided);
+            TypeDefinitionOutcome::NoAnswer => {
+                unopened.push(UnopenedTypeName::new(
+                    name,
+                    UnopenedReason::NoDeclarationSite,
+                ));
             }
             TypeDefinitionOutcome::Unreadable { .. } => {
-                return Ok(TypeDeclarationsOutcome::UnreadableTypeDefinition);
+                unopened.push(UnopenedTypeName::new(
+                    name,
+                    UnopenedReason::UnreadableTypeDefinition,
+                ));
             }
-            // 宣言が無いのはサーバの答えそのもの。読めないのと違い、こちら側の穴ではない。
-            TypeDefinitionOutcome::NoAnswer => continue,
+            TypeDefinitionOutcome::NotSupported => {
+                unopened.push(UnopenedTypeName::new(
+                    name,
+                    UnopenedReason::TypeDefinitionNotProvided,
+                ));
+            }
         }
     }
 
-    Ok(TypeDeclarationsOutcome::Located(declarations))
+    Ok(TracedTypeNames::new(declared, unopened))
 }
 
-/// 宣言の位置へ hover を送り、型エイリアスの右辺を集める。
+/// 宣言の位置へ hover を送り、型エイリアスの右辺を開く。
 ///
-/// `declarations` は [`type_declarations_of`] が返した宣言。**そのファイルは先に
+/// `traced` は [`traced_type_names_of`] が返した結果。**宣言のファイルは先に
 /// 呼び出し側が開かせておく**（開かせていないファイルへの hover は綴りを持たない
-/// 応答になり、その型名は解決されないまま残る）。
+/// 応答になる）。
+///
+/// **エイリアスでなかった型名は落とす。** `interface` / `class` に右辺が無いのは
+/// **サーバの答え**で、開けなかったのとは別物（綴りのまま比べてよい）。
+/// **右辺はあるのに差し込めなかった型名は落とさない**（[`DeclaredAlias`]）。
 ///
 /// # Errors
 ///
 /// 往復が失敗したとき。
-pub fn resolved_types_of(
+pub fn opened_type_names_of(
     session: &mut Session,
-    declarations: &[TypeDeclaration],
-) -> Result<ResolvedTypes, ClientError> {
+    traced: TracedTypeNames,
+) -> Result<TracedTypeNames, ClientError> {
     let mut resolutions = Vec::new();
+    let mut unopened = Vec::new();
 
-    for declaration in declarations {
-        let HoverOutcome::Answered(declared) = session.hover_at_declaration(declaration.site())?
-        else {
-            continue;
-        };
-        let Some(resolved) = resolved_type_of(declared.as_str()) else {
-            continue;
+    for declaration in traced.declared() {
+        let name = declaration.name().to_owned();
+
+        let declared = match session.hover_at_declaration(declaration.site())? {
+            HoverOutcome::Answered(declared) => declared,
+            HoverOutcome::NoAnswer => {
+                unopened.push(UnopenedTypeName::new(
+                    name,
+                    UnopenedReason::NoSpellingAtDeclaration,
+                ));
+                continue;
+            }
+            HoverOutcome::Unreadable => {
+                unopened.push(UnopenedTypeName::new(
+                    name,
+                    UnopenedReason::UnreadableDeclarationHover,
+                ));
+                continue;
+            }
+            HoverOutcome::NotSupported => {
+                unopened.push(UnopenedTypeName::new(
+                    name,
+                    UnopenedReason::HoverNotProvided,
+                ));
+                continue;
+            }
         };
 
-        resolutions.push((declaration.name().to_owned(), resolved));
+        match declared_alias_of(declared.as_str()) {
+            DeclaredAlias::Opened(resolved) => resolutions.push((name, resolved)),
+            // 開く先が無いのはサーバの答え。綴りのまま比べてよい。
+            DeclaredAlias::NotAnAlias => continue,
+            DeclaredAlias::Unopenable => {
+                unopened.push(UnopenedTypeName::new(name, UnopenedReason::UnopenableAlias))
+            }
+        }
     }
 
-    Ok(ResolvedTypes::new(resolutions))
+    Ok(traced
+        .with_resolved(ResolvedTypes::new(resolutions))
+        .with_unopened(unopened))
+}
+
+/// 宣言の綴りを読んだ結果。
+///
+/// **「エイリアスではない」と「エイリアスだが開けない」を分ける。** 前者は
+/// **開く先が無いというサーバの答え**なので綴りのまま比べてよく、後者は
+/// **サーバは右辺を返しているのに dryguard が差し込めていない**ので、
+/// 綴りのまま比べた結果を答えにできない
+/// (`rules/architecture.md`「どこまでを「取れなかった」に数えるか」)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclaredAlias {
+    /// 型エイリアスで、差し込める右辺があった。
+    Opened(String),
+    /// 型エイリアスではなかった（`interface` / `class` / `enum`）。
+    NotAnAlias,
+    /// 型エイリアスだが、右辺を差し込める形にできなかった。
+    Unopenable,
 }
 
 /// hover が返した宣言の綴りから、その名前が指す型の綴りを読む。
 ///
 /// `declared` は宣言の位置へ hover を送って返った綴り（`type Amount = number` /
-/// `interface User` / `class Invoice`）。型エイリアスでなければ `None`。
+/// `interface User` / `class Invoice`）。
 ///
 /// **型引数を取るエイリアスは開かない。** `type Box<T> = { value: T }` の右辺を
 /// `Box<string>` の位置へ差し込むと `{ value: T }<string>` になり、綴りとして壊れる。
-/// 型引数の当てはめには型そのものの構文解析が要る。
+/// 型引数の当てはめには型そのものの構文解析が要る。**開かないだけで、開く先はある**ので
+/// [`DeclaredAlias::Unopenable`] を返す。
 ///
 /// **1 段しか開かない。** `type A = B` の右辺は `B` のままになる。2 段目を開くには
 /// `B` が書かれている位置が要り、それは宣言のあるファイルの中にあるので、
 /// **もう一度そのファイルを構文木にするところから始まる**。
-fn resolved_type_of(declared: &str) -> Option<String> {
-    let aliased = declared.trim().strip_prefix(ALIAS_KEYWORD)?;
-    let (name, resolved) = aliased.split_once(ALIAS_MARKER)?;
+fn declared_alias_of(declared: &str) -> DeclaredAlias {
+    let Some(aliased) = declared.trim().strip_prefix(ALIAS_KEYWORD) else {
+        return DeclaredAlias::NotAnAlias;
+    };
+    // ここから先は `type` の宣言。右辺を読み取れなくても、**開く先が無いのとは別**。
+    let Some((name, resolved)) = aliased.split_once(ALIAS_MARKER) else {
+        return DeclaredAlias::Unopenable;
+    };
 
     if name.contains(TYPE_ARGUMENTS_START) {
-        return None;
+        return DeclaredAlias::Unopenable;
     }
 
     let resolved = resolved.trim();
     if resolved.is_empty() {
-        return None;
+        return DeclaredAlias::Unopenable;
     }
 
-    Some(resolved.to_owned())
+    DeclaredAlias::Opened(resolved.to_owned())
 }
 
 #[cfg(test)]
@@ -206,59 +374,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_resolved_type_of_an_alias_declaration_is_the_spelling_on_its_right() {
+    fn test_declared_alias_of_an_alias_declaration_is_the_spelling_on_its_right() {
         assert_eq!(
-            resolved_type_of("type Amount = number"),
-            Some("number".to_owned())
+            declared_alias_of("type Amount = number"),
+            DeclaredAlias::Opened("number".to_owned())
         );
     }
 
     #[test]
-    fn test_resolved_type_of_an_alias_of_a_function_type_keeps_the_whole_type() {
+    fn test_declared_alias_of_an_alias_of_a_function_type_keeps_the_whole_type() {
         // `=>` を右辺の区切りと取り違えると、`(value: string)` だけが残る
         assert_eq!(
-            resolved_type_of("type Handler = (value: string) => number"),
-            Some("(value: string) => number".to_owned())
+            declared_alias_of("type Handler = (value: string) => number"),
+            DeclaredAlias::Opened("(value: string) => number".to_owned())
         );
     }
 
     #[test]
-    fn test_resolved_type_of_an_alias_written_over_lines_keeps_every_line() {
+    fn test_declared_alias_of_an_alias_written_over_lines_keeps_every_line() {
         // オブジェクト型はサーバが複数行に展開して返す。1 行目で打ち切ると型が変わる
         assert_eq!(
-            resolved_type_of("type Shape = {\n    id: string;\n}"),
-            Some("{\n    id: string;\n}".to_owned())
+            declared_alias_of("type Shape = {\n    id: string;\n}"),
+            DeclaredAlias::Opened("{\n    id: string;\n}".to_owned())
         );
     }
 
     #[test]
-    fn test_resolved_type_of_an_interface_declaration_is_not_read_as_an_alias() {
+    fn test_declared_alias_of_an_interface_declaration_is_not_read_as_an_alias() {
         // 対照は最初のテスト。`interface` には右辺が無いので、開く先が無い
-        assert_eq!(resolved_type_of("interface User"), None);
+        assert_eq!(
+            declared_alias_of("interface User"),
+            DeclaredAlias::NotAnAlias
+        );
     }
 
     #[test]
-    fn test_resolved_type_of_a_class_declaration_is_not_read_as_an_alias() {
-        assert_eq!(resolved_type_of("class Invoice"), None);
+    fn test_declared_alias_of_a_class_declaration_is_not_read_as_an_alias() {
+        assert_eq!(
+            declared_alias_of("class Invoice"),
+            DeclaredAlias::NotAnAlias
+        );
     }
 
     #[test]
-    fn test_resolved_type_of_an_alias_taking_type_arguments_is_not_opened() {
-        // 右辺を `Box<string>` の位置へ差し込むと `{ value: T; }<string>` になる。
+    fn test_declared_alias_of_an_alias_taking_type_arguments_cannot_be_opened() {
+        // 対照は 1 つ上のテスト（`interface`）。**右辺はある**ので、開けなかったのと
+        // 開く先が無いのを同じにすると、綴りのまま比べた結果を答えとして出してしまう。
+        // 右辺を `Box<string>` の位置へ差し込むと `{ value: T; }<string>` になるので、
         // 型引数の当てはめには型そのものの構文解析が要る
-        assert_eq!(resolved_type_of("type Box<T> = { value: T; }"), None);
+        assert_eq!(
+            declared_alias_of("type Box<T> = { value: T; }"),
+            DeclaredAlias::Unopenable
+        );
     }
 
     #[test]
-    fn test_resolved_type_of_a_name_that_only_starts_with_the_keyword_is_not_read_as_an_alias() {
+    fn test_declared_alias_of_a_name_that_only_starts_with_the_keyword_is_not_read_as_an_alias() {
         // `type` を語として見ないと、`typeof` で始まる綴りを開いてしまう
-        assert_eq!(resolved_type_of("typeof rate = number"), None);
+        assert_eq!(
+            declared_alias_of("typeof rate = number"),
+            DeclaredAlias::NotAnAlias
+        );
     }
 
     #[test]
-    fn test_resolved_type_of_an_alias_without_a_right_hand_side_is_not_read() {
-        // 空の綴りを解決結果にすると、差し込んだ先の型が消える
-        assert_eq!(resolved_type_of("type Amount = "), None);
+    fn test_declared_alias_of_an_alias_without_a_right_hand_side_cannot_be_opened() {
+        // 空の綴りを解決結果にすると、差し込んだ先の型が消える。**エイリアスではある**ので、
+        // 綴りのまま比べてよい `interface` とは分ける
+        assert_eq!(
+            declared_alias_of("type Amount = "),
+            DeclaredAlias::Unopenable
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@ use crate::classification::verdict::Verdict;
 use crate::location::Location;
 use crate::pipeline::{Scan, SkippedFile};
 use crate::semantics::caller_domain::CallerDomains;
+use crate::semantics::resolved_type::UnopenedReason;
 use crate::syntax::module_distance::ModuleDistance;
 use crate::threshold::Threshold;
 
@@ -219,11 +220,39 @@ fn type_signature_text_of(signal: TypeSignatureMatch) -> Option<&'static str> {
         TypeSignatureMatch::UnreadableHover => Some("測れない (hover の応答を読めない)"),
         TypeSignatureMatch::UnreadableSignature => Some("測れない (返った綴りを読み解けない)"),
         TypeSignatureMatch::HoverNotProvided => Some("測れない (サーバが hover を提供していない)"),
-        TypeSignatureMatch::TypeDefinitionNotProvided => {
-            Some("測れない (サーバが typeDefinition を提供していない)")
+        TypeSignatureMatch::UnopenedTypeName { reason } => Some(unopened_text_of(reason)),
+    }
+}
+
+/// 比較に残る型名を開けなかった理由。
+///
+/// **理由まで出す。** どれなのかで利用者が次にすることが違う
+/// （`semantics::resolved_type::UnopenedReason`）。
+fn unopened_text_of(reason: UnopenedReason) -> &'static str {
+    match reason {
+        UnopenedReason::TypeDefinitionNotProvided => {
+            "測れない (比較に残る型名を開けない: サーバが typeDefinition を提供していない)"
         }
-        TypeSignatureMatch::UnreadableTypeDefinition => {
-            Some("測れない (typeDefinition の応答を読めない)")
+        UnopenedReason::NoDeclarationSite => {
+            "測れない (比較に残る型名を開けない: サーバが宣言の場所を答えない)"
+        }
+        UnopenedReason::UnreadableTypeDefinition => {
+            "測れない (比較に残る型名を開けない: typeDefinition の応答を読めない)"
+        }
+        UnopenedReason::UnreadableDeclaringDocument => {
+            "測れない (比較に残る型名を開けない: 宣言のファイルを読めない)"
+        }
+        UnopenedReason::NoSpellingAtDeclaration => {
+            "測れない (比較に残る型名を開けない: サーバが宣言の位置に型を持たない)"
+        }
+        UnopenedReason::UnreadableDeclarationHover => {
+            "測れない (比較に残る型名を開けない: 宣言の位置の hover の応答を読めない)"
+        }
+        UnopenedReason::HoverNotProvided => {
+            "測れない (比較に残る型名を開けない: サーバが hover を提供していない)"
+        }
+        UnopenedReason::UnopenableAlias => {
+            "測れない (比較に残る型名を開けない: エイリアスの右辺を差し込める形にできない)"
         }
     }
 }
@@ -668,11 +697,13 @@ mod tests {
     }
 
     #[test]
-    fn test_text_of_without_type_definition_says_so_instead_of_calling_the_pair_not_unifiable() {
-        // 対照は上のテスト（単一化不能と言い切る場合）。**型名を 1 つも開けていないのに
+    fn test_text_of_with_an_unopened_type_name_says_so_instead_of_calling_the_pair_not_unifiable() {
+        // 対照は上のテスト（単一化不能と言い切る場合）。**比較に残る型名を開けていないのに
         // 「単一化不能」と出すと、確かめられなかったことが答えとして読まれる**
         let text = text_of_accidental_duplication_with_semantics(
-            TypeSignatureMatch::TypeDefinitionNotProvided,
+            TypeSignatureMatch::UnopenedTypeName {
+                reason: UnopenedReason::TypeDefinitionNotProvided,
+            },
             CallerDomainOverlap::Unavailable {
                 reason: SemanticsUnavailable::NotAsked,
             },
@@ -680,7 +711,7 @@ mod tests {
 
         assert!(
             text.contains(
-                "型シグネチャ: 測れない (サーバが typeDefinition を提供していない) → どちらでもない"
+                "型シグネチャ: 測れない (比較に残る型名を開けない: サーバが typeDefinition を提供していない) → どちらでもない"
             ),
             "開けなかったことが理由として出る: {text}"
         );
@@ -691,7 +722,9 @@ mod tests {
         // 対照は 1 つ上のテスト（サーバが提供していない場合）。**サーバは宣言を持っており、
         // 読めないのはこちら側の穴**なので、直す先が違う
         let text = text_of_accidental_duplication_with_semantics(
-            TypeSignatureMatch::UnreadableTypeDefinition,
+            TypeSignatureMatch::UnopenedTypeName {
+                reason: UnopenedReason::UnreadableTypeDefinition,
+            },
             CallerDomainOverlap::Unavailable {
                 reason: SemanticsUnavailable::NotAsked,
             },
@@ -699,7 +732,7 @@ mod tests {
 
         assert!(
             text.contains(
-                "型シグネチャ: 測れない (typeDefinition の応答を読めない) → どちらでもない"
+                "型シグネチャ: 測れない (比較に残る型名を開けない: typeDefinition の応答を読めない) → どちらでもない"
             ),
             "読めなかったことが理由として出る: {text}"
         );

@@ -26,7 +26,7 @@ use crate::lsp::{
 };
 use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outcome_of};
 use crate::semantics::resolved_type::{
-    TypeDeclaration, TypeDeclarationsOutcome, resolved_types_of, type_declarations_of,
+    TypeDeclaration, UnopenedReason, UnopenedTypeName, opened_type_names_of, traced_type_names_of,
 };
 use crate::semantics::type_signature::{TypeSignatureOutcome, type_signature_outcome_of};
 use crate::source_position::SourcePosition;
@@ -429,22 +429,14 @@ fn resolved_type_signature_outcome_of(
     document: &SourceDocument,
     position: SourcePosition,
 ) -> Result<TypeSignatureOutcome, ClientError> {
-    let declarations = match type_declarations_of(session, document, chunk.type_references())? {
-        TypeDeclarationsOutcome::Located(declarations) => declarations,
-        TypeDeclarationsOutcome::TypeDefinitionNotProvided => {
-            return Ok(TypeSignatureOutcome::TypeDefinitionNotProvided);
-        }
-        TypeDeclarationsOutcome::UnreadableTypeDefinition => {
-            return Ok(TypeSignatureOutcome::UnreadableTypeDefinition);
-        }
-    };
-    open_declaring_documents(session, &declarations)?;
-    let resolved = resolved_types_of(session, &declarations)?;
+    let traced = traced_type_names_of(session, document, chunk.type_references())?;
+    let unopened = unopened_declaring_documents_of(session, traced.declared())?;
+    let traced = opened_type_names_of(session, traced.with_unopened(unopened))?;
 
-    type_signature_outcome_of(session, document, position, &resolved, &declarations)
+    type_signature_outcome_of(session, document, position, &traced)
 }
 
-/// 型が宣言されているファイルを開かせる。
+/// 型が宣言されているファイルを開かせて、開かせられなかった型名を返す。
 ///
 /// **開かせないと宣言の綴りが返らない。** サーバは開かせていないファイルへの hover に
 /// 綴りを持たない応答を返す（typescript-language-server 6.0.0 で実測）。
@@ -462,30 +454,41 @@ fn resolved_type_signature_outcome_of(
 /// 兄弟ディレクトリで宣言されたエイリアスが解決できず、この Issue が直したかった
 /// 偽陰性がそのまま残る。
 ///
-/// 読めなかったファイルは飛ばす。**その型名が解決されないまま残るだけ**で、
-/// 比較は綴りのまま続く（今までと同じ形）。
+/// **読めなかったファイルの型名は、開けなかったものとして返す。** 飛ばして黙っていると、
+/// 綴りのまま比べた結果を答えとして出すことになる（`rules/architecture.md`
+/// 「取れなかったシグナルを既定値で埋めない」）。それを答えに出すかどうかは、
+/// **その型名が比較に残る綴りに現れるか**で決まる（`semantics::type_signature`）。
 ///
 /// # Errors
 ///
 /// 開かせる要求の送信が失敗したとき。
-fn open_declaring_documents(
+fn unopened_declaring_documents_of(
     session: &mut Session,
     declarations: &[TypeDeclaration],
-) -> Result<(), ClientError> {
+) -> Result<Vec<UnopenedTypeName>, ClientError> {
+    let mut unopened = Vec::new();
+
     for declaration in declarations {
         let path = declaration.site().path();
 
-        let Ok(text) = source_of(path) else {
-            continue;
-        };
-        let Ok(document) = SourceDocument::new(path, text) else {
+        // 読めないのと `file:` URI にできないのは、どちらも「そのファイルを
+        // 開かせられなかった」。直す先が同じなので分けない。
+        let opened = source_of(path)
+            .ok()
+            .and_then(|text| SourceDocument::new(path, text).ok());
+
+        let Some(document) = opened else {
+            unopened.push(UnopenedTypeName::new(
+                declaration.name().to_owned(),
+                UnopenedReason::UnreadableDeclaringDocument,
+            ));
             continue;
         };
 
         session.open_document(&document)?;
     }
 
-    Ok(())
+    Ok(unopened)
 }
 
 /// 4 つの問い合わせの結果を、シグナルと落ちた理由にまとめる。
@@ -578,13 +581,9 @@ fn type_signature_match_of(
         | (_, TypeSignatureOutcome::UnreadableSignature) => TypeSignatureMatch::UnreadableSignature,
         (TypeSignatureOutcome::HoverNotProvided, _)
         | (_, TypeSignatureOutcome::HoverNotProvided) => TypeSignatureMatch::HoverNotProvided,
-        (TypeSignatureOutcome::TypeDefinitionNotProvided, _)
-        | (_, TypeSignatureOutcome::TypeDefinitionNotProvided) => {
-            TypeSignatureMatch::TypeDefinitionNotProvided
-        }
-        (TypeSignatureOutcome::UnreadableTypeDefinition, _)
-        | (_, TypeSignatureOutcome::UnreadableTypeDefinition) => {
-            TypeSignatureMatch::UnreadableTypeDefinition
+        (TypeSignatureOutcome::UnopenedTypeName { reason }, _)
+        | (_, TypeSignatureOutcome::UnopenedTypeName { reason }) => {
+            TypeSignatureMatch::UnopenedTypeName { reason: *reason }
         }
     }
 }
@@ -1594,8 +1593,8 @@ mod tests {
 
     use crate::classification::DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
     use crate::classification::verdict::Verdict;
-    use crate::semantics::resolved_type::ResolvedTypes;
-    use crate::semantics::type_signature::TypeSignature;
+    use crate::semantics::resolved_type::TracedTypeNames;
+    use crate::semantics::type_signature::normalized_outcome_of;
     use crate::similarity::Similarity;
     use crate::test_support::{line, missing_server, signature_text};
 
@@ -1634,21 +1633,16 @@ mod tests {
 
     /// 正規化できた型シグネチャ。
     fn normalized(text: &str) -> TypeSignatureOutcome {
-        let signature = TypeSignature::from_signature_text(
-            &signature_text(text),
-            &ResolvedTypes::default(),
-            &[],
-        )
-        .expect("テストが渡す綴りは読み取れる");
-
-        TypeSignatureOutcome::Normalized(signature)
+        normalized_outcome_of(&signature_text(text), &TracedTypeNames::default())
     }
 
     #[test]
-    fn test_asked_semantics_do_not_call_a_pair_not_unifiable_without_type_definition() {
-        // 型名を 1 つも開けていないので、綴りのまま比べた結果は答えにならない
+    fn test_asked_semantics_do_not_call_a_pair_not_unifiable_with_an_unopened_type_name() {
+        // 比較に残る型名を開けていないので、綴りのまま比べた結果は答えにならない
         let asked = asked_semantics_of_outcomes(
-            Ok(TypeSignatureOutcome::TypeDefinitionNotProvided),
+            Ok(TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::TypeDefinitionNotProvided,
+            }),
             Ok(normalized("function sumOf(amounts: number[]): number")),
             Ok(CallerDomainsOutcome::NoReferences),
             Ok(CallerDomainsOutcome::NoReferences),
@@ -1656,7 +1650,9 @@ mod tests {
 
         assert_eq!(
             asked.type_signature_match,
-            TypeSignatureMatch::TypeDefinitionNotProvided
+            TypeSignatureMatch::UnopenedTypeName {
+                reason: UnopenedReason::TypeDefinitionNotProvided
+            }
         );
     }
 
@@ -1674,10 +1670,13 @@ mod tests {
     }
 
     #[test]
-    fn test_asked_semantics_do_not_call_a_pair_not_unifiable_with_an_unreadable_type_definition() {
-        // 宣言は返っているが読めていない。開けていれば重なったかもしれない
+    fn test_asked_semantics_carry_the_reason_a_type_name_could_not_be_opened() {
+        // 対照は 2 つ上のテスト（サーバが提供していない場合）。**サーバは宣言を持っており、
+        // 読めないのはこちら側の穴**なので、理由まで運ばないと直す先が入れ替わる
         let asked = asked_semantics_of_outcomes(
-            Ok(TypeSignatureOutcome::UnreadableTypeDefinition),
+            Ok(TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::UnreadableTypeDefinition,
+            }),
             Ok(normalized("function sumOf(amounts: number[]): number")),
             Ok(CallerDomainsOutcome::NoReferences),
             Ok(CallerDomainsOutcome::NoReferences),
@@ -1685,7 +1684,9 @@ mod tests {
 
         assert_eq!(
             asked.type_signature_match,
-            TypeSignatureMatch::UnreadableTypeDefinition
+            TypeSignatureMatch::UnopenedTypeName {
+                reason: UnopenedReason::UnreadableTypeDefinition
+            }
         );
     }
 

@@ -13,7 +13,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use crate::lsp::{ClientError, HoverOutcome, Session, SignatureText, SourceDocument};
-use crate::semantics::resolved_type::{ResolvedTypes, TypeDeclaration};
+use crate::semantics::resolved_type::{
+    ResolvedTypes, TracedTypeNames, TypeDeclaration, UnopenedReason,
+};
 use crate::source_position::SourcePosition;
 use crate::syntax::type_spelling::{
     names_only_types, substitutable_type_name_spans_of, substituted_spelling_of, type_name_spans_of,
@@ -78,28 +80,29 @@ pub enum TypeSignatureOutcome {
     NoTypeThere,
     /// hover の応答を `lsp` が読めなかった。
     UnreadableHover,
-    /// 綴りは返ったが、[`TypeSignature::from_signature_text`] が読み解けなかった。
+    /// 綴りは返ったが、[`normalized_outcome_of`] が読み解けなかった。
     UnreadableSignature,
     /// サーバが hover を提供していない。
     HoverNotProvided,
-    /// サーバが typeDefinition を提供していないので、型名を 1 つも開けなかった。
+    /// **比較に残る綴りに現れる**型名を開けなかった。
     ///
     /// **綴りのまま比べた結果を出さない。** 開けていれば重なったかもしれないので、
     /// 「単一化不能」として出すと確かめられなかったことを答えにしてしまう。
-    TypeDefinitionNotProvided,
-    /// 宣言の場所は返ったが、`lsp` がパスとして読めなかった。
     ///
-    /// **サーバは宣言を持っている。** 読めないのはこちら側の穴なので、宣言が無いのとは
-    /// 分けて出す。
-    UnreadableTypeDefinition,
+    /// **開けなかった型名が比較に残る綴りに現れなければ、ここには来ない**
+    /// (`rules/architecture.md`「どこまでを「取れなかった」に数えるか」)。
+    /// 開けたかどうかは、そのシグネチャの比較に効いたときだけ答えを変える。
+    UnopenedTypeName {
+        /// 開けなかった理由。
+        reason: UnopenedReason,
+    },
 }
 
 /// その位置にある名前の型を尋ねて、正規化した形にする。
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
-/// `Chunk::name_position` が指す識別子の位置。`resolved` は
-/// `semantics::resolved_type` が集めた型エイリアスの右辺、`declarations` は
-/// 同じく集めた型名ごとの宣言の場所。
+/// `Chunk::name_position` が指す識別子の位置。`traced` は
+/// `semantics::resolved_type` が型名を宣言まで辿った結果。
 ///
 /// # Errors
 ///
@@ -110,13 +113,10 @@ pub fn type_signature_outcome_of(
     session: &mut Session,
     document: &SourceDocument,
     position: SourcePosition,
-    resolved: &ResolvedTypes,
-    declarations: &[TypeDeclaration],
+    traced: &TracedTypeNames,
 ) -> Result<TypeSignatureOutcome, ClientError> {
     let outcome = match session.hover(document, position)? {
-        HoverOutcome::Answered(signature_text) => {
-            normalized_outcome_of(&signature_text, resolved, declarations)
-        }
+        HoverOutcome::Answered(signature_text) => normalized_outcome_of(&signature_text, traced),
         HoverOutcome::NoAnswer => TypeSignatureOutcome::NoTypeThere,
         HoverOutcome::Unreadable => TypeSignatureOutcome::UnreadableHover,
         HoverOutcome::NotSupported => TypeSignatureOutcome::HoverNotProvided,
@@ -125,19 +125,62 @@ pub fn type_signature_outcome_of(
     Ok(outcome)
 }
 
-/// 綴りを正規化した結果。読み解けなければ、その旨。
-fn normalized_outcome_of(
+/// 綴りを正規化した結果。読み解けなかった / 開けなかった型名が残ったなら、その旨。
+///
+/// **開けなかった型名を見るのは、正規化した後の綴りに対してだけ**
+/// (`rules/architecture.md`「どこまでを「取れなかった」に数えるか」)。
+/// 差し込みで消えた型名も、正規化で落ちる関数の名前も、比較には残らないので
+/// 答えを変えない。
+pub fn normalized_outcome_of(
     signature_text: &SignatureText,
-    resolved: &ResolvedTypes,
-    declarations: &[TypeDeclaration],
+    traced: &TracedTypeNames,
 ) -> TypeSignatureOutcome {
-    let Some(signature) =
-        TypeSignature::from_signature_text(signature_text, resolved, declarations)
+    let Some(normalized) = NormalizedSignature::from_signature_text(signature_text, traced) else {
+        return unreadable_outcome_of(signature_text, traced);
+    };
+
+    // 名前順で先に来るものを出す。尋ねた順に任せると、同じ綴りが巡ごとに違う理由を出す。
+    let unopened = normalized
+        .remaining_type_names
+        .iter()
+        .find_map(|name| traced.unopened_reason_of(name));
+
+    if let Some(reason) = unopened {
+        return TypeSignatureOutcome::UnopenedTypeName { reason };
+    }
+
+    TypeSignatureOutcome::Normalized(normalized.signature)
+}
+
+/// 正規化できなかった綴りの答え。開けなかった型名のせいで読めないなら、その理由。
+///
+/// **シグネチャ全体が 1 つの型名に置き換わっている形（`const halved: Scaling`）は、
+/// その型名を開けないと引数リストが現れず割れない。** 読めなかったこととして出すと、
+/// **利用者は dryguard 側の穴だと読む**（直す先は「その型名を開けるようにする」なのに）。
+///
+/// **割れる綴りは見ない。** そこで読めなかった原因は注釈の外（壊れた引数の綴りなど）に
+/// あり、注釈に書かれた型名を理由にすると別の原因を答えることになる（[`annotation_of`]）。
+fn unreadable_outcome_of(
+    signature_text: &SignatureText,
+    traced: &TracedTypeNames,
+) -> TypeSignatureOutcome {
+    let Some(reason) = unopened_annotation_reason_of(&flattened(signature_text.as_str()), traced)
     else {
         return TypeSignatureOutcome::UnreadableSignature;
     };
 
-    TypeSignatureOutcome::Normalized(signature)
+    TypeSignatureOutcome::UnopenedTypeName { reason }
+}
+
+/// 注釈に書かれた型名のうち、開けなかったものの理由。開けていれば `None`。
+///
+/// 名前順で先に来るものを出す（[`normalized_outcome_of`] と同じ理由）。
+fn unopened_annotation_reason_of(text: &str, traced: &TracedTypeNames) -> Option<UnopenedReason> {
+    let (_, annotated) = annotation_of(text)?;
+
+    declared_type_names_of(annotated)?
+        .iter()
+        .find_map(|name| traced.unopened_reason_of(name))
 }
 
 /// 単一化の可否を比べられる形に直した型シグネチャ。
@@ -165,12 +208,23 @@ pub struct TypeSignature {
     declarations: Vec<TypeDeclaration>,
 }
 
-impl TypeSignature {
+/// 正規化した型シグネチャと、**比較に残る綴りに現れた型名**。
+///
+/// **2 つを一緒に返す。** 残った型名が分かるのは正規化の途中だけだが、
+/// 開けなかった型名がそこに現れたかを決めるのに要る。
+/// [`TypeSignature`] に持たせると、**開けたかどうかで単一化の可否が変わってしまう**。
+struct NormalizedSignature {
+    signature: TypeSignature,
+    /// 名前順。並びを綴りに任せると、同じ 2 つが尋ねた順で違う理由を出す。
+    remaining_type_names: BTreeSet<String>,
+}
+
+impl NormalizedSignature {
     /// hover が返した綴りから組み立てる。
     ///
     /// `text` は hover が返した綴り。サーバごとに宣言形（`function decl(a: string): number`）と
     /// 値形（`const arrow: (a: string) => number`）の 2 通りがあり、どちらも同じ形へ直す。
-    /// `resolved` は型エイリアスの右辺で、綴りを読む前に差し込む。
+    /// `traced` が持つ型エイリアスの右辺を、綴りを読む前に差し込む。
     ///
     /// 引数リストと戻り値の型を読み取れない綴りでは `None`。**空の引数リストで
     /// 埋めない**ので、後段は「引数が無い関数」と「読めなかった」を区別できる
@@ -181,15 +235,8 @@ impl TypeSignature {
     /// （[`SplitSignature::to_function_type`]）。ただしシグネチャ全体がエイリアスに
     /// 置き換わる形（`const aliased: Handler`）は引数リストを持たず**割れない**ので、
     /// そこだけ割る前に開く（[`opened_annotation_of`]）。
-    ///
-    /// `declarations` は `semantics::resolved_type` が集めた型名ごとの宣言の場所。
-    /// **持ち回すのは、差し込んだ後の綴りに残った名前の分だけ**
-    /// （[`remaining_declarations_of`]）。
-    pub fn from_signature_text(
-        text: &SignatureText,
-        resolved: &ResolvedTypes,
-        declarations: &[TypeDeclaration],
-    ) -> Option<Self> {
+    fn from_signature_text(text: &SignatureText, traced: &TracedTypeNames) -> Option<Self> {
+        let resolved = traced.resolved();
         let opened = opened_annotation_of(&flattened(text.as_str()), resolved);
         let written = SplitSignature::from_spelling(&opened)?;
 
@@ -213,16 +260,15 @@ impl TypeSignature {
 
         // 型が書かれる場所だけを渡す。綴り全体を渡すと、正規化で落ちる関数の名前
         // （`function Amount<T>(…)`）を型名として数える。
-        let remaining = remaining_declarations_of(
+        let remaining_type_names = remaining_type_names_of(
             declared
                 .iter()
                 .flat_map(DeclaredTypeParameter::annotated_types)
                 .chain(parameters.iter().map(Parameter::annotated_type))
                 .chain(std::iter::once(return_type.as_str())),
-            declarations,
         )?;
 
-        Some(Self {
+        let signature = TypeSignature {
             kind,
             type_parameters: placeholders.type_parameters(&declared)?,
             parameters: parameters
@@ -230,10 +276,17 @@ impl TypeSignature {
                 .map(|parameter| parameter.renamed(&placeholders))
                 .collect::<Option<Vec<Parameter>>>()?,
             return_type: placeholders.renamed(&return_type)?,
-            declarations: remaining,
+            declarations: declarations_named_in(&remaining_type_names, traced.declared()),
+        };
+
+        Some(Self {
+            signature,
+            remaining_type_names,
         })
     }
+}
 
+impl TypeSignature {
     /// 2 つの型シグネチャが同じ型構造に重なるか。
     ///
     /// 引数名と型変数名の違いは正規化の時点で消えているので、ここでは形が同じかを見る。
@@ -247,40 +300,43 @@ impl TypeSignature {
     }
 }
 
-/// 比較に残る型の綴りに現れる型名の宣言だけを、名前順に選び出す。
+/// 比較に残る型の綴りに現れる型名を、名前順に集める。
 /// 型として読めない綴りが混じっていれば `None`。
 ///
-/// `types` は正規化後に残る型の綴り（型変数の制約と既定の型・引数の型・戻り値の型）、
-/// `declarations` はそのチャンクのシグネチャに書かれた型名について尋ねた宣言。
+/// `types` は正規化後に残る型の綴り（型変数の制約と既定の型・引数の型・戻り値の型）。
 ///
-/// **見るのは差し込んだ後の綴り。** 差し込みで消えた名前まで持つと、どちらも `number` に
+/// **見るのは差し込んだ後の綴り。** 差し込みで消えた名前まで数えると、どちらも `number` に
 /// 開かれた 2 つが宣言の場所の違いで別物になり、**エイリアスを開いた意味が消える**。
 ///
 /// **Why not（シグネチャ全体の綴りを渡す）**: そこには正規化で落ちる関数の名前が
 /// 含まれる。名前が型名と同じ綴りで型引数を取ると（`function Amount<T>(…)`）、
 /// **比較には残らない綴りを根拠に別物と答える**ことになる。
-fn remaining_declarations_of<'a>(
-    types: impl Iterator<Item = &'a str>,
-    declarations: &[TypeDeclaration],
-) -> Option<Vec<TypeDeclaration>> {
+fn remaining_type_names_of<'a>(types: impl Iterator<Item = &'a str>) -> Option<BTreeSet<String>> {
     let mut remaining = BTreeSet::new();
     for spelling in types {
         remaining.extend(declared_type_names_of(spelling)?);
     }
 
-    // 名前順の集合から引く。**並びを宣言の側に任せない**（型名が書かれた順のままだと、
-    // 同じ 2 つが並びの違いで等しくなくなる余地が残る）。
-    Some(
-        remaining
-            .iter()
-            .filter_map(|name| {
-                declarations
-                    .iter()
-                    .find(|declaration| declaration.name() == name.as_str())
-            })
-            .cloned()
-            .collect(),
-    )
+    Some(remaining)
+}
+
+/// その型名たちの宣言だけを、名前順に選び出す。
+///
+/// **並びを宣言の側に任せない**（型名が書かれた順のままだと、同じ 2 つが並びの違いで
+/// 等しくなくなる余地が残る）。
+fn declarations_named_in(
+    names: &BTreeSet<String>,
+    declarations: &[TypeDeclaration],
+) -> Vec<TypeDeclaration> {
+    names
+        .iter()
+        .filter_map(|name| {
+            declarations
+                .iter()
+                .find(|declaration| declaration.name() == name.as_str())
+        })
+        .cloned()
+        .collect()
 }
 
 /// 呼び出しの仕方。
@@ -502,20 +558,13 @@ fn opened_spelling_of(spelling: &str, resolved: &ResolvedTypes) -> Option<String
 /// [`SplitSignature`] が割れない**。割れた綴りには手を触れない。
 ///
 /// **開けなければ元の綴りを返す。** ここで読めなかった綴りは割る側でも割れないので、
-/// [`TypeSignature::from_signature_text`] が `None` を返す。**読めなかったことは
+/// [`NormalizedSignature::from_signature_text`] が `None` を返す。**読めなかったことは
 /// そこで出る**ので、この段で握りつぶしたことにはならない。
 ///
 /// **Why not（いつでも注釈を開いてから割る）**: 割れる綴りでは、引数と戻り値が
 /// それぞれ型 1 つ分として開かれる。手前でまとめて開くと同じ綴りを二度開くことになる。
 fn opened_annotation_of(text: &str, resolved: &ResolvedTypes) -> String {
-    if SplitSignature::from_spelling(text).is_some() {
-        return text.to_owned();
-    }
-
-    let annotated = SignatureScan::new(text)
-        .top_level_index_of(':')
-        .and_then(|separator| Some((text.get(..=separator)?, text.get(separator + 1..)?)));
-    let Some((named, annotated)) = annotated else {
+    let Some((named, annotated)) = annotation_of(text) else {
         return text.to_owned();
     };
     let Some(opened) = opened_spelling_of(annotated, resolved) else {
@@ -523,6 +572,21 @@ fn opened_annotation_of(text: &str, resolved: &ResolvedTypes) -> String {
     };
 
     format!("{named}{opened}")
+}
+
+/// シグネチャ全体が 1 つの型に置き換わっている綴りを、名前までの部分と型の部分に割る。
+///
+/// 引数リストを持つ綴り（[`SplitSignature`] が割れる）と、top level に `:` を持たない
+/// 綴りでは `None`。**開く側と、開けなかった理由を引く側が同じ判断を要る**ので、
+/// どちらにも同じ割り方を書かない。
+fn annotation_of(text: &str) -> Option<(&str, &str)> {
+    if SplitSignature::from_spelling(text).is_some() {
+        return None;
+    }
+
+    let separator = SignatureScan::new(text).top_level_index_of(':')?;
+
+    Some((text.get(..=separator)?, text.get(separator + 1..)?))
 }
 
 /// その綴りが、どこに書かれていても同じ型を指すか。
@@ -1061,27 +1125,170 @@ impl Placeholders {
 mod tests {
     use super::*;
 
+    use crate::semantics::resolved_type::UnopenedTypeName;
     use crate::test_support::{declaration_site, signature_text};
 
-    /// テストが渡す綴りは読み取れる前提で組み立てる。解決した型名は無い。
+    /// テストが渡す綴りは読み取れる前提で組み立てる。辿った型名は無い。
     fn signature(text: &str) -> TypeSignature {
-        signature_with(text, &ResolvedTypes::default())
+        signature_tracing(text, &TracedTypeNames::default())
     }
 
     /// 解決した型名を差し込んでから組み立てる。
     fn signature_with(text: &str, resolved: &ResolvedTypes) -> TypeSignature {
-        TypeSignature::from_signature_text(&signature_text(text), resolved, &[])
-            .expect("テストが渡す綴りは読み取れる")
+        signature_tracing(
+            text,
+            &TracedTypeNames::default().with_resolved(resolved.clone()),
+        )
     }
 
     /// 綴りに書かれた型名の宣言まで持たせて組み立てる。
     fn signature_declaring(text: &str, declarations: &[TypeDeclaration]) -> TypeSignature {
-        TypeSignature::from_signature_text(
-            &signature_text(text),
-            &ResolvedTypes::default(),
-            declarations,
+        signature_tracing(
+            text,
+            &TracedTypeNames::new(declarations.to_vec(), Vec::new()),
         )
-        .expect("テストが渡す綴りは読み取れる")
+    }
+
+    /// 型名を辿った結果を渡して組み立てる。
+    fn signature_tracing(text: &str, traced: &TracedTypeNames) -> TypeSignature {
+        let TypeSignatureOutcome::Normalized(signature) =
+            normalized_outcome_of(&signature_text(text), traced)
+        else {
+            panic!("テストが渡す綴りは読み取れる: {text}");
+        };
+
+        signature
+    }
+
+    /// その綴りを読み解けなかったか。
+    fn unreadable(text: &str) -> bool {
+        normalized_outcome_of(&signature_text(text), &TracedTypeNames::default())
+            == TypeSignatureOutcome::UnreadableSignature
+    }
+
+    /// 型名 1 つ分を、宣言まで辿って開いた結果。
+    fn tracing_one(name: &str, spelling: &str, path: &str) -> TracedTypeNames {
+        TracedTypeNames::new(vec![declared(name, path, 1)], Vec::new())
+            .with_resolved(resolving(name, spelling))
+    }
+
+    /// 開けなかった型名 1 つ分。
+    fn unopened(name: &str, reason: UnopenedReason) -> UnopenedTypeName {
+        UnopenedTypeName::new(name.to_owned(), reason)
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_keeping_an_unopened_type_name_is_unmeasurable() {
+        // 開けていれば重なったかもしれないので、綴りのまま比べた結果を答えにしない
+        let traced = TracedTypeNames::default()
+            .with_unopened(vec![unopened("Amount", UnopenedReason::NoDeclarationSite)]);
+
+        assert_eq!(
+            normalized_outcome_of(
+                &signature_text("function halve(amount: Amount): Amount"),
+                &traced
+            ),
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::NoDeclarationSite
+            }
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_without_the_unopened_type_name_is_normalized() {
+        // 対照は上のテスト。同じ型名が同じ理由で開けなくても、比較に残る綴りに
+        // 現れなければ答えを変えない
+        let traced = TracedTypeNames::default()
+            .with_unopened(vec![unopened("Amount", UnopenedReason::NoDeclarationSite)]);
+
+        assert_eq!(
+            normalized_outcome_of(
+                &signature_text("function halve(value: number): number"),
+                &traced
+            ),
+            TypeSignatureOutcome::Normalized(signature("function halve(value: number): number"))
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_opening_the_type_name_is_normalized() {
+        // 差し込みで綴りから消えた型名は、比較に残らないので測れないにしない
+        let traced = TracedTypeNames::default()
+            .with_resolved(resolving("Amount", "number"))
+            .with_unopened(vec![unopened("Total", UnopenedReason::NoDeclarationSite)]);
+
+        assert_eq!(
+            normalized_outcome_of(
+                &signature_text("function halve(amount: Amount): number"),
+                &traced
+            ),
+            TypeSignatureOutcome::Normalized(signature("function halve(amount: number): number"))
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_named_like_an_unopened_type_is_normalized() {
+        // 関数の名前は正規化で落ちる。比較に残らない綴りを根拠に測れないと答えない
+        let traced = TracedTypeNames::default()
+            .with_unopened(vec![unopened("Amount", UnopenedReason::NoDeclarationSite)]);
+
+        assert_eq!(
+            normalized_outcome_of(&signature_text("function Amount<T>(value: T): T"), &traced),
+            TypeSignatureOutcome::Normalized(signature("function Amount<T>(value: T): T"))
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_two_unopened_type_names_answers_by_name_order() {
+        // 尋ねた順に任せると、同じ綴りが巡ごとに違う理由を出す
+        let traced = TracedTypeNames::default().with_unopened(vec![
+            unopened("Total", UnopenedReason::UnreadableTypeDefinition),
+            unopened("Amount", UnopenedReason::NoDeclarationSite),
+        ]);
+
+        assert_eq!(
+            normalized_outcome_of(
+                &signature_text("function halve(amount: Amount): Total"),
+                &traced
+            ),
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::NoDeclarationSite
+            }
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_whole_signature_alias_that_is_unopened_says_why() {
+        // 呼び出し可能なエイリアスが注釈全体を占める綴りは、**開けないと引数リストが
+        // 現れず割れない**。読み解けなかったこととして出すと、直す先が
+        // 「その型名を開けるようにする」ではなく dryguard 側の穴に見える
+        let traced = TracedTypeNames::default().with_unopened(vec![unopened(
+            "Scaling",
+            UnopenedReason::TypeDefinitionNotProvided,
+        )]);
+
+        assert_eq!(
+            normalized_outcome_of(&signature_text("const halveAmount: Scaling"), &traced),
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::TypeDefinitionNotProvided
+            }
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_an_unreadable_spelling_is_not_read_as_an_unopened_type_name() {
+        // 対照は上のテスト。割れる綴りが読めないのは注釈の外に原因があるので、
+        // 別の型名が開けていないことを理由にすると、別の原因を答えることになる
+        let traced = TracedTypeNames::default()
+            .with_unopened(vec![unopened("Amount", UnopenedReason::NoDeclarationSite)]);
+
+        assert_eq!(
+            normalized_outcome_of(
+                &signature_text("function broken(x: { id string }): Amount"),
+                &traced
+            ),
+            TypeSignatureOutcome::UnreadableSignature
+        );
     }
 
     /// 型名 1 つ分の宣言。
@@ -1348,40 +1555,19 @@ mod tests {
     #[test]
     fn test_a_signature_without_a_parameter_list_cannot_be_read() {
         // 型エイリアスなど、関数でないものへの hover はこの形で返る
-        assert_eq!(
-            TypeSignature::from_signature_text(
-                &signature_text("type UserId = string"),
-                &ResolvedTypes::default(),
-                &[]
-            ),
-            None
-        );
+        assert!(unreadable("type UserId = string"));
     }
 
     #[test]
     fn test_a_signature_without_a_return_type_cannot_be_read() {
-        assert_eq!(
-            TypeSignature::from_signature_text(
-                &signature_text("function decl(a: string)"),
-                &ResolvedTypes::default(),
-                &[]
-            ),
-            None
-        );
+        assert!(unreadable("function decl(a: string)"));
     }
 
     #[test]
     fn test_a_parameter_without_a_type_annotation_cannot_be_read() {
         // 名前だけの引数からは型を取り出せない。空の型で埋めると、
         // 型注釈の無い引数どうしが「同じ型」として重なる
-        assert_eq!(
-            TypeSignature::from_signature_text(
-                &signature_text("function decl(a, b: string): void"),
-                &ResolvedTypes::default(),
-                &[]
-            ),
-            None
-        );
+        assert!(unreadable("function decl(a, b: string): void"));
     }
 
     #[test]
@@ -1448,41 +1634,20 @@ mod tests {
     #[test]
     fn test_a_signature_that_is_nothing_but_an_unresolved_alias_cannot_be_read() {
         // 対照は上のテスト。解決が無ければ引数リストが見つからない
-        assert_eq!(
-            TypeSignature::from_signature_text(
-                &signature_text("const halveAmount: Scaling"),
-                &ResolvedTypes::default(),
-                &[]
-            ),
-            None
-        );
+        assert!(unreadable("const halveAmount: Scaling"));
     }
 
     #[test]
     fn test_a_signature_holding_a_spelling_that_does_not_read_as_a_type_cannot_be_read() {
         // 型として読めない綴りの上では、どこが型名かを確かめられない。**綴りのまま比べた
         // 結果を答えにしない**（`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」）
-        assert_eq!(
-            TypeSignature::from_signature_text(
-                &signature_text("function broken(x: { id string }): void"),
-                &ResolvedTypes::default(),
-                &[]
-            ),
-            None
-        );
+        assert!(unreadable("function broken(x: { id string }): void"));
     }
 
     #[test]
     fn test_a_signature_holding_the_same_shape_written_correctly_is_read() {
         // 対照は上のテスト。違うのはメンバーの `:` 1 文字だけ
-        assert!(
-            TypeSignature::from_signature_text(
-                &signature_text("function whole(x: { id: string }): void"),
-                &ResolvedTypes::default(),
-                &[]
-            )
-            .is_some()
-        );
+        assert!(!unreadable("function whole(x: { id: string }): void"));
     }
 
     #[test]
@@ -2105,18 +2270,14 @@ mod tests {
     fn test_a_type_name_opened_into_a_predefined_type_does_not_carry_its_declaration() {
         // 差し込みで消えた名前まで持つと、**どちらも `number` に開かれた 2 つが
         // 宣言の場所の違いで別物になる**（エイリアスを開いた意味が消える）
-        let billing = TypeSignature::from_signature_text(
-            &signature_text("function scaleAmount(amount: Amount): Amount"),
-            &resolving("Amount", "number"),
-            &[declared("Amount", "/repo/src/billing/money.ts", 1)],
-        )
-        .expect("テストが渡す綴りは読み取れる");
-        let report = TypeSignature::from_signature_text(
-            &signature_text("function scaleTotal(total: Amount): Amount"),
-            &resolving("Amount", "number"),
-            &[declared("Amount", "/repo/src/report/money.ts", 1)],
-        )
-        .expect("テストが渡す綴りは読み取れる");
+        let billing = signature_tracing(
+            "function scaleAmount(amount: Amount): Amount",
+            &tracing_one("Amount", "number", "/repo/src/billing/money.ts"),
+        );
+        let report = signature_tracing(
+            "function scaleTotal(total: Amount): Amount",
+            &tracing_one("Amount", "number", "/repo/src/report/money.ts"),
+        );
 
         assert!(billing.is_unifiable_with(&report));
     }
@@ -2126,18 +2287,14 @@ mod tests {
         // 対照は上のテスト。**関数の名前は正規化で落ちる**のに、綴り全体を走査すると
         // 型名として数えてしまう（`Amount<T>` の `<` はメソッド名の印ではないため）。
         // 型を書く場所だけを見る形なら、差し込みで消えた `Amount` はどこにも残らない
-        let billing = TypeSignature::from_signature_text(
-            &signature_text("function Amount<T>(value: Amount): T"),
-            &resolving("Amount", "number"),
-            &[declared("Amount", "/repo/src/billing/money.ts", 1)],
-        )
-        .expect("テストが渡す綴りは読み取れる");
-        let report = TypeSignature::from_signature_text(
-            &signature_text("function Amount<T>(value: Amount): T"),
-            &resolving("Amount", "number"),
-            &[declared("Amount", "/repo/src/report/money.ts", 1)],
-        )
-        .expect("テストが渡す綴りは読み取れる");
+        let billing = signature_tracing(
+            "function Amount<T>(value: Amount): T",
+            &tracing_one("Amount", "number", "/repo/src/billing/money.ts"),
+        );
+        let report = signature_tracing(
+            "function Amount<T>(value: Amount): T",
+            &tracing_one("Amount", "number", "/repo/src/report/money.ts"),
+        );
 
         assert!(billing.is_unifiable_with(&report));
     }
