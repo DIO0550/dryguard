@@ -136,7 +136,7 @@ pub fn normalized_outcome_of(
     traced: &TracedTypeNames,
 ) -> TypeSignatureOutcome {
     let Some(normalized) = NormalizedSignature::from_signature_text(signature_text, traced) else {
-        return TypeSignatureOutcome::UnreadableSignature;
+        return unreadable_outcome_of(signature_text, traced);
     };
 
     // 名前順で先に来るものを出す。尋ねた順に任せると、同じ綴りが巡ごとに違う理由を出す。
@@ -150,6 +150,37 @@ pub fn normalized_outcome_of(
     }
 
     TypeSignatureOutcome::Normalized(normalized.signature)
+}
+
+/// 正規化できなかった綴りの答え。開けなかった型名のせいで読めないなら、その理由。
+///
+/// **シグネチャ全体が 1 つの型名に置き換わっている形（`const halved: Scaling`）は、
+/// その型名を開けないと引数リストが現れず割れない。** 読めなかったこととして出すと、
+/// **利用者は dryguard 側の穴だと読む**（直す先は「その型名を開けるようにする」なのに）。
+///
+/// **割れる綴りは見ない。** そこで読めなかった原因は注釈の外（壊れた引数の綴りなど）に
+/// あり、注釈に書かれた型名を理由にすると別の原因を答えることになる（[`annotation_of`]）。
+fn unreadable_outcome_of(
+    signature_text: &SignatureText,
+    traced: &TracedTypeNames,
+) -> TypeSignatureOutcome {
+    let Some(reason) = unopened_annotation_reason_of(&flattened(signature_text.as_str()), traced)
+    else {
+        return TypeSignatureOutcome::UnreadableSignature;
+    };
+
+    TypeSignatureOutcome::UnopenedTypeName { reason }
+}
+
+/// 注釈に書かれた型名のうち、開けなかったものの理由。開けていれば `None`。
+///
+/// 名前順で先に来るものを出す（[`normalized_outcome_of`] と同じ理由）。
+fn unopened_annotation_reason_of(text: &str, traced: &TracedTypeNames) -> Option<UnopenedReason> {
+    let (_, annotated) = annotation_of(text)?;
+
+    declared_type_names_of(annotated)?
+        .iter()
+        .find_map(|name| traced.unopened_reason_of(name))
 }
 
 /// 単一化の可否を比べられる形に直した型シグネチャ。
@@ -533,14 +564,7 @@ fn opened_spelling_of(spelling: &str, resolved: &ResolvedTypes) -> Option<String
 /// **Why not（いつでも注釈を開いてから割る）**: 割れる綴りでは、引数と戻り値が
 /// それぞれ型 1 つ分として開かれる。手前でまとめて開くと同じ綴りを二度開くことになる。
 fn opened_annotation_of(text: &str, resolved: &ResolvedTypes) -> String {
-    if SplitSignature::from_spelling(text).is_some() {
-        return text.to_owned();
-    }
-
-    let annotated = SignatureScan::new(text)
-        .top_level_index_of(':')
-        .and_then(|separator| Some((text.get(..=separator)?, text.get(separator + 1..)?)));
-    let Some((named, annotated)) = annotated else {
+    let Some((named, annotated)) = annotation_of(text) else {
         return text.to_owned();
     };
     let Some(opened) = opened_spelling_of(annotated, resolved) else {
@@ -548,6 +572,21 @@ fn opened_annotation_of(text: &str, resolved: &ResolvedTypes) -> String {
     };
 
     format!("{named}{opened}")
+}
+
+/// シグネチャ全体が 1 つの型に置き換わっている綴りを、名前までの部分と型の部分に割る。
+///
+/// 引数リストを持つ綴り（[`SplitSignature`] が割れる）と、top level に `:` を持たない
+/// 綴りでは `None`。**開く側と、開けなかった理由を引く側が同じ判断を要る**ので、
+/// どちらにも同じ割り方を書かない。
+fn annotation_of(text: &str) -> Option<(&str, &str)> {
+    if SplitSignature::from_spelling(text).is_some() {
+        return None;
+    }
+
+    let separator = SignatureScan::new(text).top_level_index_of(':')?;
+
+    Some((text.get(..=separator)?, text.get(separator + 1..)?))
 }
 
 /// その綴りが、どこに書かれていても同じ型を指すか。
@@ -1219,13 +1258,35 @@ mod tests {
     }
 
     #[test]
+    fn test_normalized_outcome_of_a_whole_signature_alias_that_is_unopened_says_why() {
+        // 呼び出し可能なエイリアスが注釈全体を占める綴りは、**開けないと引数リストが
+        // 現れず割れない**。読み解けなかったこととして出すと、直す先が
+        // 「その型名を開けるようにする」ではなく dryguard 側の穴に見える
+        let traced = TracedTypeNames::default().with_unopened(vec![unopened(
+            "Scaling",
+            UnopenedReason::TypeDefinitionNotProvided,
+        )]);
+
+        assert_eq!(
+            normalized_outcome_of(&signature_text("const halveAmount: Scaling"), &traced),
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::TypeDefinitionNotProvided
+            }
+        );
+    }
+
+    #[test]
     fn test_normalized_outcome_of_an_unreadable_spelling_is_not_read_as_an_unopened_type_name() {
-        // 読み解けなかったのと開けなかったのは、利用者が次にすることが違う
+        // 対照は上のテスト。割れる綴りが読めないのは注釈の外に原因があるので、
+        // 別の型名が開けていないことを理由にすると、別の原因を答えることになる
         let traced = TracedTypeNames::default()
             .with_unopened(vec![unopened("Amount", UnopenedReason::NoDeclarationSite)]);
 
         assert_eq!(
-            normalized_outcome_of(&signature_text("const amount: Amount"), &traced),
+            normalized_outcome_of(
+                &signature_text("function broken(x: { id string }): Amount"),
+                &traced
+            ),
             TypeSignatureOutcome::UnreadableSignature
         );
     }
