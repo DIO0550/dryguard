@@ -290,8 +290,7 @@ fn type_signature_lean_of(signal: TypeSignatureMatch) -> Lean {
         | TypeSignatureMatch::UnreadableHover
         | TypeSignatureMatch::UnreadableSignature
         | TypeSignatureMatch::HoverNotProvided
-        | TypeSignatureMatch::TypeDefinitionNotProvided
-        | TypeSignatureMatch::UnreadableTypeDefinition => Lean::Neither,
+        | TypeSignatureMatch::UnopenedTypeName { .. } => Lean::Neither,
     }
 }
 

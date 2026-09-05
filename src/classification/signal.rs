@@ -5,6 +5,7 @@
 //! 埋めてしまうと、後段も読者も「そういう値だった」と「見ていない」を区別できない。
 
 use crate::semantics::caller_domain::CallerDomains;
+use crate::semantics::resolved_type::UnopenedReason;
 use crate::similarity::Similarity;
 use crate::syntax::module_distance::ModuleDistance;
 
@@ -164,10 +165,15 @@ pub enum TypeSignatureMatch {
     UnreadableSignature,
     /// サーバが hover を提供していない。
     HoverNotProvided,
-    /// サーバが typeDefinition を提供していないので、書かれた型名を 1 つも開けなかった。
-    TypeDefinitionNotProvided,
-    /// typeDefinition の応答を `lsp` が読めなかった。
-    UnreadableTypeDefinition,
+    /// **比較に残る綴りに現れる**型名を開けなかった。
+    ///
+    /// 開けなかった型名が比較に残る綴りに現れなければ、判定は変わらないので
+    /// ここには来ない（`rules/architecture.md`
+    /// 「取れなかったシグナルを既定値で埋めない」の「どこまでを取れなかったに数えるか」）。
+    UnopenedTypeName {
+        /// 開けなかった理由。
+        reason: UnopenedReason,
+    },
 }
 
 /// 呼び出し元ドメインの重なりのシグナル（Stage 2）。

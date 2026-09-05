@@ -23,8 +23,10 @@ use dryguard::lsp::{
 use dryguard::pipeline::{MeasuredPair, chunk_pair_of, measured_pair_of};
 use dryguard::report::text_of;
 use dryguard::semantics::caller_domain::CallerDomains;
-use dryguard::semantics::resolved_type::ResolvedTypes;
-use dryguard::semantics::type_signature::TypeSignature;
+use dryguard::semantics::resolved_type::TracedTypeNames;
+use dryguard::semantics::type_signature::{
+    TypeSignature, TypeSignatureOutcome, normalized_outcome_of,
+};
 use dryguard::syntax::chunk::Chunk;
 
 /// `tests/fixtures/` 配下の位置。
@@ -97,8 +99,8 @@ fn type_signature_of(session: &mut Session, chunk: &Chunk) -> TypeSignature {
     let Ok(HoverOutcome::Answered(signature_text)) = session.hover(&document, position) else {
         panic!("名前の位置には hover が答える: {}", chunk.path().display());
     };
-    let Some(signature) =
-        TypeSignature::from_signature_text(&signature_text, &ResolvedTypes::default(), &[])
+    let TypeSignatureOutcome::Normalized(signature) =
+        normalized_outcome_of(&signature_text, &TracedTypeNames::default())
     else {
         panic!(
             "サーバが返した綴りは読み取れる: {}",
@@ -387,7 +389,7 @@ fn test_compare_with_an_lsp_opens_a_qualified_type_alias() {
 fn test_compare_with_an_lsp_opens_a_type_alias_that_replaces_the_whole_signature() {
     // 呼び出し可能なエイリアスで注釈すると、hover は `const halveAmount: Scaling` と
     // 綴り全体をエイリアス名 1 語で返す。**引数リストが無いので、解決を綴りを読む前に
-    // 差し込まないと入口に入れない**（`from_signature_text` が `None` を返す）
+    // 差し込まないと入口に入れない**（`normalized_outcome_of` が読み解けないと答える）
     let halves_an_amount = fixture("references/src/billing/scale.ts", 7);
     let halves_a_total = fixture("references/src/report/total.ts", 5);
 

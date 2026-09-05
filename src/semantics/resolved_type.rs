@@ -76,29 +76,125 @@ impl ResolvedTypes {
         }
     }
 
-    /// その型名の解決後の綴り。解決できていなければ `None`。
+    /// その型名の解決後の綴り。開けていなければ `None`。
     ///
-    /// `None` は「エイリアスではなかった」と「宣言まで届かなかった」の両方で返る。
-    /// **どちらでも綴りをそのまま比べる**ので、呼び出し側が分ける材料は要らない。
+    /// `None` は「エイリアスではなかった」と「開けなかった」の両方で返る。
+    /// **分けるのは [`TracedTypeNames::unopened_reason_of`] の側**で、ここは
+    /// 差し込む綴りがあるかだけを答える。
     pub fn resolved_of(&self, name: &str) -> Option<&str> {
         self.by_name.get(name).map(String::as_str)
     }
 }
 
-/// 型名の宣言を尋ねた結果。
+/// 型名 1 つを開けなかった理由。
 ///
-/// **サーバが typeDefinition を提供していないことを、宣言が無いのと同じにしない。**
-/// 前者では**どの型名も開けない**ので、綴りのまま比べた結果を「単一化不能」として
-/// 出すと、確かめられなかったことを確かめた答えとして出すことになる
-/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TypeDeclarationsOutcome {
-    /// 尋ね終えた。宣言の場所が返らなかった型名は入らない。
-    Located(Vec<TypeDeclaration>),
+/// **1 つにまとめない。** どれなのかで**利用者が次にすることが違う**（サーバを替える /
+/// そのファイルをプロジェクトに入れる / そのファイルを読めるようにする /
+/// そのチャンクを諦める / dryguard 側の穴）(`rules/coding.md`
+/// 「エラー型は原因ごとにバリアントを分ける」)。
+///
+/// **止まった段ではなく、次にすることで分ける。** typeDefinition の段だけで 3 通りの
+/// 対処に分かれるので、段でまとめると直す先が読めなくなる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnopenedReason {
     /// サーバが typeDefinition を提供していない。
     TypeDefinitionNotProvided,
+    /// サーバが宣言の場所を答えなかった。
+    ///
+    /// **宣言が無いとは限らない。** そのファイルをプロジェクトとして見ていないときにも
+    /// 空が返る（`lsp::TypeDefinitionOutcome::NoAnswer`）ので、サーバの答えとして読まない。
+    NoDeclarationSite,
     /// 宣言の場所は返ったが、パスとして読めない URI だった。
     UnreadableTypeDefinition,
+    /// 宣言のファイルを読めず、サーバに開かせられなかった。
+    UnreadableDeclaringDocument,
+    /// サーバが宣言の位置に綴りを持たなかった。
+    NoSpellingAtDeclaration,
+    /// 宣言の位置の hover の応答を `lsp` が読めなかった。
+    UnreadableDeclarationHover,
+    /// サーバが hover を提供していない。
+    HoverNotProvided,
+}
+
+/// 開けなかった型名 1 つと、その理由。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnopenedTypeName {
+    name: String,
+    reason: UnopenedReason,
+}
+
+impl UnopenedTypeName {
+    /// 開けなかった型名と、その理由から作る。
+    pub fn new(name: String, reason: UnopenedReason) -> Self {
+        Self { name, reason }
+    }
+
+    /// ソースに書かれた型名の綴り。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// 開けなかった理由。
+    pub fn reason(&self) -> UnopenedReason {
+        self.reason
+    }
+}
+
+/// シグネチャに書かれた型名を、宣言まで辿った結果。
+///
+/// 型名 1 つは、宣言の場所が取れた（[`TracedTypeNames::declared`]）・開いた綴りが取れた
+/// （[`TracedTypeNames::resolved`]）・開けなかった（[`TracedTypeNames::unopened_reason_of`]）の
+/// どれかに入る。
+///
+/// **3 つを 1 つの値で持つ。** 開けた型名は差し込みで綴りから消え、開けなかった型名は
+/// 綴りに残る。**比較に残る綴りに現れたのがどちらだったか**を同じ 1 つの入力から引けないと、
+/// 開けなかったことを答えに出すかどうかが決められない
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TracedTypeNames {
+    declared: Vec<TypeDeclaration>,
+    resolved: ResolvedTypes,
+    unopened: Vec<UnopenedTypeName>,
+}
+
+impl TracedTypeNames {
+    /// 宣言の場所が取れた型名と、そこで開けなかった型名から作る。
+    pub fn new(declared: Vec<TypeDeclaration>, unopened: Vec<UnopenedTypeName>) -> Self {
+        Self {
+            declared,
+            resolved: ResolvedTypes::default(),
+            unopened,
+        }
+    }
+
+    /// 後の段で開けなかった型名を足す。
+    pub fn with_unopened(mut self, unopened: Vec<UnopenedTypeName>) -> Self {
+        self.unopened.extend(unopened);
+        self
+    }
+
+    /// 開けた型名の綴りを持たせる。**足すのではなく置き換える**（開くのは 1 度だけ）。
+    pub fn with_resolved(self, resolved: ResolvedTypes) -> Self {
+        Self { resolved, ..self }
+    }
+
+    /// 宣言の場所が取れた型名。
+    pub fn declared(&self) -> &[TypeDeclaration] {
+        &self.declared
+    }
+
+    /// 開けた型名の、解決後の綴り。
+    pub fn resolved(&self) -> &ResolvedTypes {
+        &self.resolved
+    }
+
+    /// その型名を開けなかった理由。開けていれば `None`。
+    pub fn unopened_reason_of(&self, name: &str) -> Option<UnopenedReason> {
+        self.unopened
+            .iter()
+            .find(|unopened| unopened.name() == name)
+            .map(UnopenedTypeName::reason)
+    }
 }
 
 /// シグネチャに書かれた型名の宣言が、どこにあるかを尋ねる。
@@ -106,71 +202,110 @@ pub enum TypeDeclarationsOutcome {
 /// `document` は先に [`Session::open_document`] で開かせておく。`type_references` は
 /// `Chunk::type_references` が集めた型名。
 ///
-/// **宣言が返らなかった型名は落とす。** その型名が解決できないだけで、残りは解決できるので、
-/// 綴りのまま比較へ進む（今までと同じ形）。
-///
-/// **落とさないのは 2 つ。** サーバが typeDefinition を提供していないとき（どの型名も
-/// 開けない）と、返った URI をパスとして読めなかったとき（**サーバは宣言を持っており、
-/// 読めないのはこちら側の穴**）。どちらも、綴りのまま比べた結果を答えとして出さない
-/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+/// **宣言まで届かなかった型名を、ここでは落とさない。** 落とすかどうかは
+/// **比較に残る綴りに現れるか**で決まり、それが分かるのは正規化した後
+/// （`semantics::type_signature`）(`rules/architecture.md`
+/// 「取れなかったシグナルを既定値で埋めない」)。
 ///
 /// # Errors
 ///
 /// そのドキュメントを開かせていないとき、往復が失敗したとき。
-pub fn type_declarations_of(
+pub fn traced_type_names_of(
     session: &mut Session,
     document: &SourceDocument,
     type_references: &[TypeReference],
-) -> Result<TypeDeclarationsOutcome, ClientError> {
-    let mut declarations = Vec::new();
+) -> Result<TracedTypeNames, ClientError> {
+    let mut declared = Vec::new();
+    let mut unopened = Vec::new();
 
     for reference in type_references {
+        let name = reference.name().to_owned();
+
         match session.type_definition(document, reference.position())? {
             TypeDefinitionOutcome::Answered(site) => {
-                declarations.push(TypeDeclaration::new(reference.name().to_owned(), site));
+                declared.push(TypeDeclaration::new(name, site));
             }
-            TypeDefinitionOutcome::NotSupported => {
-                return Ok(TypeDeclarationsOutcome::TypeDefinitionNotProvided);
+            TypeDefinitionOutcome::NoAnswer => {
+                unopened.push(UnopenedTypeName::new(
+                    name,
+                    UnopenedReason::NoDeclarationSite,
+                ));
             }
             TypeDefinitionOutcome::Unreadable { .. } => {
-                return Ok(TypeDeclarationsOutcome::UnreadableTypeDefinition);
+                unopened.push(UnopenedTypeName::new(
+                    name,
+                    UnopenedReason::UnreadableTypeDefinition,
+                ));
             }
-            // 宣言が無いのはサーバの答えそのもの。読めないのと違い、こちら側の穴ではない。
-            TypeDefinitionOutcome::NoAnswer => continue,
+            TypeDefinitionOutcome::NotSupported => {
+                unopened.push(UnopenedTypeName::new(
+                    name,
+                    UnopenedReason::TypeDefinitionNotProvided,
+                ));
+            }
         }
     }
 
-    Ok(TypeDeclarationsOutcome::Located(declarations))
+    Ok(TracedTypeNames::new(declared, unopened))
 }
 
-/// 宣言の位置へ hover を送り、型エイリアスの右辺を集める。
+/// 宣言の位置へ hover を送り、型エイリアスの右辺を開く。
 ///
-/// `declarations` は [`type_declarations_of`] が返した宣言。**そのファイルは先に
+/// `traced` は [`traced_type_names_of`] が返した結果。**宣言のファイルは先に
 /// 呼び出し側が開かせておく**（開かせていないファイルへの hover は綴りを持たない
-/// 応答になり、その型名は解決されないまま残る）。
+/// 応答になる）。
+///
+/// **エイリアスでなかった型名は落とす。** `interface` / `class` に右辺が無いのは
+/// **サーバの答え**で、開けなかったのとは別物（綴りのまま比べてよい）。
 ///
 /// # Errors
 ///
 /// 往復が失敗したとき。
-pub fn resolved_types_of(
+pub fn opened_type_names_of(
     session: &mut Session,
-    declarations: &[TypeDeclaration],
-) -> Result<ResolvedTypes, ClientError> {
+    traced: TracedTypeNames,
+) -> Result<TracedTypeNames, ClientError> {
     let mut resolutions = Vec::new();
+    let mut unopened = Vec::new();
 
-    for declaration in declarations {
-        let HoverOutcome::Answered(declared) = session.hover_at_declaration(declaration.site())?
-        else {
-            continue;
+    for declaration in traced.declared() {
+        let name = declaration.name().to_owned();
+
+        let declared = match session.hover_at_declaration(declaration.site())? {
+            HoverOutcome::Answered(declared) => declared,
+            HoverOutcome::NoAnswer => {
+                unopened.push(UnopenedTypeName::new(
+                    name,
+                    UnopenedReason::NoSpellingAtDeclaration,
+                ));
+                continue;
+            }
+            HoverOutcome::Unreadable => {
+                unopened.push(UnopenedTypeName::new(
+                    name,
+                    UnopenedReason::UnreadableDeclarationHover,
+                ));
+                continue;
+            }
+            HoverOutcome::NotSupported => {
+                unopened.push(UnopenedTypeName::new(
+                    name,
+                    UnopenedReason::HoverNotProvided,
+                ));
+                continue;
+            }
         };
+
         let Some(resolved) = resolved_type_of(declared.as_str()) else {
             continue;
         };
 
-        resolutions.push((declaration.name().to_owned(), resolved));
+        resolutions.push((name, resolved));
     }
 
-    Ok(ResolvedTypes::new(resolutions))
+    Ok(traced
+        .with_resolved(ResolvedTypes::new(resolutions))
+        .with_unopened(unopened))
 }
 
 /// hover が返した宣言の綴りから、その名前が指す型の綴りを読む。
