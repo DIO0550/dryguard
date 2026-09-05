@@ -251,6 +251,9 @@ fn unopened_text_of(reason: UnopenedReason) -> &'static str {
         UnopenedReason::HoverNotProvided => {
             "測れない (比較に残る型名を開けない: サーバが hover を提供していない)"
         }
+        UnopenedReason::UnopenableAlias => {
+            "測れない (比較に残る型名を開けない: エイリアスの右辺を差し込める形にできない)"
+        }
     }
 }
 

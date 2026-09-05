@@ -114,6 +114,12 @@ pub enum UnopenedReason {
     UnreadableDeclarationHover,
     /// サーバが hover を提供していない。
     HoverNotProvided,
+    /// 宣言は型エイリアスだが、右辺を差し込める形にできなかった。
+    ///
+    /// **サーバは右辺を返している。** 開けないのは dryguard 側の都合（型引数の当てはめが
+    /// 要る `type Box<T> = ...` など）なので、開く先が無い `interface` / `class` とは
+    /// 分けて出す。
+    UnopenableAlias,
 }
 
 /// 開けなかった型名 1 つと、その理由。
@@ -257,6 +263,7 @@ pub fn traced_type_names_of(
 ///
 /// **エイリアスでなかった型名は落とす。** `interface` / `class` に右辺が無いのは
 /// **サーバの答え**で、開けなかったのとは別物（綴りのまま比べてよい）。
+/// **右辺はあるのに差し込めなかった型名は落とさない**（[`DeclaredAlias`]）。
 ///
 /// # Errors
 ///
@@ -296,11 +303,14 @@ pub fn opened_type_names_of(
             }
         };
 
-        let Some(resolved) = resolved_type_of(declared.as_str()) else {
-            continue;
-        };
-
-        resolutions.push((name, resolved));
+        match declared_alias_of(declared.as_str()) {
+            DeclaredAlias::Opened(resolved) => resolutions.push((name, resolved)),
+            // 開く先が無いのはサーバの答え。綴りのまま比べてよい。
+            DeclaredAlias::NotAnAlias => continue,
+            DeclaredAlias::Unopenable => {
+                unopened.push(UnopenedTypeName::new(name, UnopenedReason::UnopenableAlias))
+            }
+        }
     }
 
     Ok(traced
@@ -308,32 +318,55 @@ pub fn opened_type_names_of(
         .with_unopened(unopened))
 }
 
+/// 宣言の綴りを読んだ結果。
+///
+/// **「エイリアスではない」と「エイリアスだが開けない」を分ける。** 前者は
+/// **開く先が無いというサーバの答え**なので綴りのまま比べてよく、後者は
+/// **サーバは右辺を返しているのに dryguard が差し込めていない**ので、
+/// 綴りのまま比べた結果を答えにできない
+/// (`rules/architecture.md`「どこまでを「取れなかった」に数えるか」)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclaredAlias {
+    /// 型エイリアスで、差し込める右辺があった。
+    Opened(String),
+    /// 型エイリアスではなかった（`interface` / `class` / `enum`）。
+    NotAnAlias,
+    /// 型エイリアスだが、右辺を差し込める形にできなかった。
+    Unopenable,
+}
+
 /// hover が返した宣言の綴りから、その名前が指す型の綴りを読む。
 ///
 /// `declared` は宣言の位置へ hover を送って返った綴り（`type Amount = number` /
-/// `interface User` / `class Invoice`）。型エイリアスでなければ `None`。
+/// `interface User` / `class Invoice`）。
 ///
 /// **型引数を取るエイリアスは開かない。** `type Box<T> = { value: T }` の右辺を
 /// `Box<string>` の位置へ差し込むと `{ value: T }<string>` になり、綴りとして壊れる。
-/// 型引数の当てはめには型そのものの構文解析が要る。
+/// 型引数の当てはめには型そのものの構文解析が要る。**開かないだけで、開く先はある**ので
+/// [`DeclaredAlias::Unopenable`] を返す。
 ///
 /// **1 段しか開かない。** `type A = B` の右辺は `B` のままになる。2 段目を開くには
 /// `B` が書かれている位置が要り、それは宣言のあるファイルの中にあるので、
 /// **もう一度そのファイルを構文木にするところから始まる**。
-fn resolved_type_of(declared: &str) -> Option<String> {
-    let aliased = declared.trim().strip_prefix(ALIAS_KEYWORD)?;
-    let (name, resolved) = aliased.split_once(ALIAS_MARKER)?;
+fn declared_alias_of(declared: &str) -> DeclaredAlias {
+    let Some(aliased) = declared.trim().strip_prefix(ALIAS_KEYWORD) else {
+        return DeclaredAlias::NotAnAlias;
+    };
+    // ここから先は `type` の宣言。右辺を読み取れなくても、**開く先が無いのとは別**。
+    let Some((name, resolved)) = aliased.split_once(ALIAS_MARKER) else {
+        return DeclaredAlias::Unopenable;
+    };
 
     if name.contains(TYPE_ARGUMENTS_START) {
-        return None;
+        return DeclaredAlias::Unopenable;
     }
 
     let resolved = resolved.trim();
     if resolved.is_empty() {
-        return None;
+        return DeclaredAlias::Unopenable;
     }
 
-    Some(resolved.to_owned())
+    DeclaredAlias::Opened(resolved.to_owned())
 }
 
 #[cfg(test)]
@@ -341,59 +374,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_resolved_type_of_an_alias_declaration_is_the_spelling_on_its_right() {
+    fn test_declared_alias_of_an_alias_declaration_is_the_spelling_on_its_right() {
         assert_eq!(
-            resolved_type_of("type Amount = number"),
-            Some("number".to_owned())
+            declared_alias_of("type Amount = number"),
+            DeclaredAlias::Opened("number".to_owned())
         );
     }
 
     #[test]
-    fn test_resolved_type_of_an_alias_of_a_function_type_keeps_the_whole_type() {
+    fn test_declared_alias_of_an_alias_of_a_function_type_keeps_the_whole_type() {
         // `=>` を右辺の区切りと取り違えると、`(value: string)` だけが残る
         assert_eq!(
-            resolved_type_of("type Handler = (value: string) => number"),
-            Some("(value: string) => number".to_owned())
+            declared_alias_of("type Handler = (value: string) => number"),
+            DeclaredAlias::Opened("(value: string) => number".to_owned())
         );
     }
 
     #[test]
-    fn test_resolved_type_of_an_alias_written_over_lines_keeps_every_line() {
+    fn test_declared_alias_of_an_alias_written_over_lines_keeps_every_line() {
         // オブジェクト型はサーバが複数行に展開して返す。1 行目で打ち切ると型が変わる
         assert_eq!(
-            resolved_type_of("type Shape = {\n    id: string;\n}"),
-            Some("{\n    id: string;\n}".to_owned())
+            declared_alias_of("type Shape = {\n    id: string;\n}"),
+            DeclaredAlias::Opened("{\n    id: string;\n}".to_owned())
         );
     }
 
     #[test]
-    fn test_resolved_type_of_an_interface_declaration_is_not_read_as_an_alias() {
+    fn test_declared_alias_of_an_interface_declaration_is_not_read_as_an_alias() {
         // 対照は最初のテスト。`interface` には右辺が無いので、開く先が無い
-        assert_eq!(resolved_type_of("interface User"), None);
+        assert_eq!(
+            declared_alias_of("interface User"),
+            DeclaredAlias::NotAnAlias
+        );
     }
 
     #[test]
-    fn test_resolved_type_of_a_class_declaration_is_not_read_as_an_alias() {
-        assert_eq!(resolved_type_of("class Invoice"), None);
+    fn test_declared_alias_of_a_class_declaration_is_not_read_as_an_alias() {
+        assert_eq!(
+            declared_alias_of("class Invoice"),
+            DeclaredAlias::NotAnAlias
+        );
     }
 
     #[test]
-    fn test_resolved_type_of_an_alias_taking_type_arguments_is_not_opened() {
-        // 右辺を `Box<string>` の位置へ差し込むと `{ value: T; }<string>` になる。
+    fn test_declared_alias_of_an_alias_taking_type_arguments_cannot_be_opened() {
+        // 対照は 1 つ上のテスト（`interface`）。**右辺はある**ので、開けなかったのと
+        // 開く先が無いのを同じにすると、綴りのまま比べた結果を答えとして出してしまう。
+        // 右辺を `Box<string>` の位置へ差し込むと `{ value: T; }<string>` になるので、
         // 型引数の当てはめには型そのものの構文解析が要る
-        assert_eq!(resolved_type_of("type Box<T> = { value: T; }"), None);
+        assert_eq!(
+            declared_alias_of("type Box<T> = { value: T; }"),
+            DeclaredAlias::Unopenable
+        );
     }
 
     #[test]
-    fn test_resolved_type_of_a_name_that_only_starts_with_the_keyword_is_not_read_as_an_alias() {
+    fn test_declared_alias_of_a_name_that_only_starts_with_the_keyword_is_not_read_as_an_alias() {
         // `type` を語として見ないと、`typeof` で始まる綴りを開いてしまう
-        assert_eq!(resolved_type_of("typeof rate = number"), None);
+        assert_eq!(
+            declared_alias_of("typeof rate = number"),
+            DeclaredAlias::NotAnAlias
+        );
     }
 
     #[test]
-    fn test_resolved_type_of_an_alias_without_a_right_hand_side_is_not_read() {
-        // 空の綴りを解決結果にすると、差し込んだ先の型が消える
-        assert_eq!(resolved_type_of("type Amount = "), None);
+    fn test_declared_alias_of_an_alias_without_a_right_hand_side_cannot_be_opened() {
+        // 空の綴りを解決結果にすると、差し込んだ先の型が消える。**エイリアスではある**ので、
+        // 綴りのまま比べてよい `interface` とは分ける
+        assert_eq!(
+            declared_alias_of("type Amount = "),
+            DeclaredAlias::Unopenable
+        );
     }
 
     #[test]
