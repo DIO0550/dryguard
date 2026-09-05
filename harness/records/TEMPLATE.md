@@ -95,7 +95,7 @@
 | `smart-constructor` | rules/coding.md「生成時に検証し、不正な値を存在させない」 |
 | `type-vocabulary` | rules/coding.md「値の語彙を型で閉じる」 |
 | `illegal-state` | rules/coding.md「不正な状態を型で表現できなくする」 |
-| `enum-omission-direction` | rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」（許可リスト・拒否リストに無い形がどちらへ倒れるかを決めずに書いた。`分類: なし` から昇格。pr-148 指摘 1 / 3 / 4 / 5 がこの族） |
+| `enum-omission-direction` | rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」（許可リスト・拒否リストに無い形がどちらへ倒れるかを決めずに書いた、または安全な倒れ方が違う消費者間で同じ一覧を使い回した。`分類: なし` から昇格。pr-148 指摘 3 / 4 / 5（列挙の穴）・指摘 1（使い回し）がこの族） |
 | `lint-suppress` | rules/coding.md「禁止事項」（lint 抑制を足さない） |
 | `comment-mismatch` | rules/coding.md「コメントは doc と Why / Why not に絞る」（内容が実装・事実と食い違う） |
 | `comment-missing` | rules/coding.md「Why と Why not は別物として書く」（書くべき Why / Why not が無い） |
