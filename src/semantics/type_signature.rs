@@ -15,7 +15,9 @@ use std::fmt;
 use crate::lsp::{ClientError, HoverOutcome, Session, SignatureText, SourceDocument};
 use crate::semantics::resolved_type::{ResolvedTypes, TypeDeclaration};
 use crate::source_position::SourcePosition;
-use crate::syntax::type_spelling::substituted_spelling_of;
+use crate::syntax::type_spelling::{
+    names_only_types, substitutable_type_name_spans_of, substituted_spelling_of, type_name_spans_of,
+};
 
 /// 付け替えた型変数の綴りの前置き。
 ///
@@ -40,16 +42,14 @@ const CONSTRUCTOR_KEYWORD: &str = "constructor";
 /// 構築シグネチャの値形を導く語（`new (value: string) => Result`）。
 const NEW_KEYWORD: &str = "new";
 
-/// 後ろに値の名前を取る演算子。
-///
-/// `typeof x` の `x` は**値の名前**で、型の名前ではない。開いた綴りに残った名前を
-/// 数えるとき、これを型名と数えると宣言を辿れない名前を待つことになる。
-const VALUE_OPERATOR: &str = "typeof";
-
 /// どこで書かれても同じ型を指す綴り。
 ///
 /// TypeScript の文法が持つ組み込みの型で、**宣言を辿らずに意味が決まる**。
-/// tree-sitter が `predefined_type` として扱う一覧と同じもの。
+///
+/// **大半は型名のノードにならない**（tree-sitter は `string` などを `predefined_type`、
+/// `null` / `undefined` を `literal_type` として返す）。それでも一覧を持つのは、
+/// `bigint` が `type_identifier` として返るため。**どれがどちらかは grammar の版で動く**ので、
+/// 組み込みの型の側を一覧にしておく。
 const PREDEFINED_TYPES: [&str; 12] = [
     "any",
     "bigint",
@@ -64,45 +64,6 @@ const PREDEFINED_TYPES: [&str; 12] = [
     "unknown",
     "void",
 ];
-
-/// 型の綴りの中で、型名ではなく型の作り方を表す語。
-///
-/// **一覧から漏れた語は型名として扱われる。** 漏れると差し込みを見送るだけなので、
-/// 倒れる向きは偽陰性になる（[`is_site_independent`] がこの向きを保つ）。
-const TYPE_OPERATORS: [&str; 5] = ["keyof", "readonly", "infer", "extends", VALUE_OPERATOR];
-
-/// 識別子として読まれるリテラル型。
-///
-/// リテラル型のうち、**綴りが識別子の形をしているのはこの 2 つだけ**。文字列リテラル型
-/// (`"a"`) と数値リテラル型 (`42`) は識別子として読まれないので、ここに並べる相手にならない
-/// （[`is_site_independent`] は識別子だけを見る）。
-const BOOLEAN_LITERALS: [&str; 2] = ["true", "false"];
-
-/// 開いた綴りを検証するときに、メンバーや引数の名前と見なす印。
-///
-/// **`<` は入れない。** 検証する相手は開いた後の綴りで、そこには総称型の参照
-/// (`Local<string>`) が現れる。それは宣言を辿る相手なので、メソッド名の印として
-/// 見逃すと**別々のモジュールの `Local<string>` が同じ綴りとして重なる**。
-///
-/// **Why not（型引数の中身を読んで見分ける）**: メソッド名か総称型かは `<` の後ろが
-/// 型変数の宣言かどうかで決まり、読むには型そのものの構文解析が要る。
-/// 取りこぼす側（差し込みを見送る = 偽陰性）に倒した。
-const VETTED_MEMBER_MARKERS: [&str; 4] = [":", "?:", "(", "?("];
-
-/// 引用符の始まり。
-///
-/// **綴りを検証する側は引用符の中を見ない**（識別子の走査が [`QuoteState`] で飛ばす）。
-/// ところが引用符の中は**宣言の場所に依存する意味を運べる** —— テンプレートリテラル型の
-/// 補間 (`` `${Local}` ``) と、`typeof import("./local")` の指定子がこれ。中を読まずに
-/// 通すと、別々のモジュールの綴りが同じものとして重なる。
-///
-/// **Why not（補間と指定子をそれぞれ見分ける）**: 見分ける形を足しても、
-/// 引用符の中を見ない限り次の形で同じことが起きる。**見ない場所を無くすのではなく、
-/// 見ない場所を持つ綴りごと差し込みの対象から外す。**
-///
-/// 代償は、文字列リテラル型のエイリアス (`type Mode = "on" | "off"`) が開かれなくなること。
-/// 倒れる向きは偽陰性。
-const QUOTE_MARKS: [char; 3] = ['"', '\'', '`'];
 
 /// サーバに型シグネチャを尋ねた結果。
 ///
@@ -248,7 +209,7 @@ impl TypeSignature {
                 .iter()
                 .map(Parameter::annotated_type)
                 .chain(std::iter::once(return_type.as_str())),
-        );
+        )?;
 
         // 型が書かれる場所だけを渡す。綴り全体を渡すと、正規化で落ちる関数の名前
         // （`function Amount<T>(…)`）を型名として数える。
@@ -259,16 +220,16 @@ impl TypeSignature {
                 .chain(parameters.iter().map(Parameter::annotated_type))
                 .chain(std::iter::once(return_type.as_str())),
             declarations,
-        );
+        )?;
 
         Some(Self {
             kind,
-            type_parameters: placeholders.type_parameters(&declared),
+            type_parameters: placeholders.type_parameters(&declared)?,
             parameters: parameters
                 .iter()
                 .map(|parameter| parameter.renamed(&placeholders))
-                .collect(),
-            return_type: placeholders.renamed(&return_type),
+                .collect::<Option<Vec<Parameter>>>()?,
+            return_type: placeholders.renamed(&return_type)?,
             declarations: remaining,
         })
     }
@@ -287,6 +248,7 @@ impl TypeSignature {
 }
 
 /// 比較に残る型の綴りに現れる型名の宣言だけを、名前順に選び出す。
+/// 型として読めない綴りが混じっていれば `None`。
 ///
 /// `types` は正規化後に残る型の綴り（型変数の制約と既定の型・引数の型・戻り値の型）、
 /// `declarations` はそのチャンクのシグネチャに書かれた型名について尋ねた宣言。
@@ -300,23 +262,25 @@ impl TypeSignature {
 fn remaining_declarations_of<'a>(
     types: impl Iterator<Item = &'a str>,
     declarations: &[TypeDeclaration],
-) -> Vec<TypeDeclaration> {
+) -> Option<Vec<TypeDeclaration>> {
     let mut remaining = BTreeSet::new();
     for spelling in types {
-        remaining.extend(declared_type_names_of(spelling));
+        remaining.extend(declared_type_names_of(spelling)?);
     }
 
     // 名前順の集合から引く。**並びを宣言の側に任せない**（型名が書かれた順のままだと、
     // 同じ 2 つが並びの違いで等しくなくなる余地が残る）。
-    remaining
-        .iter()
-        .filter_map(|name| {
-            declarations
-                .iter()
-                .find(|declaration| declaration.name() == name.as_str())
-        })
-        .cloned()
-        .collect()
+    Some(
+        remaining
+            .iter()
+            .filter_map(|name| {
+                declarations
+                    .iter()
+                    .find(|declaration| declaration.name() == name.as_str())
+            })
+            .cloned()
+            .collect(),
+    )
 }
 
 /// 呼び出しの仕方。
@@ -391,19 +355,26 @@ impl Parameter {
         &self.annotated_type
     }
 
-    /// 型変数を付け替えた引数。**渡し方は付け替えの対象にしない。**
-    fn renamed(&self, placeholders: &Placeholders) -> Self {
-        Self {
+    /// 型変数を付け替えた引数。型として読めない綴りでは `None`。
+    ///
+    /// **渡し方は付け替えの対象にしない。**
+    fn renamed(&self, placeholders: &Placeholders) -> Option<Self> {
+        Some(Self {
             kind: self.kind,
-            annotated_type: placeholders.renamed(&self.annotated_type),
-        }
+            annotated_type: placeholders.renamed(&self.annotated_type)?,
+        })
     }
 }
 
 impl fmt::Display for Parameter {
-    /// 型 1 つ分の綴りとして書き出す。入れ子の関数型を組み立て直すのに使う。
+    /// 引数リストの 1 つ分として書き出す。入れ子の関数型を組み立て直すのに使う。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}{}", self.kind.marker(), self.annotated_type)
+        write!(
+            formatter,
+            "{}: {}",
+            self.kind.written_name(),
+            self.annotated_type
+        )
     }
 }
 
@@ -444,14 +415,23 @@ impl ParameterKind {
         Self::Required
     }
 
-    /// 型の綴りに前置きする印。入れ子の関数型を書き出すときに使う。
-    fn marker(self) -> &'static str {
+    /// 入れ子の関数型を書き出すときに、`:` の手前へ置く綴り。
+    ///
+    /// **落とした引数名の代わりを置く。** 名前を落としたまま `?string` / `...string[]` と
+    /// 書くと TypeScript の引数リストとして読めず、型名の位置を構文木で決められない
+    /// （`syntax::type_spelling`）。置く名前は**どの引数でも同じ**なので、
+    /// 引数名に依存しないことは変わらない。
+    ///
+    /// `this` だけは落とさない。呼び出し時に渡さない引数であることを、
+    /// TypeScript が名前そのもので表すため。
+    ///
+    /// [`Parameter::from_text`] がここで書いた綴りをそのまま読み戻す。
+    fn written_name(self) -> &'static str {
         match self {
-            Self::Required => "",
-            Self::Optional => "?",
-            Self::Rest => Self::REST_MARKER,
-            // `this:` で始まる型は書けないので、本物の型と衝突しない。
-            Self::Receiver => "this:",
+            Self::Required => "_",
+            Self::Optional => "_?",
+            Self::Rest => "..._",
+            Self::Receiver => RECEIVER_PARAMETER,
         }
     }
 }
@@ -558,74 +538,50 @@ fn opened_annotation_of(text: &str, resolved: &ResolvedTypes) -> String {
 ///
 /// 数える相手は [`declared_type_names_of`] が決める。
 ///
-/// **引用符を含む綴りは、名前を数える前に外す。** 引用符の中は宣言の場所に依存する意味を
-/// 運ぶのに、**識別子として現れないことがある**（`typeof import("./")`）ので、
-/// 名前を数えるだけでは掬えない（[`QUOTE_MARKS`]）。
+/// **型名にならない依存もある。** 値の名前（`typeof localValue`）・計算されたキー
+/// （`{ [key]: string }`）・モジュールの指定子（`import("./local")`）・`this` 型で、
+/// どれも名前を数えるだけでは掬えないのに**指す先は書いた人の位置で決まる**。
+/// そこは `syntax::type_spelling` の `names_only_types` が見る。
+///
+/// **読めない綴りは通さない。** そこに何が書かれているかを確かめられていないので、
+/// 「名前が 1 つも無い」と同じには扱えない
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
 ///
 /// **Why not（残った名前もその宣言まで辿る）**: 辿るには宣言のあるファイルを
 /// 構文木にするところから始まり、綴りではなく位置で差し込む形になる（Issue #133）。
 fn is_site_independent(spelling: &str) -> bool {
-    let hides_names_in_quotes = spelling.contains(QUOTE_MARKS);
-    let holds_a_declared_name = !declared_type_names_of(spelling).is_empty();
+    let (Some(names), Some(names_only_types)) =
+        (declared_type_names_of(spelling), names_only_types(spelling))
+    else {
+        return false;
+    };
+    let holds_a_declared_name = !names.is_empty();
 
-    !hides_names_in_quotes && !holds_a_declared_name
+    !holds_a_declared_name && names_only_types
 }
 
-/// その綴りに残っている、どこかで宣言された型の名前。1 つも無ければ空。
+/// その綴りに残っている、どこかで宣言された型の名前。型として読めない綴りでは `None`。
 ///
-/// 名前として数えないのは 2 つ。メンバーや引数の名前（後ろに [`VETTED_MEMBER_MARKERS`] が
-/// 続く）と、[`PREDEFINED_TYPES`] / [`TYPE_OPERATORS`] / [`BOOLEAN_LITERALS`] に載っている語。
+/// **どこが型名かは構文木が決める**（`syntax::type_spelling`）。メンバー名・メソッド名・
+/// `typeof` の後ろの値の名前・文字列リテラル型の中身は、そもそも型名のノードにならない。
+/// 数えないのは [`PREDEFINED_TYPES`] に載っている語だけ。
 ///
-/// **引用符の中も見る。** テンプレートリテラル型の補間（`` `${Local}` ``）に残った名前も
-/// 宣言を辿る相手なので、飛ばすと別々のモジュールの綴りが同じものとして重なる。
-/// 代わりに文字列リテラル型の中の語まで数えるが、**これを使う側はどちらも
-/// 宣言が返った型名しか相手にしない**ので、綴りが偶然一致したときに倒れる向きは偽陰性。
-fn declared_type_names_of(spelling: &str) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    let mut identifier = String::new();
-
-    for (index, character) in spelling.char_indices() {
-        if is_identifier_character(character) {
-            identifier.push(character);
-            continue;
-        }
-
-        let following = spelling.get(index..).unwrap_or_default();
-        if names_a_declared_type(&identifier, following) {
-            names.insert(identifier.clone());
-        }
-        identifier.clear();
-    }
-
-    if names_a_declared_type(&identifier, "") {
-        names.insert(identifier);
-    }
-
-    names
-}
-
-/// その語が、どこかで宣言された型の名前か。空の語と、数字で始まる語は名前ではない。
+/// **束縛された名前も数える。** 束縛は綴りごとに 1 つの集合で見ているので、同じ綴りの
+/// 束縛が外側の名前を隠す（`(<Local>() => Local) & Local` の末尾の `Local`）。
+/// 外すと**辿る名前が残っていない**と答えてしまう（偽陽性）ので、
+/// 差し替える側とは別の一覧を使う。倒れる向きは偽陰性になる。
 ///
-/// `following` はその語の後ろに続く綴り。メンバーや引数の名前を見分けるのに使う。
-///
-/// **印は名前の直後にあるものだけを見る。** 空白を跨いで探すと、条件型
-/// （`T extends U ? Local : number`）の `:` をメンバーの印と読み、**分岐に書かれた型名を
-/// 数え落とす**。サーバが返す綴りではメンバーの印が名前に続けて書かれる（`id: string`）ので、
-/// 直後だけを見ても取りこぼさない。
-fn names_a_declared_type(identifier: &str, following: &str) -> bool {
-    if identifier.is_empty() || identifier.starts_with(|first: char| first.is_ascii_digit()) {
-        return false;
-    }
-    let names_the_language = PREDEFINED_TYPES.contains(&identifier)
-        || TYPE_OPERATORS.contains(&identifier)
-        || BOOLEAN_LITERALS.contains(&identifier);
-    if names_the_language {
-        return false;
-    }
-
-    !VETTED_MEMBER_MARKERS
-        .iter()
-        .any(|marker| following.starts_with(marker))
+/// **読めなかったことを空の集合で表さない。** 名前が 1 つも無いことと、名前を数えられな
+/// かったことは別で、[`is_site_independent`] が通すのは前者だけ。
+fn declared_type_names_of(spelling: &str) -> Option<BTreeSet<String>> {
+    Some(
+        type_name_spans_of(spelling)?
+            .into_iter()
+            .filter_map(|span| spelling.get(span))
+            .filter(|name| !PREDEFINED_TYPES.contains(name))
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
 /// 引用符の中にいるかどうかを、文字を 1 つずつ読みながら追う。
@@ -1002,7 +958,7 @@ struct Placeholders {
 }
 
 impl Placeholders {
-    /// 引数と戻り値に現れる順で付け替えを決める。
+    /// 引数と戻り値に現れる順で付け替えを決める。型として読めない綴りが混じっていれば `None`。
     ///
     /// `occurrences` は引数の型と戻り値の型を、綴りに書かれた順に並べたもの。
     /// 一度も現れない型変数は宣言の順で後ろに置く。
@@ -1013,7 +969,7 @@ impl Placeholders {
     fn of<'a>(
         declared: &[DeclaredTypeParameter],
         occurrences: impl Iterator<Item = &'a str>,
-    ) -> Self {
+    ) -> Option<Self> {
         let declared_names: BTreeSet<&str> = declared
             .iter()
             .map(|declaration| declaration.name.as_str())
@@ -1021,12 +977,15 @@ impl Placeholders {
         let mut ordered: Vec<String> = Vec::new();
 
         for occurrence in occurrences {
-            for identifier in identifiers_of(occurrence) {
-                let already_ordered = ordered.iter().any(|name| name == identifier);
-                if !declared_names.contains(identifier) || already_ordered {
+            for span in substitutable_type_name_spans_of(occurrence)? {
+                let Some(name) = occurrence.get(span) else {
+                    continue;
+                };
+                let already_ordered = ordered.iter().any(|ordered| ordered == name);
+                if !declared_names.contains(name) || already_ordered {
                     continue;
                 }
-                ordered.push(identifier.to_owned());
+                ordered.push(name.to_owned());
             }
         }
 
@@ -1043,71 +1002,59 @@ impl Placeholders {
             .map(|(index, name)| (name.clone(), format!("{PLACEHOLDER_PREFIX}{index}")))
             .collect();
 
-        Self { ordered, by_name }
+        Some(Self { ordered, by_name })
     }
 
-    /// 型変数を、付け替え後の並びで返す。
+    /// 型変数を、付け替え後の並びで返す。制約か既定の型が読めなければ `None`。
     ///
     /// 制約と既定の型も付け替えの対象にする。`<T, U extends T>` のように、
     /// どちらも別の型変数を指すことがある。
-    fn type_parameters(&self, declared: &[DeclaredTypeParameter]) -> Vec<TypeParameter> {
+    fn type_parameters(&self, declared: &[DeclaredTypeParameter]) -> Option<Vec<TypeParameter>> {
         self.ordered
             .iter()
             .map(|name| {
                 let declaration = declared
                     .iter()
                     .find(|declaration| declaration.name == *name);
-                let renamed_part = |part: Option<&String>| part.map(|text| self.renamed(text));
+                // 書かれていない部分（`None`）と、書かれているが読めない部分を分ける。
+                let renamed_part = |part: Option<&String>| match part {
+                    Some(text) => self.renamed(text).map(Some),
+                    None => Some(None),
+                };
 
-                TypeParameter {
-                    constraint: renamed_part(declaration.and_then(|it| it.constraint.as_ref())),
-                    default: renamed_part(declaration.and_then(|it| it.default.as_ref())),
-                }
+                Some(TypeParameter {
+                    constraint: renamed_part(declaration.and_then(|it| it.constraint.as_ref()))?,
+                    default: renamed_part(declaration.and_then(|it| it.default.as_ref()))?,
+                })
             })
             .collect()
     }
 
     /// 型変数の名前を、付け替え後の綴りに置き換えた文字列。
+    /// 型として読めない綴りでは `None`。
     ///
-    /// 識別子の単位で置き換える。部分一致で置き換えると `T` が `Tree` の中まで書き換える。
-    fn renamed(&self, text: &str) -> String {
-        let mut renamed = String::new();
-        let mut identifier = String::new();
+    /// **どこが型名かは構文木が決める**（`syntax::type_spelling`）。綴りを識別子の単位で
+    /// 歩くと、型変数と同じ綴りのメンバー名や `typeof` の後ろの値の名前まで付け替わる。
+    fn renamed(&self, spelling: &str) -> Option<String> {
+        let mut renamed = String::with_capacity(spelling.len());
+        let mut copied = 0;
 
-        for character in text.chars() {
-            if is_identifier_character(character) {
-                identifier.push(character);
+        for span in substitutable_type_name_spans_of(spelling)? {
+            let placeholder = spelling
+                .get(span.clone())
+                .and_then(|name| self.by_name.get(name));
+            let Some(placeholder) = placeholder else {
                 continue;
-            }
+            };
 
-            self.push_renamed(&mut renamed, &identifier);
-            identifier.clear();
-            renamed.push(character);
+            renamed.push_str(spelling.get(copied..span.start)?);
+            renamed.push_str(placeholder);
+            copied = span.end;
         }
-        self.push_renamed(&mut renamed, &identifier);
+        renamed.push_str(spelling.get(copied..)?);
 
-        renamed
+        Some(renamed)
     }
-
-    /// 識別子 1 つ分を、付け替え後の綴り（対応が無ければそのまま）で書き足す。
-    fn push_renamed(&self, target: &mut String, identifier: &str) {
-        match self.by_name.get(identifier) {
-            Some(placeholder) => target.push_str(placeholder),
-            None => target.push_str(identifier),
-        }
-    }
-}
-
-/// 文字列に現れる識別子を、書かれた順に返す。
-fn identifiers_of(text: &str) -> Vec<&str> {
-    text.split(|character: char| !is_identifier_character(character))
-        .filter(|identifier| !identifier.is_empty())
-        .collect()
-}
-
-/// 識別子を作る文字か。TypeScript の識別子には `_` と `$` も入る。
-fn is_identifier_character(character: char) -> bool {
-    character.is_alphanumeric() || character == '_' || character == '$'
 }
 
 #[cfg(test)]
@@ -1964,8 +1911,8 @@ mod tests {
 
     #[test]
     fn test_two_aliases_opening_onto_the_same_template_literal_are_not_unifiable() {
-        // 補間の中の `Local` は宣言を辿る相手。走査は引用符の中を見ないので、
-        // 通すと別々のモジュールの綴りが重なる
+        // 補間の中の `Local` は宣言を辿る相手。構文木では `template_type` の下の
+        // 型名として出るので、リテラルの文字そのものと分けて数えられる
         let first = signature_with(
             "function a(x: First): void",
             &resolving("First", "`${Local}`"),
@@ -1980,8 +1927,8 @@ mod tests {
 
     #[test]
     fn test_two_aliases_opening_onto_the_same_import_query_are_not_unifiable() {
-        // 指定子は宣言の場所に依存するのに、**識別子を 1 つも残さない**。
-        // `import` は後ろが `(` なのでメンバー名として読まれ、走査には掛からない
+        // 指定子は宣言の場所に依存するのに、**型名のノードを 1 つも残さない**。
+        // 名前を数えるだけでは掬えないので、指定子そのものを見て止める
         let first = signature_with(
             "function a(x: First): void",
             &resolving("First", "typeof import(\"./local\")"),
@@ -1996,8 +1943,8 @@ mod tests {
 
     #[test]
     fn test_two_aliases_opening_onto_an_import_query_without_a_name_are_not_unifiable() {
-        // 指定子が識別子を 1 つも含まない形。**引用符の中を覗いて名前を探す形では
-        // 素通りする**ので、引用符を含む綴りごと外していることがここで効く
+        // 対照は上のテスト。指定子が識別子を 1 つも含まない形でも同じく止まる
+        // （見ているのは中身ではなく、指定子を書いていること）
         let first = signature_with(
             "function a(x: First): void",
             &resolving("First", "typeof import(\"./\")"),
@@ -2011,21 +1958,21 @@ mod tests {
     }
 
     #[test]
-    fn test_an_alias_opening_onto_a_string_literal_type_is_not_substituted() {
-        // 引用符を含む綴りを丸ごと外した代償。文字列リテラル型はどこで書かれても
-        // 同じ型を指すが、**引用符の中を見ない走査ではそれを言い切れない**
+    fn test_an_alias_opening_onto_a_string_literal_type_is_substituted() {
+        // 文字列リテラル型はどこで書かれても同じ型を指す。構文木ではリテラルの中身が
+        // 型名のノードにならないので、**引用符を含む綴りごと外す必要が無い**
         let mode = signature_with(
             "function pick(x: Mode): void",
             &resolving("Mode", "\"on\" | \"off\""),
         );
 
-        assert!(!mode.is_unifiable_with(&signature("function other(x: \"on\" | \"off\"): void")));
+        assert!(mode.is_unifiable_with(&signature("function other(x: \"on\" | \"off\"): void")));
     }
 
     #[test]
     fn test_two_aliases_opening_onto_the_same_generic_type_reference_are_not_unifiable() {
-        // `Local<string>` の `Local` は宣言を辿る相手。`<` が続くのをメソッド名の印と
-        // 読むと検証をすり抜け、別々のモジュールの `Local` が同じ綴りとして重なる
+        // `Local<string>` の `Local` は宣言を辿る相手。構文木では `generic_type` の下の
+        // 型名として出るので、総称メソッドの名前と取り違えずに数えられる
         let first = signature_with(
             "function a(x: First): void",
             &resolving("First", "Local<string>"),
@@ -2221,6 +2168,165 @@ mod tests {
         );
 
         assert!(holding.is_unifiable_with(&signature("function size(text: string): number")));
+    }
+
+    #[test]
+    fn test_a_callback_taking_an_optional_parameter_is_still_read() {
+        // 正規化した関数型は引数名を落とす。名前ごと落として `(?string) => void` と書くと
+        // TypeScript の引数リストとして読めず、シグネチャ全体が読めなくなる
+        assert!(unifiable(
+            "function retry(onError: (reason?: string) => void): void",
+            "function repeat(handler: (message?: string) => void): void"
+        ));
+    }
+
+    #[test]
+    fn test_an_optional_callback_parameter_is_not_unifiable_with_a_required_one() {
+        // 対照は上のテスト。落とした名前の代わりを置いても、省略可の印は形に残る
+        assert!(!unifiable(
+            "function retry(onError: (reason?: string) => void): void",
+            "function repeat(handler: (message: string) => void): void"
+        ));
+    }
+
+    #[test]
+    fn test_a_callback_taking_a_rest_parameter_is_still_read() {
+        // `(...string[]) => void` も引数リストとして読めない綴り
+        assert!(unifiable(
+            "function retry(onError: (...reasons: string[]) => void): void",
+            "function repeat(handler: (...messages: string[]) => void): void"
+        ));
+    }
+
+    #[test]
+    fn test_a_rest_callback_parameter_is_not_unifiable_with_an_array_one() {
+        // 対照は上のテスト。可変長の印も形に残る
+        assert!(!unifiable(
+            "function retry(onError: (...reasons: string[]) => void): void",
+            "function repeat(handler: (messages: string[]) => void): void"
+        ));
+    }
+
+    #[test]
+    fn test_a_member_named_like_a_type_variable_is_not_renamed() {
+        // 綴りを識別子で歩くと、メンバーの名前まで `%0` に付け替わる。
+        // 付け替えの相手は型が書かれる場所だけ
+        assert!(unifiable(
+            "function pick<T>(value: { T: T }): void",
+            "function other<U>(entry: { T: U }): void"
+        ));
+    }
+
+    #[test]
+    fn test_a_member_named_like_a_type_variable_is_still_compared() {
+        // 対照は上のテスト。メンバーの名前を付け替えないことと、
+        // 名前の違いを見落とすことは別
+        assert!(!unifiable(
+            "function pick<T>(value: { T: T }): void",
+            "function other<U>(entry: { U: U }): void"
+        ));
+    }
+
+    #[test]
+    fn test_a_value_named_like_a_type_variable_is_not_renamed_after_typeof() {
+        // `typeof T` の `T` は値の名前。付け替えると、綴りをそのまま持つ側と重ならなくなる
+        assert!(unifiable(
+            "function pick<T>(x: T, y: typeof T): void",
+            "function other<U>(a: U, b: typeof T): void"
+        ));
+    }
+
+    #[test]
+    fn test_a_type_variable_whose_name_holds_a_combining_mark_is_renamed() {
+        // 分解された `É`（`E` + U+0301）。識別子を英数字で切ると結合文字のところで切れ、
+        // 付け替えの対応が引けなくなる
+        assert!(unifiable(
+            "function pick<Ame\u{0301}unt>(x: Ame\u{0301}unt): void",
+            "function other<U>(a: U): void"
+        ));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_the_same_builtin_bigint_are_unifiable() {
+        // `bigint` は組み込みの型だが、tree-sitter は型名のノードとして返す。
+        // 一覧から外すと、書き下した綴りとの比較が止まる
+        let boxed = signature_with(
+            "function labelBoxed(value: Boxed): string",
+            &resolving("Boxed", "bigint"),
+        );
+        let wrapped = signature_with(
+            "function labelWrapped(value: Wrapped): string",
+            &resolving("Wrapped", "bigint"),
+        );
+
+        assert!(boxed.is_unifiable_with(&wrapped));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_a_name_shadowed_by_a_nested_binder_are_not_unifiable() {
+        // 末尾の `Local` は外で宣言された名前。綴りが束縛と同じというだけで外すと、
+        // 宣言を辿る名前が残っていないことになり、別々のモジュールの `Local` が重なる
+        let first = signature_with(
+            "function a(x: First): void",
+            &resolving("First", "(<Local>() => Local) & Local"),
+        );
+        let second = signature_with(
+            "function b(y: Second): void",
+            &resolving("Second", "(<Local>() => Local) & Local"),
+        );
+
+        assert!(!first.is_unifiable_with(&second));
+    }
+
+    #[test]
+    fn test_a_type_guard_signature_is_read() {
+        // 型述語（`value is User`）は関数の戻り値の位置にしか書けない。型 1 つ分として
+        // 読もうとすると読めず、シグネチャ全体が読めないほうへ落ちる
+        assert!(unifiable(
+            "function isUser(value: unknown): value is User",
+            "function isMember(value: unknown): value is User"
+        ));
+    }
+
+    #[test]
+    fn test_type_guards_narrowing_to_separate_types_are_not_unifiable() {
+        // 対照は上のテスト。述語が絞る型は比べる対象に残る
+        assert!(!unifiable(
+            "function isUser(value: unknown): value is User",
+            "function isAdmin(value: unknown): value is Admin"
+        ));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_the_same_value_query_are_not_unifiable() {
+        // `typeof localValue` の `localValue` は値の名前で、型名のノードにならない。
+        // 指す先は書いた人の位置で決まるので、通すと別々のモジュールの綴りが重なる
+        let first = signature_with(
+            "function a(x: First): void",
+            &resolving("First", "typeof localValue"),
+        );
+        let second = signature_with(
+            "function b(y: Second): void",
+            &resolving("Second", "typeof localValue"),
+        );
+
+        assert!(!first.is_unifiable_with(&second));
+    }
+
+    #[test]
+    fn test_two_aliases_opening_onto_the_same_computed_key_are_not_unifiable() {
+        // 計算されたキーは `unique symbol` の値を指す。型名のノードにならないので、
+        // 通すと別々のモジュールの `key` を持つ 2 つが重なる
+        let first = signature_with(
+            "function a(x: First): void",
+            &resolving("First", "{ [key]: string }"),
+        );
+        let second = signature_with(
+            "function b(y: Second): void",
+            &resolving("Second", "{ [key]: string }"),
+        );
+
+        assert!(!first.is_unifiable_with(&second));
     }
 
     #[test]

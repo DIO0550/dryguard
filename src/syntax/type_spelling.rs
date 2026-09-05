@@ -22,6 +22,13 @@ use crate::syntax::tree::{Grammar, SyntaxTree};
 /// 綴りが型として読めたかどうかが、包んだ文が読めたかどうかと一致する。
 const SPELLING_PREFIX: &str = "type __ = ";
 
+/// 戻り値の注釈としてしか書けない綴りを包むときの前置き。
+///
+/// **型述語（`value is User` / `asserts value`）は型ではない。** 関数の戻り値の位置に
+/// しか書けないので、エイリアスの右辺へ置くと読めない。引数を取らない関数型にすると
+/// 読めるようになり、述語の主語（`value`）は値の名前のノードになる。
+const RETURN_TYPE_PREFIX: &str = "type __ = () => ";
+
 /// 包むときの後置き。
 const SPELLING_SUFFIX: &str = ";";
 
@@ -42,6 +49,37 @@ const MAPPED_TYPE_CLAUSE_KIND: &str = "mapped_type_clause";
 
 /// 条件型が型を捕まえる印を表すノードの種別（`infer U`）。
 const INFER_TYPE_KIND: &str = "infer_type";
+
+/// モジュールの指定子を取る演算子を表すノードの種別（`import("./local")`）。
+const IMPORT_KIND: &str = "import";
+
+/// 型名 1 つを表さない、素の名前のノードの種別。
+///
+/// 型は `type_identifier` / `predefined_type` / `nested_type_identifier` になるので、
+/// **型の綴りの中に出る `identifier` は型名ではない**（値の名前か、その綴りの中で
+/// 束縛された名前）。
+const IDENTIFIER_KIND: &str = "identifier";
+
+/// 囲むクラスを指す型を表すノードの種別（`this`）。
+const THIS_TYPE_KIND: &str = "this_type";
+
+/// 型名でない名前が、その綴りの中でだけ意味を持つ場所のノードの種別。
+///
+/// 引数の名前（`(a: string) => void`）・タプルの要素の名前（`[first: string]`）・
+/// インデックスシグネチャの引数の名前（`{ [index: number]: string }`）・
+/// 型述語の主語（`value is User`）。**どれも外を指さない。**
+///
+/// **一覧にするのは外を指さないほう。** 外を指す形（値の名前・計算されたキー・
+/// モジュールの指定子）は文法が増えるたびに増えるが、こちらは名前が束縛される場所なので
+/// 閉じている。**一覧から漏れた形は site dependent の側へ倒れる**ので、
+/// 倒れる向きは偽陰性になる。
+const LOCAL_NAME_KINDS: [&str; 5] = [
+    "required_parameter",
+    "optional_parameter",
+    "rest_pattern",
+    "index_signature",
+    "type_predicate",
+];
 
 /// 差し込んだ綴りを括るときの括弧。
 const GROUP_OPEN: char = '(';
@@ -81,11 +119,11 @@ pub(crate) fn substituted_spelling_of(
     spelling: &str,
     opened: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    let wrapped = wrapped(spelling);
-    let spans = type_name_spans_of(&wrapped)?;
+    let wrapped = wrapped(spelling)?;
+    let spans = type_name_spans_in_wrapped(&wrapped, BoundNames::Excluded)?;
 
     // 後ろから差し替える。前から差し替えると、後ろの範囲が差し込んだ長さの分だけずれる。
-    let mut substituted = wrapped;
+    let mut substituted = wrapped.text;
     for span in spans.into_iter().rev() {
         let Some(name) = substituted.get(span.clone()) else {
             continue;
@@ -97,19 +135,136 @@ pub(crate) fn substituted_spelling_of(
         substituted = replaced(&substituted, span, &replacement);
     }
 
-    unwrapped(&substituted)
+    unwrapped(&substituted, wrapped.prefix)
 }
 
-/// 型 1 つ分の綴りを、型として読める文へ包む。
-fn wrapped(spelling: &str) -> String {
-    format!("{SPELLING_PREFIX}{spelling}{SPELLING_SUFFIX}")
+/// 綴りの中で、差し替えてよい型名が書かれている範囲。型として読めない綴りでは `None`。
+///
+/// 範囲は `spelling` の中の位置。[`substituted_spelling_of`] が差し替える位置と同じものを
+/// 返すので、**差し込む側と付け替える側が同じ判断で歩く**。
+/// 束縛された名前と、修飾された型名の末尾は外してある。
+///
+/// **Why（範囲を返して差し込みは任せる）**: 付け替え後の綴り（`%0`）は型として読めず、
+/// [`substituted_spelling_of`] の括弧の要否を確かめる再パースが必ず失敗する。
+/// 綴り 1 つ分に収まる置き換えでは括弧が要らないので、位置だけを渡す。
+pub(crate) fn substitutable_type_name_spans_of(spelling: &str) -> Option<Vec<Range<usize>>> {
+    spans_in_spelling(spelling, BoundNames::Excluded)
 }
 
-/// 包んだ文から、型 1 つ分の綴りを取り出す。前置きと後置きが揃わなければ `None`。
-fn unwrapped(wrapped: &str) -> Option<String> {
+/// 綴りに書かれた型名の範囲を、書かれた順に返す。型として読めない綴りでは `None`。
+///
+/// 範囲は `spelling` の中の位置。メンバー名・メソッド名・`typeof` の後ろの値の名前・
+/// 文字列リテラル型の中身は、そもそも型名のノードにならないので入らない。
+///
+/// **束縛された名前も返す**（[`substitutable_type_name_spans_of`] との違いはここだけ）。
+pub(crate) fn type_name_spans_of(spelling: &str) -> Option<Vec<Range<usize>>> {
+    spans_in_spelling(spelling, BoundNames::Included)
+}
+
+/// 綴りを包んで歩き、返った範囲を綴りの中の位置へ戻す。
+fn spans_in_spelling(spelling: &str, bound_names: BoundNames) -> Option<Vec<Range<usize>>> {
+    let wrapped = wrapped(spelling)?;
+    let prefix = wrapped.prefix;
+
+    Some(
+        type_name_spans_in_wrapped(&wrapped, bound_names)?
+            .into_iter()
+            .map(|span| span.start - prefix..span.end - prefix)
+            .collect(),
+    )
+}
+
+/// 束縛された名前を、返す範囲に含めるかどうか。
+///
+/// **外しすぎたときに倒れる向きが逆になる。** 差し替える側は外しすぎても差し込みを
+/// 見送るだけ（偽陰性）だが、宣言を辿る名前を数える側は外しすぎると
+/// **「辿る名前が残っていない」と答えてしまう**（偽陽性）。
+///
+/// 束縛は綴りごとに 1 つの集合で見ているので、同じ綴りの束縛が外側の名前を隠す
+/// （`(<Local>() => Local) & Local` の末尾の `Local`）。数える側はそれを外さない。
+#[derive(Clone, Copy)]
+enum BoundNames {
+    /// 差し替えの相手から外す。
+    Excluded,
+    /// 綴りに書かれた型名として数える。
+    Included,
+}
+
+/// その綴りが、型の名前だけで書かれているか。型として読めない綴りでは `None`。
+///
+/// **型名にならないのに、指す先が書いた人の位置で決まる綴りがある。**
+/// 値の名前（`typeof localValue`）・オブジェクト型の計算されたキー
+/// （`{ [key]: string }`）・`this` 型（囲むクラスを指す）・モジュールの指定子
+/// （`import("./local")`）で、どれも [`type_name_spans_of`] では掬えない。
+///
+/// **見分けるのは「外を指す形」ではなく「中に留まる名前」。** 外を指す形は文法が
+/// 増えるたびに増えるが、型名でない名前が許される場所は閉じている
+/// （[`LOCAL_NAME_KINDS`]）。
+pub(crate) fn names_only_types(spelling: &str) -> Option<bool> {
+    let wrapped = wrapped(spelling)?;
+    let tree = SyntaxTree::from_source(&wrapped.text, Grammar::TypeScript).ok()?;
+
+    let reaches_outside = tree
+        .named_descendants()
+        .into_iter()
+        .any(names_outside_the_type_namespace);
+
+    Some(!reaches_outside)
+}
+
+/// そのノードが、型の名前空間の外を指しているか。
+fn names_outside_the_type_namespace(node: Node<'_>) -> bool {
+    if matches!(node.kind(), THIS_TYPE_KIND | IMPORT_KIND) {
+        return true;
+    }
+    if node.kind() != IDENTIFIER_KIND {
+        return false;
+    }
+
+    let names_locally = node
+        .parent()
+        .is_some_and(|parent| LOCAL_NAME_KINDS.contains(&parent.kind()));
+
+    !names_locally
+}
+
+/// 綴りを包んで構文木にできた文と、そのとき使った前置きの長さ。
+struct Wrapped {
+    text: String,
+    prefix: usize,
+}
+
+/// 綴りを、構文木にできる文へ包む。どの包み方でも読めなければ `None`。
+///
+/// **包み方が 2 つあるのは、型が書ける場所が 1 つではないため。** 型述語
+/// （`value is User`）は関数の戻り値の位置にしか書けず、エイリアスの右辺では読めない
+/// （[`RETURN_TYPE_PREFIX`]）。
+///
+/// **Why not（はじめから戻り値の位置で包む）**: そこは型 1 つ分だけが書ける場所ではなく、
+/// 型述語も通る。**綴りが型として読めたかどうかと、包んだ文が読めたかどうかが
+/// 一致しなくなる**ので、型として読める包み方を先に試す。
+fn wrapped(spelling: &str) -> Option<Wrapped> {
+    for prefix in [SPELLING_PREFIX, RETURN_TYPE_PREFIX] {
+        let text = format!("{prefix}{spelling}{SPELLING_SUFFIX}");
+        let readable =
+            SyntaxTree::from_source(&text, Grammar::TypeScript).is_ok_and(|tree| !tree.has_error());
+
+        if readable {
+            return Some(Wrapped {
+                text,
+                prefix: prefix.len(),
+            });
+        }
+    }
+
+    None
+}
+
+/// 包んだ文から、綴りを取り出す。前置きと後置きが揃わなければ `None`。
+fn unwrapped(wrapped: &str, prefix: usize) -> Option<String> {
     Some(
         wrapped
-            .strip_prefix(SPELLING_PREFIX)?
+            .get(prefix..)?
             .strip_suffix(SPELLING_SUFFIX)?
             .to_owned(),
     )
@@ -178,19 +333,28 @@ fn spliced(text: &str, span: Range<usize>, replacement: &str) -> String {
     spliced
 }
 
-/// 包んだ文の中で、差し替えてよい型名が書かれている範囲。読めない綴りでは `None`。
+/// 包んだ文の中で、型名が書かれている範囲。読めない綴りでは `None`。
+///
+/// `bound_names` が [`BoundNames::Excluded`] なら、束縛された名前は返さない。
 ///
 /// **前置きの中は返さない。** 包むために置いた `__` も型名のノードになるので、
 /// 綴りそのものの範囲だけに絞る。
-fn type_name_spans_of(wrapped: &str) -> Option<Vec<Range<usize>>> {
-    let tree = SyntaxTree::from_source(wrapped, Grammar::TypeScript).ok()?;
+fn type_name_spans_in_wrapped(
+    wrapped: &Wrapped,
+    bound_names: BoundNames,
+) -> Option<Vec<Range<usize>>> {
+    let text = wrapped.text.as_str();
+    let tree = SyntaxTree::from_source(text, Grammar::TypeScript).ok()?;
     if tree.has_error() {
         return None;
     }
     let nodes = tree.named_descendants();
 
-    let spelling = SPELLING_PREFIX.len()..wrapped.len().saturating_sub(SPELLING_SUFFIX.len());
-    let bound = bound_names_of(&nodes, wrapped);
+    let spelling = wrapped.prefix..text.len().saturating_sub(SPELLING_SUFFIX.len());
+    let bound = match bound_names {
+        BoundNames::Excluded => bound_names_of(&nodes, text),
+        BoundNames::Included => BTreeSet::new(),
+    };
     let mut spans: Vec<Range<usize>> = Vec::new();
 
     for node in nodes {
@@ -200,7 +364,7 @@ fn type_name_spans_of(wrapped: &str) -> Option<Vec<Range<usize>>> {
         let already_covered = spans
             .last()
             .is_some_and(|taken| range.start < taken.end && taken.start <= range.start);
-        let names_the_binding = wrapped
+        let names_the_binding = text
             .get(range.clone())
             .is_some_and(|name| bound.contains(name));
 
@@ -560,5 +724,127 @@ mod tests {
             substituted_spelling_of("Map<Amount, Amount>", opening("Amount", "number")),
             Some("Map<number, number>".to_owned())
         );
+    }
+
+    /// 綴りの中で差し替えてよい型名の綴りを、書かれた順に。
+    fn substitutable_type_names_of(spelling: &str) -> Option<Vec<&str>> {
+        Some(
+            substitutable_type_name_spans_of(spelling)?
+                .into_iter()
+                .filter_map(|span| spelling.get(span))
+                .collect(),
+        )
+    }
+
+    /// 綴りに書かれた型名の綴りを、書かれた順に。
+    fn type_names_of(spelling: &str) -> Option<Vec<&str>> {
+        Some(
+            type_name_spans_of(spelling)?
+                .into_iter()
+                .filter_map(|span| spelling.get(span))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn test_the_type_names_of_a_spelling_leave_out_what_is_not_a_type_name() {
+        // メンバー名（`ID`）・組み込みの型（`string`）・文字列リテラル型の中身は型名ではない
+        assert_eq!(
+            type_names_of("{ ID: Local<string>; mode: \"Local\" }"),
+            Some(vec!["Local"])
+        );
+    }
+
+    #[test]
+    fn test_the_substitutable_type_names_of_a_spelling_leave_out_a_name_bound_inside_it() {
+        // `U` は捕まえたほうの名前。差し替えると `infer string` のような綴りになる
+        assert_eq!(
+            substitutable_type_names_of("T extends Promise<infer U> ? U : never"),
+            Some(vec!["T", "Promise"])
+        );
+    }
+
+    #[test]
+    fn test_the_type_names_of_a_spelling_hold_a_name_a_nested_binder_shadows() {
+        // 対照は上のテスト。束縛は綴りごとに 1 つの集合なので、差し替える側は
+        // 末尾の `Local` まで外す。**書かれた型名を数える側はそれを外さない**
+        assert_eq!(
+            substitutable_type_names_of("(<Local>() => Local) & Local"),
+            Some(vec![])
+        );
+        assert_eq!(
+            type_names_of("(<Local>() => Local) & Local"),
+            Some(vec!["Local", "Local", "Local"])
+        );
+    }
+
+    #[test]
+    fn test_the_type_names_of_a_spelling_that_does_not_read_as_a_type_are_not_returned() {
+        // 空で返すと、型名が 1 つも無い綴りと区別が付かない
+        assert_eq!(type_names_of("=> )("), None);
+        assert_eq!(substitutable_type_names_of("=> )("), None);
+    }
+
+    #[test]
+    fn test_a_type_predicate_is_read_in_its_return_annotation_context() {
+        // 型述語は関数の戻り値の位置にしか書けない。主語（`value`）は引数の名前なので
+        // 型名にならず、絞る先の `User` だけが返る
+        assert_eq!(type_names_of("value is User"), Some(vec!["User"]));
+    }
+
+    #[test]
+    fn test_a_spelling_written_with_type_names_alone_names_only_types() {
+        assert_eq!(names_only_types("Local<string> | \"on\""), Some(true));
+    }
+
+    #[test]
+    fn test_a_spelling_naming_a_parameter_names_only_types() {
+        // 引数の名前・タプルの要素の名前・インデックスシグネチャの引数の名前・
+        // 型述語の主語は、その綴りの中でだけ意味を持つ
+        assert_eq!(names_only_types("(a: string) => void"), Some(true));
+        assert_eq!(names_only_types("[first: string]"), Some(true));
+        assert_eq!(names_only_types("{ [index: number]: string }"), Some(true));
+        assert_eq!(names_only_types("(a: unknown) => a is Local"), Some(true));
+    }
+
+    #[test]
+    fn test_a_spelling_querying_a_value_does_not_name_only_types() {
+        // 対照は上のテスト。同じ `identifier` でも、`typeof` の後ろは外の値を指す
+        assert_eq!(names_only_types("typeof localValue"), Some(false));
+    }
+
+    #[test]
+    fn test_a_spelling_with_a_computed_key_does_not_name_only_types() {
+        // 計算されたキーは `unique symbol` の値を指す。別々のモジュールが同じ綴りの
+        // `key` を宣言していると、同じ綴りが別の型を指す
+        assert_eq!(names_only_types("{ [key]: string }"), Some(false));
+    }
+
+    #[test]
+    fn test_a_spelling_naming_the_enclosing_class_does_not_name_only_types() {
+        // `this` 型は囲むクラスを指すので、どこに書かれたかで意味が変わる
+        assert_eq!(names_only_types("this"), Some(false));
+    }
+
+    #[test]
+    fn test_a_spelling_querying_an_imported_module_does_not_name_only_types() {
+        assert_eq!(names_only_types("typeof import(\"./local\")"), Some(false));
+    }
+
+    #[test]
+    fn test_a_spelling_naming_a_type_in_an_imported_module_does_not_name_only_types() {
+        // `typeof` を伴わない書き方でも指定子は指定子
+        assert_eq!(names_only_types("import(\"./local\").Thing"), Some(false));
+    }
+
+    #[test]
+    fn test_a_string_literal_type_names_only_types() {
+        // 対照は上の 2 つ。引用符があることではなく、外を指すことを見ている
+        assert_eq!(names_only_types("\"on\" | \"off\""), Some(true));
+    }
+
+    #[test]
+    fn test_a_spelling_that_does_not_read_as_a_type_cannot_be_asked_what_it_names() {
+        assert_eq!(names_only_types("=> )("), None);
     }
 }
