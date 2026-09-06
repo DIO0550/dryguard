@@ -76,7 +76,7 @@ if structurally_similar && domains_differ { ... }
 | `session` | handshake を終えた接続。問い合わせを送れる状態。握手前は `client` |
 | `project marker` | そのサーバがプロジェクトの根と見なすファイルの名前（TS は `tsconfig.json` / `jsconfig.json`、Rust は `Cargo.toml`）。言語ごとに決まる |
 | `workspace root` | `initialize` でサーバに見せるディレクトリ |
-| `project root` | 開かせるファイル群の共通の祖先から上へ `project marker` を探した結果。見つかった / 見つからなかったを `workspace root` と一緒に持つ |
+| `project root` | **ファイル 1 つずつ**について、そのディレクトリから上へ `project marker` を探した結果。`workspace root` と、**ファイルごとの印の有無**を持つ |
 | `document` | サーバに開かせるソースファイル 1 つ分。URI・`language id`・中身の組 |
 | `language id` | LSP がサーバに伝える言語の名前（`typescript` / `typescriptreact`） |
 | `hover` | ソースの 1 点を指して、そこにある名前の型を尋ねる問い合わせ |
@@ -143,9 +143,13 @@ JSON が壊れているのは違う話）。1 語で呼ぶと、どちらの層�
 （重ねる。`docs/dryguard-plan.md`「Phase 0 のディレクトリ距離との関係」）。
 
 **`workspace root` と `project root` を混ぜない。** サーバに渡すのはどちらも 1 つの
-ディレクトリだが、後者は**印が見つかったかを一緒に持つ**。印の無い木では根をどれだけ
-広げても参照元が揃わないので、根だけを渡すと**揃っているか確かめられないことが
+ディレクトリだが、後者は**ファイルごとの印の有無を一緒に持つ**。印の下に無いファイルでは
+根をどれだけ広げても参照元が揃わないので、根だけを渡すと**揃っているか確かめられないことが
 後段に伝わらない**（`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」）。
+
+**印の有無を走査全体で 1 つにまとめない。** 根は 1 つしか渡せないが、印の下にあるかは
+ファイルごとに違う。1 つにまとめると、`scan` で印の外のファイルが 1 つ混じっただけで、
+**両側とも印の下にあるペアまで参照元を落とす**。
 
 **`project marker` は `grammar` / `language id` と同じ形の情報。** 言語ごとに決まる綴りで、
 **綴りを決めている相手が別**（印は LSP サーバ、`grammar` は tree-sitter のクレート）。
