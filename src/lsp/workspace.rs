@@ -36,22 +36,29 @@ impl WorkspaceRoot {
     /// `paths` が空のとき、絶対パスにできないパスがあるとき、共通の祖先が無いとき、
     /// URI にできないとき。
     pub fn enclosing(paths: &[PathBuf]) -> Result<Self, WorkspaceError> {
-        let ancestor = common_ancestor_directory_of(paths)?;
+        let directories = file_directories_of(paths)?;
 
-        Self::at(&ancestor)
+        Self::at(&common_ancestor_or_error_of(&directories)?)
     }
 
-    /// 開くファイル群を含む、最も近い**プロジェクトの印**のあるディレクトリ。
+    /// 開くファイル群のプロジェクトをすべて含む、最も近いディレクトリ。
     ///
     /// `paths` は候補ペアが含まれるファイル、`markers` はそのサーバがプロジェクトの根と
     /// 見なすファイルの名前（[`super::ServerCommand::project_markers`]）。
-    /// 共通の祖先から上へ 1 段ずつ辿り、**印のあるディレクトリの最初の 1 つ**を根にする。
+    /// **ファイル 1 つずつについて**、そのディレクトリから上へ辿って最も近い印を探し、
+    /// 見つかった印のディレクトリすべての共通の祖先を根にする。
     ///
     /// **Why（サーバと同じ探し方をする）**: tsserver は開いたファイルから上へ
     /// `tsconfig.json` を探す。探し方を揃えると、こちらが渡す根とサーバが組み立てる
     /// プロジェクトが一致する。ずれると `textDocument/references` が
     /// **呼び出し元を取りこぼしたまま答える**（呼び出し元は呼び出し先を import する側に
     /// あるので、inferred project には入らない）。
+    ///
+    /// **Why（共通の祖先からではなくファイルごとに探す）**: 候補ペアが兄弟プロジェクトに
+    /// またがると（`packages/a/tsconfig.json` と `packages/b/tsconfig.json` があり、
+    /// その上には無い形）、印は共通の祖先より**下**にある。祖先から上だけを見ると
+    /// どちらの印も見えず、**サーバは根の下の印を見つけて答えられるのに**
+    /// こちらが取れないものと判断してしまう。
     ///
     /// **Why not（上へ辿る段数に上限を置く）**: 走査の根を上限にすると、
     /// `scan` の根が印より下だったときに取りこぼしがそのまま残り、しかも
@@ -65,13 +72,19 @@ impl WorkspaceRoot {
         paths: &[PathBuf],
         markers: &[String],
     ) -> Result<ProjectRoot, WorkspaceError> {
-        let ancestor = common_ancestor_directory_of(paths)?;
+        let directories = file_directories_of(paths)?;
 
-        let Some(marked) = nearest_marked_directory_of(&ancestor, markers) else {
-            return Ok(ProjectRoot::Unmarked(Self::at(&ancestor)?));
+        let Some(marked) = marked_directories_of(&directories, markers) else {
+            // **1 つでも印を持たないファイルがあれば、そのファイルの参照元は揃わない。**
+            // 揃っている側だけで重なりを測ることはできないので、根は広げずに落とす。
+            return Ok(ProjectRoot::Unmarked(Self::at(
+                &common_ancestor_or_error_of(&directories)?,
+            )?));
         };
 
-        Ok(ProjectRoot::Marked(Self::at(marked)?))
+        Ok(ProjectRoot::Marked(Self::at(
+            &common_ancestor_or_error_of(&marked)?,
+        )?))
     }
 
     /// そのディレクトリを根にする。
@@ -100,9 +113,9 @@ impl WorkspaceRoot {
 /// 既定値で埋めない」）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectRoot {
-    /// 印のあるディレクトリを根にした。
+    /// 開くファイルがすべて印の下にあり、その印をすべて含む位置を根にした。
     Marked(WorkspaceRoot),
-    /// 印がどこにも無く、開くファイルの共通の祖先を根にした。
+    /// 印を持たないファイルがあり、開くファイルの共通の祖先を根にした。
     Unmarked(WorkspaceRoot),
 }
 
@@ -115,12 +128,12 @@ impl ProjectRoot {
     }
 }
 
-/// 開くファイル群をすべて含む、最も近い共通の祖先ディレクトリ。
+/// 開くファイルが 1 つずつ属するディレクトリ。
 ///
 /// # Errors
 ///
-/// `paths` が空のとき、絶対パスにできないパスがあるとき、共通の祖先が無いとき。
-fn common_ancestor_directory_of(paths: &[PathBuf]) -> Result<PathBuf, WorkspaceError> {
+/// `paths` が空のとき、絶対パスにできないパスがあるとき。
+fn file_directories_of(paths: &[PathBuf]) -> Result<Vec<PathBuf>, WorkspaceError> {
     if paths.is_empty() {
         return Err(WorkspaceError::NoPaths);
     }
@@ -140,11 +153,29 @@ fn common_ancestor_directory_of(paths: &[PathBuf]) -> Result<PathBuf, WorkspaceE
         directories.push(directory);
     }
 
-    let Some(ancestor) = common_ancestor_of(&directories) else {
-        return Err(WorkspaceError::NoCommonAncestor { directories });
-    };
+    Ok(directories)
+}
 
-    Ok(ancestor)
+/// すべてを含む最も近い共通の祖先。
+///
+/// # Errors
+///
+/// 共通の祖先が無いとき。
+fn common_ancestor_or_error_of(directories: &[PathBuf]) -> Result<PathBuf, WorkspaceError> {
+    common_ancestor_of(directories).ok_or_else(|| WorkspaceError::NoCommonAncestor {
+        directories: directories.to_vec(),
+    })
+}
+
+/// 1 つずつのディレクトリについて、その上にある最も近い印のディレクトリ。
+///
+/// **1 つでも印を持たないものがあれば `None`。** そのファイルの参照元だけが揃わない形に
+/// なり、揃っている側だけで重なりを測ることはできない。
+fn marked_directories_of(directories: &[PathBuf], markers: &[String]) -> Option<Vec<PathBuf>> {
+    directories
+        .iter()
+        .map(|directory| nearest_marked_directory_of(directory, markers).map(Path::to_path_buf))
+        .collect()
 }
 
 /// `from` から上へ辿って、印を持つ最も近いディレクトリ。どこにも無ければ `None`。
@@ -415,6 +446,48 @@ mod tests {
                 )])
                 .expect("根を決められる")
             )
+        );
+    }
+
+    #[test]
+    fn test_enclosing_project_across_sibling_projects_covers_both_markers() {
+        // 印が共通の祖先より**下**に 2 つある形（`sibling-projects/` に印は無い）。
+        // 祖先から上だけを見ると印が 1 つも見えないが、**サーバは根の下の印を
+        // 見つけて答えられる**ので、取れないものと判断してはいけない
+        let paths = vec![
+            repository_path("tests/fixtures/sibling-projects/billing/src/discount.ts"),
+            repository_path("tests/fixtures/sibling-projects/inventory/src/reorder.ts"),
+        ];
+
+        let root = WorkspaceRoot::enclosing_project(&paths, &["tsconfig.json".to_owned()])
+            .expect("根を決められる");
+
+        assert_eq!(
+            root,
+            ProjectRoot::Marked(
+                WorkspaceRoot::enclosing(&[repository_path(
+                    "tests/fixtures/sibling-projects/anything.ts"
+                )])
+                .expect("根を決められる")
+            )
+        );
+    }
+
+    #[test]
+    fn test_enclosing_project_with_one_file_outside_any_project_is_unmarked() {
+        // 対照は上のテスト。片方だけ印を持たない形。**揃っている側だけで
+        // 重なりは測れない**ので、根は広げずに落とす
+        let paths = vec![
+            repository_path("tests/fixtures/sibling-projects/billing/src/discount.ts"),
+            repository_path("tests/fixtures/billing/discount.ts"),
+        ];
+
+        let root = WorkspaceRoot::enclosing_project(&paths, &["tsconfig.json".to_owned()])
+            .expect("根を決められる");
+
+        assert_eq!(
+            root,
+            ProjectRoot::Unmarked(WorkspaceRoot::enclosing(&paths).expect("根を決められる"))
         );
     }
 
