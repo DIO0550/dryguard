@@ -17,7 +17,7 @@
 //! | ここ | サーバの起動・パイプの配線・終了 |
 //!
 //! **外へ出すのは [`ServerCommand`] / [`Client`] / [`Session`]、渡す値
-//! （[`WorkspaceRoot`] / [`ProjectRoot`] / [`SourceDocument`]）と、失敗を読むための型だけ。**
+//! （[`WorkspaceRoot`] / [`SourceDocument`]）と、失敗を読むための型だけ。**
 //! 区切りや payload の組み立て方は、いつ変えても外に影響しない位置に置く
 //! (rules/architecture.md「モジュールの公開 API」)。
 
@@ -51,7 +51,10 @@ pub use hover::{HoverOutcome, SignatureText};
 pub use references::ReferencesOutcome;
 // 型の宣言の場所は、開かせる相手を決める材料として `pipeline` が読む。
 pub use type_definition::{DeclarationSite, TypeDefinitionOutcome};
-pub use workspace::{ProjectRoot, WorkspaceError, WorkspaceRoot};
+pub use workspace::{WorkspaceError, WorkspaceRoot};
+// 根の決め方は `pipeline` だけが使う手順なので、クレートの外へは出さない
+// (rules/architecture.md「モジュールの公開 API」)。
+pub(crate) use workspace::ProjectRoot;
 
 // 失敗を読むための型だけを外へ出す。[`ClientError`] が抱えている以上、
 // 外から名前を呼べないと `source()` をたどっても中身を見分けられない。
@@ -90,7 +93,8 @@ impl ServerCommand {
     /// 実行ファイル名・引数・プロジェクトの印から起動の仕方を組み立てる。
     ///
     /// `project_markers` はそのサーバがプロジェクトの根と見なすファイルの名前。
-    /// 印を持たないサーバには空を渡す（根は開くファイルの共通の祖先のままになる）。
+    /// **印で範囲を決めないサーバには空を渡す。** 根が範囲そのものになるので、
+    /// 参照元は揃う扱いになる（`WorkspaceRoot::enclosing_project`）。
     pub fn new(
         program: impl Into<String>,
         args: Vec<String>,

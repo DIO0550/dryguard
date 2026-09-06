@@ -70,11 +70,21 @@ impl WorkspaceRoot {
     ///
     /// [`WorkspaceRoot::enclosing`] と同じ。印が見つからないのは失敗ではなく、
     /// [`ProjectRoot::is_marked`] が `false` を返す形になる。
-    pub fn enclosing_project(
+    pub(crate) fn enclosing_project(
         paths: &[PathBuf],
         markers: &[String],
     ) -> Result<ProjectRoot, WorkspaceError> {
         let directories = file_directories_of(paths)?;
+
+        // **印を持たないサーバでは、この検査そのものが当たらない。** 根で自分の範囲を
+        // 決めるサーバは、印が無くても参照元を揃えて返せる。空の一覧を「揃わないことを
+        // 確かめた」と読むと、確かめていない側の答えを落とすことになる。
+        if markers.is_empty() {
+            return Ok(ProjectRoot {
+                root: Self::at(&common_ancestor_or_error_of(&directories)?)?,
+                marked: paths.iter().cloned().collect(),
+            });
+        }
 
         // 印を持つファイルは印のディレクトリを、持たないファイルは自分のディレクトリを
         // 出す。印のほうを使わないと、根が印より下に来てサーバから印が見えなくなる。
@@ -123,14 +133,14 @@ impl WorkspaceRoot {
 /// 印の下に無いファイルでは、根をどれだけ広げても参照元は揃わない
 /// （サーバが開いたファイルとその import 先だけでプロジェクトを組み立てるため）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectRoot {
+pub(crate) struct ProjectRoot {
     root: WorkspaceRoot,
     marked: BTreeSet<PathBuf>,
 }
 
 impl ProjectRoot {
     /// サーバに見せる根。印の有無によらず、渡すものは根 1 つ。
-    pub fn workspace_root(&self) -> &WorkspaceRoot {
+    pub(crate) fn workspace_root(&self) -> &WorkspaceRoot {
         &self.root
     }
 
@@ -139,7 +149,7 @@ impl ProjectRoot {
     /// `path` は [`WorkspaceRoot::enclosing_project`] に渡したのと**同じ綴り**。
     /// 渡していない綴りは印の下に無い扱いになる（**漏れは参照元を落とす側へ倒す**。
     /// `rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」）。
-    pub fn is_marked(&self, path: &Path) -> bool {
+    pub(crate) fn is_marked(&self, path: &Path) -> bool {
         self.marked.contains(path)
     }
 }
@@ -500,6 +510,24 @@ mod tests {
         assert!(
             !root.is_marked(&outside),
             "印の外のファイルは印の外と答える"
+        );
+    }
+
+    #[test]
+    fn test_enclosing_project_without_markers_treats_every_file_as_rooted() {
+        // 印で範囲を決めないサーバ。**空の一覧は「当てはまらない」であって
+        // 「揃わないことを確かめた」ではない**ので、参照元を落とす側へ倒さない
+        let paths = paths_under_a_marked_ancestor();
+
+        let root = WorkspaceRoot::enclosing_project(&paths, &[]).expect("根を決められる");
+
+        assert_eq!(
+            root.workspace_root(),
+            &WorkspaceRoot::enclosing(&paths).expect("根を決められる")
+        );
+        assert!(
+            paths.iter().all(|path| root.is_marked(path)),
+            "印を見ないサーバでは、どのファイルも参照元を尋ねる対象になる"
         );
     }
 
