@@ -65,7 +65,10 @@ fn document(path: &Path) -> SourceDocument {
 /// 根は `WorkspaceRoot::enclosing` が渡されたパスから決める。**テスト側で広げない**
 /// （広げると、本番が作らない設定でテストが通る）。`tests/fixtures/references/` は
 /// 候補ペアの共通の祖先（`src/`）に tsconfig.json を置いてあり、そこが根になる。
-/// より下が根になるコードベースで呼び出し元が一部しか返らない話は Issue #125。
+///
+/// **印を上へ探す側は通らない。** ここで見たいのは応答の読み取りと正規化なので、
+/// 根の決め方まで本番と揃える必要は無い。印より下が根になるペアを本番の経路で
+/// 通すのは `test_compare_with_a_pair_below_the_project_marker_still_sees_every_caller`。
 fn session_over(paths: &[PathBuf]) -> Session {
     let Ok(root) = WorkspaceRoot::enclosing(paths) else {
         panic!("テストが渡すパスからは根を決められる");
@@ -311,6 +314,32 @@ fn measured_with_an_lsp(location_a: &Location, location_b: &Location) -> Measure
     measured
 }
 
+/// 先に指定したチャンクの、ドメインごとの参照元の件数。測れていなければ落とす。
+fn references_per_domain_of_a(measured: &MeasuredPair) -> Vec<(String, usize)> {
+    let CallerDomainOverlap::Measured(callers) = measured.signals().caller_domain_overlap() else {
+        panic!(
+            "実サーバは参照元を返す: {:?}",
+            measured.signals().caller_domain_overlap()
+        );
+    };
+
+    callers
+        .callers_a()
+        .references_per_domain()
+        .iter()
+        .map(|(domain, count)| {
+            let name = domain
+                .directory()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_owned();
+
+            (name, *count)
+        })
+        .collect()
+}
+
 /// 測れた呼び出し元ドメインの重なり。測れていなければ落とす。
 fn caller_domain_overlap_value(measured: &MeasuredPair) -> f64 {
     let CallerDomainOverlap::Measured(callers) = measured.signals().caller_domain_overlap() else {
@@ -321,6 +350,27 @@ fn caller_domain_overlap_value(measured: &MeasuredPair) -> f64 {
     };
 
     callers.overlap().value()
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_a_pair_below_the_project_marker_still_sees_every_caller() {
+    // 候補ペアの 2 ファイルがどちらも `src/billing/` にあるので、共通の祖先は
+    // **tsconfig.json のある `src/` より 1 段下**になる。そこを根にすると、サーバは
+    // 開いたファイルとその import 先だけでプロジェクトを組み立て、`applyDiscount` の
+    // 呼び出し元が 1 件も返らない。
+    //
+    // 数えるのは出現回数なので、invoice.ts / statement.ts が import と呼び出しで
+    // 2 回ずつ挙がって 4。**取りこぼすと 2 以下に落ちる**ので、揃っているかが値に出る
+    let discounts_an_invoice = fixture("references/src/billing/discount.ts", 5);
+    let rebates_an_invoice = fixture("references/src/billing/rebate.ts", 5);
+
+    let measured = measured_with_an_lsp(&discounts_an_invoice, &rebates_an_invoice);
+
+    assert_eq!(
+        references_per_domain_of_a(&measured),
+        vec![("billing".to_owned(), 4)]
+    );
 }
 
 #[test]

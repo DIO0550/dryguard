@@ -52,6 +52,9 @@ pub use references::ReferencesOutcome;
 // 型の宣言の場所は、開かせる相手を決める材料として `pipeline` が読む。
 pub use type_definition::{DeclarationSite, TypeDefinitionOutcome};
 pub use workspace::{WorkspaceError, WorkspaceRoot};
+// 根の決め方は `pipeline` だけが使う手順なので、クレートの外へは出さない
+// (rules/architecture.md「モジュールの公開 API」)。
+pub(crate) use workspace::ProjectRoot;
 
 // 失敗を読むための型だけを外へ出す。[`ClientError`] が抱えている以上、
 // 外から名前を呼べないと `source()` をたどっても中身を見分けられない。
@@ -66,6 +69,13 @@ const TYPESCRIPT_SERVER: &str = "typescript-language-server";
 /// stdio でしゃべらせる指定。付けないとサーバは使い方を表示して終わる。
 const STDIO_OPTION: &str = "--stdio";
 
+/// TypeScript のプロジェクトの範囲を決めるファイル。
+///
+/// tsserver はこれを見つけたディレクトリをプロジェクトの根にする。見つからなければ
+/// 開いたファイルとその import 先だけを組み立てる（inferred project）ので、
+/// **import を辿る向きの逆にある参照元が返らない**。
+const TYPESCRIPT_PROJECT_MARKERS: [&str; 2] = ["tsconfig.json", "jsconfig.json"];
+
 /// どの LSP サーバをどう起動するか。
 ///
 /// **サーバごとの差はここに閉じる。** Phase 4 で rust-analyzer を挿すときに
@@ -76,25 +86,47 @@ const STDIO_OPTION: &str = "--stdio";
 pub struct ServerCommand {
     program: String,
     args: Vec<String>,
+    project_markers: Vec<String>,
 }
 
 impl ServerCommand {
-    /// 実行ファイル名と引数から起動の仕方を組み立てる。
-    pub fn new(program: impl Into<String>, args: Vec<String>) -> Self {
+    /// 実行ファイル名・引数・プロジェクトの印から起動の仕方を組み立てる。
+    ///
+    /// `project_markers` はそのサーバがプロジェクトの根と見なすファイルの名前。
+    /// **印で範囲を決めないサーバには空を渡す。** 根が範囲そのものになるので、
+    /// 参照元は揃う扱いになる（`WorkspaceRoot::enclosing_project`）。
+    pub fn new(
+        program: impl Into<String>,
+        args: Vec<String>,
+        project_markers: Vec<String>,
+    ) -> Self {
         Self {
             program: program.into(),
             args,
+            project_markers,
         }
     }
 
     /// typescript-language-server を stdio で起動する指定。
     pub fn typescript() -> Self {
-        Self::new(TYPESCRIPT_SERVER, vec![STDIO_OPTION.to_owned()])
+        Self::new(
+            TYPESCRIPT_SERVER,
+            vec![STDIO_OPTION.to_owned()],
+            TYPESCRIPT_PROJECT_MARKERS.map(str::to_owned).to_vec(),
+        )
     }
 
     /// 実行ファイル名。
     pub fn program(&self) -> &str {
         &self.program
+    }
+
+    /// そのサーバがプロジェクトの根と見なすファイルの名前。
+    ///
+    /// 拡張子の一覧を `Grammar` が 1 箇所で持つのと同じで、**言語ごとに決まる情報**
+    /// なのでサーバの指定と一緒に置く（`rules/naming.md`「このツールの語彙を固定する」）。
+    pub fn project_markers(&self) -> &[String] {
+        &self.project_markers
     }
 }
 
@@ -608,7 +640,8 @@ mod tests {
 
     #[test]
     fn test_client_start_with_a_missing_program_reports_the_server_not_found() {
-        let command = ServerCommand::new("dryguard-no-such-language-server", Vec::new());
+        let command =
+            ServerCommand::new("dryguard-no-such-language-server", Vec::new(), Vec::new());
 
         let error = Client::start(&command).expect_err("起動できない");
 
@@ -755,6 +788,27 @@ mod tests {
 
         assert_eq!(command.program(), "typescript-language-server");
         assert_eq!(command.args, vec!["--stdio".to_owned()]);
+    }
+
+    #[test]
+    fn test_server_command_for_typescript_marks_projects_with_tsconfig() {
+        // 印が無いと根が候補ペアの共通の祖先のままになり、参照元が揃わない
+        let command = ServerCommand::typescript();
+
+        assert_eq!(
+            command.project_markers(),
+            ["tsconfig.json".to_owned(), "jsconfig.json".to_owned()]
+        );
+    }
+
+    #[test]
+    fn test_server_command_without_project_markers_has_none() {
+        // 対照は上のテスト。**印を持たないサーバもある**ので、
+        // 印の一覧が空であることと TS の一覧を取り違えない
+        let command =
+            ServerCommand::new("dryguard-no-such-language-server", Vec::new(), Vec::new());
+
+        assert!(command.project_markers().is_empty());
     }
 
     #[test]
