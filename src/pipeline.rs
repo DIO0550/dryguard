@@ -293,7 +293,10 @@ struct AskedSemantics {
 #[derive(Debug)]
 enum AskedCallerDomains {
     /// プロジェクトの印が無いので尋ねなかった。
-    Unrooted,
+    Unrooted {
+        /// 探した印の名前。利用者が何を置けばよいかを出すのに運ぶ。
+        markers: Vec<String>,
+    },
     /// 尋ねた。
     Answered(Result<CallerDomainsOutcome, ClientError>),
 }
@@ -311,7 +314,9 @@ impl AskedCallerDomains {
         position: SourcePosition,
     ) -> Self {
         if !root.is_marked(chunk.path()) {
-            return Self::Unrooted;
+            return Self::Unrooted {
+                markers: root.markers().to_vec(),
+            };
         }
 
         Self::Answered(caller_domains_outcome_of(session, document, position))
@@ -322,7 +327,7 @@ impl AskedCallerDomains {
     /// 取り出すのに自分を消費するのは、`ClientError` を複製できないため。
     fn into_error(self) -> Option<ClientError> {
         match self {
-            Self::Unrooted => None,
+            Self::Unrooted { .. } => None,
             Self::Answered(outcome) => outcome.err(),
         }
     }
@@ -590,7 +595,14 @@ fn asked_caller_domain_overlap_of(
     let (AskedCallerDomains::Answered(callers_a), AskedCallerDomains::Answered(callers_b)) =
         (callers_a, callers_b)
     else {
-        return CallerDomainOverlap::ProjectUnrooted;
+        // 片方でも尋ねていなければ、その理由に要る印の名前を運ぶ。
+        let markers = match (callers_a, callers_b) {
+            (AskedCallerDomains::Unrooted { markers }, _)
+            | (_, AskedCallerDomains::Unrooted { markers }) => markers.clone(),
+            (AskedCallerDomains::Answered(_), AskedCallerDomains::Answered(_)) => Vec::new(),
+        };
+
+        return CallerDomainOverlap::ProjectUnrooted { markers };
     };
 
     let (Ok(callers_a), Ok(callers_b)) = (callers_a, callers_b) else {
@@ -1292,10 +1304,15 @@ fn documents_of(
 
 /// 候補ペアに現れるチャンクが属するファイル。ワークスペースの根を決める材料。
 fn asked_paths_of(chunks: &[ScannedChunk], asked: &BTreeSet<usize>) -> Vec<PathBuf> {
-    asked
+    // **ファイルは 1 度だけ挙げる。** 1 つのファイルから N 個のチャンクを切り出すと、
+    // 同じパスについて祖先を辿る `is_file` が N 回走る（印がどこにも無い木では、
+    // 1 回あたりファイルシステムの根まで辿る）。
+    let unique: BTreeSet<PathBuf> = asked
         .iter()
         .map(|&index| chunks[index].chunk.path().to_path_buf())
-        .collect()
+        .collect();
+
+    unique.into_iter().collect()
 }
 
 /// 開かせたドキュメントに、チャンクごとの hover と references を尋ねる。
