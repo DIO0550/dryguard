@@ -271,9 +271,13 @@ fn caller_domain_overlap_text_of(signal: &CallerDomainOverlap) -> Option<String>
             return Some(format!("呼び出し元ドメインの重なりを{unavailable}"));
         }
         CallerDomainOverlap::NoName => "チャンクが名前を持たない",
-        // 利用者が直せるので、次にすることまで出す。
-        CallerDomainOverlap::ProjectUnrooted => {
-            "プロジェクトの印が見つからない: tsconfig.json を置くと参照元が揃う"
+        // 利用者が直せるので、次にすることまで出す。**印の綴りはシグナルが運んだものを
+        // 使う**（ここに書き写すと、サーバを足したときにそのサーバに無い名前を勧める）。
+        CallerDomainOverlap::ProjectUnrooted { markers } => {
+            return Some(format!(
+                "呼び出し元ドメインの重なりを測れない ({})",
+                unrooted_project_text_of(markers)
+            ));
         }
         CallerDomainOverlap::NoReferences => "参照元が 1 件も返らない",
         CallerDomainOverlap::UnreadableReferences => "読めない URI が混じっている",
@@ -284,6 +288,22 @@ fn caller_domain_overlap_text_of(signal: &CallerDomainOverlap) -> Option<String>
     Some(format!(
         "呼び出し元ドメインの重なりを測れない ({unmeasured})"
     ))
+}
+
+/// プロジェクトの印が見つからなかったことと、置けば揃う印の名前。
+///
+/// `markers` はそのサーバが探した印の名前（`lsp::ServerCommand::project_markers`）。
+/// **空なら名前を出さない。** 印で範囲を決めないサーバではそもそもここへ来ないが、
+/// 来たときに「何も置かなくてよい」を「何かを置け」と読ませない。
+fn unrooted_project_text_of(markers: &[String]) -> String {
+    if markers.is_empty() {
+        return "プロジェクトの印が見つからない".to_owned();
+    }
+
+    format!(
+        "プロジェクトの印が見つからない: {} のどれかを置くと参照元が揃う",
+        markers.join(" / ")
+    )
 }
 
 /// Stage 2 へ届かなかったことを表す文。
@@ -778,19 +798,43 @@ mod tests {
         // 型シグネチャは印の有無に関わらず取れるので、落ちるのは呼び出し元だけ
         let text = text_of_accidental_duplication_with_semantics(
             TypeSignatureMatch::Unifiable,
-            CallerDomainOverlap::ProjectUnrooted,
+            CallerDomainOverlap::ProjectUnrooted {
+                markers: vec!["tsconfig.json".to_owned(), "jsconfig.json".to_owned()],
+            },
         );
 
         assert!(
             text.contains(
                 "呼び出し元ドメインの重なりを測れない \
-                 (プロジェクトの印が見つからない: tsconfig.json を置くと参照元が揃う)"
+                 (プロジェクトの印が見つからない: tsconfig.json / jsconfig.json \
+                  のどれかを置くと参照元が揃う)"
             ),
             "印が無いことと、次にすることが出る: {text}"
         );
         assert!(
             text.contains("型シグネチャ: 単一化可能"),
             "型シグネチャは印の有無に関わらず出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_an_unrooted_project_without_markers_suggests_nothing_to_place() {
+        // 対照は上のテスト。**印の名前が無いのに「置け」と言わない**
+        // （そのサーバに無いファイルを勧めることになる）
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::Unifiable,
+            CallerDomainOverlap::ProjectUnrooted {
+                markers: Vec::new(),
+            },
+        );
+
+        assert!(
+            text.contains("呼び出し元ドメインの重なりを測れない (プロジェクトの印が見つからない)"),
+            "印が無いことだけを出す: {text}"
+        );
+        assert!(
+            !text.contains("を置くと参照元が揃う"),
+            "置くべきファイルの名前が無いのに勧めない: {text}"
         );
     }
 

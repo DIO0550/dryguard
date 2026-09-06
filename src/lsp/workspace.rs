@@ -83,6 +83,7 @@ impl WorkspaceRoot {
             return Ok(ProjectRoot {
                 root: Self::at(&common_ancestor_or_error_of(&directories)?)?,
                 marked: paths.iter().cloned().collect(),
+                markers: Vec::new(),
             });
         }
 
@@ -103,6 +104,7 @@ impl WorkspaceRoot {
         Ok(ProjectRoot {
             root: Self::at(&common_ancestor_or_error_of(&covered)?)?,
             marked,
+            markers: markers.to_vec(),
         })
     }
 
@@ -136,12 +138,21 @@ impl WorkspaceRoot {
 pub(crate) struct ProjectRoot {
     root: WorkspaceRoot,
     marked: BTreeSet<PathBuf>,
+    markers: Vec<String>,
 }
 
 impl ProjectRoot {
     /// サーバに見せる根。印の有無によらず、渡すものは根 1 つ。
     pub(crate) fn workspace_root(&self) -> &WorkspaceRoot {
         &self.root
+    }
+
+    /// 探した印の名前。
+    ///
+    /// **利用者が何を置けばよいかは、これでしか言えない。** 綴りを出力側に書き写すと
+    /// サーバを足したときに食い違う（`rules/coding.md`「コード内の値の再掲」）。
+    pub(crate) fn markers(&self) -> &[String] {
+        &self.markers
     }
 
     /// そのファイルが印の下にあるか。

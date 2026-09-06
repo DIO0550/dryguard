@@ -725,7 +725,9 @@ mod tests {
             TypeSignatureMatch::Unavailable {
                 reason: SemanticsUnavailable::LspUnusable,
             },
-            CallerDomainOverlap::ProjectUnrooted,
+            CallerDomainOverlap::ProjectUnrooted {
+                markers: vec!["tsconfig.json".to_owned()],
+            },
         );
 
         let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);

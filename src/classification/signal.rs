@@ -201,7 +201,13 @@ pub enum CallerDomainOverlap {
     /// **`NoReferences` と分ける。** どちらも呼び出し元が返らないが、こちらは
     /// **確かめられていない**、あちらは**1 件も無いというサーバの答え**
     /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
-    ProjectUnrooted,
+    ProjectUnrooted {
+        /// 探した印の名前。利用者が何を置けばよいかを出すのに要る。
+        ///
+        /// **綴りを出力側に書き写さない。** サーバごとに決まる情報なので、
+        /// 書き写すとサーバを足したときに食い違う（`lsp::ServerCommand::project_markers`）。
+        markers: Vec<String>,
+    },
     /// どちらかのチャンクに参照元が 1 件も返らなかった。
     NoReferences,
     /// 参照元は返ったが、パスとして読めない URI が混じっていた。
