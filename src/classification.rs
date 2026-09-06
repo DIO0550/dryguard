@@ -717,6 +717,23 @@ mod tests {
     }
 
     #[test]
+    fn test_classification_of_an_unrooted_project_keeps_the_placement_verdict() {
+        // 対照は上のテスト。同じ入力で、呼び出し元が「別ドメイン」と返る代わりに
+        // **プロジェクトの印が無くて確かめられない**形にする。確かめられていない
+        // 参照元で `DO-NOT-EXTRACT` まで動かすと、揃っていない観測を答えとして出すことになる
+        let signals = signals_of_a_caller_only_domain_match().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable,
+            },
+            CallerDomainOverlap::ProjectUnrooted,
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    #[test]
     fn test_classification_of_unifiable_type_signatures_leans_that_reason_toward_extract() {
         let signals = signals_of_a_shared_domain().with_semantics(
             TypeSignatureMatch::Unifiable,

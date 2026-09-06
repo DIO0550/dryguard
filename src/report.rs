@@ -271,6 +271,10 @@ fn caller_domain_overlap_text_of(signal: &CallerDomainOverlap) -> Option<String>
             return Some(format!("呼び出し元ドメインの重なりを{unavailable}"));
         }
         CallerDomainOverlap::NoName => "チャンクが名前を持たない",
+        // 利用者が直せるので、次にすることまで出す。
+        CallerDomainOverlap::ProjectUnrooted => {
+            "プロジェクトの印が見つからない: tsconfig.json を置くと参照元が揃う"
+        }
         CallerDomainOverlap::NoReferences => "参照元が 1 件も返らない",
         CallerDomainOverlap::UnreadableReferences => "読めない URI が混じっている",
         CallerDomainOverlap::ServerStillWorking => "サーバが作業中で答えが落ち着かない",
@@ -764,6 +768,29 @@ mod tests {
         assert!(
             text.contains("構造類似度: 0.94"),
             "測れたシグナルはそのまま値が出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_an_unrooted_project_says_what_to_place() {
+        // 対照は上のテスト（サーバを使えない場合）。**印が無いのはサーバの都合ではなく
+        // 利用者が直せる**ので、「測れない」で止めず次にすることまで出す。
+        // 型シグネチャは印の有無に関わらず取れるので、落ちるのは呼び出し元だけ
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::Unifiable,
+            CallerDomainOverlap::ProjectUnrooted,
+        );
+
+        assert!(
+            text.contains(
+                "呼び出し元ドメインの重なりを測れない \
+                 (プロジェクトの印が見つからない: tsconfig.json を置くと参照元が揃う)"
+            ),
+            "印が無いことと、次にすることが出る: {text}"
+        );
+        assert!(
+            text.contains("型シグネチャ: 単一化可能"),
+            "型シグネチャは印の有無に関わらず出る: {text}"
         );
     }
 
