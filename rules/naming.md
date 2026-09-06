@@ -74,7 +74,9 @@ if structurally_similar && domains_differ { ... }
 | `payload` | frame の本文。JSON-RPC のメッセージ 1 通そのもの |
 | `handshake` | `initialize` 要求 → 応答 → `initialized` 通知。ここまでで 1 つ |
 | `session` | handshake を終えた接続。問い合わせを送れる状態。握手前は `client` |
-| `workspace root` | `initialize` でサーバに見せるディレクトリ。開かせるファイル群の共通の祖先 |
+| `project marker` | そのサーバがプロジェクトの根と見なすファイルの名前（TS は `tsconfig.json` / `jsconfig.json`、Rust は `Cargo.toml`）。言語ごとに決まる |
+| `workspace root` | `initialize` でサーバに見せるディレクトリ |
+| `project root` | 開かせるファイル群の共通の祖先から上へ `project marker` を探した結果。見つかった / 見つからなかったを `workspace root` と一緒に持つ |
 | `document` | サーバに開かせるソースファイル 1 つ分。URI・`language id`・中身の組 |
 | `language id` | LSP がサーバに伝える言語の名前（`typescript` / `typescriptreact`） |
 | `hover` | ソースの 1 点を指して、そこにある名前の型を尋ねる問い合わせ |
@@ -139,6 +141,15 @@ JSON が壊れているのは違う話）。1 語で呼ぶと、どちらの層�
 片方が `utils/` に置かれていても、呼び出し元が 1 つのドメインに偏っていれば
 「そのドメインのもの」と言える。**置き場所の代理指標を、使われ方の観測で置き換えない**
 （重ねる。`docs/dryguard-plan.md`「Phase 0 のディレクトリ距離との関係」）。
+
+**`workspace root` と `project root` を混ぜない。** サーバに渡すのはどちらも 1 つの
+ディレクトリだが、後者は**印が見つかったかを一緒に持つ**。印の無い木では根をどれだけ
+広げても参照元が揃わないので、根だけを渡すと**揃っているか確かめられないことが
+後段に伝わらない**（`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」）。
+
+**`project marker` は `grammar` / `language id` と同じ形の情報。** 言語ごとに決まる綴りで、
+**綴りを決めている相手が別**（印は LSP サーバ、`grammar` は tree-sitter のクレート）。
+拡張子の一覧を `Grammar` が持つのと同じく、印の一覧は `ServerCommand` が 1 箇所で持つ。
 
 **`grammar` と `language id` を混ぜない。** どちらも拡張子で決まるが、`grammar` は
 tree-sitter がソースを読むための文法、`language id` は LSP サーバに言語を伝える綴りで、
