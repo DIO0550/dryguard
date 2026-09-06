@@ -26,7 +26,13 @@ if [ "${#records[@]}" -eq 0 ]; then
   exit 0
 fi
 
-tags="$(grep -h '^- 分類: `' "${records[@]}" | sed 's/^- 分類: `\([^`]*\)`.*/\1/' | sort -u)"
+# 分類だけでなく対策済からも拾う。介入だけ先に置かれ、分類がまだ 1 件も
+# 付いていないタグ（この PR で足した enum-omission-direction など）を
+# 集計から見落とさないため。
+tags="$( { grep -h '^- 分類: `' "${records[@]}" || true
+           grep -h '^- 対策済: `' "${records[@]}" || true
+         } | sed -e 's/^- 分類: `\([^`]*\)`.*/\1/' -e 's/^- 対策済: `\([^`]*\)`.*/\1/' \
+           | sort -u)"
 
 body=""
 for tag in $tags; do
