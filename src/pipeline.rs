@@ -21,8 +21,8 @@ use crate::classification::{Classification, classification_of, is_structurally_s
 use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
 use crate::location::Location;
 use crate::lsp::{
-    Client, ClientError, DocumentError, ServerCommand, Session, SourceDocument, WorkspaceError,
-    WorkspaceRoot,
+    Client, ClientError, DocumentError, ProjectRoot, ServerCommand, Session, SourceDocument,
+    WorkspaceError, WorkspaceRoot,
 };
 use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outcome_of};
 use crate::semantics::resolved_type::{
@@ -286,6 +286,45 @@ struct AskedSemantics {
     error: Option<SemanticsError>,
 }
 
+/// 参照元を尋ねた結果。
+///
+/// **印の無い木では尋ねない。** 根をどれだけ広げても参照元は揃わないので
+/// （[`crate::lsp::ServerCommand::project_markers`]）、往復のぶんだけ遅くなる。
+#[derive(Debug)]
+enum AskedCallerDomains {
+    /// プロジェクトの印が無いので尋ねなかった。
+    Unrooted,
+    /// 尋ねた。
+    Answered(Result<CallerDomainsOutcome, ClientError>),
+}
+
+impl AskedCallerDomains {
+    /// そのチャンクへ尋ねる。印が無ければ尋ねずに落とす。
+    fn ask(
+        session: &mut Session,
+        root: &ProjectRoot,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Self {
+        match root {
+            ProjectRoot::Unmarked(_) => Self::Unrooted,
+            ProjectRoot::Marked(_) => {
+                Self::Answered(caller_domains_outcome_of(session, document, position))
+            }
+        }
+    }
+
+    /// 往復の失敗。尋ねていない / 成功したときは `None`。
+    ///
+    /// 取り出すのに自分を消費するのは、`ClientError` を複製できないため。
+    fn into_error(self) -> Option<ClientError> {
+        match self {
+            Self::Unrooted => None,
+            Self::Answered(outcome) => outcome.err(),
+        }
+    }
+}
+
 impl AskedSemantics {
     /// どちらのシグナルも取れていない形。
     ///
@@ -321,9 +360,9 @@ fn unavailable_of(cause: &SemanticsError) -> SemanticsUnavailable {
 
 /// サーバを起こし、2 つのチャンクぶんの Stage 2 のシグナルを尋ねて終わらせる。
 ///
-/// 根は**候補ペアの 2 ファイルだけ**から決める。広げると、開かせないファイルまで
-/// 含む位置をサーバに見せることになる（`docs/dryguard-plan.md`「Stage 2: 意味情報収集」）。
-/// 根が tsconfig.json より下に来るコードベースで参照元が一部しか返らない話は Issue #125。
+/// 根は**候補ペアの 2 ファイル**から決め、そこから上へプロジェクトの印を探す
+/// （[`WorkspaceRoot::enclosing_project`]）。共通の祖先のままにすると、
+/// 根が印より下に来たときに**参照元が一部しか返らない**。
 ///
 /// 尋ねる前に止まったときも失敗にしない。取れなかったことを持つ [`AskedSemantics`] を返す。
 fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
@@ -335,10 +374,13 @@ fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
         Ok(document) => document,
         Err(cause) => return AskedSemantics::from_setup_failure(cause),
     };
-    let root = match WorkspaceRoot::enclosing(&[
-        pair.chunk_a.path().to_path_buf(),
-        pair.chunk_b.path().to_path_buf(),
-    ]) {
+    let root = match WorkspaceRoot::enclosing_project(
+        &[
+            pair.chunk_a.path().to_path_buf(),
+            pair.chunk_b.path().to_path_buf(),
+        ],
+        server.project_markers(),
+    ) {
         Ok(root) => root,
         Err(cause) => {
             return AskedSemantics::from_setup_failure(SemanticsError::Workspace(cause));
@@ -349,13 +391,14 @@ fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
         Ok(client) => client,
         Err(cause) => return AskedSemantics::from_setup_failure(SemanticsError::Client(cause)),
     };
-    let mut session = match client.handshake(&root) {
+    let mut session = match client.handshake(root.workspace_root()) {
         Ok(session) => session,
         Err(cause) => return AskedSemantics::from_setup_failure(SemanticsError::Client(cause)),
     };
 
     let asked = asked_semantics_of(
         &mut session,
+        &root,
         &pair.chunk_a,
         &document_a,
         &pair.chunk_b,
@@ -382,6 +425,7 @@ fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
 /// 「測れない」に化ける（[`AskedSemantics`]）。
 fn asked_semantics_of(
     session: &mut Session,
+    root: &ProjectRoot,
     chunk_a: &Chunk,
     document_a: &SourceDocument,
     chunk_b: &Chunk,
@@ -409,8 +453,8 @@ fn asked_semantics_of(
     asked_semantics_of_outcomes(
         resolved_type_signature_outcome_of(session, chunk_a, document_a, position_a),
         resolved_type_signature_outcome_of(session, chunk_b, document_b, position_b),
-        caller_domains_outcome_of(session, document_a, position_a),
-        caller_domains_outcome_of(session, document_b, position_b),
+        AskedCallerDomains::ask(session, root, document_a, position_a),
+        AskedCallerDomains::ask(session, root, document_b, position_b),
     )
 }
 
@@ -498,8 +542,8 @@ fn unopened_declaring_documents_of(
 fn asked_semantics_of_outcomes(
     signature_a: Result<TypeSignatureOutcome, ClientError>,
     signature_b: Result<TypeSignatureOutcome, ClientError>,
-    callers_a: Result<CallerDomainsOutcome, ClientError>,
-    callers_b: Result<CallerDomainsOutcome, ClientError>,
+    callers_a: AskedCallerDomains,
+    callers_b: AskedCallerDomains,
 ) -> AskedSemantics {
     let type_signature_match = asked_type_signature_match_of(&signature_a, &signature_b);
     let caller_domain_overlap = asked_caller_domain_overlap_of(&callers_a, &callers_b);
@@ -511,8 +555,8 @@ fn asked_semantics_of_outcomes(
         error: signature_a
             .err()
             .or_else(|| signature_b.err())
-            .or_else(|| callers_a.err())
-            .or_else(|| callers_b.err())
+            .or_else(|| callers_a.into_error())
+            .or_else(|| callers_b.into_error())
             .map(SemanticsError::Client),
     }
 }
@@ -532,10 +576,20 @@ fn asked_type_signature_match_of(
 }
 
 /// 参照元を尋ねた結果から、呼び出し元ドメインの重なりのシグナルにする。
+///
+/// **印が無くて尋ねていない側があれば、そのことを出す。** 揃っているか確かめられない
+/// 参照元で重なりを計算すると、確かめられなかったことを答えとして出すことになる
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
 fn asked_caller_domain_overlap_of(
-    callers_a: &Result<CallerDomainsOutcome, ClientError>,
-    callers_b: &Result<CallerDomainsOutcome, ClientError>,
+    callers_a: &AskedCallerDomains,
+    callers_b: &AskedCallerDomains,
 ) -> CallerDomainOverlap {
+    let (AskedCallerDomains::Answered(callers_a), AskedCallerDomains::Answered(callers_b)) =
+        (callers_a, callers_b)
+    else {
+        return CallerDomainOverlap::ProjectUnrooted;
+    };
+
     let (Ok(callers_a), Ok(callers_b)) = (callers_a, callers_b) else {
         return CallerDomainOverlap::Unavailable {
             reason: SemanticsUnavailable::LspUnusable,
@@ -1088,7 +1142,7 @@ impl ScanSemantics {
             };
 
             first_signature_error = first_signature_error.or_else(|| type_signature.err());
-            first_caller_error = first_caller_error.or_else(|| caller_domains.err());
+            first_caller_error = first_caller_error.or_else(|| caller_domains.into_error());
         }
 
         first_signature_error
@@ -1116,8 +1170,8 @@ enum ChunkSemantics {
     Asked {
         /// 型シグネチャを尋ねた結果。
         type_signature: Result<TypeSignatureOutcome, ClientError>,
-        /// 参照元を尋ねた結果。
-        caller_domains: Result<CallerDomainsOutcome, ClientError>,
+        /// 参照元を尋ねた結果。**印が無ければ尋ねていない**。
+        caller_domains: AskedCallerDomains,
     },
 }
 
@@ -1126,10 +1180,10 @@ enum ChunkSemantics {
 /// **サーバは走査につき 1 度だけ起こす。** 候補ペアごとに起こすと、起動と握手と
 /// プロジェクトの読み込みが候補ペアの数だけ走る（`tests/corpus/src` で 65 回）。
 ///
-/// 根は**候補ペアに現れるファイルだけ**から決める。走査の根をそのまま渡すと、
-/// 開かせないファイルまで含む位置をサーバに見せることになる
+/// 根は**候補ペアに現れるファイル**から決め、そこから上へプロジェクトの印を探す
+/// （[`WorkspaceRoot::enclosing_project`]）。走査の根をそのまま渡さないのは、
+/// 開かせないファイルまで含む位置をサーバに見せないため
 /// （`docs/dryguard-plan.md`「Stage 2: 意味情報収集」）。
-/// 根が tsconfig.json より下に来るコードベースで参照元が一部しか返らない話は Issue #125。
 ///
 /// **候補ペアが 1 組も無ければサーバを起こさない**。似ていないペアの判定は Stage 2 で
 /// 変わらないので、起動と読み込みの待ち時間だけが増える。
@@ -1146,7 +1200,10 @@ fn scan_semantics_of(
         Ok(documents) => documents,
         Err(cause) => return ScanSemantics::from_failure(chunks.len(), asked, cause),
     };
-    let root = match WorkspaceRoot::enclosing(&asked_paths_of(chunks, asked)) {
+    let root = match WorkspaceRoot::enclosing_project(
+        &asked_paths_of(chunks, asked),
+        server.project_markers(),
+    ) {
         Ok(root) => root,
         Err(cause) => {
             return ScanSemantics::from_failure(
@@ -1163,14 +1220,14 @@ fn scan_semantics_of(
             return ScanSemantics::from_failure(chunks.len(), asked, SemanticsError::Client(cause));
         }
     };
-    let mut session = match client.handshake(&root) {
+    let mut session = match client.handshake(root.workspace_root()) {
         Ok(session) => session,
         Err(cause) => {
             return ScanSemantics::from_failure(chunks.len(), asked, SemanticsError::Client(cause));
         }
     };
 
-    let semantics = asked_scan_semantics_of(&mut session, chunks, asked, &documents);
+    let semantics = asked_scan_semantics_of(&mut session, &root, chunks, asked, &documents);
 
     // **答えを受け取っていても、異常終了したサーバの答えは採らない**（[`semantics_of`]）。
     if let Err(cause) = session.shutdown() {
@@ -1248,6 +1305,7 @@ fn asked_paths_of(chunks: &[ScannedChunk], asked: &BTreeSet<usize>) -> Vec<PathB
 /// 「測れない」に化ける（[`AskedSemantics`]）。
 fn asked_scan_semantics_of(
     session: &mut Session,
+    root: &ProjectRoot,
     chunks: &[ScannedChunk],
     asked: &BTreeSet<usize>,
     documents: &AskedDocuments,
@@ -1271,9 +1329,9 @@ fn asked_scan_semantics_of(
             )
         })
         .collect();
-    let callers: Vec<Result<CallerDomainsOutcome, ClientError>> = askable
+    let callers: Vec<AskedCallerDomains> = askable
         .iter()
-        .map(|askable| caller_domains_outcome_of(session, askable.document, askable.position))
+        .map(|askable| AskedCallerDomains::ask(session, root, askable.document, askable.position))
         .collect();
 
     ScanSemantics {
@@ -1322,7 +1380,7 @@ fn per_chunk_semantics_of(
     asked: &BTreeSet<usize>,
     askable: &[AskableChunk<'_>],
     signatures: Vec<Result<TypeSignatureOutcome, ClientError>>,
-    callers: Vec<Result<CallerDomainsOutcome, ClientError>>,
+    callers: Vec<AskedCallerDomains>,
 ) -> Vec<ChunkSemantics> {
     let mut per_chunk: Vec<ChunkSemantics> = (0..chunk_count)
         .map(|index| unasked_chunk_semantics_of(index, asked))
@@ -1636,6 +1694,11 @@ mod tests {
         normalized_outcome_of(&signature_text(text), &TracedTypeNames::default())
     }
 
+    /// 参照元を尋ねて、サーバが答えた形。
+    fn answered(outcome: CallerDomainsOutcome) -> AskedCallerDomains {
+        AskedCallerDomains::Answered(Ok(outcome))
+    }
+
     #[test]
     fn test_asked_semantics_do_not_call_a_pair_not_unifiable_with_an_unopened_type_name() {
         // 比較に残る型名を開けていないので、綴りのまま比べた結果は答えにならない
@@ -1644,8 +1707,8 @@ mod tests {
                 reason: UnopenedReason::TypeDefinitionNotProvided,
             }),
             Ok(normalized("function sumOf(amounts: number[]): number")),
-            Ok(CallerDomainsOutcome::NoReferences),
-            Ok(CallerDomainsOutcome::NoReferences),
+            answered(CallerDomainsOutcome::NoReferences),
+            answered(CallerDomainsOutcome::NoReferences),
         );
 
         assert_eq!(
@@ -1662,8 +1725,8 @@ mod tests {
         let asked = asked_semantics_of_outcomes(
             Ok(normalized("function totalOf(values: string[]): number")),
             Ok(normalized("function sumOf(amounts: number[]): number")),
-            Ok(CallerDomainsOutcome::NoReferences),
-            Ok(CallerDomainsOutcome::NoReferences),
+            answered(CallerDomainsOutcome::NoReferences),
+            answered(CallerDomainsOutcome::NoReferences),
         );
 
         assert_eq!(asked.type_signature_match, TypeSignatureMatch::NotUnifiable);
@@ -1678,8 +1741,8 @@ mod tests {
                 reason: UnopenedReason::UnreadableTypeDefinition,
             }),
             Ok(normalized("function sumOf(amounts: number[]): number")),
-            Ok(CallerDomainsOutcome::NoReferences),
-            Ok(CallerDomainsOutcome::NoReferences),
+            answered(CallerDomainsOutcome::NoReferences),
+            answered(CallerDomainsOutcome::NoReferences),
         );
 
         assert_eq!(
@@ -1695,8 +1758,8 @@ mod tests {
         asked_semantics_of_outcomes(
             Ok(normalized("function totalOf(values: number[]): number")),
             Ok(normalized("function sumOf(amounts: number[]): number")),
-            Err(ClientError::PipesNotWired),
-            Ok(CallerDomainsOutcome::NoReferences),
+            AskedCallerDomains::Answered(Err(ClientError::PipesNotWired)),
+            answered(CallerDomainsOutcome::NoReferences),
         )
     }
 
@@ -1799,7 +1862,7 @@ mod tests {
     /// 尋ねた 2 つの結果を持つチャンク。
     fn asked(
         type_signature: Result<TypeSignatureOutcome, ClientError>,
-        caller_domains: Result<CallerDomainsOutcome, ClientError>,
+        caller_domains: AskedCallerDomains,
     ) -> ChunkSemantics {
         ChunkSemantics::Asked {
             type_signature,
@@ -1824,11 +1887,11 @@ mod tests {
             per_chunk: vec![
                 asked(
                     Ok(TypeSignatureOutcome::NoTypeThere),
-                    Err(failure("later-references")),
+                    AskedCallerDomains::Answered(Err(failure("later-references"))),
                 ),
                 asked(
                     Err(failure("earlier-hover")),
-                    Ok(CallerDomainsOutcome::NoReferences),
+                    answered(CallerDomainsOutcome::NoReferences),
                 ),
             ],
             setup_error: None,
@@ -1851,11 +1914,11 @@ mod tests {
             per_chunk: vec![
                 asked(
                     Ok(TypeSignatureOutcome::NoTypeThere),
-                    Err(failure("only-references")),
+                    AskedCallerDomains::Answered(Err(failure("only-references"))),
                 ),
                 asked(
                     Ok(TypeSignatureOutcome::NoTypeThere),
-                    Ok(CallerDomainsOutcome::NoReferences),
+                    answered(CallerDomainsOutcome::NoReferences),
                 ),
             ],
             setup_error: None,
