@@ -299,19 +299,22 @@ enum AskedCallerDomains {
 }
 
 impl AskedCallerDomains {
-    /// そのチャンクへ尋ねる。印が無ければ尋ねずに落とす。
+    /// そのチャンクへ尋ねる。**そのチャンクのファイル**が印の下になければ尋ねずに落とす。
+    ///
+    /// **判断はファイルごと。** 走査全体で 1 つにまとめると、印の外のファイルが 1 つ
+    /// 混じっただけで、両側とも印の下にあるペアまで参照元を落とす。
     fn ask(
         session: &mut Session,
         root: &ProjectRoot,
+        chunk: &Chunk,
         document: &SourceDocument,
         position: SourcePosition,
     ) -> Self {
-        match root {
-            ProjectRoot::Unmarked(_) => Self::Unrooted,
-            ProjectRoot::Marked(_) => {
-                Self::Answered(caller_domains_outcome_of(session, document, position))
-            }
+        if !root.is_marked(chunk.path()) {
+            return Self::Unrooted;
         }
+
+        Self::Answered(caller_domains_outcome_of(session, document, position))
     }
 
     /// 往復の失敗。尋ねていない / 成功したときは `None`。
@@ -453,8 +456,8 @@ fn asked_semantics_of(
     asked_semantics_of_outcomes(
         resolved_type_signature_outcome_of(session, chunk_a, document_a, position_a),
         resolved_type_signature_outcome_of(session, chunk_b, document_b, position_b),
-        AskedCallerDomains::ask(session, root, document_a, position_a),
-        AskedCallerDomains::ask(session, root, document_b, position_b),
+        AskedCallerDomains::ask(session, root, chunk_a, document_a, position_a),
+        AskedCallerDomains::ask(session, root, chunk_b, document_b, position_b),
     )
 }
 
@@ -1331,7 +1334,15 @@ fn asked_scan_semantics_of(
         .collect();
     let callers: Vec<AskedCallerDomains> = askable
         .iter()
-        .map(|askable| AskedCallerDomains::ask(session, root, askable.document, askable.position))
+        .map(|askable| {
+            AskedCallerDomains::ask(
+                session,
+                root,
+                &chunks[askable.index].chunk,
+                askable.document,
+                askable.position,
+            )
+        })
         .collect();
 
     ScanSemantics {

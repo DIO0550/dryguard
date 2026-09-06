@@ -3,6 +3,7 @@
 //! **根は開くファイルから決める。** 候補ペアのファイルだけを開く形（`docs/dryguard-plan.md`
 //! 「Stage 2: 意味情報収集 (LSP)」）なので、根もその範囲を出ない位置に置く。
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -45,8 +46,9 @@ impl WorkspaceRoot {
     ///
     /// `paths` は候補ペアが含まれるファイル、`markers` はそのサーバがプロジェクトの根と
     /// 見なすファイルの名前（[`super::ServerCommand::project_markers`]）。
-    /// **ファイル 1 つずつについて**、そのディレクトリから上へ辿って最も近い印を探し、
-    /// 見つかった印のディレクトリすべての共通の祖先を根にする。
+    /// **ファイル 1 つずつについて**、そのディレクトリから上へ辿って最も近い印を探す。
+    /// 根は、印を持つファイルは印のディレクトリ・持たないファイルは自分のディレクトリを
+    /// 出し合った共通の祖先。**印の有無はファイルごとに** [`ProjectRoot`] が持つ。
     ///
     /// **Why（サーバと同じ探し方をする）**: tsserver は開いたファイルから上へ
     /// `tsconfig.json` を探す。探し方を揃えると、こちらが渡す根とサーバが組み立てる
@@ -67,24 +69,31 @@ impl WorkspaceRoot {
     /// # Errors
     ///
     /// [`WorkspaceRoot::enclosing`] と同じ。印が見つからないのは失敗ではなく、
-    /// [`ProjectRoot::Unmarked`] として返る。
+    /// [`ProjectRoot::is_marked`] が `false` を返す形になる。
     pub fn enclosing_project(
         paths: &[PathBuf],
         markers: &[String],
     ) -> Result<ProjectRoot, WorkspaceError> {
         let directories = file_directories_of(paths)?;
 
-        let Some(marked) = marked_directories_of(&directories, markers) else {
-            // **1 つでも印を持たないファイルがあれば、そのファイルの参照元は揃わない。**
-            // 揃っている側だけで重なりを測ることはできないので、根は広げずに落とす。
-            return Ok(ProjectRoot::Unmarked(Self::at(
-                &common_ancestor_or_error_of(&directories)?,
-            )?));
-        };
+        // 印を持つファイルは印のディレクトリを、持たないファイルは自分のディレクトリを
+        // 出す。印のほうを使わないと、根が印より下に来てサーバから印が見えなくなる。
+        let mut covered = Vec::with_capacity(directories.len());
+        let mut marked = BTreeSet::new();
+        for (path, directory) in paths.iter().zip(&directories) {
+            let Some(found) = nearest_marked_directory_of(directory, markers) else {
+                covered.push(directory.clone());
+                continue;
+            };
 
-        Ok(ProjectRoot::Marked(Self::at(
-            &common_ancestor_or_error_of(&marked)?,
-        )?))
+            covered.push(found.to_path_buf());
+            marked.insert(path.clone());
+        }
+
+        Ok(ProjectRoot {
+            root: Self::at(&common_ancestor_or_error_of(&covered)?)?,
+            marked,
+        })
     }
 
     /// そのディレクトリを根にする。
@@ -104,27 +113,34 @@ impl WorkspaceRoot {
     }
 }
 
-/// プロジェクトの印から決めたワークスペースの根。
+/// プロジェクトの印から決めた根と、**ファイルごとの**印の有無。
 ///
-/// **印が見つかったかを根と一緒に持つ。** 印の無い木では、根をどれだけ広げても
-/// 参照元は揃わない（サーバが開いたファイルとその import 先だけでプロジェクトを
-/// 組み立てるため）。根だけを返すと、**揃っているか確かめられないことが
-/// 呼び出し側に伝わらない**（`rules/architecture.md`「取れなかったシグナルを
-/// 既定値で埋めない」）。
+/// **印の有無をファイルごとに持つ。** 根は 1 つしか渡せないが、印の下にあるかは
+/// ファイルごとに違う。まとめて 1 つの真偽にすると、`scan` で印の外のファイルが
+/// 1 つ混じっただけで、**両側とも印の下にあるペアまで参照元を落とす**
+/// （`rules/architecture.md`「どこまでを「取れなかった」に数えるか」）。
+///
+/// 印の下に無いファイルでは、根をどれだけ広げても参照元は揃わない
+/// （サーバが開いたファイルとその import 先だけでプロジェクトを組み立てるため）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProjectRoot {
-    /// 開くファイルがすべて印の下にあり、その印をすべて含む位置を根にした。
-    Marked(WorkspaceRoot),
-    /// 印を持たないファイルがあり、開くファイルの共通の祖先を根にした。
-    Unmarked(WorkspaceRoot),
+pub struct ProjectRoot {
+    root: WorkspaceRoot,
+    marked: BTreeSet<PathBuf>,
 }
 
 impl ProjectRoot {
-    /// サーバに見せる根。印が見つかったかによらず、渡すものは根 1 つ。
+    /// サーバに見せる根。印の有無によらず、渡すものは根 1 つ。
     pub fn workspace_root(&self) -> &WorkspaceRoot {
-        match self {
-            Self::Marked(root) | Self::Unmarked(root) => root,
-        }
+        &self.root
+    }
+
+    /// そのファイルが印の下にあるか。
+    ///
+    /// `path` は [`WorkspaceRoot::enclosing_project`] に渡したのと**同じ綴り**。
+    /// 渡していない綴りは印の下に無い扱いになる（**漏れは参照元を落とす側へ倒す**。
+    /// `rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」）。
+    pub fn is_marked(&self, path: &Path) -> bool {
+        self.marked.contains(path)
     }
 }
 
@@ -165,17 +181,6 @@ fn common_ancestor_or_error_of(directories: &[PathBuf]) -> Result<PathBuf, Works
     common_ancestor_of(directories).ok_or_else(|| WorkspaceError::NoCommonAncestor {
         directories: directories.to_vec(),
     })
-}
-
-/// 1 つずつのディレクトリについて、その上にある最も近い印のディレクトリ。
-///
-/// **1 つでも印を持たないものがあれば `None`。** そのファイルの参照元だけが揃わない形に
-/// なり、揃っている側だけで重なりを測ることはできない。
-fn marked_directories_of(directories: &[PathBuf], markers: &[String]) -> Option<Vec<PathBuf>> {
-    directories
-        .iter()
-        .map(|directory| nearest_marked_directory_of(directory, markers).map(Path::to_path_buf))
-        .collect()
 }
 
 /// `from` から上へ辿って、印を持つ最も近いディレクトリ。どこにも無ければ `None`。
@@ -355,6 +360,13 @@ mod tests {
         assert_eq!(root.uri().as_str(), expected_uri_of("src"));
     }
 
+    /// そのディレクトリを指す根。**開くファイルではなくディレクトリから組み立てる**ので、
+    /// 「印のあるディレクトリまで上がったか」を、入力と別の道筋で確かめられる。
+    fn marked_root_of(relative_directory: &str) -> WorkspaceRoot {
+        WorkspaceRoot::enclosing(&[repository_path(relative_directory).join("anything.ts")])
+            .expect("根を決められる")
+    }
+
     /// このリポジトリに置いていないファイルの名前。印が見つからない側の入力に使う。
     ///
     /// **実在する名前を使わない。** `tsconfig.json` を渡すと、リポジトリより上の階層に
@@ -382,13 +394,14 @@ mod tests {
         .expect("根を決められる");
 
         assert_eq!(
-            root,
-            ProjectRoot::Marked(
-                WorkspaceRoot::enclosing(&[repository_path(
-                    "tests/fixtures/references/src/anything.ts"
-                )])
-                .expect("根を決められる")
-            )
+            root.workspace_root(),
+            &marked_root_of("tests/fixtures/references/src")
+        );
+        assert!(
+            paths_under_a_marked_ancestor()
+                .iter()
+                .all(|path| root.is_marked(path)),
+            "どちらのファイルも印の下にある"
         );
     }
 
@@ -402,11 +415,14 @@ mod tests {
         )
         .expect("根を決められる");
 
+        let paths = paths_under_a_marked_ancestor();
         assert_eq!(
-            root,
-            ProjectRoot::Unmarked(
-                WorkspaceRoot::enclosing(&paths_under_a_marked_ancestor()).expect("根を決められる")
-            )
+            root.workspace_root(),
+            &WorkspaceRoot::enclosing(&paths).expect("根を決められる")
+        );
+        assert!(
+            paths.iter().all(|path| !root.is_marked(path)),
+            "どちらのファイルも印の下に無い"
         );
     }
 
@@ -423,9 +439,10 @@ mod tests {
             .expect("根を決められる");
 
         assert_eq!(
-            root,
-            ProjectRoot::Marked(WorkspaceRoot::enclosing(&paths).expect("根を決められる"))
+            root.workspace_root(),
+            &WorkspaceRoot::enclosing(&paths).expect("根を決められる")
         );
+        assert!(paths.iter().all(|path| root.is_marked(path)));
     }
 
     #[test]
@@ -439,13 +456,8 @@ mod tests {
         .expect("根を決められる");
 
         assert_eq!(
-            root,
-            ProjectRoot::Marked(
-                WorkspaceRoot::enclosing(&[repository_path(
-                    "tests/fixtures/references/src/anything.ts"
-                )])
-                .expect("根を決められる")
-            )
+            root.workspace_root(),
+            &marked_root_of("tests/fixtures/references/src")
         );
     }
 
@@ -463,31 +475,31 @@ mod tests {
             .expect("根を決められる");
 
         assert_eq!(
-            root,
-            ProjectRoot::Marked(
-                WorkspaceRoot::enclosing(&[repository_path(
-                    "tests/fixtures/sibling-projects/anything.ts"
-                )])
-                .expect("根を決められる")
-            )
+            root.workspace_root(),
+            &marked_root_of("tests/fixtures/sibling-projects")
+        );
+        assert!(
+            paths.iter().all(|path| root.is_marked(path)),
+            "どちらのファイルも自分のプロジェクトの下にある"
         );
     }
 
     #[test]
-    fn test_enclosing_project_with_one_file_outside_any_project_is_unmarked() {
-        // 対照は上のテスト。片方だけ印を持たない形。**揃っている側だけで
-        // 重なりは測れない**ので、根は広げずに落とす
-        let paths = vec![
-            repository_path("tests/fixtures/sibling-projects/billing/src/discount.ts"),
-            repository_path("tests/fixtures/billing/discount.ts"),
-        ];
+    fn test_enclosing_project_marks_only_the_files_under_a_project() {
+        // 対照は上のテスト。片方だけ印を持たない形。**印の外の 1 つに引きずられて
+        // 印の下のファイルまで落とさない**（`scan` では印の外のファイルが 1 つ
+        // 混じっただけで、両側とも印の下にあるペアの参照元まで失われる）
+        let inside = repository_path("tests/fixtures/sibling-projects/billing/src/discount.ts");
+        let outside = repository_path("tests/fixtures/billing/discount.ts");
+        let paths = vec![inside.clone(), outside.clone()];
 
         let root = WorkspaceRoot::enclosing_project(&paths, &["tsconfig.json".to_owned()])
             .expect("根を決められる");
 
-        assert_eq!(
-            root,
-            ProjectRoot::Unmarked(WorkspaceRoot::enclosing(&paths).expect("根を決められる"))
+        assert!(root.is_marked(&inside), "印の下のファイルは印の下と答える");
+        assert!(
+            !root.is_marked(&outside),
+            "印の外のファイルは印の外と答える"
         );
     }
 
