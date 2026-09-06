@@ -36,7 +36,7 @@ pub(crate) fn line(number: usize) -> LineNumber {
 /// 実行ファイルが無いので `Client::start` が `ServerNotFound` で落ち、
 /// **サーバが入っている環境でも入っていない環境でも同じ経路を通る**。
 pub(crate) fn missing_server() -> ServerCommand {
-    ServerCommand::new("dryguard-no-such-language-server", Vec::new())
+    ServerCommand::new("dryguard-no-such-language-server", Vec::new(), Vec::new())
 }
 
 /// hover が返した綴り。
