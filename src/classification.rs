@@ -754,6 +754,22 @@ mod tests {
     }
 
     #[test]
+    fn test_classification_of_an_unverifiable_membership_keeps_the_placement_verdict() {
+        // 対照は上の 2 つ（印が無い / 範囲外）。**所属を確かめる手立てが無い**形。
+        // 参照元は返るかもしれないが揃っているかを言えないので、判定は動かさない
+        let signals = signals_of_a_caller_only_domain_match().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable,
+            },
+            CallerDomainOverlap::ProjectMembershipNotProvided,
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    #[test]
     fn test_classification_of_unifiable_type_signatures_leans_that_reason_toward_extract() {
         let signals = signals_of_a_shared_domain().with_semantics(
             TypeSignatureMatch::Unifiable,

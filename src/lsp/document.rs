@@ -71,7 +71,7 @@ impl SourceDocument {
     /// もので、Windows のドライブ文字を持つ URI を弾く。こちらの URI を通すと
     /// **Windows では必ず失敗する**（`file:///C:/repo/a.ts` が常にドライブ文字を持つ）。
     /// 絶対パスは [`SourceDocument::new`] が既に持っているので、そのまま取っておく。
-    pub(super) fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 

@@ -287,6 +287,9 @@ fn caller_domain_overlap_text_of(signal: &CallerDomainOverlap) -> Option<String>
                 outside_project_text_of(markers)
             ));
         }
+        CallerDomainOverlap::ProjectMembershipNotProvided => {
+            "サーバがプロジェクトの所属を答えられない"
+        }
         CallerDomainOverlap::NoReferences => "参照元が 1 件も返らない",
         CallerDomainOverlap::UnreadableReferences => "読めない URI が混じっている",
         CallerDomainOverlap::ServerStillWorking => "サーバが作業中で答えが落ち着かない",
@@ -889,6 +892,27 @@ mod tests {
         assert!(
             !text.contains("プロジェクトの印が見つからない"),
             "印はあるので、置く話にしない: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_an_unverifiable_membership_does_not_blame_the_project_config() {
+        // 対照は上のテスト（範囲外と確かめた場合）。**確かめる術が無いだけ**なので、
+        // 範囲を直せとは言わない。直す先はサーバのほう
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::Unifiable,
+            CallerDomainOverlap::ProjectMembershipNotProvided,
+        );
+
+        assert!(
+            text.contains(
+                "呼び出し元ドメインの重なりを測れない (サーバがプロジェクトの所属を答えられない)"
+            ),
+            "確かめられなかったことが出る: {text}"
+        );
+        assert!(
+            !text.contains("プロジェクトの範囲から外れている"),
+            "確かめていないのに範囲外と言わない: {text}"
         );
     }
 
