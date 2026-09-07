@@ -14,7 +14,7 @@
 //! | `hover` | hover の応答から型の綴りを取り出す |
 //! | `type_definition` | typeDefinition の応答から型の宣言の場所を取り出す |
 //! | `references` | references の応答から参照元のファイルを取り出す |
-//! | `project_membership` | projectInfo の応答から、割り当てられたプロジェクトを取り出す |
+//! | `project_membership` | projectInfo の応答を読み、設定されたプロジェクトか見分ける |
 //! | ここ | サーバの起動・パイプの配線・終了 |
 //!
 //! **外へ出すのは [`ServerCommand`] / [`Client`] / [`Session`]、渡す値
@@ -50,13 +50,14 @@ pub use document::{DocumentError, SourceDocument};
 // hover / references の結果は「取れた / 取れなかった理由」を分けて持つので、
 // 外から読める形で出す。
 pub use hover::{HoverOutcome, SignatureText};
-pub use project_membership::ProjectMembershipOutcome;
 pub use references::ReferencesOutcome;
 // 型の宣言の場所は、開かせる相手を決める材料として `pipeline` が読む。
 pub use type_definition::{DeclarationSite, TypeDefinitionOutcome};
 pub use workspace::{WorkspaceError, WorkspaceRoot};
-// 根の決め方は `pipeline` だけが使う手順なので、クレートの外へは出さない
-// (rules/architecture.md「モジュールの公開 API」)。
+// 根の決め方と所属の確かめ方は `pipeline` だけが使う手順なので、クレートの外へは出さない
+// (rules/architecture.md「モジュールの公開 API」)。所属のほうは**サーバ固有の要求の形**
+// でもあるので、外へ出すと typescript-language-server の都合が公開 API に居座る。
+pub(crate) use project_membership::ProjectMembershipOutcome;
 pub(crate) use workspace::ProjectRoot;
 
 // 失敗を読むための型だけを外へ出す。[`ClientError`] が抱えている以上、
@@ -370,7 +371,7 @@ impl Session {
     ///
     /// そのドキュメントを開かせていないとき、往復が失敗したとき、
     /// 応答からプロジェクトの綴りを読めないとき。
-    pub fn project_membership(
+    pub(crate) fn project_membership(
         &mut self,
         document: &SourceDocument,
     ) -> Result<ProjectMembershipOutcome, ClientError> {
