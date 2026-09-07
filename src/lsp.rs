@@ -360,6 +360,14 @@ impl Session {
             .map_err(ClientError::Conversation)
     }
 
+    /// そのサーバが references に答えるか。
+    ///
+    /// **尋ねる前に分かる。** 答えに効かない問い合わせを省くのに使う
+    /// （references に答えないサーバでは、所属を確かめても呼び出し元は取れない）。
+    pub(crate) fn answers_references(&self) -> bool {
+        provides_references(&self.capabilities)
+    }
+
     /// そのファイルを、サーバがどのプロジェクトの一員として扱っているかを尋ねる。
     ///
     /// hover と同じく、**サーバができると宣言していなければ送らない**。

@@ -319,8 +319,12 @@ enum AskedCallerDomains {
 /// チャンクを切り出すと、同じ答えのために N 回往復することになる
 /// （[`asked_paths_of`] が印を探す回数を 1 回に畳んでいるのと同じ形）。
 enum AskedMembership {
-    /// 印の下にあり、サーバも設定ファイルのプロジェクトの一員として扱っている。
-    InProject,
+    /// 参照元を尋ねてよい。
+    ///
+    /// **一員だと確かめられたときだけではない。** 所属が参照元の答えに効かないとき
+    /// （印を見ないサーバ・references に答えないサーバ）も含む
+    /// （`rules/architecture.md`「効かない材料が欠けたのは、取れたのと同じ扱いでよい」）。
+    Askable,
     /// プロジェクトの印が無い。
     Unrooted {
         /// 探した印の名前。
@@ -343,12 +347,19 @@ impl AskedMembership {
     /// `document` はサーバに開かせたファイル。印の有無は**そのファイルのパス**で見る
     /// （`document.path()` は開かせたときの絶対パスそのもの）。
     fn ask(session: &mut Session, root: &ProjectRoot, document: &SourceDocument) -> Self {
-        // **印で範囲を決めないサーバには尋ねない。** 根がそのまま範囲なので
+        // **references に答えないサーバには尋ねない。** 呼び出し元はどのみち取れないので、
+        // 所属は答えに効かない。ここで尋ねると、`ReferencesNotProvided` と出すべき場面で
+        // **所属のほうを理由に出す**（利用者が直す先を取り違える）。
+        if !session.answers_references() {
+            return Self::Askable;
+        }
+
+        // **印で範囲を決めないサーバにも尋ねない。** 根がそのまま範囲なので
         // （[`WorkspaceRoot::enclosing_project`]）、所属を尋ねられなくても
         // 参照元は揃う。ここで尋ねると、その口を持たないサーバで**今まで取れていた
         // 参照元を落とす**ことになる。
         if root.markers().is_empty() {
-            return Self::InProject;
+            return Self::Askable;
         }
 
         if !root.is_marked(document.path()) {
@@ -359,7 +370,7 @@ impl AskedMembership {
 
         match session.project_membership(document) {
             Err(cause) => Self::Unreachable(Some(cause)),
-            Ok(ProjectMembershipOutcome::Configured { .. }) => Self::InProject,
+            Ok(ProjectMembershipOutcome::Configured { .. }) => Self::Askable,
             Ok(ProjectMembershipOutcome::Inferred) => Self::OutsideProject {
                 markers: root.markers().to_vec(),
             },
@@ -395,7 +406,7 @@ impl AskedCallerDomains {
             // 「取れなかったシグナルを既定値で埋めない」）。
             AskedMembership::NotProvided => Self::MembershipNotProvided,
             AskedMembership::Unreachable(cause) => Self::MembershipUnreachable(cause.take()),
-            AskedMembership::InProject => {
+            AskedMembership::Askable => {
                 Self::Answered(caller_domains_outcome_of(session, document, position))
             }
         }
