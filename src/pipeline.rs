@@ -343,6 +343,14 @@ impl AskedMembership {
     /// `document` はサーバに開かせたファイル。印の有無は**そのファイルのパス**で見る
     /// （`document.path()` は開かせたときの絶対パスそのもの）。
     fn ask(session: &mut Session, root: &ProjectRoot, document: &SourceDocument) -> Self {
+        // **印で範囲を決めないサーバには尋ねない。** 根がそのまま範囲なので
+        // （[`WorkspaceRoot::enclosing_project`]）、所属を尋ねられなくても
+        // 参照元は揃う。ここで尋ねると、その口を持たないサーバで**今まで取れていた
+        // 参照元を落とす**ことになる。
+        if root.markers().is_empty() {
+            return Self::InProject;
+        }
+
         if !root.is_marked(document.path()) {
             return Self::Unrooted {
                 markers: root.markers().to_vec(),
@@ -532,13 +540,19 @@ fn asked_semantics_of(
         };
     };
 
+    // **型シグネチャを先に尋ねる。** 走査側と同じ順で、[`asked_semantics_of_outcomes`] が
+    // 型シグネチャの失敗を先に採るのと揃える。所属を先に尋ねると、そこで接続が切れた
+    // ときに**後から落ちた hover の失敗が報告される**。
+    let signature_a = resolved_type_signature_outcome_of(session, chunk_a, document_a, position_a);
+    let signature_b = resolved_type_signature_outcome_of(session, chunk_b, document_b, position_b);
+
     // 所属はファイルごとに 1 度だけ確かめる（走査側と同じ形。[`AskedMembership`]）。
     let mut membership_a = AskedMembership::ask(session, root, document_a);
     let mut membership_b = AskedMembership::ask(session, root, document_b);
 
     asked_semantics_of_outcomes(
-        resolved_type_signature_outcome_of(session, chunk_a, document_a, position_a),
-        resolved_type_signature_outcome_of(session, chunk_b, document_b, position_b),
+        signature_a,
+        signature_b,
         AskedCallerDomains::ask(session, &mut membership_a, document_a, position_a),
         AskedCallerDomains::ask(session, &mut membership_b, document_b, position_b),
     )
@@ -1439,24 +1453,24 @@ fn asked_scan_semantics_of(
             )
         })
         .collect();
-    // **所属はファイルごとに 1 度だけ確かめる。** チャンクごとに尋ねると、1 ファイルから
-    // N 個の候補チャンクを切り出したときに同じ答えのための往復が N 回走る。
-    let mut memberships: Vec<AskedMembership> = documents
-        .documents
-        .iter()
-        .map(|document| AskedMembership::ask(session, root, document))
-        .collect();
-    let callers: Vec<AskedCallerDomains> = askable
-        .iter()
-        .map(|askable| {
-            AskedCallerDomains::ask(
-                session,
-                &mut memberships[askable.document_index],
-                askable.document,
-                askable.position,
-            )
-        })
-        .collect();
+    // **所属はファイルごとに 1 度だけ、尋ねる相手が現れたときに確かめる。**
+    // チャンクごとに尋ねると同じ答えのための往復が N 回走り、先にまとめて尋ねると
+    // **名前を持つチャンクが 1 つも無いファイル**（無名のコールバックだけのファイルなど）
+    // にも往復が 1 回走る。そちらの答えは `NoName` にしかならない。
+    let mut memberships: Vec<Option<AskedMembership>> =
+        documents.documents.iter().map(|_| None).collect();
+    let mut callers = Vec::with_capacity(askable.len());
+    for askable in &askable {
+        let membership = memberships[askable.document_index]
+            .get_or_insert_with(|| AskedMembership::ask(session, root, askable.document));
+
+        callers.push(AskedCallerDomains::ask(
+            session,
+            membership,
+            askable.document,
+            askable.position,
+        ));
+    }
 
     ScanSemantics {
         per_chunk: per_chunk_semantics_of(chunks.len(), asked, &askable, signatures, callers),
