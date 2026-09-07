@@ -405,6 +405,25 @@ fn test_compare_with_a_pair_inside_the_project_config_still_measures_its_callers
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_a_pair_in_a_referenced_project_still_measures_its_callers() {
+    // solution-style の木。根の `tsconfig.json` は `files: []` で、`references` が
+    // 指す `tsconfig.app.json` が実際にファイルを持つ。サーバが名乗るのは印の名前で
+    // ない `tsconfig.app.json` なので、**印のファイル名で絞ると範囲内のペアまで
+    // 範囲外と答える**（参照元は揃っているのに落とすことになる）
+    let discounts_an_invoice = fixture("solution-project/src/discount.ts", 5);
+    let rebates_an_invoice = fixture("solution-project/src/rebate.ts", 5);
+
+    let measured = measured_with_an_lsp(&discounts_an_invoice, &rebates_an_invoice);
+
+    assert_eq!(
+        references_per_domain_of_a(&measured),
+        vec![("src".to_owned(), 4)],
+        "invoice.ts と statement.ts が import と呼び出しで 2 回ずつ挙がる"
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_a_pair_below_the_project_marker_still_sees_every_caller() {
     // 候補ペアの 2 ファイルがどちらも `src/billing/` にあるので、共通の祖先は
     // **tsconfig.json のある `src/` より 1 段下**になる。そこを根にすると、サーバは

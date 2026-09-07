@@ -320,7 +320,8 @@ fn unrooted_project_text_of(markers: &[String]) -> String {
 /// **空なら名前を出さない。** 印で範囲を決めないサーバではそもそもここへ来ないが、
 /// 来たときに「無い印の範囲を直せ」と読ませない。
 ///
-/// **範囲を絞っている項目名までは出さない。** どれが効いたかは印のファイルを読まないと
+/// **範囲を絞っている項目名までは出さない。** `files` / `include` / `exclude` のどれが
+/// 効いたかも、`references` の先の設定ファイルが絞ったのかも、印のファイルを読まないと
 /// 言えず、読まずに済ませたのがこの実装の要点（サーバに尋ねて答えを得ている）。
 fn outside_project_text_of(markers: &[String]) -> String {
     if markers.is_empty() {
@@ -328,7 +329,7 @@ fn outside_project_text_of(markers: &[String]) -> String {
     }
 
     format!(
-        "プロジェクトの範囲から外れている: {} の files / include / exclude を見直すと参照元が揃う",
+        "プロジェクトの範囲から外れている: {} が指す範囲を見直すと参照元が揃う",
         markers.join(" / ")
     )
 }
@@ -881,7 +882,7 @@ mod tests {
             text.contains(
                 "呼び出し元ドメインの重なりを測れない \
                  (プロジェクトの範囲から外れている: tsconfig.json / jsconfig.json \
-                  の files / include / exclude を見直すと参照元が揃う)"
+                  が指す範囲を見直すと参照元が揃う)"
             ),
             "範囲から外れていることと、直す相手が出る: {text}"
         );
@@ -908,7 +909,7 @@ mod tests {
             "範囲から外れていることだけを出す: {text}"
         );
         assert!(
-            !text.contains("を見直すと参照元が揃う"),
+            !text.contains("が指す範囲を見直すと参照元が揃う"),
             "直す相手の名前が無いのに勧めない: {text}"
         );
     }

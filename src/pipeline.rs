@@ -333,12 +333,11 @@ impl AskedCallerDomains {
             // 確かめる術が無いことを「範囲外と確かめた」に置き換える**ことになるので、
             // 印の下にある扱いのまま尋ねる。
             Ok(ProjectMembershipOutcome::NotSupported) => {}
-            Ok(ProjectMembershipOutcome::Named { project }) => {
-                if !root.is_marked_project(&project) {
-                    return Self::OutsideProject {
-                        markers: root.markers().to_vec(),
-                    };
-                }
+            Ok(ProjectMembershipOutcome::Configured { .. }) => {}
+            Ok(ProjectMembershipOutcome::Inferred) => {
+                return Self::OutsideProject {
+                    markers: root.markers().to_vec(),
+                };
             }
         }
 
