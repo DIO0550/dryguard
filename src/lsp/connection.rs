@@ -440,11 +440,11 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         });
         let result = self.request(ExecuteCommand::METHOD, Some(params))?;
 
-        let Some(membership) = project_membership::outcome_of(&result) else {
+        let Some(project) = project_membership::project_of(&result) else {
             return Err(ConnectionError::UnreadableProject { result });
         };
 
-        Ok(membership)
+        Ok(project_membership::membership_of(&project))
     }
 
     /// サーバの作業に触れていない答えが返るまで、上限まで尋ね直す。

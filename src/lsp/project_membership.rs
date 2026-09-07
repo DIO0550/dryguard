@@ -1,10 +1,12 @@
-//! projectInfo の応答から、サーバがそのファイルに割り当てたプロジェクトを取り出す。
+//! projectInfo の応答から、サーバがそのファイルに割り当てたプロジェクトを読む。
 //!
-//! **サーバとの往復そのものは `connection` が持つ。** ここにあるのは受け取った応答を
-//! こちらが読める形へ直す変換だけなので、サーバを起動せずに確かめられる
+//! **応答を読むところと、実在を確かめるところを分ける。** [`project_of`] は受け取った
+//! 応答を綴りへ直すだけの純粋関数で、サーバもファイルシステムも要らずに確かめられる
 //! (rules/tdd.md「`lsp` は『応答を受け取ってから先』を切り出す」)。
+//! 実在を見るのは [`membership_of`] の側だけ。**混ぜると、同じ応答が置かれた環境で
+//! 別の答えになる**（記録した応答を別の木で読み直すと範囲外に倒れる）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -25,7 +27,7 @@ pub(super) const PROJECT_INFO_COMMAND: &str = "projectInfo";
 /// `files`）の効果まで含んだ答えになる（`rules/naming.md`「`project root` と
 /// `project membership` を混ぜない」）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProjectMembershipOutcome {
+pub(crate) enum ProjectMembershipOutcome {
     /// 設定ファイルが決めたプロジェクトの一員として扱われている。
     ///
     /// **印の名前とは限らない。** solution-style の木では、根の `tsconfig.json` が
@@ -44,31 +46,6 @@ pub enum ProjectMembershipOutcome {
     NotSupported,
 }
 
-/// projectInfo の応答から、そのファイルの所属を読む。
-///
-/// `result` は `workspace/executeCommand` が返した tsserver の応答そのもの。
-/// 綴りを読み取れなければ `None`（応答が読めなかったことは呼び出し側が失敗として扱う）。
-///
-/// **名乗ったプロジェクトが実在するファイルかどうかで分ける。** tsserver が自分で
-/// 組み立てたプロジェクトは `/dev/null/inferredProject1*` のような、ファイルとして
-/// 存在しない綴りを名乗る。
-///
-/// **Why not（印のファイル名と突き合わせる）**: solution-style の木では
-/// `tsconfig.app.json` のような印にない綴りが返り、**範囲に入っているファイルまで
-/// 範囲外と答えてしまう**（参照元が揃っているのに落とすことになる）。
-///
-/// **Why not（`/dev/null/inferredProject1*` の綴りで見分ける）**: tsserver の
-/// 内部表現なので、こちらの語彙に無い綴りに判定をぶら下げることになる。
-pub(super) fn outcome_of(result: &Value) -> Option<ProjectMembershipOutcome> {
-    let config = project_of(result)?;
-
-    if !config.is_file() {
-        return Some(ProjectMembershipOutcome::Inferred);
-    }
-
-    Some(ProjectMembershipOutcome::Configured { config })
-}
-
 /// projectInfo の応答から、割り当てられたプロジェクトの綴りを取り出す。
 ///
 /// `result` は `workspace/executeCommand` が返した tsserver の応答そのもの。
@@ -76,17 +53,38 @@ pub(super) fn outcome_of(result: &Value) -> Option<ProjectMembershipOutcome> {
 ///
 /// **成否のフラグを見ずに、綴りが取れたかで判断する。** 失敗した応答は本文を持たないので
 /// 綴りも取れず、`success` を別に読んでも同じ答えにしかならない。
-fn project_of(result: &Value) -> Option<PathBuf> {
+pub(super) fn project_of(result: &Value) -> Option<PathBuf> {
     let named = result.get("body")?.get("configFileName")?.as_str()?;
 
     Some(PathBuf::from(named))
 }
 
+/// 名乗られたプロジェクトが、設定ファイルのものか、サーバが組み立てたものか。
+///
+/// `project` は [`project_of`] が取り出した綴り。
+///
+/// **実在するファイルを名乗ったかで分ける。** tsserver が自分で組み立てたプロジェクトは
+/// `/dev/null/inferredProject1*` のような、ファイルとして存在しない綴りを名乗る。
+///
+/// **Why not（印のファイル名と突き合わせる）**: solution-style の木では
+/// `tsconfig.app.json` のような印にない綴りが返り、**範囲に入っているファイルまで
+/// 範囲外と答えてしまう**（参照元が揃っているのに落とすことになる）。
+///
+/// **Why not（`/dev/null/inferredProject1*` の綴りで見分ける）**: tsserver の
+/// 内部表現なので、こちらの語彙に無い綴りに判定をぶら下げることになる。
+pub(super) fn membership_of(project: &Path) -> ProjectMembershipOutcome {
+    if !project.is_file() {
+        return ProjectMembershipOutcome::Inferred;
+    }
+
+    ProjectMembershipOutcome::Configured {
+        config: project.to_path_buf(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-
     use serde_json::json;
 
     use crate::test_support::repository_path;
@@ -103,52 +101,36 @@ mod tests {
         })
     }
 
-    /// そのパスを名乗る応答。テストごとに綴りだけを差し替える。
-    fn outcome_naming(config: &Path) -> Option<ProjectMembershipOutcome> {
-        outcome_of(&response(json!({
-            "configFileName": config.to_string_lossy(),
+    #[test]
+    fn test_project_of_a_configured_project_is_the_config_file_it_names() {
+        let result = response(json!({
+            "configFileName": "/repo/src/tsconfig.json",
             "languageServiceDisabled": false,
-        })))
-    }
-
-    #[test]
-    fn test_outcome_of_an_existing_config_file_is_a_configured_project() {
-        let config = repository_path("tests/fixtures/references/src/tsconfig.json");
+        }));
 
         assert_eq!(
-            outcome_naming(&config),
-            Some(ProjectMembershipOutcome::Configured {
-                config: config.clone()
-            })
+            project_of(&result),
+            Some(PathBuf::from("/repo/src/tsconfig.json"))
         );
     }
 
     #[test]
-    fn test_outcome_of_a_config_file_not_named_by_a_marker_is_still_a_configured_project() {
-        // solution-style の木では、根の tsconfig.json が references で指す
-        // tsconfig.app.json が返る。**印の名前で絞ると、範囲に入っているファイルまで
-        // 範囲外と答える**（参照元が揃っているのに落とすことになる）
-        let config = repository_path("tests/fixtures/solution-project/tsconfig.app.json");
+    fn test_project_of_a_project_the_server_built_itself_is_the_name_it_gave() {
+        // 対照は上のテスト。**ここでは弾かない。** 実在を見るのは `membership_of` の
+        // 側で、こちらは置かれた環境に答えが左右されない
+        let result = response(json!({
+            "configFileName": "/dev/null/inferredProject1*",
+            "languageServiceDisabled": false,
+        }));
 
         assert_eq!(
-            outcome_naming(&config),
-            Some(ProjectMembershipOutcome::Configured {
-                config: config.clone()
-            })
+            project_of(&result),
+            Some(PathBuf::from("/dev/null/inferredProject1*"))
         );
     }
 
     #[test]
-    fn test_outcome_of_a_project_the_server_built_itself_is_an_inferred_project() {
-        // 対照は上の 2 つ。tsserver が範囲外のファイルへ割り当てる綴りで、
-        // `/dev/null` はディレクトリではないので実在しえない
-        let outcome = outcome_naming(Path::new("/dev/null/inferredProject1*"));
-
-        assert_eq!(outcome, Some(ProjectMembershipOutcome::Inferred));
-    }
-
-    #[test]
-    fn test_outcome_of_a_response_without_a_body_is_not_read() {
+    fn test_project_of_a_response_without_a_body_is_not_read() {
         // 失敗した応答は本文を持たない。空の綴りを返すと、呼び出し側は
         // 「読めなかった」と「プロジェクトの名前が空」を区別できない
         let result = json!({
@@ -160,21 +142,57 @@ mod tests {
             "message": "no project",
         });
 
-        assert_eq!(outcome_of(&result), None);
+        assert_eq!(project_of(&result), None);
     }
 
     #[test]
-    fn test_outcome_of_a_body_without_a_config_file_name_is_not_read() {
+    fn test_project_of_a_body_without_a_config_file_name_is_not_read() {
         // 対照は上のテスト。本文はあるが、こちらが読む項目だけが無い形
         let result = response(json!({ "languageServiceDisabled": false }));
 
-        assert_eq!(outcome_of(&result), None);
+        assert_eq!(project_of(&result), None);
     }
 
     #[test]
-    fn test_outcome_of_a_config_file_name_that_is_not_text_is_not_read() {
+    fn test_project_of_a_config_file_name_that_is_not_text_is_not_read() {
         let result = response(json!({ "configFileName": 12, "languageServiceDisabled": false }));
 
-        assert_eq!(outcome_of(&result), None);
+        assert_eq!(project_of(&result), None);
+    }
+
+    #[test]
+    fn test_membership_of_an_existing_config_file_is_a_configured_project() {
+        let config = repository_path("tests/fixtures/references/src/tsconfig.json");
+
+        assert_eq!(
+            membership_of(&config),
+            ProjectMembershipOutcome::Configured {
+                config: config.clone()
+            }
+        );
+    }
+
+    #[test]
+    fn test_membership_of_a_config_file_not_named_by_a_marker_is_still_a_configured_project() {
+        // solution-style の木では、根の tsconfig.json が references で指す
+        // tsconfig.app.json が返る。**印の名前で絞ると、範囲に入っているファイルまで
+        // 範囲外と答える**（参照元が揃っているのに落とすことになる）
+        let config = repository_path("tests/fixtures/solution-project/tsconfig.app.json");
+
+        assert_eq!(
+            membership_of(&config),
+            ProjectMembershipOutcome::Configured {
+                config: config.clone()
+            }
+        );
+    }
+
+    #[test]
+    fn test_membership_of_a_project_the_server_built_itself_is_an_inferred_project() {
+        // 対照は上の 2 つ。tsserver が範囲外のファイルへ割り当てる綴りで、
+        // `/dev/null` はディレクトリではないので実在しえない
+        let membership = membership_of(Path::new("/dev/null/inferredProject1*"));
+
+        assert_eq!(membership, ProjectMembershipOutcome::Inferred);
     }
 }
