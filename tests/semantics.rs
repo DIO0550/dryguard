@@ -352,6 +352,57 @@ fn caller_domain_overlap_value(measured: &MeasuredPair) -> f64 {
     callers.overlap().value()
 }
 
+/// `tests/fixtures/excluded-project/` の同じ形のペア。範囲の内と外だけが違う。
+///
+/// 木の根に `tsconfig.json` があり、`exclude` が `src/legacy` だけを外している。
+/// **どちらのペアも印の下にある**ので、印の有無だけを見ていると区別が付かない。
+///
+/// 呼び出し元は 2 つ置いてある。`invoice.ts` はペアの両方から import されているので
+/// サーバが組み立てるプロジェクトにも入るが、`statement.ts` は**どちらからも
+/// import されていない**ので入らない。範囲から外れた側で参照元を数えると、
+/// **`statement.ts` のぶんだけ黙って目減りする**。
+fn pair_in(area: &str) -> (Location, Location) {
+    (
+        fixture(&format!("excluded-project/src/{area}/discount.ts"), 5),
+        fixture(&format!("excluded-project/src/{area}/rebate.ts"), 5),
+    )
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_a_pair_excluded_by_the_project_config_does_not_measure_its_callers() {
+    // 祖先に `tsconfig.json` があるので `is_marked` は `true` を返すが、
+    // `exclude` で外れているためサーバは呼び出し元を取りこぼす。**印の有無だけで
+    // 尋ねると、揃っていない参照元を揃ったものとして受け取る**
+    let (discounts_an_invoice, rebates_an_invoice) = pair_in("legacy");
+
+    let measured = measured_with_an_lsp(&discounts_an_invoice, &rebates_an_invoice);
+
+    assert_eq!(
+        measured.signals().caller_domain_overlap(),
+        &CallerDomainOverlap::OutsideProject {
+            markers: vec!["tsconfig.json".to_owned(), "jsconfig.json".to_owned()],
+        }
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_a_pair_inside_the_project_config_still_measures_its_callers() {
+    // 対照は上のテスト。**同じ木・同じ tsconfig.json・同じ形のペア**で、
+    // 置かれているディレクトリだけが `exclude` の外にある。これが測れないと、
+    // 範囲を見る変更が範囲内のペアまで落としていることになる
+    let (discounts_an_invoice, rebates_an_invoice) = pair_in("current");
+
+    let measured = measured_with_an_lsp(&discounts_an_invoice, &rebates_an_invoice);
+
+    assert_eq!(
+        references_per_domain_of_a(&measured),
+        vec![("current".to_owned(), 4)],
+        "invoice.ts と statement.ts が import と呼び出しで 2 回ずつ挙がる"
+    );
+}
+
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_a_pair_below_the_project_marker_still_sees_every_caller() {
