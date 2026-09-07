@@ -163,6 +163,30 @@ impl ProjectRoot {
     pub(crate) fn is_marked(&self, path: &Path) -> bool {
         self.marked.contains(path)
     }
+
+    /// サーバが名乗ったプロジェクトが、こちらが探した印のものか。
+    ///
+    /// `project` は [`super::project_membership::ProjectMembershipOutcome::Named`] が
+    /// 運ぶ綴り。印のファイル名と突き合わせるので、**サーバがその場で組み立てた
+    /// プロジェクトは印のものではない**と答える（そちらの綴りは印の名前にならない）。
+    ///
+    /// **印を持たないサーバでは `true`。** 根が範囲そのものになるサーバに
+    /// 「印のものではない」と答えると、印を見ないという事実を打ち消して参照元を落とす。
+    ///
+    /// **Why not（サーバが組み立てたプロジェクトの綴りで見分ける）**: tsserver は
+    /// `/dev/null/inferredProject1*` を返すが、これはサーバの内部表現で、
+    /// **こちらの語彙に無い綴りに判定をぶら下げることになる**。印の名前は既に持っている。
+    pub(crate) fn is_marked_project(&self, project: &Path) -> bool {
+        if self.markers.is_empty() {
+            return true;
+        }
+
+        let Some(named) = project.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+
+        self.markers.iter().any(|marker| marker == named)
+    }
 }
 
 /// 開くファイルが 1 つずつ属するディレクトリ。
@@ -540,6 +564,50 @@ mod tests {
             paths.iter().all(|path| root.is_marked(path)),
             "印を見ないサーバでは、どのファイルも参照元を尋ねる対象になる"
         );
+    }
+
+    /// 印を `tsconfig.json` として決めた根。`is_marked_project` の入力に使う。
+    fn root_marked_by_tsconfig() -> ProjectRoot {
+        WorkspaceRoot::enclosing_project(
+            &paths_under_a_marked_ancestor(),
+            &["tsconfig.json".to_owned()],
+        )
+        .expect("根を決められる")
+    }
+
+    #[test]
+    fn test_is_marked_project_of_a_config_named_by_a_marker_is_that_project() {
+        let root = root_marked_by_tsconfig();
+
+        assert!(root.is_marked_project(Path::new("/repo/src/tsconfig.json")));
+    }
+
+    #[test]
+    fn test_is_marked_project_of_a_project_the_server_built_itself_is_not_that_project() {
+        // 対照は上のテスト。tsserver が範囲外のファイルへ割り当てる形。
+        // ここを `true` に倒すと、揃っていない参照元を揃ったものとして受け取る
+        let root = root_marked_by_tsconfig();
+
+        assert!(!root.is_marked_project(Path::new("/dev/null/inferredProject1*")));
+    }
+
+    #[test]
+    fn test_is_marked_project_of_a_config_with_another_name_is_not_that_project() {
+        // 印として探していない綴り。ディレクトリではなくファイル名で見ていないと、
+        // 同じディレクトリにある別の設定ファイルまで印として通る
+        let root = root_marked_by_tsconfig();
+
+        assert!(!root.is_marked_project(Path::new("/repo/src/package.json")));
+    }
+
+    #[test]
+    fn test_is_marked_project_without_any_marker_is_that_project() {
+        // 印で範囲を決めないサーバ。根が範囲そのものなので、印の名前と合わないことを
+        // 根拠に参照元を落とすと、印を見ないという事実を打ち消してしまう
+        let root = WorkspaceRoot::enclosing_project(&paths_under_a_marked_ancestor(), &[])
+            .expect("根を決められる");
+
+        assert!(root.is_marked_project(Path::new("/dev/null/inferredProject1*")));
     }
 
     #[test]

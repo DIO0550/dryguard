@@ -14,6 +14,7 @@
 //! | `hover` | hover の応答から型の綴りを取り出す |
 //! | `type_definition` | typeDefinition の応答から型の宣言の場所を取り出す |
 //! | `references` | references の応答から参照元のファイルを取り出す |
+//! | `project_membership` | projectInfo の応答から、割り当てられたプロジェクトを取り出す |
 //! | ここ | サーバの起動・パイプの配線・終了 |
 //!
 //! **外へ出すのは [`ServerCommand`] / [`Client`] / [`Session`]、渡す値
@@ -26,6 +27,7 @@ pub(crate) mod document;
 pub(crate) mod framing;
 pub(crate) mod hover;
 pub(crate) mod message;
+pub(crate) mod project_membership;
 pub(crate) mod references;
 pub(crate) mod type_definition;
 pub(crate) mod uri;
@@ -48,6 +50,7 @@ pub use document::{DocumentError, SourceDocument};
 // hover / references の結果は「取れた / 取れなかった理由」を分けて持つので、
 // 外から読める形で出す。
 pub use hover::{HoverOutcome, SignatureText};
+pub use project_membership::ProjectMembershipOutcome;
 pub use references::ReferencesOutcome;
 // 型の宣言の場所は、開かせる相手を決める材料として `pipeline` が読む。
 pub use type_definition::{DeclarationSite, TypeDefinitionOutcome};
@@ -356,6 +359,31 @@ impl Session {
             .map_err(ClientError::Conversation)
     }
 
+    /// そのファイルを、サーバがどのプロジェクトの一員として扱っているかを尋ねる。
+    ///
+    /// hover と同じく、**サーバができると宣言していなければ送らない**。
+    /// 送ってしまうと、尋ねる手立てが無いだけの話が往復の失敗になる。
+    ///
+    /// 先に [`Session::open_document`] で開かせておく。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、往復が失敗したとき、
+    /// 応答からプロジェクトの綴りを読めないとき。
+    pub fn project_membership(
+        &mut self,
+        document: &SourceDocument,
+    ) -> Result<ProjectMembershipOutcome, ClientError> {
+        if !provides_tsserver_requests(&self.capabilities) {
+            return Ok(ProjectMembershipOutcome::NotSupported);
+        }
+
+        self.client
+            .connection
+            .project_membership(document)
+            .map_err(ClientError::Conversation)
+    }
+
     /// 開かせたファイルを閉じさせる。開いていなければ何もしない。
     ///
     /// # Errors
@@ -447,6 +475,27 @@ fn provides_references(capabilities: &ServerCapabilities) -> bool {
         capabilities.references_provider,
         Some(OneOf::Left(true) | OneOf::Right(_))
     )
+}
+
+/// そのサーバが、tsserver への要求を通す口を提供するか。
+///
+/// **LSP の標準にプロジェクト所属を返す要求が無い**ので、hover のように専用の
+/// capability を見られない。代わりに、その口を広告しているかを見る
+/// （`executeCommandProvider.commands` に載る）。
+///
+/// **Why not（サーバの名前で見分ける）**: `ServerCommand` の実行ファイル名は
+/// 利用者が差し替えられる。名前で決めると、別名で入れた同じサーバに送らなくなり、
+/// **同じサーバなのに答えが変わる**。
+fn provides_tsserver_requests(capabilities: &ServerCapabilities) -> bool {
+    capabilities
+        .execute_command_provider
+        .as_ref()
+        .is_some_and(|provider| {
+            provider
+                .commands
+                .iter()
+                .any(|command| command == project_membership::TSSERVER_REQUEST_COMMAND)
+        })
 }
 
 /// 握手の失敗を、サーバが黙った場合とそれ以外に分ける。

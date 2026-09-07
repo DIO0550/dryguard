@@ -279,6 +279,14 @@ fn caller_domain_overlap_text_of(signal: &CallerDomainOverlap) -> Option<String>
                 unrooted_project_text_of(markers)
             ));
         }
+        // こちらも利用者が直せる。直す相手が印そのものなので、置く話ではなく
+        // 範囲の話として出す。
+        CallerDomainOverlap::OutsideProject { markers } => {
+            return Some(format!(
+                "呼び出し元ドメインの重なりを測れない ({})",
+                outside_project_text_of(markers)
+            ));
+        }
         CallerDomainOverlap::NoReferences => "参照元が 1 件も返らない",
         CallerDomainOverlap::UnreadableReferences => "読めない URI が混じっている",
         CallerDomainOverlap::ServerStillWorking => "サーバが作業中で答えが落ち着かない",
@@ -302,6 +310,25 @@ fn unrooted_project_text_of(markers: &[String]) -> String {
 
     format!(
         "プロジェクトの印が見つからない: {} のどれかを置くと参照元が揃う",
+        markers.join(" / ")
+    )
+}
+
+/// 印の範囲から外れていることと、範囲を持つ印の名前。
+///
+/// `markers` はそのサーバが探した印の名前（`lsp::ServerCommand::project_markers`）。
+/// **空なら名前を出さない。** 印で範囲を決めないサーバではそもそもここへ来ないが、
+/// 来たときに「無い印の範囲を直せ」と読ませない。
+///
+/// **範囲を絞っている項目名までは出さない。** どれが効いたかは印のファイルを読まないと
+/// 言えず、読まずに済ませたのがこの実装の要点（サーバに尋ねて答えを得ている）。
+fn outside_project_text_of(markers: &[String]) -> String {
+    if markers.is_empty() {
+        return "プロジェクトの範囲から外れている".to_owned();
+    }
+
+    format!(
+        "プロジェクトの範囲から外れている: {} の files / include / exclude を見直すと参照元が揃う",
         markers.join(" / ")
     )
 }
@@ -835,6 +862,54 @@ mod tests {
         assert!(
             !text.contains("を置くと参照元が揃う"),
             "置くべきファイルの名前が無いのに勧めない: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_a_file_outside_the_project_says_to_widen_the_range_not_to_place_a_marker() {
+        // 対照は「印が見つからない」テスト。**印はあるので「置け」では直らない**。
+        // 印はあるが範囲外、という別の理由なのに同じ文を出すと、利用者は
+        // 既に置いてあるファイルをもう一度置こうとする
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::Unifiable,
+            CallerDomainOverlap::OutsideProject {
+                markers: vec!["tsconfig.json".to_owned(), "jsconfig.json".to_owned()],
+            },
+        );
+
+        assert!(
+            text.contains(
+                "呼び出し元ドメインの重なりを測れない \
+                 (プロジェクトの範囲から外れている: tsconfig.json / jsconfig.json \
+                  の files / include / exclude を見直すと参照元が揃う)"
+            ),
+            "範囲から外れていることと、直す相手が出る: {text}"
+        );
+        assert!(
+            !text.contains("プロジェクトの印が見つからない"),
+            "印はあるので、置く話にしない: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_a_file_outside_the_project_without_markers_names_no_file_to_fix() {
+        // 対照は上のテスト。**印の名前が無いのに「あの印を直せ」と言わない**
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::Unifiable,
+            CallerDomainOverlap::OutsideProject {
+                markers: Vec::new(),
+            },
+        );
+
+        assert!(
+            text.contains(
+                "呼び出し元ドメインの重なりを測れない (プロジェクトの範囲から外れている)"
+            ),
+            "範囲から外れていることだけを出す: {text}"
+        );
+        assert!(
+            !text.contains("を見直すと参照元が揃う"),
+            "直す相手の名前が無いのに勧めない: {text}"
         );
     }
 

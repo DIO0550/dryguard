@@ -21,8 +21,8 @@ use crate::classification::{Classification, classification_of, is_structurally_s
 use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
 use crate::location::Location;
 use crate::lsp::{
-    Client, ClientError, DocumentError, ProjectRoot, ServerCommand, Session, SourceDocument,
-    WorkspaceError, WorkspaceRoot,
+    Client, ClientError, DocumentError, ProjectMembershipOutcome, ProjectRoot, ServerCommand,
+    Session, SourceDocument, WorkspaceError, WorkspaceRoot,
 };
 use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outcome_of};
 use crate::semantics::resolved_type::{
@@ -297,6 +297,11 @@ enum AskedCallerDomains {
         /// 探した印の名前。利用者が何を置けばよいかを出すのに運ぶ。
         markers: Vec<String>,
     },
+    /// 印はあるが、サーバがその印のプロジェクトの一員として扱っていないので尋ねなかった。
+    OutsideProject {
+        /// 探した印の名前。範囲を直す相手を出すのに運ぶ。
+        markers: Vec<String>,
+    },
     /// 尋ねた。
     Answered(Result<CallerDomainsOutcome, ClientError>),
 }
@@ -306,6 +311,9 @@ impl AskedCallerDomains {
     ///
     /// **判断はファイルごと。** 走査全体で 1 つにまとめると、印の外のファイルが 1 つ
     /// 混じっただけで、両側とも印の下にあるペアまで参照元を落とす。
+    ///
+    /// 印が見つかっても、そこで終わりにしない。印のファイルは範囲を絞れるので、
+    /// **その印のプロジェクトの一員としてサーバが扱っているか**をサーバ自身に尋ねる。
     fn ask(
         session: &mut Session,
         root: &ProjectRoot,
@@ -319,6 +327,21 @@ impl AskedCallerDomains {
             };
         }
 
+        match session.project_membership(document) {
+            Err(cause) => return Self::Answered(Err(cause)),
+            // 尋ねる手立てが無いサーバでは、印の有無までしか言えない。**そこで落とすと、
+            // 確かめる術が無いことを「範囲外と確かめた」に置き換える**ことになるので、
+            // 印の下にある扱いのまま尋ねる。
+            Ok(ProjectMembershipOutcome::NotSupported) => {}
+            Ok(ProjectMembershipOutcome::Named { project }) => {
+                if !root.is_marked_project(&project) {
+                    return Self::OutsideProject {
+                        markers: root.markers().to_vec(),
+                    };
+                }
+            }
+        }
+
         Self::Answered(caller_domains_outcome_of(session, document, position))
     }
 
@@ -327,7 +350,7 @@ impl AskedCallerDomains {
     /// 取り出すのに自分を消費するのは、`ClientError` を複製できないため。
     fn into_error(self) -> Option<ClientError> {
         match self {
-            Self::Unrooted { .. } => None,
+            Self::Unrooted { .. } | Self::OutsideProject { .. } => None,
             Self::Answered(outcome) => outcome.err(),
         }
     }
@@ -585,33 +608,37 @@ fn asked_type_signature_match_of(
 
 /// 参照元を尋ねた結果から、呼び出し元ドメインの重なりのシグナルにする。
 ///
-/// **印が無くて尋ねていない側があれば、そのことを出す。** 揃っているか確かめられない
+/// **尋ねていない側があれば、その理由を出す。** 揃っているか確かめられない
 /// 参照元で重なりを計算すると、確かめられなかったことを答えとして出すことになる
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+///
+/// **印が無い側を先に採る。** 片方が印を持たず片方が範囲外のとき、利用者がまずするのは
+/// 印を置くことで、範囲を直すのはその後になる。
 fn asked_caller_domain_overlap_of(
     callers_a: &AskedCallerDomains,
     callers_b: &AskedCallerDomains,
 ) -> CallerDomainOverlap {
-    let (AskedCallerDomains::Answered(callers_a), AskedCallerDomains::Answered(callers_b)) =
-        (callers_a, callers_b)
-    else {
-        // 片方でも尋ねていなければ、その理由に要る印の名前を運ぶ。
-        let markers = match (callers_a, callers_b) {
-            (AskedCallerDomains::Unrooted { markers }, _)
-            | (_, AskedCallerDomains::Unrooted { markers }) => markers.clone(),
-            (AskedCallerDomains::Answered(_), AskedCallerDomains::Answered(_)) => Vec::new(),
-        };
+    match (callers_a, callers_b) {
+        (AskedCallerDomains::Unrooted { markers }, _)
+        | (_, AskedCallerDomains::Unrooted { markers }) => CallerDomainOverlap::ProjectUnrooted {
+            markers: markers.clone(),
+        },
+        (AskedCallerDomains::OutsideProject { markers }, _)
+        | (_, AskedCallerDomains::OutsideProject { markers }) => {
+            CallerDomainOverlap::OutsideProject {
+                markers: markers.clone(),
+            }
+        }
+        (AskedCallerDomains::Answered(callers_a), AskedCallerDomains::Answered(callers_b)) => {
+            let (Ok(callers_a), Ok(callers_b)) = (callers_a, callers_b) else {
+                return CallerDomainOverlap::Unavailable {
+                    reason: SemanticsUnavailable::LspUnusable,
+                };
+            };
 
-        return CallerDomainOverlap::ProjectUnrooted { markers };
-    };
-
-    let (Ok(callers_a), Ok(callers_b)) = (callers_a, callers_b) else {
-        return CallerDomainOverlap::Unavailable {
-            reason: SemanticsUnavailable::LspUnusable,
-        };
-    };
-
-    caller_domain_overlap_of(callers_a, callers_b)
+            caller_domain_overlap_of(callers_a, callers_b)
+        }
+    }
 }
 
 /// そのチャンクのファイルを、サーバに開かせる形にする。

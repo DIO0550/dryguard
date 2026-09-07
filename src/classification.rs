@@ -736,6 +736,24 @@ mod tests {
     }
 
     #[test]
+    fn test_classification_of_a_file_outside_the_project_keeps_the_placement_verdict() {
+        // 対照は上のテスト（印が無い場合）。印はあるが**範囲から外れていて確かめられない**形。
+        // 印があるからといって参照元が揃うわけではないので、`DO-NOT-EXTRACT` まで動かさない
+        let signals = signals_of_a_caller_only_domain_match().with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable,
+            },
+            CallerDomainOverlap::OutsideProject {
+                markers: vec!["tsconfig.json".to_owned()],
+            },
+        );
+
+        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+        assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    #[test]
     fn test_classification_of_unifiable_type_signatures_leans_that_reason_toward_extract() {
         let signals = signals_of_a_shared_domain().with_semantics(
             TypeSignatureMatch::Unifiable,
