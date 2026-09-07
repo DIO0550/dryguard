@@ -74,7 +74,12 @@ impl WorkspaceRoot {
         paths: &[PathBuf],
         markers: &[String],
     ) -> Result<ProjectRoot, WorkspaceError> {
-        let directories = file_directories_of(paths)?;
+        // **覚えるのは渡された綴りではなく絶対パス。** 引く側が持っているのは
+        // サーバに開かせた綴り（`SourceDocument::path`）で、そちらは絶対パス。
+        // 相対パスのまま覚えると、`compare src/a.ts:1` のような呼び方で**1 つも
+        // 一致せず、印の下にあるファイルまで印が無い扱いになる**。
+        let resolved = absolute_paths_of(paths)?;
+        let directories: Vec<PathBuf> = resolved.iter().map(|path| directory_of(path)).collect();
 
         // **印を持たないサーバでは、この検査そのものが当たらない。** 根で自分の範囲を
         // 決めるサーバは、印が無くても参照元を揃えて返せる。空の一覧を「揃わないことを
@@ -82,7 +87,7 @@ impl WorkspaceRoot {
         if markers.is_empty() {
             return Ok(ProjectRoot {
                 root: Self::at(&common_ancestor_or_error_of(&directories)?)?,
-                marked: paths.iter().cloned().collect(),
+                marked: resolved.into_iter().collect(),
                 markers: Vec::new(),
             });
         }
@@ -91,7 +96,7 @@ impl WorkspaceRoot {
         // 出す。印のほうを使わないと、根が印より下に来てサーバから印が見えなくなる。
         let mut covered = Vec::with_capacity(directories.len());
         let mut marked = BTreeSet::new();
-        for (path, directory) in paths.iter().zip(&directories) {
+        for (path, directory) in resolved.iter().zip(&directories) {
             let Some(found) = nearest_marked_directory_of(directory, markers) else {
                 covered.push(directory.clone());
                 continue;
@@ -157,9 +162,11 @@ impl ProjectRoot {
 
     /// そのファイルが印の下にあるか。
     ///
-    /// `path` は [`WorkspaceRoot::enclosing_project`] に渡したのと**同じ綴り**。
-    /// 渡していない綴りは印の下に無い扱いになる（**漏れは参照元を落とす側へ倒す**。
-    /// `rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」）。
+    /// `path` は**絶対パス**（[`super::SourceDocument::path`] が返す綴り）。
+    /// [`WorkspaceRoot::enclosing_project`] は渡された綴りを絶対パスに直して覚えるので、
+    /// 呼び出し側が相対パスで渡していても引ける。**それ以外の綴りは印の下に無い扱いに
+    /// なる**（漏れは参照元を落とす側へ倒す。`rules/coding.md`
+    /// 「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」）。
     pub(crate) fn is_marked(&self, path: &Path) -> bool {
         self.marked.contains(path)
     }
@@ -171,26 +178,44 @@ impl ProjectRoot {
 ///
 /// `paths` が空のとき、絶対パスにできないパスがあるとき。
 fn file_directories_of(paths: &[PathBuf]) -> Result<Vec<PathBuf>, WorkspaceError> {
+    Ok(absolute_paths_of(paths)?
+        .iter()
+        .map(|path| directory_of(path))
+        .collect())
+}
+
+/// 開くファイルを 1 つずつ絶対パスに直したもの。
+///
+/// **リンクは辿らない**（理由は [`uri::absolute_path_of`]）。開かせるドキュメントが
+/// 同じ直し方をするので、綴りが揃う。
+///
+/// # Errors
+///
+/// `paths` が空のとき、絶対パスにできないパスがあるとき。
+fn absolute_paths_of(paths: &[PathBuf]) -> Result<Vec<PathBuf>, WorkspaceError> {
     if paths.is_empty() {
         return Err(WorkspaceError::NoPaths);
     }
 
-    let mut directories = Vec::with_capacity(paths.len());
+    let mut resolved = Vec::with_capacity(paths.len());
     for path in paths {
-        let resolved =
-            uri::absolute_path_of(path).map_err(|cause| WorkspaceError::PathNotAbsolute {
+        resolved.push(uri::absolute_path_of(path).map_err(|cause| {
+            WorkspaceError::PathNotAbsolute {
                 path: path.clone(),
                 cause,
-            })?;
-
-        // 根そのものを渡された場合だけ親が無い。そのときは根自身が答え。
-        let directory = resolved
-            .parent()
-            .map_or_else(|| resolved.clone(), Path::to_path_buf);
-        directories.push(directory);
+            }
+        })?);
     }
 
-    Ok(directories)
+    Ok(resolved)
+}
+
+/// そのファイルが属するディレクトリ。
+///
+/// 根そのものを渡された場合だけ親が無い。そのときは根自身が答え。
+fn directory_of(path: &Path) -> PathBuf {
+    path.parent()
+        .map_or_else(|| path.to_path_buf(), Path::to_path_buf)
 }
 
 /// すべてを含む最も近い共通の祖先。
@@ -539,6 +564,30 @@ mod tests {
         assert!(
             paths.iter().all(|path| root.is_marked(path)),
             "印を見ないサーバでは、どのファイルも参照元を尋ねる対象になる"
+        );
+    }
+
+    #[test]
+    fn test_enclosing_project_marks_a_file_spelled_another_way_by_its_absolute_path() {
+        // 引く側が持っているのはサーバに開かせた綴り（`SourceDocument::path`）で、
+        // そちらは絶対パスに畳まれている。渡された綴りのまま覚えると、`compare` に
+        // 相対パスを渡した回で**1 つも一致せず、印の下のファイルまで印が無い扱いになる**。
+        // ここでは `..` を挟んで、畳めば同じファイルを指す別の綴りで渡す
+        let spelled_with_a_detour = repository_path("tests/fixtures/references/src/billing")
+            .join("..")
+            .join("billing/discount.ts");
+        let folded = repository_path("tests/fixtures/references/src/billing/discount.ts");
+
+        let root = WorkspaceRoot::enclosing_project(
+            &[spelled_with_a_detour],
+            &["tsconfig.json".to_owned()],
+        )
+        .expect("根を決められる");
+
+        assert!(
+            root.is_marked(&folded),
+            "畳んだ絶対パスで引ける: {}",
+            folded.display()
         );
     }
 
