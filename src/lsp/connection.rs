@@ -37,7 +37,6 @@ use super::project_membership::{
 };
 use super::references::{self, ReferencesOutcome};
 use super::type_definition::{self, DeclarationSite, TypeDefinitionOutcome};
-use super::uri::{self, UriPathError};
 use super::workspace::WorkspaceRoot;
 use crate::source_position::SourcePosition;
 
@@ -428,9 +427,9 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             });
         }
 
-        // tsserver は URI ではなくパスで受け取る。開かせたときと同じ綴りにならないと、
-        // サーバは別のファイルとして扱う（`uri` が絶対パスにしてから URI を作っている）。
-        let path = uri::path_of(document.uri()).map_err(ConnectionError::UnreadableDocumentPath)?;
+        // tsserver は URI ではなくパスで受け取る。**URI から戻さず**、開かせるときに
+        // 使った絶対パスをそのまま渡す（戻す道は Windows のドライブ文字で必ず落ちる）。
+        let path = document.path();
 
         let params = json!({
             "command": TSSERVER_REQUEST_COMMAND,
@@ -441,11 +440,11 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         });
         let result = self.request(ExecuteCommand::METHOD, Some(params))?;
 
-        let Some(project) = project_membership::project_of(&result) else {
+        let Some(membership) = project_membership::outcome_of(&result) else {
             return Err(ConnectionError::UnreadableProject { result });
         };
 
-        Ok(ProjectMembershipOutcome::Named { project })
+        Ok(membership)
     }
 
     /// サーバの作業に触れていない答えが返るまで、上限まで尋ね直す。
@@ -797,13 +796,6 @@ pub enum ConnectionError {
         /// 開かせていなかったドキュメントの URI。
         uri: Uri,
     },
-    /// 開かせたドキュメントの URI を、サーバへ渡すパスに直せない。
-    ///
-    /// **`MalformedParams` と分ける。** あちらはサーバが添えた値を読めなかった話で、
-    /// こちらは**こちらが送る値を組み立てられなかった**話（直す先が違う）。
-    ///
-    /// どの URI で落ちたかは [`UriPathError`] が持つので、別に添えない。
-    UnreadableDocumentPath(UriPathError),
     /// projectInfo の応答から、割り当てられたプロジェクトの綴りを読めない。
     ///
     /// **`MalformedResult` と分ける。** あちらは JSON として型に落とせなかった話で、
@@ -846,10 +838,6 @@ impl fmt::Display for ConnectionError {
                 "LSP サーバに開かせていないドキュメントです: {}",
                 uri.as_str()
             ),
-            Self::UnreadableDocumentPath(cause) => write!(
-                formatter,
-                "開かせたドキュメントの URI をパスに直せません: {cause}"
-            ),
             Self::UnreadableProject { result } => write!(
                 formatter,
                 "LSP サーバの {} の応答に、割り当てられたプロジェクトがありません: {result}",
@@ -870,7 +858,6 @@ impl Error for ConnectionError {
             Self::Framing(cause) => Some(cause),
             Self::Message(cause) => Some(cause),
             Self::Send(cause) => Some(cause),
-            Self::UnreadableDocumentPath(cause) => Some(cause),
             Self::MalformedResult { cause, .. }
             | Self::MalformedParams { cause, .. }
             | Self::ParamsNotSerializable { cause, .. } => Some(cause),
