@@ -806,6 +806,44 @@ mod tests {
         assert!(!provides_references(&capabilities));
     }
 
+    /// そのサーバが実行できるコマンドとして、渡した綴りだけを宣言した capabilities。
+    fn capabilities_declaring_commands(commands: &[&str]) -> ServerCapabilities {
+        ServerCapabilities {
+            execute_command_provider: Some(lsp_types::ExecuteCommandOptions {
+                commands: commands
+                    .iter()
+                    .map(|command| (*command).to_owned())
+                    .collect(),
+                work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
+            }),
+            ..ServerCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn test_provides_tsserver_requests_with_a_server_that_declares_the_command_is_true() {
+        let capabilities =
+            capabilities_declaring_commands(&[project_membership::TSSERVER_REQUEST_COMMAND]);
+
+        assert!(provides_tsserver_requests(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_tsserver_requests_with_a_server_declaring_only_other_commands_is_false() {
+        // 対照は上のテスト。**一覧の有無ではなく中身を見る**。`is_some()` で見ていると、
+        // 別のコマンドだけを持つサーバへ tsserver 宛の要求を送ってしまう
+        let capabilities = capabilities_declaring_commands(&["_typescript.organizeImports"]);
+
+        assert!(!provides_tsserver_requests(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_tsserver_requests_with_a_server_that_declares_no_commands_is_false() {
+        let capabilities = ServerCapabilities::default();
+
+        assert!(!provides_tsserver_requests(&capabilities));
+    }
+
     #[test]
     fn test_handshake_error_of_a_server_that_closed_names_the_program() {
         // 起動して答えないまま出力を閉じたサーバ。理由は stderr と共に消えているので、
