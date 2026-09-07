@@ -414,8 +414,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     ///
     /// # Errors
     ///
-    /// そのドキュメントを開かせていないとき、URI をパスに直せないとき、
-    /// パラメータを JSON にできないとき、送受信が失敗したとき、
+    /// そのドキュメントを開かせていないとき、送受信が失敗したとき、
     /// 応答からプロジェクトの綴りを読めないとき。
     pub fn project_membership(
         &mut self,
@@ -429,6 +428,9 @@ impl<R: BufRead, W: Write> Connection<R, W> {
 
         // tsserver は URI ではなくパスで受け取る。**URI から戻さず**、開かせるときに
         // 使った絶対パスをそのまま渡す（戻す道は Windows のドライブ文字で必ず落ちる）。
+        //
+        // `json!` は値を JSON にできないと panic するが、`SourceDocument` を作れた時点で
+        // このパスは UTF-8（`uri::file_uri_of` が読めない要素を弾いている）。
         let path = document.path();
 
         let params = json!({
