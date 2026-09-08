@@ -94,8 +94,11 @@ if structurally_similar && domains_differ { ... }
 | `open` | 型名を宣言まで辿り、エイリアスの右辺の綴りを取ること |
 | `resolved type` | その型名が指していた型の綴り。**解決後** |
 | `traced type name` | シグネチャに書かれた型名 1 つを、宣言まで辿った結果。宣言の場所・開いた綴り・**開けなかった理由**のどれか |
-| `type signature` | 引数名を落とし、型変数を出現順に付け替えた形。**正規化後**。比較はこれで行う |
-| `unifiable` | 2 つの `type signature` が同じ型構造に重なること（単一化可能） |
+| `type signature` | 引数名を落とし、型変数を出現順に付け替えた形。**正規化後** |
+| `overload declaration` | 本体を持たない同名のシグネチャの宣言。実装と同じスコープに並ぶ |
+| `overload count` | hover が綴りの末尾に付ける、**綴られていない**オーバーロードの本数の要約（`(+1 overload)`） |
+| `overload set` | 1 つの名前で呼べる `type signature` の並び。オーバーロードされていなければ 1 本。**比較はこれで行う** |
+| `unifiable` | 2 つの `overload set` が同じ型構造に重なること（単一化可能） |
 
 `snippet` / `fragment` / `candidate`（chunk の意味で）/ `label`（verdict の意味で）は使わない。
 **`candidate` が指すのはペアであって chunk ではない。**
@@ -125,6 +128,21 @@ JSON が壊れているのは違う話）。1 語で呼ぶと、どちらの層�
 1 つの関数の型全体で、接頭辞（`(method)` / `constructor`）が付くことがあり**型としては読めない**。
 `type spelling` は型 1 つ分なので、**型として構文解析できる**。差し込みが型名の位置を
 構文木で決められるのは後者だけ（`syntax::type_spelling`）。
+
+**`type signature` と `overload set` を混ぜない。** hover が綴るのは**呼べる型のうち
+1 本だけ**で、残りは `overload count` に畳まれる。1 本を比較の単位にすると、
+**表示された 1 本が同じで隠れている側が違う 2 つを単一化可能と答える**（偽陽性）。
+`is_unifiable_with` を持つのは `overload set` の側だけにして、1 本だけを比べる呼び出しを
+書けなくしておく。
+
+**`overload set` の並びを落とさない。** TypeScript のオーバーロード解決は書かれた順に
+突き合わせて最初に合ったものを採るので、**並べ替えると同じ呼び出しが別のシグネチャへ
+解決する**。引数名や型変数名（正規化で消す、書いた人の都合）とは違い、**並びは型の一部**。
+
+**`overload count` と `overload declaration` を混ぜない。** 前者は**サーバが数えた本数**、
+後者は**構文木から見つけた宣言**。1 語で呼ぶと、揃っているか確かめずに集合を比べてよいかが
+言えなくなる（`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」）。
+2 つを突き合わせて食い違えば測れないにする。
 
 **`type reference` と `resolved type` を混ぜない。** どちらも型を指す綴りだが、
 書かれた型名は**書いた人の位置に依存する**（輸入した `Amount` は、どのファイルの `Amount` かを
