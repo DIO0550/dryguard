@@ -1160,6 +1160,37 @@ export function overloaded(a: unknown): unknown {
         assert_eq!(overload_positions_of_chunk(&chunk), vec![(2, 2), (3, 2)]);
     }
 
+    /// 静的な側だけがオーバーロードされ、同じ名前のインスタンスメソッドが並ぶクラス。
+    const OVERLOADED_ON_ONE_SIDE: &str = r#"export class Calc {
+  static scale(a: string): string;
+  static scale(a: unknown): unknown {
+    return a;
+  }
+  scale(a: number): number {
+    return a;
+  }
+}
+"#;
+
+    #[test]
+    fn test_chunk_of_an_instance_method_leaves_out_a_static_declaration_of_the_same_name() {
+        // クラスは同じ名前の静的メンバーとインスタンスメンバーを持てる。名前だけで
+        // 結び付けると、**本数も 1 対 1 で揃う**ので突き合わせでは落ちず、
+        // インスタンスメソッドの集合が静的な側の型で組み上がる
+        let instance = chunk_at(OVERLOADED_ON_ONE_SIDE, "a.ts:6").expect("切り出せる");
+
+        assert_eq!(overload_positions_of_chunk(&instance), Vec::new());
+    }
+
+    #[test]
+    fn test_chunk_of_a_static_method_keeps_its_own_declaration() {
+        // 対照は上のテスト。同じ入力の静的な側を見る。静的かどうかで一律に落とすと、
+        // こちらの宣言まで消える
+        let statics = chunk_at(OVERLOADED_ON_ONE_SIDE, "a.ts:3").expect("切り出せる");
+
+        assert_eq!(overload_positions_of_chunk(&statics), vec![(2, 9)]);
+    }
+
     #[test]
     fn test_chunk_of_an_overloaded_function_leaves_out_a_declaration_of_another_name() {
         // 同じスコープに別の名前の宣言が並ぶ形。名前で絞らないと集合に混ざり、
