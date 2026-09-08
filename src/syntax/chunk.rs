@@ -311,6 +311,9 @@ const OVERLOAD_DECLARATION_KINDS: [&str; 2] = ["function_signature", "method_sig
 /// 名前を載せるフィールド。
 const NAME_FIELD: &str = "name";
 
+/// クラスの静的なメンバーを表す修飾子の種別。
+const STATIC_MODIFIER: &str = "static";
+
 /// 指定行を含むチャンクノードのうち、もっとも内側のもの。1 つも無ければ `None`。
 ///
 /// 内側かどうかはバイト範囲の短さで決める。入れ子になったノードは必ず外側の範囲に
@@ -382,8 +385,13 @@ fn signature_nodes_of<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>
 
 /// そのチャンクのオーバーロード宣言。ソースに書かれた順。
 ///
-/// 集めるのは**同じスコープにある、同じ名前の宣言**。TypeScript は同じスコープに
-/// 同名の実装を 2 つ置けないので、同名の宣言はすべてこの実装のものになる。
+/// 集めるのは**同じスコープにある、同じ名前で同じ側（静的 / インスタンス）の宣言**。
+/// TypeScript は同じスコープの同じ側に同名の実装を 2 つ置けないので、そこまで揃えば
+/// 同名の宣言はすべてこの実装のものになる。
+///
+/// **側まで見るのは、クラスが同じ名前の静的メンバーとインスタンスメンバーを持てるため。**
+/// 名前だけで結び付けると**本数も 1 対 1 で揃いうる**ので `semantics` の突き合わせでは
+/// 落ちず、インスタンスメソッドの集合が静的な側の型で組み上がる。
 ///
 /// **Why not（実装の直前に並ぶ分だけを採る）**: 宣言と実装の間にはコメントが入りうる。
 /// 隣接で切ると、コメントの有無で集合が変わる。
@@ -394,12 +402,29 @@ fn overload_declarations_of<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<
     let Some(scope) = enclosing_scope_of(node) else {
         return Vec::new();
     };
+    let is_static = is_static_member(node);
 
     scope
         .named_children(&mut scope.walk())
         .filter_map(overload_declaration_in)
-        .filter(|declaration| declared_name_of(*declaration, source) == Some(name))
+        .filter(|declaration| {
+            let same_name = declared_name_of(*declaration, source) == Some(name);
+            let same_side = is_static_member(*declaration) == is_static;
+
+            same_name && same_side
+        })
         .collect()
+}
+
+/// そのノードが、クラスの静的なメンバーか。
+///
+/// **静的かどうかは修飾子のトークンにしか現れず、フィールドには載らない。**
+/// クラスの外にあるノードはどれも静的ではない。
+fn is_static_member(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+
+    node.children(&mut cursor)
+        .any(|child| child.kind() == STATIC_MODIFIER)
 }
 
 /// そのノード自身の名前の綴り。自分の `name` を持たなければ `None`。
