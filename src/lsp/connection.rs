@@ -13,8 +13,8 @@ use lsp_types::notification::{
     DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized, Notification as _, Progress,
 };
 use lsp_types::request::{
-    GotoTypeDefinition, GotoTypeDefinitionParams, GotoTypeDefinitionResponse, HoverRequest,
-    Initialize, References, Request as _, Shutdown, WorkDoneProgressCreate,
+    ExecuteCommand, GotoTypeDefinition, GotoTypeDefinitionParams, GotoTypeDefinitionResponse,
+    HoverRequest, Initialize, References, Request as _, Shutdown, WorkDoneProgressCreate,
 };
 use lsp_types::{
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover, HoverParams, InitializeResult,
@@ -31,6 +31,9 @@ use super::hover::{self, HoverOutcome};
 use super::message::{
     self, MessageError, Payload, RequestId, ResponseFailure, ResponseOutcome, ServerMessage,
     ServerRequestId,
+};
+use super::project_membership::{
+    self, PROJECT_INFO_COMMAND, ProjectMembershipOutcome, TSSERVER_REQUEST_COMMAND,
 };
 use super::references::{self, ReferencesOutcome};
 use super::type_definition::{self, DeclarationSite, TypeDefinitionOutcome};
@@ -404,6 +407,48 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         settled
     }
 
+    /// そのファイルを、サーバがどのプロジェクトの一員として扱っているかを尋ねる。
+    ///
+    /// 先に [`Connection::open_document`] で開かせておく。開かせる前は、サーバが
+    /// まだそのファイルにプロジェクトを割り当てていない。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、送受信が失敗したとき、
+    /// 応答からプロジェクトの綴りを読めないとき。
+    pub fn project_membership(
+        &mut self,
+        document: &SourceDocument,
+    ) -> Result<ProjectMembershipOutcome, ConnectionError> {
+        if !self.open_documents.contains(document.uri()) {
+            return Err(ConnectionError::DocumentNotOpen {
+                uri: document.uri().clone(),
+            });
+        }
+
+        // tsserver は URI ではなくパスで受け取る。**URI から戻さず**、開かせるときに
+        // 使った絶対パスをそのまま渡す（戻す道は Windows のドライブ文字で必ず落ちる）。
+        //
+        // `json!` は値を JSON にできないと panic するが、`SourceDocument` を作れた時点で
+        // このパスは UTF-8（`uri::file_uri_of` が読めない要素を弾いている）。
+        let path = document.path();
+
+        let params = json!({
+            "command": TSSERVER_REQUEST_COMMAND,
+            "arguments": [
+                PROJECT_INFO_COMMAND,
+                { "file": path, "needFileNameList": false },
+            ],
+        });
+        let result = self.request(ExecuteCommand::METHOD, Some(params))?;
+
+        let Some(project) = project_membership::project_of(&result) else {
+            return Err(ConnectionError::UnreadableProject { result });
+        };
+
+        Ok(project_membership::membership_of(&project))
+    }
+
     /// サーバの作業に触れていない答えが返るまで、上限まで尋ね直す。
     ///
     /// # Errors
@@ -753,6 +798,14 @@ pub enum ConnectionError {
         /// 開かせていなかったドキュメントの URI。
         uri: Uri,
     },
+    /// projectInfo の応答から、割り当てられたプロジェクトの綴りを読めない。
+    ///
+    /// **`MalformedResult` と分ける。** あちらは JSON として型に落とせなかった話で、
+    /// こちらは**形は読めたが、こちらが見る項目が無かった**話。
+    UnreadableProject {
+        /// 読めなかった応答そのもの。項目の綴りが変わったのかを見分けるのに要る。
+        result: Value,
+    },
 }
 
 impl fmt::Display for ConnectionError {
@@ -787,6 +840,11 @@ impl fmt::Display for ConnectionError {
                 "LSP サーバに開かせていないドキュメントです: {}",
                 uri.as_str()
             ),
+            Self::UnreadableProject { result } => write!(
+                formatter,
+                "LSP サーバの {} の応答に、割り当てられたプロジェクトがありません: {result}",
+                ExecuteCommand::METHOD
+            ),
         }
     }
 }
@@ -797,7 +855,8 @@ impl Error for ConnectionError {
             Self::UnexpectedResponse { .. }
             | Self::UnrequestedResponse { .. }
             | Self::ServerFailure { .. }
-            | Self::DocumentNotOpen { .. } => None,
+            | Self::DocumentNotOpen { .. }
+            | Self::UnreadableProject { .. } => None,
             Self::Framing(cause) => Some(cause),
             Self::Message(cause) => Some(cause),
             Self::Send(cause) => Some(cause),

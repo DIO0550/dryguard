@@ -22,6 +22,7 @@ const INITIAL_VERSION: i32 = 1;
 /// (rules/coding.md「生成時に検証し、不正な値を存在させない」)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceDocument {
+    path: PathBuf,
     uri: Uri,
     language_id: LanguageId,
     text: String,
@@ -53,6 +54,7 @@ impl SourceDocument {
 
         Ok(Self {
             uri: uri::file_uri_of(&resolved).map_err(DocumentError::Uri)?,
+            path: resolved,
             language_id: LanguageId::from_grammar(grammar),
             text,
         })
@@ -61,6 +63,16 @@ impl SourceDocument {
     /// このドキュメントの URI。
     pub(super) fn uri(&self) -> &Uri {
         &self.uri
+    }
+
+    /// このドキュメントの絶対パス。URI にする前の綴り。
+    ///
+    /// **URI から戻して作らない。** `uri::path_of` はサーバが返した URI を読むための
+    /// もので、Windows のドライブ文字を持つ URI を弾く。こちらの URI を通すと
+    /// **Windows では必ず失敗する**（`file:///C:/repo/a.ts` が常にドライブ文字を持つ）。
+    /// 絶対パスは [`SourceDocument::new`] が既に持っているので、そのまま取っておく。
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// `didOpen` で送る形。
@@ -234,6 +246,20 @@ mod tests {
             "渡されたパスの綴りのまま URI になる: {}",
             document.uri().as_str()
         );
+    }
+
+    #[test]
+    fn test_path_of_a_document_whose_first_segment_is_a_drive_letter_is_kept() {
+        // **URI から戻して作ると、この綴りは失われる。** `uri::path_of` は先頭要素が
+        // ドライブ文字なら `Err` を返すので、Windows の絶対パス（`C:\repo\a.ts` は
+        // 必ずこの形になる）では、サーバへ渡すパスを 1 つも組み立てられない。
+        // ファイルシステムを見ないので、Linux でも同じ経路を通せる
+        let drive_lettered = Path::new("/C:/repo/a.ts");
+
+        let document = SourceDocument::new(drive_lettered, "export const a = 1;".to_owned())
+            .expect("開かせられる");
+
+        assert_eq!(document.path(), drive_lettered);
     }
 
     #[test]

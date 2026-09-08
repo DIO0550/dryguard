@@ -14,6 +14,7 @@
 //! | `hover` | hover の応答から型の綴りを取り出す |
 //! | `type_definition` | typeDefinition の応答から型の宣言の場所を取り出す |
 //! | `references` | references の応答から参照元のファイルを取り出す |
+//! | `project_membership` | projectInfo の応答を読み、設定されたプロジェクトか見分ける |
 //! | ここ | サーバの起動・パイプの配線・終了 |
 //!
 //! **外へ出すのは [`ServerCommand`] / [`Client`] / [`Session`]、渡す値
@@ -26,6 +27,7 @@ pub(crate) mod document;
 pub(crate) mod framing;
 pub(crate) mod hover;
 pub(crate) mod message;
+pub(crate) mod project_membership;
 pub(crate) mod references;
 pub(crate) mod type_definition;
 pub(crate) mod uri;
@@ -52,8 +54,10 @@ pub use references::ReferencesOutcome;
 // 型の宣言の場所は、開かせる相手を決める材料として `pipeline` が読む。
 pub use type_definition::{DeclarationSite, TypeDefinitionOutcome};
 pub use workspace::{WorkspaceError, WorkspaceRoot};
-// 根の決め方は `pipeline` だけが使う手順なので、クレートの外へは出さない
-// (rules/architecture.md「モジュールの公開 API」)。
+// 根の決め方と所属の確かめ方は `pipeline` だけが使う手順なので、クレートの外へは出さない
+// (rules/architecture.md「モジュールの公開 API」)。所属のほうは**サーバ固有の要求の形**
+// でもあるので、外へ出すと typescript-language-server の都合が公開 API に居座る。
+pub(crate) use project_membership::ProjectMembershipOutcome;
 pub(crate) use workspace::ProjectRoot;
 
 // 失敗を読むための型だけを外へ出す。[`ClientError`] が抱えている以上、
@@ -356,6 +360,39 @@ impl Session {
             .map_err(ClientError::Conversation)
     }
 
+    /// そのサーバが references に答えるか。
+    ///
+    /// **尋ねる前に分かる。** 答えに効かない問い合わせを省くのに使う
+    /// （references に答えないサーバでは、所属を確かめても呼び出し元は取れない）。
+    pub(crate) fn answers_references(&self) -> bool {
+        provides_references(&self.capabilities)
+    }
+
+    /// そのファイルを、サーバがどのプロジェクトの一員として扱っているかを尋ねる。
+    ///
+    /// hover と同じく、**サーバができると宣言していなければ送らない**。
+    /// 送ってしまうと、尋ねる手立てが無いだけの話が往復の失敗になる。
+    ///
+    /// 先に [`Session::open_document`] で開かせておく。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、往復が失敗したとき、
+    /// 応答からプロジェクトの綴りを読めないとき。
+    pub(crate) fn project_membership(
+        &mut self,
+        document: &SourceDocument,
+    ) -> Result<ProjectMembershipOutcome, ClientError> {
+        if !provides_tsserver_requests(&self.capabilities) {
+            return Ok(ProjectMembershipOutcome::NotSupported);
+        }
+
+        self.client
+            .connection
+            .project_membership(document)
+            .map_err(ClientError::Conversation)
+    }
+
     /// 開かせたファイルを閉じさせる。開いていなければ何もしない。
     ///
     /// # Errors
@@ -447,6 +484,27 @@ fn provides_references(capabilities: &ServerCapabilities) -> bool {
         capabilities.references_provider,
         Some(OneOf::Left(true) | OneOf::Right(_))
     )
+}
+
+/// そのサーバが、tsserver への要求を通す口を提供するか。
+///
+/// **LSP の標準にプロジェクト所属を返す要求が無い**ので、hover のように専用の
+/// capability を見られない。代わりに、その口を広告しているかを見る
+/// （`executeCommandProvider.commands` に載る）。
+///
+/// **Why not（サーバの名前で見分ける）**: `ServerCommand` の実行ファイル名は
+/// 利用者が差し替えられる。名前で決めると、別名で入れた同じサーバに送らなくなり、
+/// **同じサーバなのに答えが変わる**。
+fn provides_tsserver_requests(capabilities: &ServerCapabilities) -> bool {
+    capabilities
+        .execute_command_provider
+        .as_ref()
+        .is_some_and(|provider| {
+            provider
+                .commands
+                .iter()
+                .any(|command| command == project_membership::TSSERVER_REQUEST_COMMAND)
+        })
 }
 
 /// 握手の失敗を、サーバが黙った場合とそれ以外に分ける。
@@ -754,6 +812,44 @@ mod tests {
         let capabilities = capabilities_declaring_references(None);
 
         assert!(!provides_references(&capabilities));
+    }
+
+    /// そのサーバが実行できるコマンドとして、渡した綴りだけを宣言した capabilities。
+    fn capabilities_declaring_commands(commands: &[&str]) -> ServerCapabilities {
+        ServerCapabilities {
+            execute_command_provider: Some(lsp_types::ExecuteCommandOptions {
+                commands: commands
+                    .iter()
+                    .map(|command| (*command).to_owned())
+                    .collect(),
+                work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
+            }),
+            ..ServerCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn test_provides_tsserver_requests_with_a_server_that_declares_the_command_is_true() {
+        let capabilities =
+            capabilities_declaring_commands(&[project_membership::TSSERVER_REQUEST_COMMAND]);
+
+        assert!(provides_tsserver_requests(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_tsserver_requests_with_a_server_declaring_only_other_commands_is_false() {
+        // 対照は上のテスト。**一覧の有無ではなく中身を見る**。`is_some()` で見ていると、
+        // 別のコマンドだけを持つサーバへ tsserver 宛の要求を送ってしまう
+        let capabilities = capabilities_declaring_commands(&["_typescript.organizeImports"]);
+
+        assert!(!provides_tsserver_requests(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_tsserver_requests_with_a_server_that_declares_no_commands_is_false() {
+        let capabilities = ServerCapabilities::default();
+
+        assert!(!provides_tsserver_requests(&capabilities));
     }
 
     #[test]

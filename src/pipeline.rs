@@ -21,8 +21,8 @@ use crate::classification::{Classification, classification_of, is_structurally_s
 use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
 use crate::location::Location;
 use crate::lsp::{
-    Client, ClientError, DocumentError, ProjectRoot, ServerCommand, Session, SourceDocument,
-    WorkspaceError, WorkspaceRoot,
+    Client, ClientError, DocumentError, ProjectMembershipOutcome, ProjectRoot, ServerCommand,
+    Session, SourceDocument, WorkspaceError, WorkspaceRoot,
 };
 use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outcome_of};
 use crate::semantics::resolved_type::{
@@ -297,29 +297,119 @@ enum AskedCallerDomains {
         /// 探した印の名前。利用者が何を置けばよいかを出すのに運ぶ。
         markers: Vec<String>,
     },
+    /// 印はあるが、サーバがその印のプロジェクトの一員として扱っていないので尋ねなかった。
+    OutsideProject {
+        /// 探した印の名前。範囲を直す相手を出すのに運ぶ。
+        markers: Vec<String>,
+    },
+    /// サーバに所属を尋ねる手立てが無く、揃うか確かめられないので尋ねなかった。
+    MembershipNotProvided,
+    /// 所属を尋ねる往復が失敗したので尋ねなかった。
+    ///
+    /// **理由を持つのは同じファイルの 1 つ目だけ。** `ClientError` は複製できず、
+    /// 集約も最初の 1 つしか使わない（[`ScanSemantics::into_error`]）。
+    MembershipUnreachable(Option<ClientError>),
     /// 尋ねた。
     Answered(Result<CallerDomainsOutcome, ClientError>),
 }
 
-impl AskedCallerDomains {
-    /// そのチャンクへ尋ねる。**そのチャンクのファイル**が印の下になければ尋ねずに落とす。
+/// そのファイルがプロジェクトの一員かを確かめた結果。
+///
+/// **ファイル単位の性質なので、チャンクごとに尋ね直さない。** 1 つのファイルから N 個の
+/// チャンクを切り出すと、同じ答えのために N 回往復することになる
+/// （[`asked_paths_of`] が印を探す回数を 1 回に畳んでいるのと同じ形）。
+enum AskedMembership {
+    /// 参照元を尋ねてよい。
     ///
-    /// **判断はファイルごと。** 走査全体で 1 つにまとめると、印の外のファイルが 1 つ
-    /// 混じっただけで、両側とも印の下にあるペアまで参照元を落とす。
-    fn ask(
-        session: &mut Session,
-        root: &ProjectRoot,
-        chunk: &Chunk,
-        document: &SourceDocument,
-        position: SourcePosition,
-    ) -> Self {
-        if !root.is_marked(chunk.path()) {
+    /// **一員だと確かめられたときだけではない。** 所属が参照元の答えに効かないとき
+    /// （印を見ないサーバ・references に答えないサーバ）も含む
+    /// （`rules/architecture.md`「効かない材料が欠けたのは、取れたのと同じ扱いでよい」）。
+    Askable,
+    /// プロジェクトの印が無い。
+    Unrooted {
+        /// 探した印の名前。
+        markers: Vec<String>,
+    },
+    /// 印はあるが、サーバは設定ファイルの範囲外として扱っている。
+    OutsideProject {
+        /// 探した印の名前。
+        markers: Vec<String>,
+    },
+    /// サーバに尋ねる手立てが無い。
+    NotProvided,
+    /// 尋ねる往復が失敗した。理由は 1 つ目のチャンクが持ち出す。
+    Unreachable(Option<ClientError>),
+}
+
+impl AskedMembership {
+    /// そのファイルの所属を確かめる。
+    ///
+    /// `document` はサーバに開かせたファイル。印の有無は**そのファイルのパス**で見る
+    /// （`document.path()` は開かせたときの絶対パスそのもの）。
+    fn ask(session: &mut Session, root: &ProjectRoot, document: &SourceDocument) -> Self {
+        // **references に答えないサーバには尋ねない。** 呼び出し元はどのみち取れないので、
+        // 所属は答えに効かない。ここで尋ねると、`ReferencesNotProvided` と出すべき場面で
+        // **所属のほうを理由に出す**（利用者が直す先を取り違える）。
+        if !session.answers_references() {
+            return Self::Askable;
+        }
+
+        // **印で範囲を決めないサーバにも尋ねない。** 根がそのまま範囲なので
+        // （[`WorkspaceRoot::enclosing_project`]）、所属を尋ねられなくても
+        // 参照元は揃う。ここで尋ねると、その口を持たないサーバで**今まで取れていた
+        // 参照元を落とす**ことになる。
+        if root.markers().is_empty() {
+            return Self::Askable;
+        }
+
+        if !root.is_marked(document.path()) {
             return Self::Unrooted {
                 markers: root.markers().to_vec(),
             };
         }
 
-        Self::Answered(caller_domains_outcome_of(session, document, position))
+        match session.project_membership(document) {
+            Err(cause) => Self::Unreachable(Some(cause)),
+            Ok(ProjectMembershipOutcome::Configured { .. }) => Self::Askable,
+            Ok(ProjectMembershipOutcome::Inferred) => Self::OutsideProject {
+                markers: root.markers().to_vec(),
+            },
+            Ok(ProjectMembershipOutcome::NotSupported) => Self::NotProvided,
+        }
+    }
+}
+
+impl AskedCallerDomains {
+    /// そのチャンクへ尋ねる。**そのファイルの所属が確かめられていなければ尋ねずに落とす。**
+    ///
+    /// `membership` は[そのファイルについて 1 度だけ確かめた結果](AskedMembership)。
+    /// 往復の失敗を持ち出すので `&mut` で受ける（同じファイルの 2 つ目以降は理由を持たない）。
+    ///
+    /// **判断はファイルごと。** 走査全体で 1 つにまとめると、印の外のファイルが 1 つ
+    /// 混じっただけで、両側とも印の下にあるペアまで参照元を落とす。
+    fn ask(
+        session: &mut Session,
+        membership: &mut AskedMembership,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Self {
+        match membership {
+            AskedMembership::Unrooted { markers } => Self::Unrooted {
+                markers: markers.clone(),
+            },
+            AskedMembership::OutsideProject { markers } => Self::OutsideProject {
+                markers: markers.clone(),
+            },
+            // **確かめる術が無いことを、確かめた答えとして使わない。** 印の下にあっても
+            // 範囲から外れていれば参照元は揃わないので、所属を尋ねられないサーバでは
+            // 揃っているかを言えない（`rules/architecture.md`
+            // 「取れなかったシグナルを既定値で埋めない」）。
+            AskedMembership::NotProvided => Self::MembershipNotProvided,
+            AskedMembership::Unreachable(cause) => Self::MembershipUnreachable(cause.take()),
+            AskedMembership::Askable => {
+                Self::Answered(caller_domains_outcome_of(session, document, position))
+            }
+        }
     }
 
     /// 往復の失敗。尋ねていない / 成功したときは `None`。
@@ -327,7 +417,10 @@ impl AskedCallerDomains {
     /// 取り出すのに自分を消費するのは、`ClientError` を複製できないため。
     fn into_error(self) -> Option<ClientError> {
         match self {
-            Self::Unrooted { .. } => None,
+            Self::Unrooted { .. } | Self::OutsideProject { .. } | Self::MembershipNotProvided => {
+                None
+            }
+            Self::MembershipUnreachable(cause) => cause,
             Self::Answered(outcome) => outcome.err(),
         }
     }
@@ -458,11 +551,21 @@ fn asked_semantics_of(
         };
     };
 
+    // **型シグネチャを先に尋ねる。** 走査側と同じ順で、[`asked_semantics_of_outcomes`] が
+    // 型シグネチャの失敗を先に採るのと揃える。所属を先に尋ねると、そこで接続が切れた
+    // ときに**後から落ちた hover の失敗が報告される**。
+    let signature_a = resolved_type_signature_outcome_of(session, chunk_a, document_a, position_a);
+    let signature_b = resolved_type_signature_outcome_of(session, chunk_b, document_b, position_b);
+
+    // 所属はファイルごとに 1 度だけ確かめる（走査側と同じ形。[`AskedMembership`]）。
+    let mut membership_a = AskedMembership::ask(session, root, document_a);
+    let mut membership_b = AskedMembership::ask(session, root, document_b);
+
     asked_semantics_of_outcomes(
-        resolved_type_signature_outcome_of(session, chunk_a, document_a, position_a),
-        resolved_type_signature_outcome_of(session, chunk_b, document_b, position_b),
-        AskedCallerDomains::ask(session, root, chunk_a, document_a, position_a),
-        AskedCallerDomains::ask(session, root, chunk_b, document_b, position_b),
+        signature_a,
+        signature_b,
+        AskedCallerDomains::ask(session, &mut membership_a, document_a, position_a),
+        AskedCallerDomains::ask(session, &mut membership_b, document_b, position_b),
     )
 }
 
@@ -585,33 +688,45 @@ fn asked_type_signature_match_of(
 
 /// 参照元を尋ねた結果から、呼び出し元ドメインの重なりのシグナルにする。
 ///
-/// **印が無くて尋ねていない側があれば、そのことを出す。** 揃っているか確かめられない
+/// **尋ねていない側があれば、その理由を出す。** 揃っているか確かめられない
 /// 参照元で重なりを計算すると、確かめられなかったことを答えとして出すことになる
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+///
+/// **印が無い側を先に採る。** 片方が印を持たず片方が範囲外のとき、利用者がまずするのは
+/// 印を置くことで、範囲を直すのはその後になる。
 fn asked_caller_domain_overlap_of(
     callers_a: &AskedCallerDomains,
     callers_b: &AskedCallerDomains,
 ) -> CallerDomainOverlap {
-    let (AskedCallerDomains::Answered(callers_a), AskedCallerDomains::Answered(callers_b)) =
-        (callers_a, callers_b)
-    else {
-        // 片方でも尋ねていなければ、その理由に要る印の名前を運ぶ。
-        let markers = match (callers_a, callers_b) {
-            (AskedCallerDomains::Unrooted { markers }, _)
-            | (_, AskedCallerDomains::Unrooted { markers }) => markers.clone(),
-            (AskedCallerDomains::Answered(_), AskedCallerDomains::Answered(_)) => Vec::new(),
-        };
-
-        return CallerDomainOverlap::ProjectUnrooted { markers };
-    };
-
-    let (Ok(callers_a), Ok(callers_b)) = (callers_a, callers_b) else {
-        return CallerDomainOverlap::Unavailable {
+    match (callers_a, callers_b) {
+        (AskedCallerDomains::Unrooted { markers }, _)
+        | (_, AskedCallerDomains::Unrooted { markers }) => CallerDomainOverlap::ProjectUnrooted {
+            markers: markers.clone(),
+        },
+        (AskedCallerDomains::OutsideProject { markers }, _)
+        | (_, AskedCallerDomains::OutsideProject { markers }) => {
+            CallerDomainOverlap::OutsideProject {
+                markers: markers.clone(),
+            }
+        }
+        (AskedCallerDomains::MembershipNotProvided, _)
+        | (_, AskedCallerDomains::MembershipNotProvided) => {
+            CallerDomainOverlap::ProjectMembershipNotProvided
+        }
+        (AskedCallerDomains::MembershipUnreachable(_), _)
+        | (_, AskedCallerDomains::MembershipUnreachable(_)) => CallerDomainOverlap::Unavailable {
             reason: SemanticsUnavailable::LspUnusable,
-        };
-    };
+        },
+        (AskedCallerDomains::Answered(callers_a), AskedCallerDomains::Answered(callers_b)) => {
+            let (Ok(callers_a), Ok(callers_b)) = (callers_a, callers_b) else {
+                return CallerDomainOverlap::Unavailable {
+                    reason: SemanticsUnavailable::LspUnusable,
+                };
+            };
 
-    caller_domain_overlap_of(callers_a, callers_b)
+            caller_domain_overlap_of(callers_a, callers_b)
+        }
+    }
 }
 
 /// そのチャンクのファイルを、サーバに開かせる形にする。
@@ -1349,18 +1464,24 @@ fn asked_scan_semantics_of(
             )
         })
         .collect();
-    let callers: Vec<AskedCallerDomains> = askable
-        .iter()
-        .map(|askable| {
-            AskedCallerDomains::ask(
-                session,
-                root,
-                &chunks[askable.index].chunk,
-                askable.document,
-                askable.position,
-            )
-        })
-        .collect();
+    // **所属はファイルごとに 1 度だけ、尋ねる相手が現れたときに確かめる。**
+    // チャンクごとに尋ねると同じ答えのための往復が N 回走り、先にまとめて尋ねると
+    // **名前を持つチャンクが 1 つも無いファイル**（無名のコールバックだけのファイルなど）
+    // にも往復が 1 回走る。そちらの答えは `NoName` にしかならない。
+    let mut memberships: Vec<Option<AskedMembership>> =
+        documents.documents.iter().map(|_| None).collect();
+    let mut callers = Vec::with_capacity(askable.len());
+    for askable in &askable {
+        let membership = memberships[askable.document_index]
+            .get_or_insert_with(|| AskedMembership::ask(session, root, askable.document));
+
+        callers.push(AskedCallerDomains::ask(
+            session,
+            membership,
+            askable.document,
+            askable.position,
+        ));
+    }
 
     ScanSemantics {
         per_chunk: per_chunk_semantics_of(chunks.len(), asked, &askable, signatures, callers),
@@ -1375,6 +1496,9 @@ fn asked_scan_semantics_of(
 struct AskableChunk<'a> {
     index: usize,
     document: &'a SourceDocument,
+    /// そのチャンクの中身を持つ [`AskedDocuments::documents`] の添字。
+    /// **ファイル単位で 1 度だけ確かめる所属**を引くのに使う。
+    document_index: usize,
     position: SourcePosition,
 }
 
@@ -1394,6 +1518,7 @@ fn askable_chunks_of<'a>(
                 .map(|position| AskableChunk {
                     index,
                     document: &documents.documents[document_index],
+                    document_index,
                     position,
                 })
         })
