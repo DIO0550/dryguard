@@ -641,7 +641,7 @@ mod tests {
         let text = scan_text_of(&scan, threshold);
 
         let verdict_lines = text.lines().filter(|line| line.starts_with('[')).count();
-        assert_eq!(verdict_lines, 9, "比べた 9 ペアが並ぶ: {text}");
+        assert_eq!(verdict_lines, 14, "比べた 14 ペアが並ぶ: {text}");
         assert!(text.contains("\n\n["), "ペアとペアの間に空行が入る: {text}");
     }
 
@@ -651,7 +651,7 @@ mod tests {
 
         assert!(
             text.contains(
-                "対象 6 ファイル / チャンク 5 件 / 比較 9 ペア（うち長さで確定 3 ペア）/ 候補 1 ペア"
+                "対象 8 ファイル / チャンク 6 件 / 比較 14 ペア（うち長さで確定 5 ペア）/ 候補 1 ペア"
             ),
             "走査した量と、突き合わせを省いた内訳が読める: {text}"
         );
