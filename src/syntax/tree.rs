@@ -23,7 +23,7 @@ use crate::source_position::SourcePosition;
 /// TSX の grammar では JSX の開始タグとして読まれる。どちらで読むかは拡張子で決まる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Grammar {
-    /// `.ts`
+    /// `.ts` / `.mts` / `.cts`
     TypeScript,
     /// `.tsx`
     Tsx,
@@ -34,9 +34,16 @@ impl Grammar {
     ///
     /// **読める拡張子の一覧をここ 1 箇所に置く。** 走査の対象を決める側（`codebase`）が
     /// 別の一覧を持つと、拡張子を足したときに片方だけが古くなる。
+    ///
+    /// **宣言ファイル（`.d.ts` / `.d.mts` / `.d.cts`）は実装ファイルと同じ扱いになる。**
+    /// `extension()` が返すのは最後の 1 つ（`index.d.mts` なら `mts`）で、
+    /// **綴りの上で両者を区別できない**。区別するにはファイル名の接尾辞で判定することになるが、
+    /// 宣言ファイルは本体を持つノードが無く `Chunk` を 1 つも産まないので、分ける利益が無い。
     pub fn of_path(path: &Path) -> Option<Self> {
         match path.extension()?.to_str()? {
-            "ts" => Some(Self::TypeScript),
+            // `.mts` / `.cts` に JSX は書けない（TypeScript が `.tsx` を要求する）ので
+            // TSX の grammar にはならない
+            "ts" | "mts" | "cts" => Some(Self::TypeScript),
             "tsx" => Some(Self::Tsx),
             _ => None,
         }
@@ -227,6 +234,37 @@ mod tests {
         assert_eq!(
             Grammar::of_path(Path::new("src/report/Badge.tsx")),
             Some(Grammar::Tsx)
+        );
+    }
+
+    #[test]
+    fn test_grammar_of_an_mts_path_reads_it_as_typescript() {
+        // `.mts` に JSX は書けないので TSX の grammar にはならない
+        assert_eq!(
+            Grammar::of_path(Path::new("src/billing/discount.mts")),
+            Some(Grammar::TypeScript)
+        );
+    }
+
+    #[test]
+    fn test_grammar_of_a_cts_path_reads_it_as_typescript() {
+        assert_eq!(
+            Grammar::of_path(Path::new("src/billing/discount.cts")),
+            Some(Grammar::TypeScript)
+        );
+    }
+
+    #[test]
+    fn test_grammar_of_an_esm_declaration_path_reads_it_as_typescript() {
+        // `index.d.mts` の `extension()` は `mts` を返す。宣言ファイルだけを別扱いに
+        // できないのはこのため（`.d.ts` が `.ts` と同じ扱いなのと同じ形）
+        assert_eq!(
+            Grammar::of_path(Path::new("node_modules/pkg/index.d.mts")),
+            Some(Grammar::TypeScript)
+        );
+        assert_eq!(
+            Grammar::of_path(Path::new("node_modules/pkg/index.d.cts")),
+            Some(Grammar::TypeScript)
         );
     }
 

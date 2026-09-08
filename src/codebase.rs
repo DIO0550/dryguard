@@ -21,7 +21,8 @@ use crate::syntax::tree::Grammar;
 /// 実際に調整したくなった項目だけを切り出す（閾値と同じ方針）。
 const EXCLUDED_DIRECTORY_NAMES: [&str; 5] = ["node_modules", "dist", "build", "target", ".git"];
 
-/// そのディレクトリ以下の TypeScript ファイル（`.ts` / `.tsx`）を、パス順に集める。
+/// そのディレクトリ以下の TypeScript ファイル（`.ts` / `.tsx` / `.mts` / `.cts`）を、
+/// パス順に集める。
 ///
 /// `root` は走査を始めるディレクトリ。`node_modules` などの生成物・依存の置き場
 /// （`EXCLUDED_DIRECTORY_NAMES`）は中へ降りない。
@@ -199,6 +200,8 @@ mod tests {
                 "src/inventory/stock.ts",
                 "src/report/Badge.tsx",
                 "src/shared/adder.ts",
+                "src/shared/counter.mts",
+                "src/shared/rate.d.mts",
             ]
         );
     }
@@ -257,6 +260,25 @@ mod tests {
         assert!(
             relative.contains(&"src/report/Badge.tsx".to_owned()),
             "`.tsx` が対象に入っていない: {relative:?}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_paths_of_a_directory_returns_mts_as_well_as_ts() {
+        // `.mts` を落とすと、ESM を拡張子で分けて書くリポジトリでは対象が丸ごと抜ける。
+        // 宣言ファイル（`.d.mts`）も同じ拡張子の一覧で決まるので、一緒に入る
+        let root = fixture("scan");
+
+        let paths = typescript_paths_of(&root).expect("フィクスチャのディレクトリはある");
+
+        let relative = relative_paths_of(&root, &paths);
+        assert!(
+            relative.contains(&"src/shared/counter.mts".to_owned()),
+            "`.mts` が対象に入っていない: {relative:?}"
+        );
+        assert!(
+            relative.contains(&"src/shared/rate.d.mts".to_owned()),
+            "`.d.mts` が対象に入っていない: {relative:?}"
         );
     }
 

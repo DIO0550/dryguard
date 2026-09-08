@@ -80,7 +80,7 @@ impl SourceDocument {
 /// ここにもう 1 つ置くと拡張子を足したときに片方だけが古くなる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LanguageId {
-    /// `.ts`
+    /// `.ts` / `.mts` / `.cts`
     TypeScript,
     /// `.tsx`
     TypeScriptReact,
@@ -177,6 +177,18 @@ mod tests {
             document.to_text_document_item().language_id,
             "typescriptreact"
         );
+    }
+
+    #[test]
+    fn test_new_from_an_esm_declaration_file_names_the_language_as_typescript() {
+        // 対照は下の `notes.md`。`typeDefinition` が `index.d.mts` を指したとき
+        // ここで断られると、宣言を開けず型シグネチャが「測れない」に落ちる
+        let path = repository_path("tests/fixtures/scan/src/shared/rate.d.mts");
+
+        let document = SourceDocument::new(&path, "export type Rate = number;".to_owned())
+            .expect("ドキュメントにできる");
+
+        assert_eq!(document.to_text_document_item().language_id, "typescript");
     }
 
     #[test]

@@ -2076,14 +2076,16 @@ mod tests {
 
     #[test]
     fn test_scan_of_a_codebase_does_not_compare_a_function_with_the_one_nested_in_it() {
-        // フィクスチャのチャンクは 5 つ（discount / reorder / Badge / makeAdder と
-        // その中のアロー）。総当たりなら 10 ペアだが、入れ子の 1 ペアは比較しない
+        // フィクスチャのチャンクは 6 つ（discount / reorder / Badge / makeAdder と
+        // その中のアロー / nextSequence）。総当たりなら 15 ペアだが、入れ子の 1 ペアは
+        // 比較しない。走査に入る宣言ファイル（rate.d.mts）は本体を持つノードが無いので
+        // ここに現れない
         let scan = scan_of_fixture("scan");
 
-        assert_eq!(scan.chunk_count(), 5, "切り出せたチャンクの数");
+        assert_eq!(scan.chunk_count(), 6, "切り出せたチャンクの数");
         assert_eq!(
             scan.compared_pair_count(),
-            9,
+            14,
             "入れ子の組（makeAdder とその中のアロー）は比べない"
         );
     }
@@ -2107,7 +2109,7 @@ mod tests {
 
         assert_eq!(
             scan.file_count(),
-            6,
+            8,
             "除外したディレクトリと TypeScript でないファイルは数えない"
         );
     }
