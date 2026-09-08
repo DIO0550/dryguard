@@ -1082,6 +1082,93 @@ function broken() {
         assert_eq!(name_position_of_chunk(&chunk), Some((1, 28)));
     }
 
+    /// そのチャンクのオーバーロード宣言の、名前の位置（行・列）。
+    fn overload_positions_of_chunk(chunk: &Chunk) -> Vec<(usize, usize)> {
+        chunk
+            .overload_name_positions()
+            .iter()
+            .map(|position| (position.line().get(), position.character()))
+            .collect()
+    }
+
+    const OVERLOADED_FUNCTION: &str = r#"export function overloaded(a: string): string;
+export function overloaded(a: number): number;
+export function overloaded(a: unknown): unknown {
+  return a;
+}
+"#;
+
+    #[test]
+    fn test_chunk_of_an_overloaded_function_points_at_every_declaration_name() {
+        // 実装の位置を指した hover は 1 本目しか返さない。残りを尋ねるには
+        // 宣言の名前の位置が要る
+        let chunk = chunk_at(OVERLOADED_FUNCTION, "a.ts:3").expect("切り出せる");
+
+        assert_eq!(overload_positions_of_chunk(&chunk), vec![(1, 16), (2, 16)]);
+    }
+
+    #[test]
+    fn test_chunk_of_a_function_without_overloads_has_no_declaration_names() {
+        // 対照は上のテスト。同じ名前の宣言を外しただけの違い
+        let plain = "export function overloaded(a: unknown): unknown {\n  return a;\n}\n";
+
+        let chunk = chunk_at(plain, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(overload_positions_of_chunk(&chunk), Vec::new());
+    }
+
+    #[test]
+    fn test_chunk_of_an_overloaded_method_points_at_every_declaration_name() {
+        // クラスのメソッドは `method_signature` で宣言される。関数と種別が違うので、
+        // 片方だけ拾えていないかを見る
+        let overloaded_method = r#"export class Calc {
+  scale(a: string): string;
+  scale(a: number): number;
+  scale(a: unknown): unknown {
+    return a;
+  }
+}
+"#;
+
+        let chunk = chunk_at(overloaded_method, "a.ts:4").expect("切り出せる");
+
+        assert_eq!(overload_positions_of_chunk(&chunk), vec![(2, 2), (3, 2)]);
+    }
+
+    #[test]
+    fn test_chunk_of_an_overloaded_function_leaves_out_a_declaration_of_another_name() {
+        // 同じスコープに別の名前の宣言が並ぶ形。名前で絞らないと集合に混ざり、
+        // 本数がサーバの数えた本数と食い違う
+        let two_overloaded = r#"export function overloaded(a: string): string;
+export function other(a: string): string;
+export function other(a: number): number;
+export function overloaded(a: unknown): unknown {
+  return a;
+}
+"#;
+
+        let chunk = chunk_at(two_overloaded, "a.ts:4").expect("切り出せる");
+
+        assert_eq!(overload_positions_of_chunk(&chunk), vec![(1, 16)]);
+    }
+
+    #[test]
+    fn test_chunk_of_an_overloaded_function_keeps_declarations_separated_by_a_comment() {
+        // 対照は最初のテスト。宣言の間にコメントを挟んだだけの違い。隣接で切ると
+        // コメントの有無で集合が変わる
+        let commented = r#"export function overloaded(a: string): string;
+// 文字列と数値を受ける
+export function overloaded(a: number): number;
+export function overloaded(a: unknown): unknown {
+  return a;
+}
+"#;
+
+        let chunk = chunk_at(commented, "a.ts:4").expect("切り出せる");
+
+        assert_eq!(overload_positions_of_chunk(&chunk), vec![(1, 16), (3, 16)]);
+    }
+
     /// そのチャンクのシグネチャに書かれた型名の綴り。
     fn type_names_of(chunk: &Chunk) -> Vec<&str> {
         chunk
@@ -1171,6 +1258,38 @@ function broken() {
         let chunk = chunk_at(constrained, "a.ts:1").expect("切り出せる");
 
         assert_eq!(type_names_of(&chunk), vec!["Keys"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_cover_the_overload_declarations() {
+        // 宣言にだけ現れる型名を解決しないと、開かれないエイリアスが比較に残る綴りへ出る。
+        // 対照として、実装にだけ現れる型名を 1 つ置く
+        let overloaded = r#"export function scale(a: Amount): Amount;
+export function scale(a: Rate): Rate;
+export function scale(a: Unknown): Unknown {
+  return a;
+}
+"#;
+
+        let chunk = chunk_at(overloaded, "a.ts:3").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Unknown", "Amount", "Rate"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_leave_out_a_type_variable_bound_by_one_overload_declaration() {
+        // 型変数の束縛は宣言ごとに閉じる。1 つの集合にまとめると、別の宣言の `T` が
+        // 外側の `T` を隠す。対照として、束縛されていない型名を 1 つ置く
+        let bound_by_one = r#"export function scale<T>(a: T): T;
+export function scale(a: T, rate: Rate): T;
+export function scale(a: unknown, rate?: unknown): unknown {
+  return a;
+}
+"#;
+
+        let chunk = chunk_at(bound_by_one, "a.ts:3").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["T", "Rate"]);
     }
 
     #[test]
