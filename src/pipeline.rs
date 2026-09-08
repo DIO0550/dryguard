@@ -588,7 +588,13 @@ fn resolved_type_signature_outcome_of(
     let unopened = unopened_declaring_documents_of(session, traced.declared())?;
     let traced = opened_type_names_of(session, traced.with_unopened(unopened))?;
 
-    type_signature_outcome_of(session, document, position, &traced)
+    type_signature_outcome_of(
+        session,
+        document,
+        position,
+        chunk.overload_name_positions(),
+        &traced,
+    )
 }
 
 /// 型が宣言されているファイルを開かせて、開かせられなかった型名を返す。
@@ -760,6 +766,13 @@ fn type_signature_match_of(
         }
         (TypeSignatureOutcome::UnreadableHover, _) | (_, TypeSignatureOutcome::UnreadableHover) => {
             TypeSignatureMatch::UnreadableHover
+        }
+        (TypeSignatureOutcome::OverloadSetMiscounted { counted, found }, _)
+        | (_, TypeSignatureOutcome::OverloadSetMiscounted { counted, found }) => {
+            TypeSignatureMatch::OverloadSetMiscounted {
+                counted: *counted,
+                found: *found,
+            }
         }
         (TypeSignatureOutcome::UnreadableSignature, _)
         | (_, TypeSignatureOutcome::UnreadableSignature) => TypeSignatureMatch::UnreadableSignature,

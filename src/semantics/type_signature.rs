@@ -38,6 +38,15 @@ const DEFAULT_MARKER: &str = " = ";
 /// 呼び出し時に渡さない引数（TypeScript の `this` 引数）の名前。
 const RECEIVER_PARAMETER: &str = "this";
 
+/// 綴りの末尾に付く、隠れているオーバーロードの件数の要約を開く印。
+const OVERLOAD_COUNT_PREFIX: &str = "(+";
+
+/// 件数の後ろに続く語。複数形は末尾の `s` だけが違う。
+const OVERLOAD_COUNT_UNIT: &str = "overload";
+
+/// 複数形の末尾。
+const PLURAL_SUFFIX: char = 's';
+
 /// 構築シグネチャの宣言形を導く語（`constructor Result(value: string): Result`）。
 const CONSTRUCTOR_KEYWORD: &str = "constructor";
 
@@ -74,8 +83,20 @@ const PREDEFINED_TYPES: [&str; 12] = [
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeSignatureOutcome {
-    /// 綴りを正規化できた。
-    Normalized(TypeSignature),
+    /// 呼べる型シグネチャを揃えて正規化できた。
+    Normalized(OverloadSet),
+    /// サーバが数えた本数と、揃えられた本数が食い違う。
+    ///
+    /// **綴り 1 本を答えにしない。** hover はオーバーロードされた関数について 1 本しか
+    /// 返さず、残りは件数の要約になる。揃っていない集合を比べると、**隠れている
+    /// オーバーロードが違う 2 つを単一化可能と答える**ことがある
+    /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+    OverloadSetMiscounted {
+        /// サーバが数えた本数。
+        counted: usize,
+        /// こちらが揃えられた本数。
+        found: usize,
+    },
     /// サーバがその位置に型を持たなかった。
     NoTypeThere,
     /// hover の応答を `lsp` が読めなかった。
@@ -98,11 +119,15 @@ pub enum TypeSignatureOutcome {
     },
 }
 
-/// その位置にある名前の型を尋ねて、正規化した形にする。
+/// その名前で呼べる型シグネチャを揃えて、正規化した形にする。
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
-/// `Chunk::name_position` が指す識別子の位置。`traced` は
-/// `semantics::resolved_type` が型名を宣言まで辿った結果。
+/// `Chunk::name_position` が指す識別子の位置、`overload_positions` は
+/// `Chunk::overload_name_positions` が指すオーバーロード宣言の名前の位置。
+/// `traced` は `semantics::resolved_type` が型名を宣言まで辿った結果。
+///
+/// **オーバーロードされていれば、宣言 1 つずつに尋ねる。** 実装の位置を指した hover は
+/// 1 本目しか返さず、残りは件数の要約になる（typescript-language-server 6.0.0 で実測）。
 ///
 /// # Errors
 ///
@@ -113,30 +138,129 @@ pub fn type_signature_outcome_of(
     session: &mut Session,
     document: &SourceDocument,
     position: SourcePosition,
+    overload_positions: &[SourcePosition],
     traced: &TracedTypeNames,
 ) -> Result<TypeSignatureOutcome, ClientError> {
-    let outcome = match session.hover(document, position)? {
-        HoverOutcome::Answered(signature_text) => normalized_outcome_of(&signature_text, traced),
-        HoverOutcome::NoAnswer => TypeSignatureOutcome::NoTypeThere,
-        HoverOutcome::Unreadable => TypeSignatureOutcome::UnreadableHover,
-        HoverOutcome::NotSupported => TypeSignatureOutcome::HoverNotProvided,
+    let signature_text = match asked_signature_text_of(session, document, position)? {
+        Ok(signature_text) => signature_text,
+        Err(outcome) => return Ok(outcome),
     };
 
-    Ok(outcome)
+    let counted = CountedSignature::from_spelling(signature_text.as_str());
+    let not_overloaded = counted.overloads == 1 && overload_positions.is_empty();
+    if not_overloaded {
+        return Ok(single_outcome_of(counted.spelling, traced));
+    }
+
+    if counted.overloads != overload_positions.len() {
+        return Ok(TypeSignatureOutcome::OverloadSetMiscounted {
+            counted: counted.overloads,
+            found: overload_positions.len(),
+        });
+    }
+
+    overload_set_outcome_of(
+        session,
+        document,
+        overload_positions,
+        counted.overloads,
+        traced,
+    )
 }
 
-/// 綴りを正規化した結果。読み解けなかった / 開けなかった型名が残ったなら、その旨。
+/// オーバーロード宣言 1 つずつに尋ねて、呼べる型シグネチャの集合にする。
+///
+/// **1 本でも揃わなければ、その 1 本を測れなかった理由をそのまま返す。** 集合として
+/// 比べる相手が欠けたまま比べると、確かめられなかったことを答えとして出すことになる
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+///
+/// # Errors
+///
+/// 往復が失敗したとき。
+fn overload_set_outcome_of(
+    session: &mut Session,
+    document: &SourceDocument,
+    positions: &[SourcePosition],
+    counted: usize,
+    traced: &TracedTypeNames,
+) -> Result<TypeSignatureOutcome, ClientError> {
+    let mut signatures = Vec::with_capacity(positions.len());
+
+    for position in positions {
+        let signature_text = match asked_signature_text_of(session, document, *position)? {
+            Ok(signature_text) => signature_text,
+            Err(outcome) => return Ok(outcome),
+        };
+
+        // 宣言の位置を指した hover にも件数の要約が付く。剥がさないと戻り値の型として読めない
+        let declared = CountedSignature::from_spelling(signature_text.as_str());
+        match single_outcome_of(declared.spelling, traced) {
+            TypeSignatureOutcome::Normalized(normalized) => {
+                signatures.extend(normalized.into_signatures());
+            }
+            unavailable => return Ok(unavailable),
+        }
+    }
+
+    // 空の集合は作れない（[`OverloadSet::new`]）。揃った本数が 0 なのは、
+    // サーバが数えた本数との食い違いそのもの
+    let Some(overloads) = OverloadSet::new(signatures) else {
+        return Ok(TypeSignatureOutcome::OverloadSetMiscounted { counted, found: 0 });
+    };
+
+    Ok(TypeSignatureOutcome::Normalized(overloads))
+}
+
+/// その位置にある名前の型の綴り。答えが返らなければ、その理由の答え。
+///
+/// **綴りが返ったかどうかで分けるだけ。** 正規化はここではしない。
+///
+/// # Errors
+///
+/// 往復が失敗したとき。
+fn asked_signature_text_of(
+    session: &mut Session,
+    document: &SourceDocument,
+    position: SourcePosition,
+) -> Result<Result<SignatureText, TypeSignatureOutcome>, ClientError> {
+    let asked = match session.hover(document, position)? {
+        HoverOutcome::Answered(signature_text) => Ok(signature_text),
+        HoverOutcome::NoAnswer => Err(TypeSignatureOutcome::NoTypeThere),
+        HoverOutcome::Unreadable => Err(TypeSignatureOutcome::UnreadableHover),
+        HoverOutcome::NotSupported => Err(TypeSignatureOutcome::HoverNotProvided),
+    };
+
+    Ok(asked)
+}
+
+/// 綴り 1 本を正規化した結果。読み解けなかった / 開けなかった型名が残ったなら、その旨。
+///
+/// **綴りが自分で「他にもある」と言っていれば、集合を揃えられない。** 尋ねる先が
+/// 1 つしか無いので、隠れているオーバーロードを取りに行けない。
+pub fn normalized_outcome_of(
+    signature_text: &SignatureText,
+    traced: &TracedTypeNames,
+) -> TypeSignatureOutcome {
+    let counted = CountedSignature::from_spelling(signature_text.as_str());
+    if counted.overloads != 1 {
+        return TypeSignatureOutcome::OverloadSetMiscounted {
+            counted: counted.overloads,
+            found: 1,
+        };
+    }
+
+    single_outcome_of(counted.spelling, traced)
+}
+
+/// 件数の要約を剥がした綴り 1 本を、1 本だけの集合へ正規化した結果。
 ///
 /// **開けなかった型名を見るのは、正規化した後の綴りに対してだけ**
 /// (`rules/architecture.md`「どこまでを「取れなかった」に数えるか」)。
 /// 差し込みで消えた型名も、正規化で落ちる関数の名前も、比較には残らないので
 /// 答えを変えない。
-pub fn normalized_outcome_of(
-    signature_text: &SignatureText,
-    traced: &TracedTypeNames,
-) -> TypeSignatureOutcome {
-    let Some(normalized) = NormalizedSignature::from_signature_text(signature_text, traced) else {
-        return unreadable_outcome_of(signature_text, traced);
+fn single_outcome_of(spelling: &str, traced: &TracedTypeNames) -> TypeSignatureOutcome {
+    let Some(normalized) = NormalizedSignature::from_spelling(spelling, traced) else {
+        return unreadable_outcome_of(spelling, traced);
     };
 
     // 名前順で先に来るものを出す。尋ねた順に任せると、同じ綴りが巡ごとに違う理由を出す。
@@ -149,7 +273,63 @@ pub fn normalized_outcome_of(
         return TypeSignatureOutcome::UnopenedTypeName { reason };
     }
 
-    TypeSignatureOutcome::Normalized(normalized.signature)
+    TypeSignatureOutcome::Normalized(OverloadSet::of_one(normalized.signature))
+}
+
+/// 件数の要約を剥がした綴りと、サーバが数えた本数。
+///
+/// hover はオーバーロードされた関数について 1 本だけを綴り、残りを
+/// `(+1 overload)` と要約する（typescript-language-server 6.0.0 で実測）。
+/// **要約は綴りの一部だが型ではない**ので、読む前に剥がす。
+struct CountedSignature<'text> {
+    /// 要約を剥がした綴り。
+    spelling: &'text str,
+    /// サーバが数えた、その名前で呼べる型シグネチャの本数。要約が無ければ 1。
+    overloads: usize,
+}
+
+impl CountedSignature<'_> {
+    /// hover が返した綴りから読む。要約が付いていなければ本数は 1。
+    fn from_spelling(text: &str) -> CountedSignature<'_> {
+        let alone = CountedSignature {
+            spelling: text,
+            overloads: 1,
+        };
+
+        let trimmed = text.trim_end();
+        let Some(summarized) = trimmed.strip_suffix(')') else {
+            return alone;
+        };
+        let Some(opened) = summarized.rfind(OVERLOAD_COUNT_PREFIX) else {
+            return alone;
+        };
+        let (Some(summary), Some(spelling)) = (
+            summarized.get(opened + OVERLOAD_COUNT_PREFIX.len()..),
+            trimmed.get(..opened),
+        ) else {
+            return alone;
+        };
+        let Some(hidden) = hidden_overloads_of(summary) else {
+            return alone;
+        };
+
+        CountedSignature {
+            spelling: spelling.trim_end(),
+            overloads: hidden.saturating_add(1),
+        }
+    }
+}
+
+/// 要約の中身が数えている、綴られていないオーバーロードの本数。要約でなければ `None`。
+///
+/// `summary` は `(+` と `)` に挟まれた中身（`1 overload` / `2 overloads`）。
+fn hidden_overloads_of(summary: &str) -> Option<usize> {
+    let (hidden, unit) = summary.split_once(' ')?;
+    if unit.trim_end_matches(PLURAL_SUFFIX) != OVERLOAD_COUNT_UNIT {
+        return None;
+    }
+
+    hidden.parse().ok()
 }
 
 /// 正規化できなかった綴りの答え。開けなかった型名のせいで読めないなら、その理由。
@@ -160,12 +340,8 @@ pub fn normalized_outcome_of(
 ///
 /// **割れる綴りは見ない。** そこで読めなかった原因は注釈の外（壊れた引数の綴りなど）に
 /// あり、注釈に書かれた型名を理由にすると別の原因を答えることになる（[`annotation_of`]）。
-fn unreadable_outcome_of(
-    signature_text: &SignatureText,
-    traced: &TracedTypeNames,
-) -> TypeSignatureOutcome {
-    let Some(reason) = unopened_annotation_reason_of(&flattened(signature_text.as_str()), traced)
-    else {
+fn unreadable_outcome_of(spelling: &str, traced: &TracedTypeNames) -> TypeSignatureOutcome {
+    let Some(reason) = unopened_annotation_reason_of(&flattened(spelling), traced) else {
         return TypeSignatureOutcome::UnreadableSignature;
     };
 
@@ -174,7 +350,7 @@ fn unreadable_outcome_of(
 
 /// 注釈に書かれた型名のうち、開けなかったものの理由。開けていれば `None`。
 ///
-/// 名前順で先に来るものを出す（[`normalized_outcome_of`] と同じ理由）。
+/// 名前順で先に来るものを出す（[`single_outcome_of`] と同じ理由）。
 fn unopened_annotation_reason_of(text: &str, traced: &TracedTypeNames) -> Option<UnopenedReason> {
     let (_, annotated) = annotation_of(text)?;
 
@@ -183,10 +359,57 @@ fn unopened_annotation_reason_of(text: &str, traced: &TracedTypeNames) -> Option
         .find_map(|name| traced.unopened_reason_of(name))
 }
 
-/// 単一化の可否を比べられる形に直した型シグネチャ。
+/// 1 つの名前で呼べる型シグネチャの並び。オーバーロードされていなければ 1 本。
 ///
-/// 引数名を落とし、型変数を出現順に付け替えてある。**同じ形になった 2 つは
-/// 単一化できる**（[`TypeSignature::is_unifiable_with`]）。
+/// **比較の単位はこちら**（[`TypeSignature`] ではない）。hover が綴るのは 1 本だけなので、
+/// 1 本だけを比べると**隠れているオーバーロードが違う 2 つを単一化可能と答える**。
+///
+/// **並びをそのまま持つ。** TypeScript のオーバーロード解決は書かれた順に突き合わせて
+/// 最初に合ったものを採るので、並べ替えると**同じ呼び出しが別のシグネチャに解決する**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverloadSet {
+    signatures: Vec<TypeSignature>,
+}
+
+impl OverloadSet {
+    /// 宣言に書かれた順の型シグネチャから組み立てる。1 本も無ければ `None`。
+    ///
+    /// **空の集合を作れないようにする**（`rules/coding.md`「生成時に検証し、
+    /// 不正な値を存在させない」）。通すと後段が「呼べる形が無い型」と読むが、
+    /// 実際には**1 本も揃えられなかった**。
+    pub fn new(signatures: Vec<TypeSignature>) -> Option<Self> {
+        if signatures.is_empty() {
+            return None;
+        }
+
+        Some(Self { signatures })
+    }
+
+    /// オーバーロードされていない関数の集合。
+    fn of_one(signature: TypeSignature) -> Self {
+        Self {
+            signatures: vec![signature],
+        }
+    }
+
+    /// 2 つの集合が同じ型構造に重なるか。
+    ///
+    /// 本数・並び・1 本ずつの形のどれかが違えば重ならない。引数名と型変数名の違いは
+    /// 正規化の時点で消えている（[`TypeSignature`]）。
+    pub fn is_unifiable_with(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    /// 並びをそのまま取り出す。集合を組み立て直す側が使う。
+    fn into_signatures(self) -> Vec<TypeSignature> {
+        self.signatures
+    }
+}
+
+/// 単一化の可否を比べられる形に直した型シグネチャ 1 本。
+///
+/// 引数名を落とし、型変数を出現順に付け替えてある。**比べる相手は
+/// [`OverloadSet`]** で、この 1 本だけを外から比べることはない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeSignature {
     /// 呼び出しの仕方。
@@ -220,9 +443,9 @@ struct NormalizedSignature {
 }
 
 impl NormalizedSignature {
-    /// hover が返した綴りから組み立てる。
+    /// 件数の要約を剥がした綴りから組み立てる。
     ///
-    /// `text` は hover が返した綴り。サーバごとに宣言形（`function decl(a: string): number`）と
+    /// `spelling` は hover が返した綴り。サーバごとに宣言形（`function decl(a: string): number`）と
     /// 値形（`const arrow: (a: string) => number`）の 2 通りがあり、どちらも同じ形へ直す。
     /// `traced` が持つ型エイリアスの右辺を、綴りを読む前に差し込む。
     ///
@@ -235,9 +458,9 @@ impl NormalizedSignature {
     /// （[`SplitSignature::to_function_type`]）。ただしシグネチャ全体がエイリアスに
     /// 置き換わる形（`const aliased: Handler`）は引数リストを持たず**割れない**ので、
     /// そこだけ割る前に開く（[`opened_annotation_of`]）。
-    fn from_signature_text(text: &SignatureText, traced: &TracedTypeNames) -> Option<Self> {
+    fn from_spelling(spelling: &str, traced: &TracedTypeNames) -> Option<Self> {
         let resolved = traced.resolved();
-        let opened = opened_annotation_of(&flattened(text.as_str()), resolved);
+        let opened = opened_annotation_of(&flattened(spelling), resolved);
         let written = SplitSignature::from_spelling(&opened)?;
 
         // 差し込みは型 1 つ分の綴りに対して行うので、接頭辞を落として関数型へ組み直す。
@@ -283,20 +506,6 @@ impl NormalizedSignature {
             signature,
             remaining_type_names,
         })
-    }
-}
-
-impl TypeSignature {
-    /// 2 つの型シグネチャが同じ型構造に重なるか。
-    ///
-    /// 引数名と型変数名の違いは正規化の時点で消えているので、ここでは形が同じかを見る。
-    /// 呼び出しの仕方・引数の渡し方と型・制約・型変数の既定の型が違えば重ならない。
-    ///
-    /// **綴りが同じでも、そこに残った型名が別の記号を指していれば重ならない**
-    /// （[`TypeSignature::declarations`]）。片側でしか宣言を辿れていないときも同じで、
-    /// **確かめられていないものを重なる側へ倒さない**。
-    pub fn is_unifiable_with(&self, other: &Self) -> bool {
-        self == other
     }
 }
 
@@ -558,7 +767,7 @@ fn opened_spelling_of(spelling: &str, resolved: &ResolvedTypes) -> Option<String
 /// [`SplitSignature`] が割れない**。割れた綴りには手を触れない。
 ///
 /// **開けなければ元の綴りを返す。** ここで読めなかった綴りは割る側でも割れないので、
-/// [`NormalizedSignature::from_signature_text`] が `None` を返す。**読めなかったことは
+/// [`NormalizedSignature::from_spelling`] が `None` を返す。**読めなかったことは
 /// そこで出る**ので、この段で握りつぶしたことにはならない。
 ///
 /// **Why not（いつでも注釈を開いてから割る）**: 割れる綴りでは、引数と戻り値が
@@ -1129,12 +1338,12 @@ mod tests {
     use crate::test_support::{declaration_site, signature_text};
 
     /// テストが渡す綴りは読み取れる前提で組み立てる。辿った型名は無い。
-    fn signature(text: &str) -> TypeSignature {
+    fn signature(text: &str) -> OverloadSet {
         signature_tracing(text, &TracedTypeNames::default())
     }
 
     /// 解決した型名を差し込んでから組み立てる。
-    fn signature_with(text: &str, resolved: &ResolvedTypes) -> TypeSignature {
+    fn signature_with(text: &str, resolved: &ResolvedTypes) -> OverloadSet {
         signature_tracing(
             text,
             &TracedTypeNames::default().with_resolved(resolved.clone()),
@@ -1142,7 +1351,7 @@ mod tests {
     }
 
     /// 綴りに書かれた型名の宣言まで持たせて組み立てる。
-    fn signature_declaring(text: &str, declarations: &[TypeDeclaration]) -> TypeSignature {
+    fn signature_declaring(text: &str, declarations: &[TypeDeclaration]) -> OverloadSet {
         signature_tracing(
             text,
             &TracedTypeNames::new(declarations.to_vec(), Vec::new()),
@@ -1150,7 +1359,7 @@ mod tests {
     }
 
     /// 型名を辿った結果を渡して組み立てる。
-    fn signature_tracing(text: &str, traced: &TracedTypeNames) -> TypeSignature {
+    fn signature_tracing(text: &str, traced: &TracedTypeNames) -> OverloadSet {
         let TypeSignatureOutcome::Normalized(signature) =
             normalized_outcome_of(&signature_text(text), traced)
         else {
