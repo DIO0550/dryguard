@@ -1899,6 +1899,29 @@ mod tests {
     }
 
     #[test]
+    fn test_asked_semantics_do_not_call_a_pair_unifiable_with_a_miscounted_overload_set() {
+        // 対照は上のテスト。片側のオーバーロードが揃っていないので、綴り 1 本を
+        // 比べた結果は答えにならない。**両側が同じ 1 本でも単一化可能と言わない**
+        let asked = asked_semantics_of_outcomes(
+            Ok(TypeSignatureOutcome::OverloadSetMiscounted {
+                counted: 2,
+                found: 1,
+            }),
+            Ok(normalized("function sumOf(amounts: number[]): number")),
+            answered(CallerDomainsOutcome::NoReferences),
+            answered(CallerDomainsOutcome::NoReferences),
+        );
+
+        assert_eq!(
+            asked.type_signature_match,
+            TypeSignatureMatch::OverloadSetMiscounted {
+                counted: 2,
+                found: 1
+            }
+        );
+    }
+
+    #[test]
     fn test_asked_semantics_carry_the_reason_a_type_name_could_not_be_opened() {
         // 対照は 2 つ上のテスト（サーバが提供していない場合）。**サーバは宣言を持っており、
         // 読めないのはこちら側の穴**なので、理由まで運ばないと直す先が入れ替わる

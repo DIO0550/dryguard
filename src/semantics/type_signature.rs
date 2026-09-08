@@ -1500,6 +1500,120 @@ mod tests {
         );
     }
 
+    /// 綴りを並べた順に、呼べる型シグネチャの集合にする。
+    fn overload_set(spellings: &[&str]) -> OverloadSet {
+        let signatures = spellings
+            .iter()
+            .flat_map(|spelling| signature(spelling).into_signatures())
+            .collect();
+
+        OverloadSet::new(signatures).expect("テストが渡す綴りは 1 本以上")
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_spelling_summarizing_a_hidden_overload_is_not_normalized() {
+        // 綴りが 1 本しか無いので、隠れているオーバーロードを取りに行けない。
+        // 単一化可能と答えると、隠れている側が違う 2 つを共通化してよいと言うことになる
+        assert_eq!(
+            normalized_outcome_of(
+                &signature_text("function overloaded(a: string): string (+1 overload)"),
+                &TracedTypeNames::default()
+            ),
+            TypeSignatureOutcome::OverloadSetMiscounted {
+                counted: 2,
+                found: 1
+            }
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_spelling_summarizing_several_hidden_overloads_counts_them_all()
+    {
+        // 複数形の要約。単数形だけを読むと、3 本のうち 1 本を答えにしてしまう
+        assert_eq!(
+            normalized_outcome_of(
+                &signature_text("function overloaded(a: string): string (+2 overloads)"),
+                &TracedTypeNames::default()
+            ),
+            TypeSignatureOutcome::OverloadSetMiscounted {
+                counted: 3,
+                found: 1
+            }
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_spelling_ending_in_a_parenthesis_is_still_read() {
+        // 対照は上の 2 つ。末尾が閉じ括弧というだけで剥がすと、この綴りの戻り値の型が消える
+        let importing = "function load(a: string): typeof import(\"./m\")";
+
+        assert_eq!(
+            normalized_outcome_of(&signature_text(importing), &TracedTypeNames::default()),
+            TypeSignatureOutcome::Normalized(overload_set(&[importing]))
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_spelling_ending_in_another_summary_does_not_count_overloads() {
+        // 対照は上の 3 つ。末尾の括弧組を数えている相手ごと剥がすと、オーバーロードを
+        // 数えていない綴りまで「揃っていない」と答える
+        assert_eq!(
+            normalized_outcome_of(
+                &signature_text("function tally(a: string): void (+1 note)"),
+                &TracedTypeNames::default()
+            ),
+            TypeSignatureOutcome::UnreadableSignature
+        );
+    }
+
+    #[test]
+    fn test_overload_sets_holding_the_same_signatures_in_the_same_order_are_unifiable() {
+        let one = overload_set(&[
+            "function overloaded(a: string): string",
+            "function overloaded(a: number): number",
+        ]);
+        let other = overload_set(&[
+            "function other(value: string): string",
+            "function other(value: number): number",
+        ]);
+
+        assert!(one.is_unifiable_with(&other));
+    }
+
+    #[test]
+    fn test_overload_sets_holding_the_same_signatures_in_another_order_are_not_unifiable() {
+        // 対照は上のテスト。並べ替えただけの違い。TypeScript は書かれた順に突き合わせて
+        // 最初に合ったものを採るので、`(a: string | number)` の呼び出しの解決先が変わる
+        let one = overload_set(&[
+            "function overloaded(a: string): string",
+            "function overloaded(a: number): number",
+        ]);
+        let reordered = overload_set(&[
+            "function other(a: number): number",
+            "function other(a: string): string",
+        ]);
+
+        assert!(!one.is_unifiable_with(&reordered));
+    }
+
+    #[test]
+    fn test_an_overload_set_is_not_unifiable_with_one_of_its_own_signatures() {
+        // 隠れているオーバーロードを落として 1 本だけで比べると、これが単一化可能に出る
+        let overloaded = overload_set(&[
+            "function overloaded(a: string): string",
+            "function overloaded(a: number): number",
+        ]);
+        let alone = overload_set(&["function other(a: string): string"]);
+
+        assert!(!overloaded.is_unifiable_with(&alone));
+    }
+
+    #[test]
+    fn test_an_overload_set_without_any_signature_cannot_be_made() {
+        // 空を通すと、後段は「呼べる形が無い型」と読む。実際には 1 本も揃わなかった
+        assert_eq!(OverloadSet::new(Vec::new()), None);
+    }
+
     /// 型名 1 つ分の宣言。
     fn declared(name: &str, path: &str, line: usize) -> TypeDeclaration {
         TypeDeclaration::new(name.to_owned(), declaration_site(path, line))

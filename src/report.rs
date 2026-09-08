@@ -803,6 +803,28 @@ mod tests {
     }
 
     #[test]
+    fn test_text_of_with_a_miscounted_overload_set_says_how_many_are_missing() {
+        // 対照は 1 つ上のテスト（開けなかった型名）。どちらも測れないが、直す先が違う。
+        // **本数を出さないと、利用者はどれだけ足りないのかを見られない**
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::OverloadSetMiscounted {
+                counted: 3,
+                found: 1,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (サーバは 3 本のオーバーロードを数えたが、揃えられたのは 1 本) → どちらでもない"
+            ),
+            "揃わなかった本数が理由として出る: {text}"
+        );
+    }
+
+    #[test]
     fn test_text_of_with_an_unusable_lsp_reports_why_the_type_signature_is_missing() {
         // 対照として構造類似度は測れている。測れた値と測れなかったことが
         // 同じ出方をすると、読者が両者を区別できない
