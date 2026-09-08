@@ -157,6 +157,39 @@ fn test_two_functions_taking_types_from_separate_domains_are_not_unifiable() {
     assert!(!unifiable(&discounts_an_invoice, &reorders_stock));
 }
 
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_two_functions_with_the_same_overload_set_are_unifiable() {
+    // どちらも hover は `(value: string): string (+1 overload)` を返す。
+    // 隠れている 1 本まで揃えて初めて、重なることを言い切れる
+    let parses = fixture("overloads/parse.ts", 3);
+    let decodes = fixture("overloads/decode.ts", 3);
+
+    assert!(unifiable(&parses, &decodes));
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_two_functions_differing_only_in_a_hidden_overload_are_not_unifiable() {
+    // 対照は上のテスト。**表示される 1 本は上のペアと同じ綴り**で、違うのは
+    // 要約に畳まれた側だけ（`number` と `Date`）。1 本だけを比べると単一化可能に出る
+    let parses = fixture("overloads/parse.ts", 3);
+    let reads = fixture("overloads/read.ts", 3);
+
+    assert!(!unifiable(&parses, &reads));
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_two_functions_declaring_the_same_overloads_in_another_order_are_not_unifiable() {
+    // 対照は 2 つ上のテスト。中身は同じで並びだけが違う。TypeScript は書かれた順に
+    // 突き合わせるので、`string | number` を渡した呼び出しの解決先が変わる
+    let parses = fixture("overloads/parse.ts", 3);
+    let scans = fixture("overloads/scan.ts", 3);
+
+    assert!(!unifiable(&parses, &scans));
+}
+
 /// そのチャンクの呼び出し元のファイル。サーバに尋ねて集める。
 fn reference_paths_of(session: &mut Session, chunk: &Chunk) -> Vec<PathBuf> {
     let document = document(chunk.path());
