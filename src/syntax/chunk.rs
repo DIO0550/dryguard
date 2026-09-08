@@ -36,6 +36,7 @@ pub struct Chunk {
     path: PathBuf,
     lines: LineRange,
     name_position: Option<SourcePosition>,
+    overload_name_positions: Vec<SourcePosition>,
     type_references: Vec<TypeReference>,
     source: String,
     tokens: Option<TokenSequence>,
@@ -73,39 +74,33 @@ impl Chunk {
             });
         }
 
-        Ok(Self::new(
-            location.path().to_path_buf(),
-            lines,
-            name_position_of(enclosing, tree.source()),
-            type_references_of(enclosing, tree.source()),
-            source_of_lines(tree.source(), lines),
-            TokenSequence::from_node(enclosing),
+        Ok(Self::from_node(
+            enclosing,
+            location.path(),
+            tree.source(),
             ImportSet::from_tree(tree, location.path()),
         ))
     }
 
-    /// 切り出した結果を組み立てる。
+    /// チャンクのノードから組み立てる。
     ///
-    /// モジュールの外から呼べないのは、`lines` と `source` と `tokens` が食い違った
-    /// チャンクを作れないようにするため。組み立てるのは [`Chunk::find_enclosing`] だけで、
-    /// そこでは 3 つとも同じノードから採っている
+    /// `node` は [`CHUNK_KINDS`] のノード、`path` は切り出したチャンクに持たせる位置、
+    /// `source` はそのノードを含むファイル全体のソース、`imports` はそのファイルの依存先。
+    ///
+    /// **持つ値をすべてこの 1 つのノードから採る。** 呼び出し側に組み立てさせると、
+    /// `lines` と `source` と `tokens` が食い違ったチャンクを作れてしまう
     /// (rules/coding.md「不正な状態を型で表現できなくする」)。
-    fn new(
-        path: PathBuf,
-        lines: LineRange,
-        name_position: Option<SourcePosition>,
-        type_references: Vec<TypeReference>,
-        source: String,
-        tokens: Option<TokenSequence>,
-        imports: Option<ImportSet>,
-    ) -> Self {
+    fn from_node(node: Node<'_>, path: &Path, source: &str, imports: Option<ImportSet>) -> Self {
+        let lines = line_range_of(node);
+
         Self {
-            path,
+            path: path.to_path_buf(),
             lines,
-            name_position,
-            type_references,
-            source,
-            tokens,
+            name_position: name_position_of(node, source),
+            overload_name_positions: overload_name_positions_of(node, source),
+            type_references: type_references_of(&signature_nodes_of(node, source), source),
+            source: source_of_lines(source, lines),
+            tokens: TokenSequence::from_node(node),
             imports,
         }
     }
@@ -132,7 +127,24 @@ impl Chunk {
         self.name_position
     }
 
+    /// このチャンクのオーバーロード宣言の、名前が置かれている位置。ソースに書かれた順。
+    ///
+    /// オーバーロードされていなければ空。**hover は宣言の位置を指すとその 1 本を返す**
+    /// （typescript-language-server 6.0.0 で実測）ので、集合を揃えるのに要るのは
+    /// この位置だけで、問い合わせの種別は増えない。
+    ///
+    /// **並びをそのまま持つ。** TypeScript のオーバーロード解決は書かれた順に
+    /// 突き合わせるので、並べ替えると別の型になる。
+    pub fn overload_name_positions(&self) -> &[SourcePosition] {
+        &self.overload_name_positions
+    }
+
     /// このチャンクのシグネチャに書かれた型名。1 つも書かれていなければ空。
+    ///
+    /// **オーバーロード宣言に書かれた型名も入る。** 集合として比べる以上、宣言にだけ
+    /// 現れる型名（`function f(a: Amount): Amount;` の `Amount`）を解決しないと、
+    /// 開かれないエイリアスが比較に残る綴りへ現れる
+    /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
     ///
     /// **解決前の綴りと位置だけ**を持つ。その名前が何を指しているかを尋ねるのは
     /// `semantics` の担当で、ここが決めるのはどこを指して尋ねればよいかまで。
@@ -203,15 +215,7 @@ impl FileChunks {
                 continue;
             }
 
-            chunks.push(Chunk::new(
-                path.to_path_buf(),
-                lines,
-                name_position_of(node, tree.source()),
-                type_references_of(node, tree.source()),
-                source_of_lines(tree.source(), lines),
-                TokenSequence::from_node(node),
-                imports.clone(),
-            ));
+            chunks.push(Chunk::from_node(node, path, tree.source(), imports.clone()));
         }
 
         Self {
@@ -293,6 +297,20 @@ const CHUNK_KINDS: [&str; 6] = [
     "method_definition",
 ];
 
+/// オーバーロード宣言を表すノードの種別。
+///
+/// TypeScript はオーバーロードを、本体を持つ実装 1 つと、その手前に並ぶ**本体の無い
+/// 同名の宣言**で書く。宣言は [`CHUNK_KINDS`] に無いのでチャンクにならず、
+/// 実装のチャンクの側から辿ることになる。
+///
+/// **一覧から漏れた種別は「見つからなかった」に倒れる。** 数が合わなければ
+/// `semantics` が集合を組み立てないので、漏れは偽陰性になる
+/// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+const OVERLOAD_DECLARATION_KINDS: [&str; 2] = ["function_signature", "method_signature"];
+
+/// 名前を載せるフィールド。
+const NAME_FIELD: &str = "name";
+
 /// 指定行を含むチャンクノードのうち、もっとも内側のもの。1 つも無ければ `None`。
 ///
 /// 内側かどうかはバイト範囲の短さで決める。入れ子になったノードは必ず外側の範囲に
@@ -325,19 +343,104 @@ fn name_position_of(node: Node<'_>, source: &str) -> Option<SourcePosition> {
 /// 代入先を指すと**変数に書かれた型**が返るので、注釈が付いていれば
 /// （`const named: Formatter = function inner(…)`）関数自身の型ではなくその注釈を見ることになる。
 fn name_node_of(node: Node<'_>) -> Option<Node<'_>> {
-    if let Some(name) = node.child_by_field_name("name") {
+    if let Some(name) = node.child_by_field_name(NAME_FIELD) {
         return Some(name);
     }
 
     let parent = node.parent()?;
     if let Some(name) = parent
-        .child_by_field_name("name")
+        .child_by_field_name(NAME_FIELD)
         .or_else(|| parent.child_by_field_name("key"))
     {
         return Some(name);
     }
 
     assigned_name_of(parent)
+}
+
+/// そのチャンクのオーバーロード宣言の、名前が置かれている位置。ソースに書かれた順。
+///
+/// `node` はチャンクのノード、`source` はそれを含むファイル全体のソース。
+/// オーバーロードされていなければ空。
+fn overload_name_positions_of(node: Node<'_>, source: &str) -> Vec<SourcePosition> {
+    overload_declarations_of(node, source)
+        .into_iter()
+        .filter_map(|declaration| name_position_of(declaration, source))
+        .collect()
+}
+
+/// そのチャンクの型が書かれているノード。実装のノードと、そのオーバーロード宣言。
+///
+/// **hover が答える綴りに現れる型名を集める相手**（`type_references_of`）。
+/// 集合として比べる以上、宣言にだけ現れる型名も解決の対象になる。
+fn signature_nodes_of<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>> {
+    let mut nodes = vec![node];
+    nodes.extend(overload_declarations_of(node, source));
+
+    nodes
+}
+
+/// そのチャンクのオーバーロード宣言。ソースに書かれた順。
+///
+/// 集めるのは**同じスコープにある、同じ名前の宣言**。TypeScript は同じスコープに
+/// 同名の実装を 2 つ置けないので、同名の宣言はすべてこの実装のものになる。
+///
+/// **Why not（実装の直前に並ぶ分だけを採る）**: 宣言と実装の間にはコメントが入りうる。
+/// 隣接で切ると、コメントの有無で集合が変わる。
+fn overload_declarations_of<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>> {
+    let Some(name) = declared_name_of(node, source) else {
+        return Vec::new();
+    };
+    let Some(scope) = enclosing_scope_of(node) else {
+        return Vec::new();
+    };
+
+    scope
+        .named_children(&mut scope.walk())
+        .filter_map(overload_declaration_in)
+        .filter(|declaration| declared_name_of(*declaration, source) == Some(name))
+        .collect()
+}
+
+/// そのノード自身の名前の綴り。自分の `name` を持たなければ `None`。
+///
+/// **代入先の名前へは降りない**（[`name_node_of`] と違う点）。オーバーロードできるのは
+/// 自分の名前で宣言された関数・メソッドだけなので、代入先まで見ると
+/// **オーバーロードできない形に同名の宣言を結び付ける**ことになる。
+fn declared_name_of<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
+    source.get(node.child_by_field_name(NAME_FIELD)?.byte_range())
+}
+
+/// その文（またはメンバー）が持つオーバーロード宣言。宣言でなければ `None`。
+///
+/// `export function f(…);` の宣言は `export_statement` に、`declare` の付いた宣言は
+/// さらに別の包みに入る。**包みの種別を数え上げない。** 名前付きの子を 1 つだけ持つ形で
+/// 見分けるので、包みが増えても一覧を直さずに済む。
+fn overload_declaration_in(statement: Node<'_>) -> Option<Node<'_>> {
+    if OVERLOAD_DECLARATION_KINDS.contains(&statement.kind()) {
+        return Some(statement);
+    }
+
+    let wrapped = statement.named_child(0)?;
+    if statement.named_child_count() != 1 || !OVERLOAD_DECLARATION_KINDS.contains(&wrapped.kind()) {
+        return None;
+    }
+
+    Some(wrapped)
+}
+
+/// そのチャンクの兄弟が並ぶノード。
+///
+/// `export function f(…) {…}` の関数は `export_statement` に包まれるので、
+/// 兄弟が並ぶのは 1 つ上になる。**包みの種別を数え上げない**のは
+/// [`overload_declaration_in`] と同じ理由で、名前付きの子を 1 つだけ持つ形で見分ける。
+fn enclosing_scope_of(node: Node<'_>) -> Option<Node<'_>> {
+    let parent = node.parent()?;
+    if parent.named_child_count() != 1 {
+        return Some(parent);
+    }
+
+    parent.parent().or(Some(parent))
 }
 
 /// 代入の左辺のうち、問い合わせられる名前になっているノード。代入でなければ `None`。

@@ -82,32 +82,40 @@ impl TypeReference {
 
 /// そのチャンクのシグネチャに書かれた型名。1 つも書かれていなければ空。
 ///
-/// `node` はチャンクのノード、`source` はそれを含むファイル全体のソース。
+/// `nodes` はチャンクの型が書かれているノード（実装と、そのオーバーロード宣言）、
+/// `source` はそれを含むファイル全体のソース。
 ///
 /// **同じ綴りは 1 つにまとめる。** 尋ねる先は綴りごとに 1 箇所あればよく、
-/// 同じ名前へ 2 度尋ねる理由が無い。
+/// 同じ名前へ 2 度尋ねる理由が無い。**ノードをまたいでも 1 つにまとめる。**
+/// 同じファイルの同じ綴りは同じ型を指すので、宣言ごとに尋ね直す理由が無い。
+///
+/// **型変数の束縛はノードごとに見る。** オーバーロード宣言はそれぞれが自分の型変数を
+/// 宣言するので、まとめて 1 つの集合にすると**別の宣言の型変数が外側の型名を隠す**。
 ///
 /// **空は「書かれていない」。** キーワードの型だけで書かれたシグネチャがこれで、
 /// 集められなかったという状態は無い（構文木からは必ず採れる）ので `Option` にしない。
-pub(super) fn type_references_of(node: Node<'_>, source: &str) -> Vec<TypeReference> {
-    let declared = bound_type_names_of(node, source);
+pub(super) fn type_references_of(nodes: &[Node<'_>], source: &str) -> Vec<TypeReference> {
     let mut references: Vec<TypeReference> = Vec::new();
 
-    for annotated in annotated_nodes_of(node) {
-        for identifier in type_identifiers_of(annotated) {
-            let Some(reference) = type_reference_of(identifier, source) else {
-                continue;
-            };
-            if declared.contains(reference.name()) {
-                continue;
+    for node in nodes {
+        let declared = bound_type_names_of(*node, source);
+
+        for annotated in annotated_nodes_of(*node) {
+            for identifier in type_identifiers_of(annotated) {
+                let Some(reference) = type_reference_of(identifier, source) else {
+                    continue;
+                };
+                if declared.contains(reference.name()) {
+                    continue;
+                }
+                if references
+                    .iter()
+                    .any(|kept| kept.name() == reference.name())
+                {
+                    continue;
+                }
+                references.push(reference);
             }
-            if references
-                .iter()
-                .any(|kept| kept.name() == reference.name())
-            {
-                continue;
-            }
-            references.push(reference);
         }
     }
 
