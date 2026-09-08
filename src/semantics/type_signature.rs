@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::num::NonZeroUsize;
 
 use crate::lsp::{ClientError, HoverOutcome, Session, SignatureText, SourceDocument};
 use crate::semantics::resolved_type::{
@@ -46,6 +47,9 @@ const OVERLOAD_COUNT_UNIT: &str = "overload";
 
 /// 複数形の末尾。
 const PLURAL_SUFFIX: char = 's';
+
+/// オーバーロードされていない名前で呼べる、型シグネチャの本数。
+const ALONE: NonZeroUsize = NonZeroUsize::MIN;
 
 /// 構築シグネチャの宣言形を導く語（`constructor Result(value: string): Result`）。
 const CONSTRUCTOR_KEYWORD: &str = "constructor";
@@ -93,7 +97,11 @@ pub enum TypeSignatureOutcome {
     /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
     OverloadSetMiscounted {
         /// サーバが数えた本数。
-        counted: usize,
+        ///
+        /// **0 にはならない。** 綴られている 1 本と、要約が数えた本数の和なので、
+        /// 数えた結果が 0 になる綴りは存在しない
+        /// (`rules/coding.md`「生成時に検証し、不正な値を存在させない」)。
+        counted: NonZeroUsize,
         /// こちらが揃えられた本数。
         found: usize,
     },
@@ -147,12 +155,12 @@ pub fn type_signature_outcome_of(
     };
 
     let counted = CountedSignature::from_spelling(signature_text.as_str());
-    let not_overloaded = counted.overloads == 1 && overload_positions.is_empty();
+    let not_overloaded = counted.overloads == ALONE && overload_positions.is_empty();
     if not_overloaded {
         return Ok(single_outcome_of(counted.spelling, traced));
     }
 
-    if counted.overloads != overload_positions.len() {
+    if counted.overloads.get() != overload_positions.len() {
         return Ok(TypeSignatureOutcome::OverloadSetMiscounted {
             counted: counted.overloads,
             found: overload_positions.len(),
@@ -181,7 +189,7 @@ fn overload_set_outcome_of(
     session: &mut Session,
     document: &SourceDocument,
     positions: &[SourcePosition],
-    counted: usize,
+    counted: NonZeroUsize,
     traced: &TracedTypeNames,
 ) -> Result<TypeSignatureOutcome, ClientError> {
     let mut signatures = Vec::with_capacity(positions.len());
@@ -242,7 +250,7 @@ pub fn normalized_outcome_of(
     traced: &TracedTypeNames,
 ) -> TypeSignatureOutcome {
     let counted = CountedSignature::from_spelling(signature_text.as_str());
-    if counted.overloads != 1 {
+    if counted.overloads != ALONE {
         return TypeSignatureOutcome::OverloadSetMiscounted {
             counted: counted.overloads,
             found: 1,
@@ -285,7 +293,9 @@ struct CountedSignature<'text> {
     /// 要約を剥がした綴り。
     spelling: &'text str,
     /// サーバが数えた、その名前で呼べる型シグネチャの本数。要約が無ければ 1。
-    overloads: usize,
+    ///
+    /// **綴られている 1 本を数に含めるので 0 にならない。**
+    overloads: NonZeroUsize,
 }
 
 impl CountedSignature<'_> {
@@ -293,7 +303,7 @@ impl CountedSignature<'_> {
     fn from_spelling(text: &str) -> CountedSignature<'_> {
         let alone = CountedSignature {
             spelling: text,
-            overloads: 1,
+            overloads: ALONE,
         };
 
         let trimmed = text.trim_end();
@@ -315,7 +325,7 @@ impl CountedSignature<'_> {
 
         CountedSignature {
             spelling: spelling.trim_end(),
-            overloads: hidden.saturating_add(1),
+            overloads: ALONE.saturating_add(hidden),
         }
     }
 }
@@ -377,7 +387,7 @@ impl OverloadSet {
     /// **空の集合を作れないようにする**（`rules/coding.md`「生成時に検証し、
     /// 不正な値を存在させない」）。通すと後段が「呼べる形が無い型」と読むが、
     /// 実際には**1 本も揃えられなかった**。
-    pub fn new(signatures: Vec<TypeSignature>) -> Option<Self> {
+    fn new(signatures: Vec<TypeSignature>) -> Option<Self> {
         if signatures.is_empty() {
             return None;
         }
@@ -1335,7 +1345,7 @@ mod tests {
     use super::*;
 
     use crate::semantics::resolved_type::UnopenedTypeName;
-    use crate::test_support::{declaration_site, signature_text};
+    use crate::test_support::{declaration_site, overload_count, signature_text};
 
     /// テストが渡す綴りは読み取れる前提で組み立てる。辿った型名は無い。
     fn signature(text: &str) -> OverloadSet {
@@ -1520,7 +1530,7 @@ mod tests {
                 &TracedTypeNames::default()
             ),
             TypeSignatureOutcome::OverloadSetMiscounted {
-                counted: 2,
+                counted: overload_count(2),
                 found: 1
             }
         );
@@ -1536,7 +1546,7 @@ mod tests {
                 &TracedTypeNames::default()
             ),
             TypeSignatureOutcome::OverloadSetMiscounted {
-                counted: 3,
+                counted: overload_count(3),
                 found: 1
             }
         );

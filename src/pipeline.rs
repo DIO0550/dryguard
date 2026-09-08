@@ -1820,7 +1820,7 @@ mod tests {
     use crate::semantics::resolved_type::TracedTypeNames;
     use crate::semantics::type_signature::normalized_outcome_of;
     use crate::similarity::Similarity;
-    use crate::test_support::{line, missing_server, signature_text};
+    use crate::test_support::{line, missing_server, overload_count, signature_text};
 
     fn measured(value: f64) -> Similarity {
         Similarity::new(value).expect("テストが渡す値は 0.0-1.0")
@@ -1904,7 +1904,7 @@ mod tests {
         // 比べた結果は答えにならない。**両側が同じ 1 本でも単一化可能と言わない**
         let asked = asked_semantics_of_outcomes(
             Ok(TypeSignatureOutcome::OverloadSetMiscounted {
-                counted: 2,
+                counted: overload_count(2),
                 found: 1,
             }),
             Ok(normalized("function sumOf(amounts: number[]): number")),
@@ -1915,7 +1915,7 @@ mod tests {
         assert_eq!(
             asked.type_signature_match,
             TypeSignatureMatch::OverloadSetMiscounted {
-                counted: 2,
+                counted: overload_count(2),
                 found: 1
             }
         );

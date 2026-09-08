@@ -423,7 +423,7 @@ mod tests {
     use crate::pipeline::{Scan, scan_of};
     use crate::similarity::Similarity;
     use crate::syntax::module_distance::ModuleDistance;
-    use crate::test_support::{line, missing_server};
+    use crate::test_support::{line, missing_server, overload_count};
     use crate::threshold::Threshold;
 
     fn location(path: &str, number: usize) -> Location {
@@ -808,7 +808,7 @@ mod tests {
         // **本数を出さないと、利用者はどれだけ足りないのかを見られない**
         let text = text_of_accidental_duplication_with_semantics(
             TypeSignatureMatch::OverloadSetMiscounted {
-                counted: 3,
+                counted: overload_count(3),
                 found: 1,
             },
             CallerDomainOverlap::Unavailable {

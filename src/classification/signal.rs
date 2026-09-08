@@ -4,6 +4,8 @@
 //! (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
 //! 埋めてしまうと、後段も読者も「そういう値だった」と「見ていない」を区別できない。
 
+use std::num::NonZeroUsize;
+
 use crate::semantics::caller_domain::CallerDomains;
 use crate::semantics::resolved_type::UnopenedReason;
 use crate::similarity::Similarity;
@@ -169,8 +171,8 @@ pub enum TypeSignatureMatch {
     /// 比べると、**隠れているオーバーロードが違う 2 つを単一化可能と答える**
     /// （`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」）。
     OverloadSetMiscounted {
-        /// サーバが数えた本数。
-        counted: usize,
+        /// サーバが数えた本数。**0 にはならない**（`semantics::type_signature`）。
+        counted: NonZeroUsize,
         /// こちらが揃えられた本数。
         found: usize,
     },
