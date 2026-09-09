@@ -1,7 +1,8 @@
 //! 型 1 つ分の綴りを、構文木から読んだ構造にする。
 //!
 //! **綴りの一致で比べると、同じ型が書かれ方の違いで別物になる。** 引数名・タプルのラベル・
-//! 型述語の主語は書いた人の都合で、共用体の並びと括弧は同じ型に 2 通りの綴りを与える。
+//! 型述語の主語は書いた人の都合で、共用体の並びと括弧は同じ型に 2 通りの綴りを与える
+//! （**交差型の並びは型の一部**なので落とさない）。
 //! 畳んだり切ったりして落とそうとすると、**形の一覧を持つことになる**
 //! （`docs/dryguard-plan.md` の Stage 2 が求めるのは綴りではなく型の一致）。
 //!
@@ -116,7 +117,7 @@ pub(crate) enum TypeStructure {
     Callable(Callable),
     /// 共用体。
     Union(Vec<TypeStructure>),
-    /// 交差型。
+    /// 交差型。**並びは落とさない**（呼べる型を並べるとオーバーロードの並びになる）。
     Intersection(Vec<TypeStructure>),
     /// タプル。**ラベルは落ちている**（TypeScript ではラベルが型を変えない）。
     Tuple(Vec<TupleElement>),
@@ -264,7 +265,7 @@ impl Callable {
         }
     }
 
-    /// 型変数を出現順に付け替え、可換な並びを固定した形。
+    /// 型変数を出現順に付け替え、共用体の並びを固定した形。
     /// 綴りのまま持っている部分を読めなければ `None`。
     ///
     /// **付け替えてから並べ替える。** 逆にすると、付け替え前の名前で整列することになり、
@@ -490,13 +491,26 @@ impl TypeStructure {
 
     /// 可換な並びを固定した形。
     ///
-    /// 並べ替えるのは共用体と交差型だけ。**タプルの要素と型引数の並びは型の一部**なので
-    /// そのまま残す。
+    /// **並べ替えるのは共用体だけ。** タプルの要素と型引数の並びは型の一部で、
+    /// **交差型の並びも型の一部**（下記）。
+    ///
+    /// **Why not（交差型も並べ替える）**: 交差型が並べる呼べる型は
+    /// オーバーロードの並びそのもので、TypeScript は書かれた順に突き合わせる
+    /// （`rules/naming.md`「`overload set` の並びを落とさない」）。`tsc 5.9.3` で確かめると、
+    /// `Wide & Narrow` と `Narrow & Wide` は同じ引数に対して別の型を返す。
+    /// 並べ替えると**単一化できない 2 つを重ねてしまう**（偽陽性）。
+    ///
+    /// **Why not（呼べる型を含む交差型だけ並べ替えない）**: 呼び出しの形を持つかは
+    /// 綴りのまま持つ側（オブジェクト型の呼び出しシグネチャ）や、開けなかった型名からは
+    /// 決められない。一覧に無い形が偽陽性へ倒れるので、並べ替えないほうへ寄せる
+    /// （`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」）。
     fn sorted(self) -> Self {
         match self {
             Self::Callable(callable) => Self::Callable(callable.sorted()),
             Self::Union(members) => Self::Union(sorted_members(members)),
-            Self::Intersection(members) => Self::Intersection(sorted_members(members)),
+            Self::Intersection(members) => {
+                Self::Intersection(members.into_iter().map(Self::sorted).collect())
+            }
             Self::Tuple(elements) => Self::Tuple(
                 elements
                     .into_iter()
@@ -536,7 +550,9 @@ fn renamed_members(
         .collect()
 }
 
-/// 並べた型を、それぞれ並びを固定したうえで整列した形。
+/// 共用体の相手を、それぞれ並びを固定したうえで整列した形。
+///
+/// **交差型には使わない**（[`TypeStructure::sorted`]）。
 fn sorted_members(members: Vec<TypeStructure>) -> Vec<TypeStructure> {
     let mut sorted: Vec<TypeStructure> = members.into_iter().map(TypeStructure::sorted).collect();
     sorted.sort();
@@ -757,6 +773,9 @@ fn flattened_union(members: Vec<TypeStructure>) -> Vec<TypeStructure> {
 }
 
 /// 交差型の中の交差型を、1 つの並びへ均した形。[`flattened_union`] と同じ理由。
+///
+/// **均しても書かれた順は変わらない。** 交差型の並びはオーバーロードの並びなので、
+/// 入れ子を開くだけにして並べ替えない（[`TypeStructure::sorted`]）。
 fn flattened_intersection(members: Vec<TypeStructure>) -> Vec<TypeStructure> {
     members
         .into_iter()
@@ -1082,10 +1101,22 @@ mod tests {
     }
 
     #[test]
-    fn test_an_intersection_written_in_the_other_order_reads_as_the_same_structure() {
+    fn test_an_intersection_written_in_the_other_order_reads_as_a_different_structure() {
+        // 交差型が並べる呼べる型はオーバーロードの並びそのもの。
+        // `((a: string) => string) & ((a: number) => number)` を逆順にすると、
+        // 同じ引数を渡した呼び出しが別のシグネチャへ解決する
+        assert!(!same_structure(
+            "(x: ((a: string) => string) & ((a: number) => number)) => void",
+            "(x: ((a: number) => number) & ((a: string) => string)) => void"
+        ));
+    }
+
+    #[test]
+    fn test_an_intersection_written_in_the_same_order_reads_as_the_same_structure() {
+        // 対照。並びが同じなら、中の引数名は落ちる
         assert!(same_structure(
-            "(x: Left & Right) => void",
-            "(x: Right & Left) => void"
+            "(x: Left & ((a: string) => void)) => void",
+            "(y: Left & ((b: string) => void)) => void"
         ));
     }
 
