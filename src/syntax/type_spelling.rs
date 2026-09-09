@@ -119,10 +119,11 @@ pub(crate) fn substituted_spelling_of(
     spelling: &str,
     opened: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    let wrapped = wrapped(spelling)?;
+    let wrapped = Wrapped::from_spelling(spelling)?;
     let spans = type_name_spans_in_wrapped(&wrapped, BoundNames::Excluded)?;
 
     // 後ろから差し替える。前から差し替えると、後ろの範囲が差し込んだ長さの分だけずれる。
+    let prefix = wrapped.span().start;
     let mut substituted = wrapped.text;
     for span in spans.into_iter().rev() {
         let Some(name) = substituted.get(span.clone()) else {
@@ -135,7 +136,7 @@ pub(crate) fn substituted_spelling_of(
         substituted = replaced(&substituted, span, &replacement);
     }
 
-    unwrapped(&substituted, wrapped.prefix)
+    unwrapped(&substituted, prefix)
 }
 
 /// 綴りの中で、差し替えてよい型名が書かれている範囲。型として読めない綴りでは `None`。
@@ -163,8 +164,8 @@ pub(crate) fn type_name_spans_of(spelling: &str) -> Option<Vec<Range<usize>>> {
 
 /// 綴りを包んで歩き、返った範囲を綴りの中の位置へ戻す。
 fn spans_in_spelling(spelling: &str, bound_names: BoundNames) -> Option<Vec<Range<usize>>> {
-    let wrapped = wrapped(spelling)?;
-    let prefix = wrapped.prefix;
+    let wrapped = Wrapped::from_spelling(spelling)?;
+    let prefix = wrapped.span().start;
 
     Some(
         type_name_spans_in_wrapped(&wrapped, bound_names)?
@@ -201,8 +202,8 @@ enum BoundNames {
 /// 増えるたびに増えるが、型名でない名前が許される場所は閉じている
 /// （[`LOCAL_NAME_KINDS`]）。
 pub(crate) fn names_only_types(spelling: &str) -> Option<bool> {
-    let wrapped = wrapped(spelling)?;
-    let tree = SyntaxTree::from_source(&wrapped.text, Grammar::TypeScript).ok()?;
+    let wrapped = Wrapped::from_spelling(spelling)?;
+    let tree = SyntaxTree::from_source(wrapped.text(), Grammar::TypeScript).ok()?;
 
     let reaches_outside = tree
         .named_descendants()
@@ -229,35 +230,50 @@ fn names_outside_the_type_namespace(node: Node<'_>) -> bool {
 }
 
 /// 綴りを包んで構文木にできた文と、そのとき使った前置きの長さ。
-struct Wrapped {
+///
+/// **包み方を 1 箇所に置く。** 型名の範囲を返す側（このモジュール）と、構造として読む側
+/// （`syntax::type_structure`）が別々に包むと、**片方だけが読める綴り**が生まれる。
+pub(crate) struct Wrapped {
     text: String,
     prefix: usize,
 }
 
-/// 綴りを、構文木にできる文へ包む。どの包み方でも読めなければ `None`。
-///
-/// **包み方が 2 つあるのは、型が書ける場所が 1 つではないため。** 型述語
-/// （`value is User`）は関数の戻り値の位置にしか書けず、エイリアスの右辺では読めない
-/// （[`RETURN_TYPE_PREFIX`]）。
-///
-/// **Why not（はじめから戻り値の位置で包む）**: そこは型 1 つ分だけが書ける場所ではなく、
-/// 型述語も通る。**綴りが型として読めたかどうかと、包んだ文が読めたかどうかが
-/// 一致しなくなる**ので、型として読める包み方を先に試す。
-fn wrapped(spelling: &str) -> Option<Wrapped> {
-    for prefix in [SPELLING_PREFIX, RETURN_TYPE_PREFIX] {
-        let text = format!("{prefix}{spelling}{SPELLING_SUFFIX}");
-        let readable =
-            SyntaxTree::from_source(&text, Grammar::TypeScript).is_ok_and(|tree| !tree.has_error());
+impl Wrapped {
+    /// 綴りを、構文木にできる文へ包む。どの包み方でも読めなければ `None`。
+    ///
+    /// **包み方が 2 つあるのは、型が書ける場所が 1 つではないため。** 型述語
+    /// （`value is User`）は関数の戻り値の位置にしか書けず、エイリアスの右辺では読めない
+    /// （[`RETURN_TYPE_PREFIX`]）。
+    ///
+    /// **Why not（はじめから戻り値の位置で包む）**: そこは型 1 つ分だけが書ける場所ではなく、
+    /// 型述語も通る。**綴りが型として読めたかどうかと、包んだ文が読めたかどうかが
+    /// 一致しなくなる**ので、型として読める包み方を先に試す。
+    pub(crate) fn from_spelling(spelling: &str) -> Option<Self> {
+        for prefix in [SPELLING_PREFIX, RETURN_TYPE_PREFIX] {
+            let text = format!("{prefix}{spelling}{SPELLING_SUFFIX}");
+            let readable = SyntaxTree::from_source(&text, Grammar::TypeScript)
+                .is_ok_and(|tree| !tree.has_error());
 
-        if readable {
-            return Some(Wrapped {
-                text,
-                prefix: prefix.len(),
-            });
+            if readable {
+                return Some(Self {
+                    text,
+                    prefix: prefix.len(),
+                });
+            }
         }
+
+        None
     }
 
-    None
+    /// 包んだ文そのもの。
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// 包んだ文の中で、元の綴りが占める範囲。
+    pub(crate) fn span(&self) -> Range<usize> {
+        self.prefix..self.text.len().saturating_sub(SPELLING_SUFFIX.len())
+    }
 }
 
 /// 包んだ文から、綴りを取り出す。前置きと後置きが揃わなければ `None`。
@@ -343,14 +359,14 @@ fn type_name_spans_in_wrapped(
     wrapped: &Wrapped,
     bound_names: BoundNames,
 ) -> Option<Vec<Range<usize>>> {
-    let text = wrapped.text.as_str();
+    let text = wrapped.text();
     let tree = SyntaxTree::from_source(text, Grammar::TypeScript).ok()?;
     if tree.has_error() {
         return None;
     }
     let nodes = tree.named_descendants();
 
-    let spelling = wrapped.prefix..text.len().saturating_sub(SPELLING_SUFFIX.len());
+    let spelling = wrapped.span();
     let bound = match bound_names {
         BoundNames::Excluded => bound_names_of(&nodes, text),
         BoundNames::Included => BTreeSet::new(),
