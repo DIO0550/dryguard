@@ -94,6 +94,9 @@ if structurally_similar && domains_differ { ... }
 | `open` | 型名を宣言まで辿り、エイリアスの右辺の綴りを取ること |
 | `resolved type` | その型名が指していた型の綴り。**解決後** |
 | `traced type name` | シグネチャに書かれた型名 1 つを、宣言まで辿った結果。宣言の場所・開いた綴り・**開けなかった理由**のどれか |
+| `type structure` | `type spelling` を構文木から読んだ形。**書かれ方の違い**（括弧・引数名・タプルのラベル・共用体の並び）を落としてある |
+| `callable` | 呼べる型（関数型・構築型）1 つ分の `type structure`。型変数・引数・戻り値を持つ |
+| `spelled type` | `type structure` のうち、**分解せず綴りのまま持つ**もの。比較も綴りで行う |
 | `type signature` | 引数名を落とし、型変数を出現順に付け替えた形。**正規化後** |
 | `overload declaration` | 本体を持たない同名のシグネチャの宣言。実装と同じスコープに並ぶ |
 | `overload count` | hover が綴りの末尾に付ける、**綴られていない**オーバーロードの本数の要約（`(+1 overload)`） |
@@ -128,6 +131,18 @@ JSON が壊れているのは違う話）。1 語で呼ぶと、どちらの層�
 1 つの関数の型全体で、接頭辞（`(method)` / `constructor`）が付くことがあり**型としては読めない**。
 `type spelling` は型 1 つ分なので、**型として構文解析できる**。差し込みが型名の位置を
 構文木で決められるのは後者だけ（`syntax::type_spelling`）。
+
+**`type spelling` と `type structure` を混ぜない。** どちらも型 1 つ分を指すが、綴りは
+書いた人の書き方に依存し、構造は依存しない。**同じ型に 2 通り以上の綴りがある**
+（`string | number` と `number | string`、`(string | number) | null` と
+`string | number | null`、`[left: string]` と `[string]`）ので、**綴りの一致で比べると
+書かれ方の違いが型の違いに見える**（`specifier` と `module path` を分けているのと同じ形）。
+畳んだり切ったりで落とそうとすると**書かれ方の一覧を持つ**ことになるので、
+構文木から読み直す側を別の語で呼ぶ。
+
+**`spelled type` を「分解できなかった型」と呼ばない。** 分解しないのは判断であって
+失敗ではなく、**綴りで比べれば答えは出る**（同じ綴りなら重なる）。「取れなかった」
+（`rules/architecture.md`）と 1 語で呼ぶと、シグナルを落とすべきかどうかが言えなくなる。
 
 **`type signature` と `overload set` を混ぜない。** hover が綴るのは**呼べる型のうち
 1 本だけ**で、残りは `overload count` に畳まれる。1 本を比較の単位にすると、
