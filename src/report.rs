@@ -210,18 +210,27 @@ fn module_distance_text_of(distance: ModuleDistance) -> String {
 /// 埋めると、読む側は測った結果としてそれを読む
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
 /// **測れなかったのとは別**なので、そちらは理由まで出す。
-fn type_signature_text_of(signal: TypeSignatureMatch) -> Option<&'static str> {
-    match signal {
-        TypeSignatureMatch::Unifiable => Some("単一化可能"),
-        TypeSignatureMatch::NotUnifiable => Some("単一化不能"),
-        TypeSignatureMatch::Unavailable { reason } => semantics_unavailable_text_of(reason),
-        TypeSignatureMatch::NoName => Some("測れない (チャンクが名前を持たない)"),
-        TypeSignatureMatch::NoTypeThere => Some("測れない (サーバがその位置に型を持たない)"),
-        TypeSignatureMatch::UnreadableHover => Some("測れない (hover の応答を読めない)"),
-        TypeSignatureMatch::UnreadableSignature => Some("測れない (返った綴りを読み解けない)"),
-        TypeSignatureMatch::HoverNotProvided => Some("測れない (サーバが hover を提供していない)"),
-        TypeSignatureMatch::UnopenedTypeName { reason } => Some(unopened_text_of(reason)),
-    }
+fn type_signature_text_of(signal: TypeSignatureMatch) -> Option<String> {
+    let text = match signal {
+        TypeSignatureMatch::Unifiable => "単一化可能",
+        TypeSignatureMatch::NotUnifiable => "単一化不能",
+        TypeSignatureMatch::Unavailable { reason } => semantics_unavailable_text_of(reason)?,
+        TypeSignatureMatch::NoName => "測れない (チャンクが名前を持たない)",
+        TypeSignatureMatch::NoTypeThere => "測れない (サーバがその位置に型を持たない)",
+        TypeSignatureMatch::UnreadableHover => "測れない (hover の応答を読めない)",
+        TypeSignatureMatch::UnreadableSignature => "測れない (返った綴りを読み解けない)",
+        TypeSignatureMatch::HoverNotProvided => "測れない (サーバが hover を提供していない)",
+        TypeSignatureMatch::UnopenedTypeName { reason } => unopened_text_of(reason),
+        // 本数は測れなかった相手そのものなので、綴りに埋め込む。**「オーバーロードが
+        // 揃わない」だけでは、利用者はどれだけ足りないのかを見られない**
+        TypeSignatureMatch::OverloadSetMiscounted { counted, found } => {
+            return Some(format!(
+                "測れない (サーバは {counted} 本のオーバーロードを数えたが、揃えられたのは {found} 本)"
+            ));
+        }
+    };
+
+    Some(text.to_owned())
 }
 
 /// 比較に残る型名を開けなかった理由。
@@ -414,7 +423,7 @@ mod tests {
     use crate::pipeline::{Scan, scan_of};
     use crate::similarity::Similarity;
     use crate::syntax::module_distance::ModuleDistance;
-    use crate::test_support::{line, missing_server};
+    use crate::test_support::{line, missing_server, overload_count};
     use crate::threshold::Threshold;
 
     fn location(path: &str, number: usize) -> Location {
@@ -790,6 +799,28 @@ mod tests {
                 "型シグネチャ: 測れない (比較に残る型名を開けない: typeDefinition の応答を読めない) → どちらでもない"
             ),
             "読めなかったことが理由として出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_a_miscounted_overload_set_says_how_many_are_missing() {
+        // 対照は 1 つ上のテスト（開けなかった型名）。どちらも測れないが、直す先が違う。
+        // **本数を出さないと、利用者はどれだけ足りないのかを見られない**
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::OverloadSetMiscounted {
+                counted: overload_count(3),
+                found: 1,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (サーバは 3 本のオーバーロードを数えたが、揃えられたのは 1 本) → どちらでもない"
+            ),
+            "揃わなかった本数が理由として出る: {text}"
         );
     }
 

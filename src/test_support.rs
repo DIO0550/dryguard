@@ -6,6 +6,7 @@
 //!
 //! 汎用の操作（値を別の表現へ直すなど）は実装側の責務なので、ここに書かない。
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use crate::line_number::LineNumber;
@@ -47,6 +48,16 @@ pub(crate) fn missing_server() -> ServerCommand {
 /// テストが渡すのは書き間違い。
 pub(crate) fn signature_text(text: &str) -> SignatureText {
     SignatureText::new(text.to_owned()).expect("テストが渡す綴りは空ではない")
+}
+
+/// サーバが数えたオーバーロードの本数。
+///
+/// # Panics
+///
+/// `count` が 0 のとき。綴られている 1 本を数に含めるので 0 本にはならず、
+/// テストが渡すのは書き間違い。
+pub(crate) fn overload_count(count: usize) -> NonZeroUsize {
+    NonZeroUsize::new(count).expect("テストが渡す本数は 1 以上")
 }
 
 /// 型が宣言されている場所。行の先頭を指す。

@@ -588,7 +588,13 @@ fn resolved_type_signature_outcome_of(
     let unopened = unopened_declaring_documents_of(session, traced.declared())?;
     let traced = opened_type_names_of(session, traced.with_unopened(unopened))?;
 
-    type_signature_outcome_of(session, document, position, &traced)
+    type_signature_outcome_of(
+        session,
+        document,
+        position,
+        chunk.overload_name_positions(),
+        &traced,
+    )
 }
 
 /// 型が宣言されているファイルを開かせて、開かせられなかった型名を返す。
@@ -760,6 +766,13 @@ fn type_signature_match_of(
         }
         (TypeSignatureOutcome::UnreadableHover, _) | (_, TypeSignatureOutcome::UnreadableHover) => {
             TypeSignatureMatch::UnreadableHover
+        }
+        (TypeSignatureOutcome::OverloadSetMiscounted { counted, found }, _)
+        | (_, TypeSignatureOutcome::OverloadSetMiscounted { counted, found }) => {
+            TypeSignatureMatch::OverloadSetMiscounted {
+                counted: *counted,
+                found: *found,
+            }
         }
         (TypeSignatureOutcome::UnreadableSignature, _)
         | (_, TypeSignatureOutcome::UnreadableSignature) => TypeSignatureMatch::UnreadableSignature,
@@ -1807,7 +1820,7 @@ mod tests {
     use crate::semantics::resolved_type::TracedTypeNames;
     use crate::semantics::type_signature::normalized_outcome_of;
     use crate::similarity::Similarity;
-    use crate::test_support::{line, missing_server, signature_text};
+    use crate::test_support::{line, missing_server, overload_count, signature_text};
 
     fn measured(value: f64) -> Similarity {
         Similarity::new(value).expect("テストが渡す値は 0.0-1.0")
@@ -1883,6 +1896,29 @@ mod tests {
         );
 
         assert_eq!(asked.type_signature_match, TypeSignatureMatch::NotUnifiable);
+    }
+
+    #[test]
+    fn test_asked_semantics_do_not_call_a_pair_unifiable_with_a_miscounted_overload_set() {
+        // 対照は上のテスト。片側のオーバーロードが揃っていないので、綴り 1 本を
+        // 比べた結果は答えにならない。**両側が同じ 1 本でも単一化可能と言わない**
+        let asked = asked_semantics_of_outcomes(
+            Ok(TypeSignatureOutcome::OverloadSetMiscounted {
+                counted: overload_count(2),
+                found: 1,
+            }),
+            Ok(normalized("function sumOf(amounts: number[]): number")),
+            answered(CallerDomainsOutcome::NoReferences),
+            answered(CallerDomainsOutcome::NoReferences),
+        );
+
+        assert_eq!(
+            asked.type_signature_match,
+            TypeSignatureMatch::OverloadSetMiscounted {
+                counted: overload_count(2),
+                found: 1
+            }
+        );
     }
 
     #[test]
