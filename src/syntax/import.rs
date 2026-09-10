@@ -161,6 +161,17 @@ const STRING_LITERAL_KINDS: [&str; 2] = ["string", "template_string"];
 /// CommonJS が依存を読み込む関数の名前。
 const REQUIRE_FUNCTION_NAME: &str = "require";
 
+/// `require` の要素のうち、**読み込みを行わないと分かっているもの**の名前。
+///
+/// `require.resolve` は指定子を解決するだけで、読み込まない。
+///
+/// **ここに無い名前は「読み込みかもしれない」側へ落ちる。** `require.call(null, "./dep")` や
+/// `require.apply(null, ["./dep"])` は読み込みそのもので、呼ばれる側が
+/// `member_expression` になるため [`specifier_of`] では採れない。落ちた先は
+/// [`RequireSpelling::Rebound`]（＝読み取れない）なので、**値を作らずに測れないと言う**
+/// だけで済む (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+const NON_LOADING_REQUIRE_MEMBERS: [&str; 1] = ["resolve"];
+
 /// そのファイルで `require` の綴りが何を指しているか。
 ///
 /// `require` は予約語ではないので、綴りだけでは CommonJS の読み込みだと言えない
@@ -228,18 +239,23 @@ fn is_require_spelled_outside_a_call(tree: &SyntaxTree<'_>, node: Node<'_>) -> b
     if tree.text_of(node) != Some(REQUIRE_FUNCTION_NAME) {
         return false;
     }
-    !is_use_that_cannot_bind(node)
+    !is_use_that_cannot_load(tree, node)
 }
 
-/// そのノードが、新しい名前を導入しえない位置に置かれた名前か。
+/// そのノードが、**新しい名前も読み込みも作りえない**位置に置かれた名前か。
 ///
-/// 呼び出しの呼ばれる側（`require("./dep")`）・メンバアクセスの受け側
-/// （`require.resolve(…)`）・要素の名前（`registry.require`）・単項演算の対象
-/// （`typeof require`）。**どれも束縛を作らない。**
+/// 呼び出しの呼ばれる側（`require("./dep")`。読み込みだが、[`specifier_of`] が採る）・
+/// 読み込まないと分かっている要素の受け側（`require.resolve(…)`）・要素の名前
+/// （`registry.require`）・単項演算の対象（`typeof require`）。
 ///
-/// **ここから漏れた位置は「束縛かもしれない」側へ落ちる。** 落ちた先は
-/// [`SpecifierReading::Unreadable`] なので、**値を作らずに測れないと言う**だけで済む。
-fn is_use_that_cannot_bind(node: Node<'_>) -> bool {
+/// **「束縛を作らない」だけでは足りない。** `require.call(null, "./dep")` は束縛を
+/// 作らないが**読み込みそのもの**で、[`specifier_of`] は呼ばれる側が
+/// `member_expression` なので採らない。除外すると、その読み込みが落ちたまま
+/// ファイルが測れる側に残る。
+///
+/// **ここから漏れた位置は [`RequireSpelling::Rebound`] へ落ちる。** 落ちた先は
+/// 「読み取れない」なので、**値を作らずに測れないと言う**だけで済む。
+fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     if node.kind() == MEMBER_NAME_KIND {
         return true;
     }
@@ -252,11 +268,25 @@ fn is_use_that_cannot_bind(node: Node<'_>) -> bool {
     let is_called = parent.kind() == CALL_EXPRESSION_KIND
         && parent.child_by_field_name("function") == Some(positioned);
     let is_member_object = parent.kind() == MEMBER_EXPRESSION_KIND
-        && parent.child_by_field_name("object") == Some(positioned);
+        && parent.child_by_field_name("object") == Some(positioned)
+        && accesses_non_loading_member(tree, parent);
     let is_unary_operand = parent.kind() == UNARY_EXPRESSION_KIND
         && parent.child_by_field_name("argument") == Some(positioned);
 
     is_called || is_member_object || is_unary_operand
+}
+
+/// そのメンバアクセスが、読み込みを行わないと分かっている要素を指しているか。
+///
+/// 計算された添字（`require["call"]`）は `member_expression` にならないので、
+/// ここへ来ない（＝読み込みかもしれない側へ落ちる）。
+fn accesses_non_loading_member(tree: &SyntaxTree<'_>, member: Node<'_>) -> bool {
+    let Some(name) = member.child_by_field_name("property") else {
+        return false;
+    };
+
+    tree.text_of(name)
+        .is_some_and(|text| NON_LOADING_REQUIRE_MEMBERS.contains(&text))
 }
 
 /// 包んでいる包みの外まで遡ったノード。
@@ -868,6 +898,25 @@ const stock = require("./stock");
                 "src/utils/b.ts",
             ),
             1.0
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_loading_through_require_call_cannot_be_created() {
+        // 対照に読み取れる import を 1 件置く。`require.call` は束縛を作らないが
+        // **読み込みそのもの**で、呼ばれる側が `member_expression` なので採れない。
+        // メンバの受け側を名前を見ずに外す実装だと、この読み込みが落ちたまま
+        // ファイルが測れる側に残り、重なりが 1.00 に出る
+        let real_import_and_an_indirect_load = r#"import { pad } from "./pad";
+const stock = require.call(null, "./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(real_import_and_an_indirect_load),
+                Path::new("src/utils/a.ts"),
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
         );
     }
 
