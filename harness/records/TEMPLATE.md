@@ -90,6 +90,7 @@
 | `verdict-placement` | rules/architecture.md「判定は 1 箇所にだけ置く」 |
 | `missing-signal` | rules/architecture.md「取れなかったシグナルを既定値で埋めない」 |
 | `module-api` | rules/architecture.md「モジュールの公開 API」 |
+| `query-granularity` | rules/architecture.md「ファイル単位で決まる答えをチャンク単位で問い合わせない」（答えがファイル/プロジェクトに一意に決まる問い合わせを、候補チャンクごとに呼んで往復を増やす。`分類: なし` から昇格。pr-155 指摘 8・pr-158 指摘 8 が同じ形で、後者は前者を「同じ形」と自己申告している） |
 | `result-option` | rules/coding.md「不在は `Option`、失敗は `Result`」 |
 | `error-variant` | rules/coding.md「エラー型は原因ごとにバリアントを分ける」 |
 | `smart-constructor` | rules/coding.md「生成時に検証し、不正な値を存在させない」 |
