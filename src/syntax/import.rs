@@ -131,6 +131,7 @@ const EXPORT_SPECIFIER_KIND: &str = "export_specifier";
 const EXPORT_STATEMENT_KIND: &str = "export_statement";
 const PAIR_KIND: &str = "pair";
 const NAMESPACE_EXPORT_KIND: &str = "namespace_export";
+const JSX_ATTRIBUTE_KIND: &str = "jsx_attribute";
 const TYPE_IDENTIFIER_KIND: &str = "type_identifier";
 
 /// 型を言い当てる式。**型と値の欄を分けていない**ので、どちらの側かは
@@ -213,7 +214,7 @@ const IMPORT_EXPORT_KINDS: [&str; 4] = [
     "export_specifier",
 ];
 
-const TYPE_ONLY_KINDS: [&str; 15] = [
+const TYPE_ONLY_KINDS: [&str; 16] = [
     "function_type",
     "constructor_type",
     "call_signature",
@@ -229,6 +230,7 @@ const TYPE_ONLY_KINDS: [&str; 15] = [
     "type_parameter",
     "type_parameters",
     "type_arguments",
+    "implements_clause",
 ];
 
 /// 読み込みを起こさないと分かっている、`require` の要素の名前。
@@ -469,6 +471,7 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     let is_renamed_on_the_way_in = is_the_imported_side_of_a_rename(node);
     let is_an_object_key = is_an_object_key(node);
     let is_an_asserted_type = is_the_type_side_of_an_assertion(node);
+    let is_a_jsx_attribute_name = is_a_jsx_attribute_name(node);
 
     is_called
         || is_non_loading_member_object
@@ -477,6 +480,29 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
         || is_renamed_on_the_way_in
         || is_an_object_key
         || is_an_asserted_type
+        || is_a_jsx_attribute_name
+}
+
+/// そのノードが、JSX の属性の**名前**か。
+///
+/// `<Widget require={false} />` の属性の名前は、オブジェクトの欄の名前と同じく
+/// 束縛でも参照でもない。値を渡す側（`<Widget loader={require} />`）は
+/// `jsx_expression` の下に来るのでここへは入らない。
+///
+/// **名前の位置に限る。** 属性の下の最初の名前だけを見て、値の側
+/// （`<Widget loader={require} />` / `<Widget label="require" />`）は数えたまま残す。
+///
+/// **Why not（欄の名前と同じく文字列の外まで戻す）**: JSX に引用符つきの属性名は無いので、
+/// 戻しても答えが変わらない。`is_an_object_key` が戻すのは `{ "require": false }` があるため。
+fn is_a_jsx_attribute_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != JSX_ATTRIBUTE_KIND {
+        return false;
+    }
+
+    parent.named_child(0) == Some(node)
 }
 
 /// そのノードが、型を言い当てる式の**型の側**の綴りか。
@@ -1522,6 +1548,97 @@ export const Path = () => <p>C:\users</p>;
                 IMPORTS_PAD_FROM_PARENT,
                 "src/report/dateHelper.ts"
             ))
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_naming_a_jsx_attribute_require_reaches_the_same_module() {
+        // JSX の属性の名前は欄の名前と同じで、束縛も参照も作らない。
+        // 名前として数えると、`require` という prop を持つ画面が軒並み落ちる
+        let require_as_a_jsx_attribute = r#"import { pad } from "./pad";
+
+export const View = () => <Widget require={false} label="x" />;
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tsx_tree_of(require_as_a_jsx_attribute),
+                Path::new("src/utils/formatDate.tsx"),
+            ),
+            Ok(import_set(
+                IMPORTS_PAD_FROM_PARENT,
+                "src/report/dateHelper.ts"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_shorthanding_a_jsx_attribute_require_cannot_be_created() {
+        // 対照。省略記法（`{...}` の中で名前を渡す）は**名前を参照する**ので、
+        // 読み込む関数そのものを prop として持ち出せる
+        let require_passed_as_a_jsx_value = r#"import { pad } from "./pad";
+
+export const View = () => <Widget loader={require} />;
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tsx_tree_of(require_passed_as_a_jsx_value),
+                Path::new("src/utils/a.tsx"),
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_writing_require_as_a_jsx_attribute_value_cannot_be_created() {
+        // 対照。属性の値の文字列は名前の位置と**同じ親の直下**に来るので、
+        // 位置を見ずに属性の下なら外すと、この綴りまで落ちる
+        let require_as_a_jsx_attribute_value = r#"import { pad } from "./pad";
+
+export const View = () => <Widget label="require" />;
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tsx_tree_of(require_as_a_jsx_attribute_value),
+                Path::new("src/utils/a.tsx"),
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_implementing_a_type_named_require_reaches_the_same_module() {
+        // `implements` の名前は型空間にしかいない。実行時には消えるので、
+        // 束縛し直しも読み込みも起こしえない
+        let require_in_an_implements_clause = r#"import { pad } from "./pad";
+import type { require } from "./loader";
+
+class Worker implements require {}
+"#;
+
+        assert_eq!(
+            import_set(require_in_an_implements_clause, "src/utils/a.ts"),
+            import_set(IMPORTS_PAD_AND_LOADER, "src/utils/a.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_extending_a_class_named_require_cannot_be_created() {
+        // 対照。`extends` の側は**値**（実行時に評価される式）なので、
+        // 型だけの `implements` と同じに扱うと持ち出しを見落とす
+        let require_in_an_extends_clause = r#"import { pad } from "./pad";
+
+class Worker extends require {}
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(require_in_an_extends_clause),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
         );
     }
 
