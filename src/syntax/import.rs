@@ -1550,6 +1550,24 @@ const options = { require: false };
     }
 
     #[test]
+    fn test_import_set_of_a_file_writing_require_as_an_object_value_cannot_be_created() {
+        // 対照。引用符つきの欄の名前と**同じ木の形**（`string` の下の `string_fragment`）
+        // だが、こちらは `pair` の `value` の側。欄かどうかを欄の名前まで見ずに
+        // 「`pair` の下の文字列」で決めると、こちらまで外れる
+        let require_as_an_object_value = r#"import { pad } from "./pad";
+const options = { mode: "require" };
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(require_as_an_object_value),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
     fn test_import_set_of_a_file_shorthanding_require_into_an_object_cannot_be_created() {
         // 対照。省略記法は**名前を参照する**ので、読み込む関数そのものを
         // オブジェクトへ持ち出せる。欄の名前と同じに扱うと持ち出しを見落とす
