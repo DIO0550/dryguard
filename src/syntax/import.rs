@@ -144,8 +144,6 @@ const TRANSPARENT_WRAPPER_KINDS: [&str; 4] = [
     "non_null_expression",
 ];
 const IDENTIFIER_KIND: &str = "identifier";
-/// メンバアクセスや、オブジェクト・クラスの要素に書かれた名前。**束縛を作らない。**
-const MEMBER_NAME_KIND: &str = "property_identifier";
 const DYNAMIC_IMPORT_KIND: &str = "import";
 const STRING_FRAGMENT_KIND: &str = "string_fragment";
 /// 引数の並びには現れるが、引数ではないもの。
@@ -161,19 +159,17 @@ const STRING_LITERAL_KINDS: [&str; 2] = ["string", "template_string"];
 /// CommonJS が依存を読み込む関数の名前。
 const REQUIRE_FUNCTION_NAME: &str = "require";
 
-/// **呼ばれても**読み込みを起こさないと分かっている、`require` の要素の名前。
+/// 読み込みを起こさないと分かっている、`require` の要素の名前。
 ///
-/// `require.resolve(…)` は指定子を解決するだけで、読み込まない。
+/// `resolve` は指定子を解決するだけで読み込まない。`cache` と `main` は値で、
+/// 呼べる関数ですらない。**どれも持ち出した先で呼んでも読み込まない。**
 ///
-/// **呼ばれていない要素アクセス（`require.cache` / `require.main`）はここに要らない。**
-/// 値を読むだけなので、[`cannot_load_through`] が呼ばれているかで先に外す。
-///
-/// **ここに無い名前を呼ぶと「読み込みかもしれない」側へ落ちる。**
-/// `require.call(null, "./dep")` や `require.apply(null, ["./dep"])` は読み込みそのもので、
-/// 呼ばれる側が `member_expression` になるため [`specifier_of`] では採れない。落ちた先は
-/// [`RequireSpelling::Rebound`]（＝読み取れない）なので、**値を作らずに測れないと言う**
-/// だけで済む (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-const NON_LOADING_REQUIRE_MEMBERS: [&str; 1] = ["resolve"];
+/// **ここに無い名前は「読み込みかもしれない」側へ落ちる。** `require.call(null, "./dep")` /
+/// `require.apply(null, ["./dep"])` は読み込みそのもので、呼ばれる側が `member_expression`
+/// になるため [`specifier_of`] では採れない。落ちた先は [`RequireSpelling::Rebound`]
+/// （＝読み取れない）なので、**値を作らずに測れないと言う**だけで済む
+/// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+const NON_LOADING_REQUIRE_MEMBERS: [&str; 3] = ["resolve", "cache", "main"];
 
 /// そのファイルで `require` の綴りが何を指しているか。
 ///
@@ -247,21 +243,18 @@ fn is_require_spelled_outside_a_call(tree: &SyntaxTree<'_>, node: Node<'_>) -> b
 
 /// そのノードが、**新しい名前も読み込みも作りえない**位置に置かれた名前か。
 ///
-/// 呼び出しの呼ばれる側（`require("./dep")`。読み込みだが、[`specifier_of`] が採る）・
-/// 読み込みを起こしえない要素アクセス（`require.cache` / `require.resolve(…)`）・
-/// **呼ばれていない**要素の名前（`registry.require`）・単項演算の対象（`typeof require`）。
+/// 3 つだけ。呼び出しの呼ばれる側（`require("./dep")`。読み込みだが、[`specifier_of`]
+/// が採る）・読み込みを起こしえない要素の受け側（`require.cache` / `require.resolve`）・
+/// 単項演算の対象（`typeof require`）。
 ///
-/// **判断軸は「呼ばれているか」。** `module.require("./dep")` は要素の名前だが
-/// **読み込みそのもの**で、[`specifier_of`] は呼ばれる側が `member_expression` なので
-/// 採らない。名前というだけで外すと、その読み込みが落ちたままファイルが測れる側に残る。
-/// 逆に `require.cache` は呼ばれていないので、値を読むだけで読み込みを起こさない。
+/// **「呼ばれていないから inert」は成り立たない。** 呼ばれていない参照は**値として
+/// 持ち出せる**ので、後から呼ばれうる（`const load = module.require.bind(module);`）。
+/// 要素の名前（`module.require` / `registry.require`）を inert と言えないのはこのため
+/// （`module` と `registry` を木の上で区別できない）。
 ///
 /// **ここから漏れた位置は [`RequireSpelling::Rebound`] へ落ちる。** 落ちた先は
 /// 「読み取れない」なので、**値を作らずに測れないと言う**だけで済む。
 fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
-    if node.kind() == MEMBER_NAME_KIND {
-        return !is_invoked_member_name(node);
-    }
     // 包みは値を変えないので、外まで戻ってから位置を見る（`(require)("./dep")`）
     let positioned = outside_wrappers(node);
     let Some(parent) = positioned.parent() else {
@@ -269,46 +262,29 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     };
 
     let is_called = is_invoked(node);
-    let is_member_object = parent.kind() == MEMBER_EXPRESSION_KIND
+    let is_non_loading_member_object = parent.kind() == MEMBER_EXPRESSION_KIND
         && parent.child_by_field_name("object") == Some(positioned)
-        && cannot_load_through(tree, parent);
+        && accesses_a_non_loading_member(tree, parent);
     let is_unary_operand = parent.kind() == UNARY_EXPRESSION_KIND
         && parent.child_by_field_name("argument") == Some(positioned);
 
-    is_called || is_member_object || is_unary_operand
+    is_called || is_non_loading_member_object || is_unary_operand
 }
 
-/// その `require` の要素アクセスが、読み込みを起こしえないか。
+/// その要素アクセスが、読み込みを起こさないと分かっている名前を指しているか。
 ///
-/// **呼ばれていなければ値を読むだけ**（`require.cache` / `require.main`）。
-/// 呼ばれているなら、読み込まないと分かっている名前（`require.resolve(…)`）に限る。
+/// **呼ばれているかは見ない。** `require.resolve` は読んだだけでも持ち出せるが、
+/// 持ち出した先で呼んでも読み込まない。名前そのものが答えを決める。
 ///
 /// 計算された添字（`require["call"]`）は `member_expression` にならないので、
 /// ここへ来ない（＝読み込みかもしれない側へ落ちる）。
-fn cannot_load_through(tree: &SyntaxTree<'_>, member: Node<'_>) -> bool {
-    if !is_invoked(member) {
-        return true;
-    }
+fn accesses_a_non_loading_member(tree: &SyntaxTree<'_>, member: Node<'_>) -> bool {
     let Some(name) = member.child_by_field_name("property") else {
         return false;
     };
 
     tree.text_of(name)
         .is_some_and(|text| NON_LOADING_REQUIRE_MEMBERS.contains(&text))
-}
-
-/// その要素の名前を持つメンバアクセスが、呼び出しの呼ばれる側になっているか。
-///
-/// `module.require("./dep")` の `require` は真、`registry.require` の `require` は偽。
-fn is_invoked_member_name(name: Node<'_>) -> bool {
-    let Some(member) = name.parent() else {
-        return false;
-    };
-    if member.kind() != MEMBER_EXPRESSION_KIND {
-        return false;
-    }
-
-    is_invoked(member)
 }
 
 /// その式が、呼び出しの呼ばれる側になっているか。包みは外へ辿る。
@@ -852,21 +828,38 @@ const pad = require("./pad");
     }
 
     #[test]
-    fn test_import_set_of_a_file_referencing_an_uncalled_require_member_reaches_the_same_module() {
-        // 呼ばれていない要素の名前（`registry.require`）は読み込みを起こさない。
-        // 名前というだけで束縛の側へ落とすと、書いてある import まで測れなくなる
-        let references_an_uncalled_member = r#"const handler = registry.require;
-const pad = require("./pad");
+    fn test_import_set_of_a_file_referencing_an_uncalled_require_member_cannot_be_created() {
+        // 対照に読み取れる import を 1 件置く。**呼ばれていない参照は値として
+        // 持ち出せる**ので、後から呼ばれうる。呼ばれていないというだけで
+        // 読み込まないと決める実装だと、持ち出された読み込みが落ちたまま測れる
+        let real_import_and_an_uncalled_member = r#"import { pad } from "./pad";
+const handler = registry.require;
 "#;
 
         assert_eq!(
-            overlap(
-                references_an_uncalled_member,
-                "src/utils/a.ts",
-                IMPORTS_PAD_FROM_SIBLING,
-                "src/utils/b.ts",
+            ImportSet::from_tree(
+                &tree_of(real_import_and_an_uncalled_member),
+                Path::new("src/utils/a.ts"),
             ),
-            1.0
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_aliasing_module_require_cannot_be_created() {
+        // 対照に読み取れる import を 1 件置く。`module.require` は `.bind` の受け側に
+        // なるので呼ばれる側ではないが、**別名として持ち出されて後から呼ばれる**
+        let real_import_and_an_aliased_loader = r#"import { pad } from "./pad";
+const load = module.require.bind(module);
+load("./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(real_import_and_an_aliased_loader),
+                Path::new("src/utils/a.ts"),
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
         );
     }
 
