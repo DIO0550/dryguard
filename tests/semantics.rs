@@ -190,6 +190,27 @@ fn test_two_functions_declaring_the_same_overloads_in_another_order_are_not_unif
     assert!(!unifiable(&parses, &scans));
 }
 
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_two_functions_taking_the_same_union_in_another_order_are_unifiable() {
+    // hover は共用体を書かれた順のまま返す（`string | number` / `number | string`）。
+    // 綴りの一致で比べると、同じ型を受ける 2 つが別物になる
+    let either = fixture("spellings/either.ts", 3);
+    let reversed = fixture("spellings/reversed.ts", 2);
+
+    assert!(unifiable(&either, &reversed));
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_two_functions_taking_unions_of_different_members_are_not_unifiable() {
+    // 対照は上のテスト。並べ替えても、共用体の中身が違えば重ならない
+    let either = fixture("spellings/either.ts", 3);
+    let widened = fixture("spellings/widened.ts", 2);
+
+    assert!(!unifiable(&either, &widened));
+}
+
 /// そのチャンクの呼び出し元のファイル。サーバに尋ねて集める。
 fn reference_paths_of(session: &mut Session, chunk: &Chunk) -> Vec<PathBuf> {
     let document = document(chunk.path());

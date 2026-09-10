@@ -20,6 +20,10 @@
 //!
 //! 型 1 つ分の綴りの中で型名がどこに書かれているかは `type_spelling` が構文木から決める。
 //! **何に差し替えるかは知らない**ので、ここも LSP を知らないまま保たれる。
+//!
+//! 同じ綴りを型の構造として読むのは `type_structure`。**書かれ方の違い（括弧・引数名・
+//! タプルのラベル・共用体の並び）を落とすのが目的**で、単一化の可否を比べるのは
+//! それを受け取る `semantics::type_signature` の側。
 
 pub mod chunk;
 pub mod import;
@@ -29,3 +33,4 @@ pub mod token;
 pub mod tree;
 pub mod type_reference;
 pub(crate) mod type_spelling;
+pub(crate) mod type_structure;
