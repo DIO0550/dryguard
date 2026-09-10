@@ -51,6 +51,9 @@ impl ModulePath {
 /// 空では作れない。import が 1 つも無いことを空の集合として通すと、後段が
 /// 「依存先が食い違っている」と「材料が無い」を区別できなくなる
 /// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
+///
+/// **欠けたままでも作れない。** 読み取れなかった宣言が 1 つでもあれば作らない
+/// （同じ規約の適用。下の [`ImportSet::from_tree`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportSet(HashSet<ModulePath>);
 
@@ -58,10 +61,14 @@ impl ImportSet {
     /// 構文木の import を集めて、解決済みの依存先の集合にする。
     ///
     /// `tree` は importer の構文木、`importer` はそのファイルの位置。
-    /// 依存の宣言を 1 つも読み取れなかったときは作れないので `None` を返す。
-    /// **「宣言が無い」とは言えない。** 読み取れる形は文法が持つ書き方より狭い。
+    ///
+    /// **読み取れなかった依存の宣言が 1 つでもあれば `None` を返す。** 欠けたまま
+    /// 集合を返すと、後段はその重なりを測れた値として読む。1 件落ちるだけで
+    /// 重なりは過大にも過小にも動くので、**落ちたことが構造に出ないと区別できない**
+    /// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
+    /// 宣言を 1 つも読み取れなかったときも作れないので `None`。
     pub fn from_tree(tree: &SyntaxTree<'_>, importer: &Path) -> Option<Self> {
-        let paths: HashSet<ModulePath> = specifiers_of(tree)
+        let paths: HashSet<ModulePath> = specifiers_of(tree)?
             .iter()
             .map(|specifier| ModulePath::from_specifier(specifier, importer))
             .collect();
@@ -99,14 +106,20 @@ const DEPENDENCY_STATEMENT_KINDS: [&str; 2] = ["import_statement", "export_state
 const IMPORT_REQUIRE_CLAUSE_KIND: &str = "import_require_clause";
 
 const CALL_EXPRESSION_KIND: &str = "call_expression";
+const MEMBER_EXPRESSION_KIND: &str = "member_expression";
+const UNARY_EXPRESSION_KIND: &str = "unary_expression";
 const IDENTIFIER_KIND: &str = "identifier";
 /// メンバアクセスや、オブジェクト・クラスの要素に書かれた名前。**束縛を作らない。**
 const MEMBER_NAME_KIND: &str = "property_identifier";
 const DYNAMIC_IMPORT_KIND: &str = "import";
-const STRING_KIND: &str = "string";
-const TEMPLATE_STRING_KIND: &str = "template_string";
-const TEMPLATE_SUBSTITUTION_KIND: &str = "template_substitution";
 const STRING_FRAGMENT_KIND: &str = "string_fragment";
+
+/// 指定子を書ける文字列リテラルの種別。
+///
+/// テンプレートリテラルを入れるのは、**置換を持つものも依存の宣言だから**。
+/// 種別で外すと「宣言していない」と区別が付かなくなる（読めないことは
+/// [`unquoted_text_of`] が言う）。
+const STRING_LITERAL_KINDS: [&str; 2] = ["string", "template_string"];
 
 /// CommonJS が依存を読み込む関数の名前。
 const REQUIRE_FUNCTION_NAME: &str = "require";
@@ -127,15 +140,22 @@ enum RequireSpelling {
 ///
 /// 文字列を無条件に拾わず、**依存を宣言する文が指定子として持っているものだけ**を採る。
 /// `const path = "./pad";` を拾うと、依存していないファイルが依存しているように見える。
-fn specifiers_of<'source>(tree: &SyntaxTree<'source>) -> Vec<&'source str> {
+///
+/// **読み取れない宣言が 1 つでもあれば `None` を返す。** 残りだけを返すと、
+/// 呼び出し側は欠けた集合を揃った集合として扱う。
+fn specifiers_of<'source>(tree: &SyntaxTree<'source>) -> Option<Vec<&'source str>> {
     // `require` が何を指すかはファイル全体を見ないと決まらないので、木を歩く前に 1 回だけ決める
     let spelling = require_spelling_of(tree);
+    let mut specifiers = Vec::new();
 
-    tree.named_descendants()
-        .into_iter()
-        .filter_map(|node| specifier_literal_of(tree, node, spelling))
-        .filter_map(|literal| unquoted_text_of(tree, literal))
-        .collect()
+    for node in tree.named_descendants() {
+        match specifier_of(tree, node, spelling) {
+            SpecifierReading::NotADeclaration => {}
+            SpecifierReading::Specifier(specifier) => specifiers.push(specifier),
+            SpecifierReading::Unreadable => return None,
+        }
+    }
+    Some(specifiers)
 }
 
 /// そのファイルで `require` の綴りが CommonJS の読み込みを指しているか。
@@ -166,107 +186,166 @@ fn is_require_spelled_outside_a_call(tree: &SyntaxTree<'_>, node: Node<'_>) -> b
     if tree.text_of(node) != Some(REQUIRE_FUNCTION_NAME) {
         return false;
     }
-    if node.kind() == MEMBER_NAME_KIND {
-        return false;
-    }
-    !is_called_function(node)
+    !is_use_that_cannot_bind(node)
 }
 
-/// そのノードが呼び出し式の呼ばれる側か。
-fn is_called_function(node: Node<'_>) -> bool {
+/// そのノードが、新しい名前を導入しえない位置に置かれた名前か。
+///
+/// 呼び出しの呼ばれる側（`require("./dep")`）・メンバアクセスの受け側
+/// （`require.resolve(…)`）・要素の名前（`registry.require`）・単項演算の対象
+/// （`typeof require`）。**どれも束縛を作らない。**
+///
+/// **ここから漏れた位置は「束縛かもしれない」側へ落ちる。** 落ちた先は
+/// [`SpecifierReading::Unreadable`] なので、**値を作らずに測れないと言う**だけで済む。
+fn is_use_that_cannot_bind(node: Node<'_>) -> bool {
+    if node.kind() == MEMBER_NAME_KIND {
+        return true;
+    }
     let Some(parent) = node.parent() else {
         return false;
     };
 
-    parent.kind() == CALL_EXPRESSION_KIND && parent.child_by_field_name("function") == Some(node)
+    let is_called = parent.kind() == CALL_EXPRESSION_KIND
+        && parent.child_by_field_name("function") == Some(node);
+    let is_member_object = parent.kind() == MEMBER_EXPRESSION_KIND
+        && parent.child_by_field_name("object") == Some(node);
+    let is_unary_operand = parent.kind() == UNARY_EXPRESSION_KIND
+        && parent.child_by_field_name("argument") == Some(node);
+
+    is_called || is_member_object || is_unary_operand
 }
 
-/// その文が依存先として指している文字列リテラルのノード。依存を宣言していなければ `None`。
+/// ノード 1 つを依存の宣言として読んだ結果。
+enum SpecifierReading<'source> {
+    /// 依存を宣言していないノード。
+    NotADeclaration,
+    /// 読み取れた指定子。
+    Specifier(&'source str),
+    /// 依存を宣言しているが、指定子を読み取れなかった。
+    ///
+    /// **落とさずにここへ出す。** 黙って落とすと、同じファイルの他の宣言だけで
+    /// 重なりが測れてしまう (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
+    Unreadable,
+}
+
+/// そのノードが宣言している依存先の指定子。
 ///
 /// `spelling` は、そのファイルで `require` の綴りが何を指しているか。
-fn specifier_literal_of<'tree>(
-    tree: &SyntaxTree<'_>,
-    node: Node<'tree>,
+fn specifier_of<'source>(
+    tree: &SyntaxTree<'source>,
+    node: Node<'_>,
     spelling: RequireSpelling,
-) -> Option<Node<'tree>> {
+) -> SpecifierReading<'source> {
     if DEPENDENCY_STATEMENT_KINDS.contains(&node.kind()) {
-        return node.child_by_field_name("source");
+        let Some(source) = node.child_by_field_name("source") else {
+            return SpecifierReading::NotADeclaration;
+        };
+        return reading_of(tree, source);
     }
     if node.kind() == IMPORT_REQUIRE_CLAUSE_KIND {
-        return first_static_string_child_of(node);
+        return reading_of_first_string_child(tree, node);
     }
-    if is_dependency_call(tree, node, spelling) {
-        return first_static_string_argument_of(node);
+    if calls_dynamic_import(node) {
+        return reading_of_argument(tree, node);
     }
-    None
+    if calls_require(tree, node) {
+        // 綴りが束縛され直していると、この呼び出しが読み込みなのかを決められない
+        if spelling == RequireSpelling::Rebound {
+            return SpecifierReading::Unreadable;
+        }
+        return reading_of_argument(tree, node);
+    }
+    SpecifierReading::NotADeclaration
 }
 
-/// その呼び出しが依存を読み込む形か（`import("./pad")` / `require("./pad")`）。
-///
-/// 動的 import も CommonJS の `require` も依存の宣言なので拾う。
-/// `registry.require("./pad")` は呼ばれる側が `member_expression` になるので外れる。
-fn is_dependency_call(tree: &SyntaxTree<'_>, node: Node<'_>, spelling: RequireSpelling) -> bool {
+/// その呼び出しが動的 import か（`import("./pad")`）。
+fn calls_dynamic_import(node: Node<'_>) -> bool {
     if node.kind() != CALL_EXPRESSION_KIND {
         return false;
     }
-    let Some(called) = node.child_by_field_name("function") else {
+
+    node.child_by_field_name("function")
+        .is_some_and(|called| called.kind() == DYNAMIC_IMPORT_KIND)
+}
+
+/// その呼び出しが `require` の綴りを呼んでいるか。
+///
+/// `registry.require("./pad")` は呼ばれる側が `member_expression` になるので外れる。
+fn calls_require(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
+    if node.kind() != CALL_EXPRESSION_KIND {
         return false;
+    }
+
+    node.child_by_field_name("function").is_some_and(|called| {
+        called.kind() == IDENTIFIER_KIND && tree.text_of(called) == Some(REQUIRE_FUNCTION_NAME)
+    })
+}
+
+/// その呼び出しの引数から読み取った指定子。
+///
+/// 文字列リテラルを渡していない（`require(name)`）ものも依存の宣言なので、
+/// 読み取れないこととして返す。
+fn reading_of_argument<'source>(
+    tree: &SyntaxTree<'source>,
+    call: Node<'_>,
+) -> SpecifierReading<'source> {
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return SpecifierReading::Unreadable;
     };
 
-    let calls_import = called.kind() == DYNAMIC_IMPORT_KIND;
-    let spells_require =
-        called.kind() == IDENTIFIER_KIND && tree.text_of(called) == Some(REQUIRE_FUNCTION_NAME);
-    let calls_require = spells_require && spelling == RequireSpelling::ModuleLoader;
-
-    calls_import || calls_require
+    reading_of_first_string_child(tree, arguments)
 }
 
-/// そのノードの直下にある最初の、綴りが決まっている文字列リテラル。
-fn first_static_string_child_of(node: Node<'_>) -> Option<Node<'_>> {
+/// そのノードの直下にある最初の文字列リテラルから読み取った指定子。
+fn reading_of_first_string_child<'source>(
+    tree: &SyntaxTree<'source>,
+    node: Node<'_>,
+) -> SpecifierReading<'source> {
     let mut cursor = node.walk();
+    let literal = node
+        .named_children(&mut cursor)
+        .find(|child| STRING_LITERAL_KINDS.contains(&child.kind()));
 
-    node.named_children(&mut cursor)
-        .find(|child| is_static_string_literal(*child))
+    let Some(literal) = literal else {
+        return SpecifierReading::Unreadable;
+    };
+    reading_of(tree, literal)
 }
 
-/// その呼び出しの最初の引数が綴りの決まっている文字列リテラルなら、そのノード。
-fn first_static_string_argument_of(node: Node<'_>) -> Option<Node<'_>> {
-    let arguments = node.child_by_field_name("arguments")?;
+/// その文字列リテラルから読み取った指定子。
+fn reading_of<'source>(tree: &SyntaxTree<'source>, literal: Node<'_>) -> SpecifierReading<'source> {
+    let Some(text) = unquoted_text_of(tree, literal) else {
+        return SpecifierReading::Unreadable;
+    };
 
-    first_static_string_child_of(arguments)
+    SpecifierReading::Specifier(text)
 }
 
-/// その文字列リテラルの綴りが、書いた時点で決まっているか。
+/// 引用符の中身。**綴りをそのまま取り出せないときは `None`。**
 ///
-/// **置換を持たないテンプレートリテラル（`` require(`./pad`) ``）は決まっている。**
+/// 取り出せるのは、中身が**断片 1 つだけ**でできているときに限る。
+/// 断片が分かれるのは次の 3 つで、どれも最初の断片を採ると別の依存先になる。
+///
+/// - エスケープを含む（`"./pad"` の断片は `./pa` で、続きが別のノードになる）
+/// - 置換を持つテンプレートリテラル（`` import(`./${name}`) ``。書いた時点で先が決まらない）
+/// - 中身が空（`import("")`。指定子として使えない）
+///
+/// **置換を持たないテンプレートリテラル（`` require(`./pad`) ``）は断片 1 つなので取り出せる。**
 /// 引用符の違いだけで落とすと、同じ依存先を書き方の違いで別物と数える。
-/// 置換を持つもの（`` import(`./${name}`) ``）は決まらないので採らない。
-fn is_static_string_literal(node: Node<'_>) -> bool {
-    if node.kind() == STRING_KIND {
-        return true;
-    }
-    node.kind() == TEMPLATE_STRING_KIND && !has_substitution(node)
-}
-
-/// そのテンプレートリテラルが、書いた時点で決まらない部分を持つか。
-fn has_substitution(node: Node<'_>) -> bool {
-    let mut cursor = node.walk();
-
-    node.named_children(&mut cursor)
-        .any(|child| child.kind() == TEMPLATE_SUBSTITUTION_KIND)
-}
-
-/// 引用符の中身。空文字列（`import("")`）のときは中身のノードが無いので `None`。
 fn unquoted_text_of<'source>(
     tree: &SyntaxTree<'source>,
     literal: Node<'_>,
 ) -> Option<&'source str> {
     let mut cursor = literal.walk();
-    let fragment = literal
-        .named_children(&mut cursor)
-        .find(|child| child.kind() == STRING_FRAGMENT_KIND)?;
+    let parts: Vec<Node<'_>> = literal.named_children(&mut cursor).collect();
 
-    tree.text_of(fragment)
+    let [only] = parts.as_slice() else {
+        return None;
+    };
+    if only.kind() != STRING_FRAGMENT_KIND {
+        return None;
+    }
+    tree.text_of(*only)
 }
 
 /// その指定子が importer の位置から解決するものか。
@@ -609,30 +688,41 @@ const stock = registry.require("./stock");
     }
 
     #[test]
-    fn test_import_set_ignores_a_require_given_a_template_literal_with_a_substitution() {
-        // 拾ってよい import を 1 件、拾ってはいけない呼び出しを 1 件、同じソースに置く。
-        // 置換があると先が決まらない。断片（"./"）まで拾う実装だと集合に
-        // "src/utils" が入り、重なりが 0.5 に落ちる
-        let real_import_and_a_dynamic_require = r#"import { pad } from "./pad";
+    fn test_import_set_of_a_file_with_a_substituted_require_cannot_be_created() {
+        // 対照に読み取れる import を 1 件置く。読み取れない宣言を黙って落とす実装だと
+        // "./pad" だけの集合が作れてしまい、欠けた集合で重なりを測ることになる
+        let real_import_and_a_substituted_require = r#"import { pad } from "./pad";
 const stock = require(`./${target}`);
 "#;
 
         assert_eq!(
-            overlap(
-                real_import_and_a_dynamic_require,
-                "src/utils/a.ts",
-                IMPORTS_PAD_FROM_SIBLING,
-                "src/utils/b.ts",
+            ImportSet::from_tree(
+                &tree_of(real_import_and_a_substituted_require),
+                Path::new("src/utils/a.ts"),
             ),
-            1.0
+            None
         );
     }
 
     #[test]
-    fn test_import_set_ignores_a_require_that_the_file_rebinds() {
-        // 拾ってよい import を 1 件、拾ってはいけない呼び出しを 1 件、同じソースに置く。
-        // `require` は予約語ではないので、綴りだけを見る実装だと集合に "./stock" が
-        // 入り、重なりが 0.5 に落ちる
+    fn test_import_set_of_a_file_with_an_escaped_specifier_cannot_be_created() {
+        // エスケープを含む綴りは断片が分かれる。最初の断片だけを採る実装だと
+        // "./pa" を依存先として集合に入れてしまう（"./pad" とは別物になる）
+        let escaped = format!(
+            "import {{ pad }} from \"./pa{}u0064\";\nimport {{ trim }} from \"./trim\";\n",
+            char::from(92u8)
+        );
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(&escaped), Path::new("src/utils/a.ts")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_that_rebinds_require_cannot_be_created() {
+        // 対照に読み取れる import を 1 件置く。`require` は予約語ではないので、
+        // 綴りだけを見る実装だと集合に "./stock" が入り、重なりが 0.5 に落ちる
         let real_import_and_a_rebound_require = r#"import { pad } from "./pad";
 
 function require(target: string): string {
@@ -643,8 +733,27 @@ const stock = require("./stock");
 "#;
 
         assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(real_import_and_a_rebound_require),
+                Path::new("src/utils/a.ts"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_require_guarded_by_typeof_reaches_the_same_module() {
+        // `typeof require` も `require.resolve` も束縛を作らない。束縛を疑って
+        // 落とすと、CommonJS でよくあるこの書き方のファイルが軒並み測れなくなる
+        let guarded = r#"if (typeof require !== "undefined") {
+  require("./pad");
+}
+const resolved = require.resolve("./pad");
+"#;
+
+        assert_eq!(
             overlap(
-                real_import_and_a_rebound_require,
+                guarded,
                 "src/utils/a.ts",
                 IMPORTS_PAD_FROM_SIBLING,
                 "src/utils/b.ts",
