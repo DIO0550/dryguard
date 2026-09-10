@@ -125,6 +125,8 @@ const IMPORT_REQUIRE_CLAUSE_KIND: &str = "import_require_clause";
 const CALL_EXPRESSION_KIND: &str = "call_expression";
 const MEMBER_EXPRESSION_KIND: &str = "member_expression";
 const UNARY_EXPRESSION_KIND: &str = "unary_expression";
+const SUBSCRIPT_EXPRESSION_KIND: &str = "subscript_expression";
+const IMPORT_SPECIFIER_KIND: &str = "import_specifier";
 /// 中の式の値をそのまま返す包み。**綴りを見る前に剥がす。**
 ///
 /// 括弧と、TypeScript の型だけの注記（`require as NodeRequire` / `require!` /
@@ -202,7 +204,7 @@ const IMPORT_EXPORT_KINDS: [&str; 4] = [
     "export_specifier",
 ];
 
-const TYPE_ONLY_KINDS: [&str; 12] = [
+const TYPE_ONLY_KINDS: [&str; 14] = [
     "function_type",
     "constructor_type",
     "call_signature",
@@ -215,6 +217,8 @@ const TYPE_ONLY_KINDS: [&str; 12] = [
     "type_alias_declaration",
     "interface_declaration",
     "type_annotation",
+    "type_parameter",
+    "type_parameters",
 ];
 
 /// 読み込みを起こさないと分かっている、`require` の要素の名前。
@@ -293,13 +297,35 @@ fn require_spelling_of(tree: &SyntaxTree<'_>) -> RequireSpelling {
 /// 綴りが `require` でも、[`is_use_that_cannot_load`] が挙げる位置なら数えない。
 /// **綴りで比べられない名前は、`require` かどうかを決められないので数える。**
 fn is_require_spelled_outside_a_call(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
-    if is_escaped_name(tree, node) {
+    if is_escaped_name(tree, node) || is_unreadable_computed_key(tree, node) {
         return true;
     }
     if tree.text_of(node) != Some(REQUIRE_FUNCTION_NAME) {
         return false;
     }
     !is_use_that_cannot_load(tree, node)
+}
+
+/// そのノードが、綴りを読み取れない添字か。
+///
+/// **添字は名前と同じ働きをする。** `module["require"]("./dep")` は
+/// `module.require("./dep")` と同じ読み込みで、綴りが読めれば
+/// [`is_require_spelled_outside_a_call`] の一致が捕まえる。読めないと
+/// **`require` かどうかを決められない**。
+///
+/// [`KINDS_THAT_SPELL_BACKSLASHES`] が `escape_sequence` を外しているのは
+/// 「文字列の中の逆立ちは名前ではない」という理由だが、**添字の文字列だけは名前になる**。
+fn is_unreadable_computed_key(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
+    if !STRING_LITERAL_KINDS.contains(&node.kind()) {
+        return false;
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let is_the_index = parent.kind() == SUBSCRIPT_EXPRESSION_KIND
+        && parent.child_by_field_name("index") == Some(node);
+
+    is_the_index && unquoted_text_of(tree, node).is_none()
 }
 
 /// そのノードが、エスケープを含む名前か。
@@ -349,8 +375,34 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     let is_unary_operand = parent.kind() == UNARY_EXPRESSION_KIND
         && parent.child_by_field_name("argument") == Some(positioned);
     let is_written_in_a_type = is_written_only_in_a_type(node);
+    let is_renamed_on_the_way_in = is_the_imported_side_of_a_rename(node);
 
-    is_called || is_non_loading_member_object || is_unary_operand || is_written_in_a_type
+    is_called
+        || is_non_loading_member_object
+        || is_unary_operand
+        || is_written_in_a_type
+        || is_renamed_on_the_way_in
+}
+
+/// そのノードが、別名を付けた輸入の**輸入元の側**か。
+///
+/// `import { require as load }` で実行時の名前になるのは `load` だけ。輸入元の綴りは
+/// 束縛を作らないので、数えると測れるファイルが減る。
+///
+/// **別名の側（`import { load as require }`）は数える。** そちらは束縛を作る。
+///
+/// 輸出（`export { a as require }`）は見ない。輸出の別名は実行時の名前を作らないが、
+/// 輸入元の側が既にある束縛を指すので、その宣言のところで数えれば足りる。
+fn is_the_imported_side_of_a_rename(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != IMPORT_SPECIFIER_KIND {
+        return false;
+    }
+    let is_the_name = parent.child_by_field_name("name") == Some(node);
+
+    is_the_name && parent.child_by_field_name("alias").is_some()
 }
 
 /// そのノードが、型空間にだけ置かれた名前か。
@@ -1342,6 +1394,82 @@ abstract class Base { abstract require(path: string): void; }
     const IMPORTS_PAD_AND_LOADER: &str = r#"import { pad } from "./pad";
 import { load } from "./loader";
 "#;
+
+    #[test]
+    fn test_import_set_of_a_file_loading_through_an_escaped_computed_key_cannot_be_created() {
+        // 添字に書いた綴りを読み取れないと、それが `require` かどうかを決められない。
+        // 逆立ちを文字列の中だから無害と決めると、**読み込みを 1 件落としたまま
+        // 測れたと答える**（この PR で唯一、安全でない側へ倒れていた形）
+        let escaped_computed_key =
+            "import { pad } from \"./pad\";\nmodule[\"requ\\u0069re\"](\"./stock\");\n";
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(escaped_computed_key), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_reading_a_plain_computed_key_reaches_the_same_module() {
+        // 対照。読み取れる添字まで測れなくすると、`config["title"]` を書いただけの
+        // ファイルが軒並み落ちる
+        let plain_computed_key = r#"import { pad } from "./pad";
+const title = config["title"];
+"#;
+
+        assert_eq!(
+            import_set(plain_computed_key, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_importing_require_under_another_name_reaches_the_same_modules() {
+        // 別名を付けた輸入で実行時の名前になるのは別名のほうだけ。輸入元の綴りは
+        // 束縛を作らないので、数えると測れるファイルが減る
+        let require_imported_under_another_name = r#"import { pad } from "./pad";
+import { require as load } from "./loader";
+"#;
+
+        assert_eq!(
+            import_set(require_imported_under_another_name, "src/utils/a.ts"),
+            import_set(IMPORTS_PAD_AND_LOADER, "src/utils/a.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_aliasing_an_import_to_require_cannot_be_created() {
+        // 対照。別名のほうが `require` なら実行時の名前を作る。輸入元と別名を
+        // 見分けずに外すと、この形まで測れる側へ戻ってしまう
+        let import_aliased_to_require = r#"import { pad } from "./pad";
+import { load as require } from "./loader";
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(import_aliased_to_require),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_naming_a_generic_parameter_require_reaches_the_same_module() {
+        // 型変数の名前も型空間にしかいない。実物の関数・クラスに付いていても同じ
+        let require_named_as_a_generic_parameter = r#"import { pad } from "./pad";
+
+export function parse<require>(value: require): require { return value; }
+"#;
+
+        assert_eq!(
+            import_set(
+                require_named_as_a_generic_parameter,
+                "src/utils/formatDate.ts"
+            ),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
 
     #[test]
     fn test_import_set_of_a_file_importing_require_only_as_a_type_reaches_the_same_modules() {
