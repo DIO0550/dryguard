@@ -190,6 +190,18 @@ const REQUIRE_FUNCTION_NAME: &str = "require";
 /// **ここに無い種別は「読み込みかもしれない」側へ落ちる。** 型の中の位置を挙げ
 /// そこねても、測れない側（安全側）へ落ちるだけで済む
 /// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+/// 型だけを運ぶ輸入・輸出に置かれる印。**名前のないノード**として木に出る。
+const TYPE_ONLY_MARKER_KIND: &str = "type";
+
+/// 印を探す先の種別。文にも個々の名前にも付けられる
+/// （`import type { require }` と `import { type require }`）。
+const IMPORT_EXPORT_KINDS: [&str; 4] = [
+    "import_statement",
+    "import_specifier",
+    "export_statement",
+    "export_specifier",
+];
+
 const TYPE_ONLY_KINDS: [&str; 12] = [
     "function_type",
     "constructor_type",
@@ -341,11 +353,13 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     is_called || is_non_loading_member_object || is_unary_operand || is_written_in_a_type
 }
 
-/// そのノードが、型の中だけに現れる構文の下に置かれているか。
+/// そのノードが、型空間にだけ置かれた名前か。
 ///
 /// **祖先をすべて辿る。** 型の中の名前は、要素の宣言（親が [`TYPE_ONLY_KINDS`]）と
 /// 引数の名前（`required_parameter` を挟む）で親までの深さが違うので、
 /// 親だけを見ると片方が漏れる。
+///
+/// 型だけの輸入・輸出は種別では見分けられない（下の [`spells_a_type_only_marker`]）。
 fn is_written_only_in_a_type(node: Node<'_>) -> bool {
     let mut ancestor = node.parent();
 
@@ -353,9 +367,30 @@ fn is_written_only_in_a_type(node: Node<'_>) -> bool {
         if TYPE_ONLY_KINDS.contains(&current.kind()) {
             return true;
         }
+        if IMPORT_EXPORT_KINDS.contains(&current.kind()) && spells_a_type_only_marker(current) {
+            return true;
+        }
         ancestor = current.parent();
     }
     false
+}
+
+/// その輸入・輸出が、型だけを運ぶ印を持っているか。
+///
+/// **印は名前のないノード。** `import type { require }` と `import { require }` は
+/// **名前のあるノードだけを見ると同じ木**になるので、名前のない子まで見ないと
+/// 区別できない。綴りで探すと `import { type as require }`（`type` という名前を
+/// `require` へ別名にした**値**の輸入）を取り違える。
+///
+/// **名前のない子だけを数えるのは、印がキーワードだから。** 同じ綴りの名前付きノードを
+/// 印と取り違えると、値の輸入を型だけの輸入として外す（安全でない側）。
+/// 今の文法にそういうノードは無いので**この条件を外してもテストは通る**が、
+/// 外れたときの向きが安全でないほうなので残す。
+fn spells_a_type_only_marker(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+
+    node.children(&mut cursor)
+        .any(|child| !child.is_named() && child.kind() == TYPE_ONLY_MARKER_KIND)
 }
 
 /// その要素アクセスが、読み込みを起こさないと分かっている名前を指しているか。
@@ -1299,6 +1334,73 @@ abstract class Base { abstract require(path: string): void; }
         assert_eq!(
             import_set(require_declared_in_types, "src/utils/formatDate.ts"),
             import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    /// 型だけの輸入と値の輸入は、**名前のあるノードだけを見ると同じ木**になる。
+    /// 印は名前のないノードなので、そこまで見ないと区別できない。
+    const IMPORTS_PAD_AND_LOADER: &str = r#"import { pad } from "./pad";
+import { load } from "./loader";
+"#;
+
+    #[test]
+    fn test_import_set_of_a_file_importing_require_only_as_a_type_reaches_the_same_modules() {
+        // 型だけの輸入は実行時の名前を作らない。束縛と数えると、`require` という型を
+        // 輸入しただけで書いてある依存が全部落ちる
+        let require_imported_as_a_type = r#"import { pad } from "./pad";
+import type { require } from "./loader";
+"#;
+
+        assert_eq!(
+            import_set(require_imported_as_a_type, "src/utils/a.ts"),
+            import_set(IMPORTS_PAD_AND_LOADER, "src/utils/a.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_marking_require_as_a_type_in_the_clause_reaches_the_same_modules()
+    {
+        // 印が輸入の文ではなく個々の名前に付く形。木の上では印の置き場所が違う
+        let require_marked_as_a_type = r#"import { pad } from "./pad";
+import { type require } from "./loader";
+"#;
+
+        assert_eq!(
+            import_set(require_marked_as_a_type, "src/utils/a.ts"),
+            import_set(IMPORTS_PAD_AND_LOADER, "src/utils/a.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_importing_require_as_a_value_cannot_be_created() {
+        // 対照。値として輸入した `require` は実行時の名前を作るので、外してはいけない
+        let require_imported_as_a_value = r#"import { pad } from "./pad";
+import { require } from "./loader";
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(require_imported_as_a_value),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_aliasing_an_import_named_type_to_require_cannot_be_created() {
+        // 対照。綴りに `type` が現れるが印ではない。**`type` という名前を `require` へ
+        // 別名にした値の輸入**なので、綴りで印を探す実装だと外れてしまう
+        let type_aliased_to_require = r#"import { pad } from "./pad";
+import { type as require } from "./loader";
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(type_aliased_to_require),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
         );
     }
 
