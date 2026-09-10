@@ -307,13 +307,94 @@ fn require_spelling_of(tree: &SyntaxTree<'_>) -> RequireSpelling {
 /// 綴りが `require` でも、[`is_use_that_cannot_load`] が挙げる位置なら数えない。
 /// **綴りで比べられない名前は、`require` かどうかを決められないので数える。**
 fn is_require_spelled_outside_a_call(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
-    if is_escaped_name(tree, node) || is_unreadable_computed_key(tree, node) {
+    if is_escaped_name(tree, node)
+        || is_unreadable_computed_key(tree, node)
+        || is_an_invoked_unreadable_key(tree, node)
+    {
         return true;
     }
     if tree.text_of(node) != Some(REQUIRE_FUNCTION_NAME) {
         return false;
     }
+    if is_a_dependency_literal(tree, node) {
+        return false;
+    }
     !is_use_that_cannot_load(tree, node)
+}
+
+/// そのノードが、**呼ばれている**添字アクセスのうち、綴りを読み取れないものか。
+///
+/// `module["re" + "quire"]("./dep")` は読み込みだが、**どのノードも `require` を綴らない**
+/// ので、[`is_require_spelled_outside_a_call`] の一致でも [`is_unreadable_computed_key`]
+/// でも見つけられない（後者は添字が文字列リテラルのときだけを見る）。
+///
+/// **呼ばれているものだけを見る。** 呼ばれていない添字（`arr[i]` / `map[key]`）まで
+/// 落とすと、ごく普通のコードがすべて測れなくなる。そのぶん
+/// `const load = module[key]; load("./dep");` は漏れるが、漏れは
+/// [`RequireSpelling::Rebound`] ではなく**取りこぼし**になる。
+///
+/// **Why not（添字を解いて綴りを組み直す）**: 定数畳み込みを持つことになる。
+/// `"re" + "quire"` を解けても、次は `[..."require"].join("")` が来る。
+fn is_an_invoked_unreadable_key(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
+    if node.kind() != SUBSCRIPT_EXPRESSION_KIND || !is_invoked(node) {
+        return false;
+    }
+    let Some(index) = node.child_by_field_name("index") else {
+        return false;
+    };
+
+    unquoted_text_of(tree, inside_wrappers(index)).is_none()
+}
+
+/// そのノードが、[`specifier_of`] が指定子として読む文字列リテラルの中身か。
+///
+/// **依存先の名前が `require` でも、それはこのファイルの名前ではない**
+/// （`import loader from "require"` / `require("require")`）。指定子として読まれる
+/// 綴りまで名前として数えると、**読み取れている宣言を読み取れないと答える**。
+///
+/// 見るのは [`specifier_of`] が読む 3 つの位置だけ。**広げると逆向きに倒れる**
+/// （指定子でない綴りを見逃す = 偽陽性）ので、位置は同じ欄・同じ順序で確かめる。
+fn is_a_dependency_literal(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
+    let literal = outside_a_string_literal(node);
+    let Some(parent) = literal.parent() else {
+        return false;
+    };
+
+    if DEPENDENCY_STATEMENT_KINDS.contains(&parent.kind()) {
+        return parent.child_by_field_name("source") == Some(literal);
+    }
+    if parent.kind() == IMPORT_REQUIRE_CLAUSE_KIND {
+        return first_string_child_of(parent) == Some(literal);
+    }
+    is_the_first_argument_of_a_dependency_call(tree, literal)
+}
+
+/// その文字列リテラルが、指定子を受け取る呼び出しの**最初の引数**か。
+///
+/// [`reading_of_argument`] が読むのと同じ 1 つに限る。2 つ目以降は指定子として
+/// 読まれないので、そこに書かれた `require` は名前として数える側に残す。
+fn is_the_first_argument_of_a_dependency_call(tree: &SyntaxTree<'_>, literal: Node<'_>) -> bool {
+    // 包みは値を変えないので、引数の位置は包みの外で見る（`require(("./pad"))`）
+    let written = outside_wrappers(literal);
+    let Some(arguments) = written.parent() else {
+        return false;
+    };
+    let Some(call) = arguments.parent() else {
+        return false;
+    };
+    let is_a_dependency_call = calls_dynamic_import(call) || calls_require(tree, call);
+
+    is_a_dependency_call
+        && call.child_by_field_name("arguments") == Some(arguments)
+        && first_expression_child_of(arguments) == Some(written)
+}
+
+/// そのノードの直下にある最初の文字列リテラル。
+fn first_string_child_of(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+
+    node.named_children(&mut cursor)
+        .find(|child| STRING_LITERAL_KINDS.contains(&child.kind()))
 }
 
 /// そのノードが、綴りを読み取れない添字か。
@@ -674,12 +755,7 @@ fn reading_of_first_string_child<'source>(
     tree: &SyntaxTree<'source>,
     node: Node<'_>,
 ) -> SpecifierReading<'source> {
-    let mut cursor = node.walk();
-    let literal = node
-        .named_children(&mut cursor)
-        .find(|child| STRING_LITERAL_KINDS.contains(&child.kind()));
-
-    let Some(literal) = literal else {
+    let Some(literal) = first_string_child_of(node) else {
         return SpecifierReading::Unreadable;
     };
     reading_of(tree, literal)
@@ -1546,6 +1622,102 @@ const options = { require: false };
         assert_eq!(
             import_set(require_as_an_object_key, "src/utils/formatDate.ts"),
             import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_loading_through_a_computed_key_cannot_be_created() {
+        // 添字が文字列リテラルですらないと、**どのノードも `require` を綴らない**。
+        // 綴りの一致では見つけられないので、呼ばれている添字は読み取れない側へ落とす
+        let require_spelled_by_a_computed_key = r#"import { pad } from "./pad";
+module["re" + "quire"]("./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(require_spelled_by_a_computed_key),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_calling_a_readable_computed_key_reaches_the_same_module() {
+        // 対照。添字が読み取れれば綴りは分かるので、`require` でないと言い切れる。
+        // 呼ばれているだけで落とすと、ごく普通の要素アクセスまで測れなくなる
+        let readable_computed_key_called = r#"import { pad } from "./pad";
+handlers["load"]("./stock");
+"#;
+
+        assert_eq!(
+            import_set(readable_computed_key_called, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_reading_an_uninvoked_computed_key_reaches_the_same_module() {
+        // 対照。呼ばれていない添字は読み込みを起こさない。呼ばれているかを見ずに
+        // 落とすと、ごく普通の要素アクセス（`arr[i]` / `map[key]`）まで測れなくなる
+        let uninvoked_computed_key = r#"import { pad } from "./pad";
+const value = config[key];
+"#;
+
+        assert_eq!(
+            import_set(uninvoked_computed_key, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_passing_require_to_another_call_cannot_be_created() {
+        // 対照。指定子として読まれるのは依存を受ける呼び出しの引数だけ。
+        // 呼び出しなら何でも除外すると、ただの文字列の位置で綴りを見逃す
+        let require_passed_to_another_call = r#"import { pad } from "./pad";
+load("require");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(require_passed_to_another_call),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_spelling_require_in_a_later_argument_cannot_be_created() {
+        // 対照。指定子として読まれるのは**最初の引数だけ**なので、2 つ目以降の
+        // `require` は名前として数える側に残る。読む位置を広げると綴りを見逃す
+        let require_spelled_in_a_later_argument = r#"const { pad } = require("./pad", "require");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(require_spelled_in_a_later_argument),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_depending_on_a_module_named_require_reaches_both_modules() {
+        // 依存先の綴りが `require` でも、それは**依存先の名前**であって
+        // このファイルの名前ではない。輸入の `source` の欄と、呼び出しの最初の引数は
+        // どちらも `specifier_of` が既に指定子として読む位置
+        let imports_a_module_named_require = r#"import { pad } from "./pad";
+import loader from "require";
+"#;
+        let requires_a_module_named_require = r#"const { pad } = require("./pad");
+const loader = require("require");
+"#;
+
+        assert_eq!(
+            import_set(imports_a_module_named_require, "src/utils/a.ts"),
+            import_set(requires_a_module_named_require, "src/utils/a.ts")
         );
     }
 
