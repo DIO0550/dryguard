@@ -171,6 +171,21 @@ const STRING_LITERAL_KINDS: [&str; 2] = ["string", "template_string"];
 /// CommonJS が依存を読み込む関数の名前。
 const REQUIRE_FUNCTION_NAME: &str = "require";
 
+/// 型の中でしか現れない、要素を宣言する種別。
+///
+/// **どれも値の側には現れない。** 実装を伴う定義は `method_definition`、
+/// クラスの欄は `public_field_definition` と別の種別になるので、
+/// `class C { require() {} }` はここに当たらない（測れない側のまま）。
+///
+/// **ここに無い種別は「読み込みかもしれない」側へ落ちる。** 型の中の位置を挙げ
+/// そこねても、測れない側（安全側）へ落ちるだけで済む
+/// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+const TYPE_MEMBER_KINDS: [&str; 3] = [
+    "method_signature",
+    "property_signature",
+    "abstract_method_signature",
+];
+
 /// 読み込みを起こさないと分かっている、`require` の要素の名前。
 ///
 /// `resolve` は指定子を解決するだけで読み込まない。`cache` と `main` は値で、
@@ -284,6 +299,9 @@ fn is_escaped_name(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
 /// 要素の名前（`module.require` / `registry.require`）を inert と言えないのはこのため
 /// （`module` と `registry` を木の上で区別できない）。
 ///
+/// **型の中で宣言された要素の名前だけは別**（[`TYPE_MEMBER_KINDS`]）。値を持たないので
+/// 持ち出せず、その型を使う側の `loader.require(…)` は要素アクセスとして別に数える。
+///
 /// **ここから漏れた位置は [`RequireSpelling::Rebound`] へ落ちる。** 落ちた先は
 /// 「読み取れない」なので、**値を作らずに測れないと言う**だけで済む。
 fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
@@ -299,8 +317,9 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
         && accesses_a_non_loading_member(tree, parent);
     let is_unary_operand = parent.kind() == UNARY_EXPRESSION_KIND
         && parent.child_by_field_name("argument") == Some(positioned);
+    let is_declared_in_a_type = TYPE_MEMBER_KINDS.contains(&parent.kind());
 
-    is_called || is_non_loading_member_object || is_unary_operand
+    is_called || is_non_loading_member_object || is_unary_operand || is_declared_in_a_type
 }
 
 /// その要素アクセスが、読み込みを起こさないと分かっている名前を指しているか。
@@ -1225,6 +1244,41 @@ export const Path = () => <p>C:\users</p>;
                 IMPORTS_PAD_FROM_PARENT,
                 "src/report/dateHelper.ts"
             ))
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_declaring_require_in_a_type_reaches_the_same_module() {
+        // 型の中の名前は、実行時の `require` を束縛し直しも読み込みもしない。
+        // 数えると、`require` を持つ型を書いただけで、書いてある import まで測れなくなる
+        let require_declared_in_types = r#"import { pad } from "./pad";
+
+interface Loader { require(path: string): void }
+type Reader = { require: (path: string) => void };
+abstract class Base { abstract require(path: string): void; }
+"#;
+
+        assert_eq!(
+            import_set(require_declared_in_types, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_defining_a_require_method_on_a_class_cannot_be_created() {
+        // 対照。実装を伴う定義は型ではないので、外してはいけない。型の中の名前を外すのに
+        // 要素の名前を丸ごと外すと、この形まで測れる側へ戻ってしまう
+        let require_defined_on_a_class = r#"import { pad } from "./pad";
+
+class Loader { require(path: string): string { return path; } }
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(require_defined_on_a_class),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
         );
     }
 
