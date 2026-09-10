@@ -146,8 +146,18 @@ const TRANSPARENT_WRAPPER_KINDS: [&str; 4] = [
 const IDENTIFIER_KIND: &str = "identifier";
 const DYNAMIC_IMPORT_KIND: &str = "import";
 const STRING_FRAGMENT_KIND: &str = "string_fragment";
-/// 引数の並びには現れるが、引数ではないもの。
+/// コメント。引数の並びには現れるが、引数ではない。
 const COMMENT_KIND: &str = "comment";
+
+/// 逆立ちが**書かれていて当たり前**の葉の種別。
+///
+/// 正規表現（`/\d+/`）・コメント・文字列の中のエスケープ。ここに無い葉に逆立ちが
+/// あれば、それは名前に書かれたエスケープ（`require`）で、**綴りでは比べられない**。
+///
+/// **一覧を空にすると、逆立ちを持つファイルはすべて測れない側へ落ちる**（安全側）。
+/// 足しそこねても存在しない依存を作らない
+/// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+const KINDS_THAT_SPELL_BACKSLASHES: [&str; 3] = [COMMENT_KIND, "regex_pattern", "escape_sequence"];
 
 /// 指定子を書ける文字列リテラルの種別。
 ///
@@ -230,15 +240,35 @@ fn require_spelling_of(tree: &SyntaxTree<'_>) -> RequireSpelling {
     RequireSpelling::ModuleLoader
 }
 
-/// そのノードが、呼ばれる側ではない `require` の綴りか。
+/// そのノードが、[`specifier_of`] が採る呼び出し以外で `require` を指しうる名前か。
 ///
-/// **メンバアクセスや要素の名前（`registry.require`）は数えない。** 束縛を作らないので、
-/// 数えると `require` という名前の要素を触るだけでそのファイルの読み込みが全部落ちる。
+/// 綴りが `require` でも、[`is_use_that_cannot_load`] が挙げる位置なら数えない。
+/// **綴りで比べられない名前は、`require` かどうかを決められないので数える。**
 fn is_require_spelled_outside_a_call(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
+    if is_escaped_name(tree, node) {
+        return true;
+    }
     if tree.text_of(node) != Some(REQUIRE_FUNCTION_NAME) {
         return false;
     }
     !is_use_that_cannot_load(tree, node)
+}
+
+/// そのノードが、エスケープを含む名前か。
+///
+/// 名前にはエスケープを書ける（`require` は JS の上では `require` と同じ名前）が、
+/// 木が返すのは**書かれた綴りのまま**なので、`require` との一致では見つけられない。
+/// 見つけられないまま呼び出しを採ると、**存在しない依存**を集合に入れる。
+///
+/// 見るのは葉だけ。親は子の綴りを丸ごと含むので、葉に無い逆立ちは無い。
+fn is_escaped_name(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
+    if node.named_child_count() != 0 {
+        return false;
+    }
+    if KINDS_THAT_SPELL_BACKSLASHES.contains(&node.kind()) {
+        return false;
+    }
+    tree.text_of(node).is_some_and(|text| text.contains('\\'))
 }
 
 /// そのノードが、**新しい名前も読み込みも作りえない**位置に置かれた名前か。
@@ -469,8 +499,13 @@ fn unquoted_text_of<'source>(
 }
 
 /// その指定子が importer の位置から解決するものか。
+///
+/// 区切りを伴わない `.` と `..` も相対指定。`.` を漏らすと、別々のディレクトリの
+/// 入口が畳まれずに 1 つの依存先（`.`）になり、**依存していない先を共有している**ことになる。
 fn is_relative(specifier: &str) -> bool {
-    specifier.starts_with("./") || specifier.starts_with("../") || specifier == ".."
+    let starts_with_a_step = specifier.starts_with("./") || specifier.starts_with("../");
+    let is_a_bare_step = specifier == "." || specifier == "..";
+    starts_with_a_step || is_a_bare_step
 }
 
 /// `directory` から見た `specifier` を、`.` と `..` を畳んだ 1 本のパスにする。
@@ -555,6 +590,13 @@ mod tests {
     fn test_module_path_of_a_package_specifier_is_kept_as_written() {
         // パッケージ名は importer の位置に依らない
         assert_eq!(resolved("react", "src/utils/formatDate.ts"), "react");
+    }
+
+    #[test]
+    fn test_module_path_of_a_bare_dot_specifier_is_the_importers_directory() {
+        // `.` は `./` と同じくそのディレクトリの入口を指す。畳まずに `.` のまま持つと、
+        // 別々のディレクトリの入口が 1 つの依存先になる
+        assert_eq!(resolved(".", "src/billing/a.ts"), "src/billing");
     }
 
     fn tree_of(source: &str) -> SyntaxTree<'_> {
@@ -1109,6 +1151,53 @@ const clock = require("../shared/clock");
         assert_eq!(
             overlap(billing, "src/billing/a.ts", inventory, "src/inventory/b.ts"),
             0.5
+        );
+    }
+
+    #[test]
+    fn test_import_overlap_of_files_requiring_a_bare_dot_is_not_total() {
+        // 対照に共有している ESM の依存を 1 件置く。`.` を畳まないと両側の集合が
+        // {"src/shared/util", "."} で揃い、**別々のディレクトリの入口**を共有している
+        // ことにして重なりが 1.00 と過大に出る
+        let billing = r#"import { util } from "../shared/util";
+const entry = require(".");
+"#;
+        let inventory = r#"import { util } from "../shared/util";
+const entry = require(".");
+"#;
+
+        assert_eq!(
+            overlap(billing, "src/billing/a.ts", inventory, "src/inventory/b.ts"),
+            1.0 / 3.0
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_binding_an_escaped_require_cannot_be_created() {
+        // 対照に読み取れる import を 1 件置く。`require` は JS の上では `require` と
+        // 同じ名前だが、木が返すのは書かれた綴りのままなので、束縛を綴りで見つけられない。
+        // 見つけられないまま呼び出しを採ると、**存在しない依存**を集合に入れる
+        let escaped_binding = "import { pad } from \"./pad\";\nconst requ\\u0069re = helper;\nrequire(\"./stock\");\n";
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(escaped_binding), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_with_a_backslash_outside_a_name_reaches_the_same_module() {
+        // 対照。逆立ちが名前の中に無い（正規表現・コメント・文字列の中）ファイルまで
+        // 測れなくすると、`\d` を書いただけのファイルが軒並み落ちる
+        let backslashes_outside_names = r#"// a \ backslash in a comment
+const digits = /\d+/;
+const escaped = "a\nb";
+import { pad } from "./pad";
+"#;
+
+        assert_eq!(
+            import_set(backslashes_outside_names, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
         );
     }
 
