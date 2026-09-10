@@ -67,7 +67,7 @@ if structurally_similar && domains_differ { ... }
 | `lean` | シグナルが判定を傾けた向き（共通化する側 / しない側 / どちらでもない） |
 | `domain` | ドメイン。ディレクトリ構造からの推定と `dryguard.toml` の宣言で決まる |
 | `import` | 依存の宣言。ソースに書かれた `import` / `export ... from` / `require` そのもの |
-| `specifier` | `from` の後ろに書かれた文字列（`"./pad"`）。**解決前** |
+| `specifier` | 依存の宣言が依存先として書いている文字列（`from` の後ろ・`require` の引数。`"./pad"`）。**解決前** |
 | `module path` | 指定子を importer の位置から解決した依存先（`src/utils/pad`）。**解決後** |
 | `module distance` | 2 つのファイルを隔てているディレクトリの段数 |
 | `frame` | LSP のストリーム上の 1 通分。`Content-Length` ヘッダと、それが数えた本文 |
