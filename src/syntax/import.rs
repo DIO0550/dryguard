@@ -183,10 +183,14 @@ const REQUIRE_FUNCTION_NAME: &str = "require";
 /// `method_definition`、クラスの欄は `public_field_definition`、
 /// `declare function` は `ambient_declaration` の下に来るので、どれも測れない側に残る。
 ///
+/// **種別ではなく祖先で決めているのはこのため。** クラスの名前（`class require {}`）は
+/// 木の上で型の名前と**同じ `type_identifier`** だが、実行時の束縛を作る。
+/// 祖先が `class_declaration` でここに無いので、測れない側に残る。
+///
 /// **ここに無い種別は「読み込みかもしれない」側へ落ちる。** 型の中の位置を挙げ
 /// そこねても、測れない側（安全側）へ落ちるだけで済む
 /// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-const TYPE_ONLY_KINDS: [&str; 9] = [
+const TYPE_ONLY_KINDS: [&str; 12] = [
     "function_type",
     "constructor_type",
     "call_signature",
@@ -196,6 +200,9 @@ const TYPE_ONLY_KINDS: [&str; 9] = [
     "property_signature",
     "index_signature",
     "type_query",
+    "type_alias_declaration",
+    "interface_declaration",
+    "type_annotation",
 ];
 
 /// 読み込みを起こさないと分かっている、`require` の要素の名前。
@@ -1292,6 +1299,53 @@ abstract class Base { abstract require(path: string): void; }
         assert_eq!(
             import_set(require_declared_in_types, "src/utils/formatDate.ts"),
             import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_aliasing_require_as_a_type_reaches_the_same_module() {
+        // 型の名前としての `require` は型空間にしかいない。実行時の読み込みとは
+        // 別の名前空間なので、束縛と数えると型を 1 つ書いただけで測れなくなる
+        let require_aliased_as_a_type = r#"import { pad } from "./pad";
+
+type require = string;
+let value: require;
+"#;
+
+        assert_eq!(
+            import_set(require_aliased_as_a_type, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_declaring_require_as_an_interface_reaches_the_same_module() {
+        // インタフェースの名前も型空間にしかいない
+        let require_declared_as_an_interface = r#"import { pad } from "./pad";
+
+interface require { readonly kind: string }
+"#;
+
+        assert_eq!(
+            import_set(require_declared_as_an_interface, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_declaring_a_class_named_require_cannot_be_created() {
+        // 対照。クラスの名前は木の上で型の名前と**同じ `type_identifier`** になるが、
+        // 実行時の束縛を作る。種別だけで外すと、この形まで測れる側へ戻ってしまう
+        let class_named_require = r#"import { pad } from "./pad";
+
+class require {
+  load(path: string): string { return path; }
+}
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(class_named_require), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::UnreadableDeclaration)
         );
     }
 
