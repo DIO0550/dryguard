@@ -151,13 +151,15 @@ const COMMENT_KIND: &str = "comment";
 
 /// 逆立ちが**書かれていて当たり前**の葉の種別。
 ///
-/// 正規表現（`/\d+/`）・コメント・文字列の中のエスケープ。ここに無い葉に逆立ちが
-/// あれば、それは名前に書かれたエスケープ（`require`）で、**綴りでは比べられない**。
+/// 正規表現（`/\d+/`）・コメント・文字列の中のエスケープ・JSX の地の文（`C:\users`）。
+/// **どれも名前を書けない場所。** ここに無い葉に逆立ちがあれば、それは名前に書かれた
+/// エスケープ（`require`）で、**綴りでは比べられない**。
 ///
 /// **一覧を空にすると、逆立ちを持つファイルはすべて測れない側へ落ちる**（安全側）。
 /// 足しそこねても存在しない依存を作らない
 /// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-const KINDS_THAT_SPELL_BACKSLASHES: [&str; 3] = [COMMENT_KIND, "regex_pattern", "escape_sequence"];
+const KINDS_THAT_SPELL_BACKSLASHES: [&str; 4] =
+    [COMMENT_KIND, "regex_pattern", "escape_sequence", "jsx_text"];
 
 /// 指定子を書ける文字列リテラルの種別。
 ///
@@ -602,6 +604,10 @@ mod tests {
     fn tree_of(source: &str) -> SyntaxTree<'_> {
         SyntaxTree::from_source(source, Grammar::TypeScript)
             .expect("テストが渡すソースは木にできる")
+    }
+
+    fn tsx_tree_of(source: &str) -> SyntaxTree<'_> {
+        SyntaxTree::from_source(source, Grammar::Tsx).expect("テストが渡すソースは木にできる")
     }
 
     fn import_set(source: &str, importer: &str) -> ImportSet {
@@ -1198,6 +1204,46 @@ import { pad } from "./pad";
         assert_eq!(
             import_set(backslashes_outside_names, "src/utils/formatDate.ts"),
             import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_with_a_backslash_in_jsx_text_reaches_the_same_module() {
+        // 対照。JSX の地の文は名前ではないので、逆立ちがあっても綴りは比べられる。
+        // 名前でない葉まで名前として数えると、`C:\users` と書いた画面が軒並み落ちる
+        let backslash_in_jsx_text = r#"import { pad } from "./pad";
+
+export const Path = () => <p>C:\users</p>;
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tsx_tree_of(backslash_in_jsx_text),
+                Path::new("src/utils/formatDate.tsx"),
+            ),
+            Ok(import_set(
+                IMPORTS_PAD_FROM_PARENT,
+                "src/report/dateHelper.ts"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_exporting_an_import_equals_require_cannot_be_created() {
+        // 対照に読み取れる import を 1 件置く。tree-sitter はこの形の右辺を
+        // `import_require_clause` として出さず、`require` が呼ばれる側でない
+        // `identifier` として残る。宣言として見えないまま残りだけで測ると、
+        // **欠けた集合を揃った集合として扱う**
+        let exported_import_equals = r#"import { pad } from "./pad";
+export import dep = require("./dep");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(exported_import_equals),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
         );
     }
 
