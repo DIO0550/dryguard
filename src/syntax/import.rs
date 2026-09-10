@@ -171,19 +171,31 @@ const STRING_LITERAL_KINDS: [&str; 2] = ["string", "template_string"];
 /// CommonJS が依存を読み込む関数の名前。
 const REQUIRE_FUNCTION_NAME: &str = "require";
 
-/// 型の中でしか現れない、要素を宣言する種別。
+/// 型の中でしか現れない構文の種別。
 ///
-/// **どれも値の側には現れない。** 実装を伴う定義は `method_definition`、
-/// クラスの欄は `public_field_definition` と別の種別になるので、
-/// `class C { require() {} }` はここに当たらない（測れない側のまま）。
+/// **この下に書かれた名前は、実行時の値を束縛しない。** 要素の宣言
+/// （`interface L { require(): void }`）だけでなく、**型の中の引数の名前**
+/// （`type H = (require: string) => void`）もここへ入る。`type_query` の中の名前
+/// （`typeof require`）は値を指すが、指すだけで束縛し直さない。
+///
+/// **値の側の構文は木の上でここへ入らない。** 実物の関数の引数は
+/// `function_declaration` / `arrow_function` の下、実装を伴う定義は
+/// `method_definition`、クラスの欄は `public_field_definition`、
+/// `declare function` は `ambient_declaration` の下に来るので、どれも測れない側に残る。
 ///
 /// **ここに無い種別は「読み込みかもしれない」側へ落ちる。** 型の中の位置を挙げ
 /// そこねても、測れない側（安全側）へ落ちるだけで済む
 /// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-const TYPE_MEMBER_KINDS: [&str; 3] = [
+const TYPE_ONLY_KINDS: [&str; 9] = [
+    "function_type",
+    "constructor_type",
+    "call_signature",
+    "construct_signature",
     "method_signature",
-    "property_signature",
     "abstract_method_signature",
+    "property_signature",
+    "index_signature",
+    "type_query",
 ];
 
 /// 読み込みを起こさないと分かっている、`require` の要素の名前。
@@ -317,9 +329,26 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
         && accesses_a_non_loading_member(tree, parent);
     let is_unary_operand = parent.kind() == UNARY_EXPRESSION_KIND
         && parent.child_by_field_name("argument") == Some(positioned);
-    let is_declared_in_a_type = TYPE_MEMBER_KINDS.contains(&parent.kind());
+    let is_written_in_a_type = is_written_only_in_a_type(node);
 
-    is_called || is_non_loading_member_object || is_unary_operand || is_declared_in_a_type
+    is_called || is_non_loading_member_object || is_unary_operand || is_written_in_a_type
+}
+
+/// そのノードが、型の中だけに現れる構文の下に置かれているか。
+///
+/// **祖先をすべて辿る。** 型の中の名前は、要素の宣言（親が [`TYPE_ONLY_KINDS`]）と
+/// 引数の名前（`required_parameter` を挟む）で親までの深さが違うので、
+/// 親だけを見ると片方が漏れる。
+fn is_written_only_in_a_type(node: Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+
+    while let Some(current) = ancestor {
+        if TYPE_ONLY_KINDS.contains(&current.kind()) {
+            return true;
+        }
+        ancestor = current.parent();
+    }
+    false
 }
 
 /// その要素アクセスが、読み込みを起こさないと分かっている名前を指しているか。
@@ -457,9 +486,11 @@ fn reading_of_argument<'source>(
     let Some(arguments) = call.child_by_field_name("arguments") else {
         return SpecifierReading::Unreadable;
     };
-    let Some(first) = first_expression_child_of(arguments) else {
+    let Some(written) = first_expression_child_of(arguments) else {
         return SpecifierReading::Unreadable;
     };
+    // 包みは値を変えないので、綴りを見る前に剥がす（`require(("./pad"))`）
+    let first = inside_wrappers(written);
     if !STRING_LITERAL_KINDS.contains(&first.kind()) {
         return SpecifierReading::Unreadable;
     }
@@ -1260,6 +1291,55 @@ abstract class Base { abstract require(path: string): void; }
 
         assert_eq!(
             import_set(require_declared_in_types, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_naming_require_in_a_type_parameter_reaches_the_same_module() {
+        // 型の中の引数の名前も値を持たない。要素の宣言だけを外すと、この形が残る
+        let require_named_in_type_parameters = r#"import { pad } from "./pad";
+
+type Handler = (require: string) => void;
+type Factory = new (require: string) => void;
+interface Callable { (require: string): void }
+"#;
+
+        assert_eq!(
+            import_set(require_named_in_type_parameters, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_taking_require_as_a_function_parameter_cannot_be_created() {
+        // 対照。実物の関数の引数は名前を束縛するので、外してはいけない。型の中の引数を
+        // 外すのに引数の種別だけで決めると、この形まで測れる側へ戻ってしまう
+        let require_taken_as_a_parameter = r#"import { pad } from "./pad";
+
+export function load(require: (path: string) => string): string {
+  return require("./stock");
+}
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(require_taken_as_a_parameter),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_require_given_a_parenthesized_specifier_reaches_the_same_module() {
+        // 包みは値を変えない。呼ばれる側だけ剥がして引数を剥がさないと、
+        // 綴りの決まった指定子を読み取れないことにしてしまう
+        let parenthesized_specifier = r#"const pad = require(("./pad"));
+"#;
+
+        assert_eq!(
+            import_set(parenthesized_specifier, "src/utils/formatDate.ts"),
             import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
         );
     }
