@@ -5,6 +5,7 @@
 //! 依存先が食い違っていると誤って言うのは、このツールが最も損をする外し方
 //! （共有ユーティリティに「共通化するな」と言うことになる）。
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Component, Path};
 
@@ -32,12 +33,14 @@ impl ModulePath {
     /// （拡張子の省略・`tsconfig` のパスエイリアス）、`syntax` は I/O を持てない
     /// (rules/coding.md 禁止事項)。
     pub fn from_specifier(specifier: &str, importer: &Path) -> Self {
-        if !is_relative(specifier) {
+        let written = with_forward_separators(specifier);
+        if !is_relative(&written) {
+            // パッケージ名は importer の位置に依らないので、区切りも直さず綴りのまま残す
             return Self(specifier.to_string());
         }
 
         let directory = importer.parent().unwrap_or_else(|| Path::new(""));
-        Self(folded_path(directory, specifier))
+        Self(folded_path(directory, &written))
     }
 
     /// 解決済みの依存先そのもの。
@@ -547,7 +550,12 @@ fn is_the_imported_side_of_a_rename(node: Node<'_>) -> bool {
             let is_the_name = parent.child_by_field_name("name") == Some(node);
             is_the_name && parent.child_by_field_name("alias").is_some()
         }
-        EXPORT_SPECIFIER_KIND | NAMESPACE_EXPORT_KIND => is_inside_a_re_export(parent),
+        EXPORT_SPECIFIER_KIND => {
+            // 別名の側は輸出される名前でしかなく、輸出元の有無に関わらず束縛を作らない
+            let is_the_alias = parent.child_by_field_name("alias") == Some(node);
+            is_the_alias || is_inside_a_re_export(parent)
+        }
+        NAMESPACE_EXPORT_KIND => is_inside_a_re_export(parent),
         _ => false,
     }
 }
@@ -827,6 +835,23 @@ fn unquoted_text_of<'source>(
 ///
 /// 区切りを伴わない `.` と `..` も相対指定。`.` を漏らすと、別々のディレクトリの
 /// 入口が畳まれずに 1 つの依存先（`.`）になり、**依存していない先を共有している**ことになる。
+/// 区切りを `/` に揃えた綴り。逆立ちを含まなければ借りたまま返す。
+///
+/// CommonJS は Windows の区切りで書いた相対指定（`require(".\\stock")`）も
+/// importer からの相対として読み込む。揃えずに [`is_relative`] へ渡すと
+/// **パッケージ名として書かれたまま残り、別々のディレクトリの同じ綴りが
+/// 1 つの依存先になる**（`rules/naming.md`「`specifier` と `module path` を混ぜない」）。
+///
+/// **効かせるのは相対かどうかの判定と、畳む側だけ。** パッケージ名の綴りに逆立ちが
+/// あっても、それは importer の位置に依らないので直さない。
+fn with_forward_separators(specifier: &str) -> Cow<'_, str> {
+    if !specifier.contains('\\') {
+        return Cow::Borrowed(specifier);
+    }
+
+    Cow::Owned(specifier.replace('\\', "/"))
+}
+
 fn is_relative(specifier: &str) -> bool {
     let starts_with_a_step = specifier.starts_with("./") || specifier.starts_with("../");
     let is_a_bare_step = specifier == "." || specifier == "..";
@@ -922,6 +947,27 @@ mod tests {
         // `.` は `./` と同じくそのディレクトリの入口を指す。畳まずに `.` のまま持つと、
         // 別々のディレクトリの入口が 1 つの依存先になる
         assert_eq!(resolved(".", "src/billing/a.ts"), "src/billing");
+    }
+
+    #[test]
+    fn test_module_path_of_a_windows_relative_specifier_is_folded_from_the_importer() {
+        // CommonJS は Windows の区切りで書いた相対指定も importer からの相対として扱う。
+        // 畳まずに書かれたまま持つと、**別々のディレクトリ**の `.\\stock` が 1 つの依存先になる
+        assert_eq!(
+            resolved(".\\stock", "src/billing/a.ts"),
+            "src/billing/stock"
+        );
+        assert_eq!(
+            resolved("..\\shared\\pad", "src/billing/a.ts"),
+            "src/shared/pad"
+        );
+    }
+
+    #[test]
+    fn test_module_path_of_a_package_name_containing_a_backslash_is_written_as_it_is() {
+        // 対照。相対指定でない綴りはパッケージ名で、importer の位置に依らない。
+        // 区切りを直して畳むと、**書かれていない依存先**になる
+        assert_eq!(resolved("vendor\\pad", "src/billing/a.ts"), "vendor\\pad");
     }
 
     fn tree_of(source: &str) -> SyntaxTree<'_> {
@@ -1502,6 +1548,24 @@ const entry = require(".");
     }
 
     #[test]
+    fn test_import_set_of_a_file_requiring_a_windows_relative_path_cannot_be_created() {
+        // 特性テスト。TypeScript の文字列に逆立ちを書く唯一の方法はエスケープなので、
+        // 区切りを直す前に**指定子として読み取れない**側で落ちる。
+        // `ModulePath::from_specifier` の区切りを直しても、この経路の答えは変わらない
+        let requires_a_windows_relative_path = r#"import { pad } from "./pad";
+const entry = require(".\\stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(requires_a_windows_relative_path),
+                Path::new("src/billing/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
     fn test_import_set_of_a_file_binding_an_escaped_require_cannot_be_created() {
         // 対照に読み取れる import を 1 件置く。`require` は JS の上では `require` と
         // 同じ名前だが、木が返すのは書かれた綴りのままなので、束縛を綴りで見つけられない。
@@ -1900,6 +1964,21 @@ export { require as load } from "./loader";
         assert_eq!(
             import_set(require_re_exported, "src/utils/a.ts"),
             import_set(IMPORTS_PAD_AND_LOADER, "src/utils/a.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_exporting_a_local_name_as_require_reaches_the_same_module() {
+        // 輸出元が無くても、**別名の側**はローカルの名前を作らない。輸出される名前で
+        // しかないので、束縛でも参照でもない
+        let local_exported_as_require = r#"import { pad } from "./pad";
+const load = 1;
+export { load as require };
+"#;
+
+        assert_eq!(
+            import_set(local_exported_as_require, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
         );
     }
 
