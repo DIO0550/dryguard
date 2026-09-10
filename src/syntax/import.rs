@@ -125,8 +125,24 @@ const IMPORT_REQUIRE_CLAUSE_KIND: &str = "import_require_clause";
 const CALL_EXPRESSION_KIND: &str = "call_expression";
 const MEMBER_EXPRESSION_KIND: &str = "member_expression";
 const UNARY_EXPRESSION_KIND: &str = "unary_expression";
-/// 括弧だけの式。**式そのものは変えない**ので、綴りを見る前に剥がす。
-const PARENTHESIZED_EXPRESSION_KIND: &str = "parenthesized_expression";
+/// 中の式の値をそのまま返す包み。**綴りを見る前に剥がす。**
+///
+/// 括弧と、TypeScript の型だけの注記（`require as NodeRequire` / `require!` /
+/// `require satisfies NodeRequire`）。どれも実行時の値は中の式そのもの。
+/// **どれも最初の子が中の式**なので、1 つの規則で剥がせる。
+///
+/// **ここから漏れた包みは [`RequireSpelling::Rebound`] へ落ちる。** 落ちた先は
+/// 「読み取れない」なので、**値を作らずに測れないと言う**だけで済む
+/// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+///
+/// **Why not（`<NodeRequire>require` / `(0, require)` も入れる）**: 前者は最初の子が型、
+/// 後者は値が最後の子で、剥がし方が違う。上の落ち方で足りるので規則を増やさない。
+const TRANSPARENT_WRAPPER_KINDS: [&str; 4] = [
+    "parenthesized_expression",
+    "as_expression",
+    "satisfies_expression",
+    "non_null_expression",
+];
 const IDENTIFIER_KIND: &str = "identifier";
 /// メンバアクセスや、オブジェクト・クラスの要素に書かれた名前。**束縛を作らない。**
 const MEMBER_NAME_KIND: &str = "property_identifier";
@@ -165,12 +181,17 @@ enum RequireSpelling {
 /// **読み取れない宣言が 1 つでもあれば `None` を返す。** 残りだけを返すと、
 /// 呼び出し側は欠けた集合を揃った集合として扱う。
 fn specifiers_of<'source>(tree: &SyntaxTree<'source>) -> Option<Vec<&'source str>> {
-    // `require` が何を指すかはファイル全体を見ないと決まらないので、木を歩く前に 1 回だけ決める
-    let spelling = require_spelling_of(tree);
+    // 綴りが何を指すかはファイル全体を見ないと決まらないので、木を歩く前に 1 回だけ決める。
+    // **束縛され直しているかもしれないファイルは、呼び出しを見つけたかに関わらず
+    // 読み取れないとして返す。** 見つけられなかった読み込みがあるかもしれず、
+    // 「見つけた呼び出しの数」ではそれを言えない
+    if require_spelling_of(tree) == RequireSpelling::Rebound {
+        return None;
+    }
     let mut specifiers = Vec::new();
 
     for node in tree.named_descendants() {
-        match specifier_of(tree, node, spelling) {
+        match specifier_of(tree, node) {
             SpecifierReading::NotADeclaration => {}
             SpecifierReading::Specifier(specifier) => specifiers.push(specifier),
             SpecifierReading::Unreadable => return None,
@@ -222,8 +243,8 @@ fn is_use_that_cannot_bind(node: Node<'_>) -> bool {
     if node.kind() == MEMBER_NAME_KIND {
         return true;
     }
-    // 括弧は式を変えないので、外まで戻ってから位置を見る（`(require)("./dep")`）
-    let positioned = outside_parentheses(node);
+    // 包みは値を変えないので、外まで戻ってから位置を見る（`(require)("./dep")`）
+    let positioned = outside_wrappers(node);
     let Some(parent) = positioned.parent() else {
         return false;
     };
@@ -238,12 +259,12 @@ fn is_use_that_cannot_bind(node: Node<'_>) -> bool {
     is_called || is_member_object || is_unary_operand
 }
 
-/// 包んでいる括弧の外まで遡ったノード。
-fn outside_parentheses(node: Node<'_>) -> Node<'_> {
+/// 包んでいる包みの外まで遡ったノード。
+fn outside_wrappers(node: Node<'_>) -> Node<'_> {
     let mut current = node;
 
     while let Some(parent) = current.parent() {
-        if parent.kind() != PARENTHESIZED_EXPRESSION_KIND {
+        if !TRANSPARENT_WRAPPER_KINDS.contains(&parent.kind()) {
             break;
         }
         current = parent;
@@ -251,11 +272,11 @@ fn outside_parentheses(node: Node<'_>) -> Node<'_> {
     current
 }
 
-/// 包んでいる括弧を剥がした式。
-fn inside_parentheses(node: Node<'_>) -> Node<'_> {
+/// 包みを剥がした中の式。
+fn inside_wrappers(node: Node<'_>) -> Node<'_> {
     let mut current = node;
 
-    while current.kind() == PARENTHESIZED_EXPRESSION_KIND {
+    while TRANSPARENT_WRAPPER_KINDS.contains(&current.kind()) {
         let Some(inner) = first_expression_child_of(current) else {
             break;
         };
@@ -287,12 +308,9 @@ enum SpecifierReading<'source> {
 
 /// そのノードが宣言している依存先の指定子。
 ///
-/// `spelling` は、そのファイルで `require` の綴りが何を指しているか。
-fn specifier_of<'source>(
-    tree: &SyntaxTree<'source>,
-    node: Node<'_>,
-    spelling: RequireSpelling,
-) -> SpecifierReading<'source> {
+/// **`require` の綴りが束縛され直しているファイルはここへ来ない**
+/// （[`specifiers_of`] が先に読み取れないとして返す）。
+fn specifier_of<'source>(tree: &SyntaxTree<'source>, node: Node<'_>) -> SpecifierReading<'source> {
     if DEPENDENCY_STATEMENT_KINDS.contains(&node.kind()) {
         let Some(source) = node.child_by_field_name("source") else {
             return SpecifierReading::NotADeclaration;
@@ -306,10 +324,6 @@ fn specifier_of<'source>(
         return reading_of_argument(tree, node);
     }
     if calls_require(tree, node) {
-        // 綴りが束縛され直していると、この呼び出しが読み込みなのかを決められない
-        if spelling == RequireSpelling::Rebound {
-            return SpecifierReading::Unreadable;
-        }
         return reading_of_argument(tree, node);
     }
     SpecifierReading::NotADeclaration
@@ -335,7 +349,7 @@ fn calls_require(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     }
 
     node.child_by_field_name("function").is_some_and(|called| {
-        let called = inside_parentheses(called);
+        let called = inside_wrappers(called);
         called.kind() == IDENTIFIER_KIND && tree.text_of(called) == Some(REQUIRE_FUNCTION_NAME)
     })
 }
@@ -822,6 +836,57 @@ const stock = require("./stock");
                 "src/utils/b.ts",
             ),
             1.0
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_require_behind_a_type_annotation_reaches_the_same_module() {
+        // 型だけの注記は実行時の値を変えない。剥がさないと呼び出しが宣言として
+        // 分類されず、中の `require` だけが束縛と見なされる
+        let annotated = r#"const pad = (require as NodeRequire)("./pad");"#;
+
+        assert_eq!(
+            overlap(
+                annotated,
+                "src/utils/a.ts",
+                IMPORTS_PAD_FROM_SIBLING,
+                "src/utils/b.ts",
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_require_behind_a_non_null_assertion_reaches_the_same_module() {
+        let asserted = r#"const pad = require!("./pad");"#;
+
+        assert_eq!(
+            overlap(
+                asserted,
+                "src/utils/a.ts",
+                IMPORTS_PAD_FROM_SIBLING,
+                "src/utils/b.ts",
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_wrapping_require_in_an_unpeeled_form_cannot_be_created() {
+        // 対照に読み取れる import を 1 件置く。剥がせない包み（値が最後の子にある
+        // 順次評価）は呼び出しとして分類されないが、**綴りは束縛の側へ落ちる**ので
+        // ファイルごと測れないになる。ここが崩れると、包みの形を 1 つ見つけるたびに
+        // 欠けた集合で測ることになる
+        let real_import_and_an_indirect_require = r#"import { pad } from "./pad";
+const stock = (0, require)("./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(real_import_and_an_indirect_require),
+                Path::new("src/utils/a.ts"),
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
         );
     }
 
