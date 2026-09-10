@@ -130,6 +130,12 @@ const IMPORT_SPECIFIER_KIND: &str = "import_specifier";
 const EXPORT_SPECIFIER_KIND: &str = "export_specifier";
 const EXPORT_STATEMENT_KIND: &str = "export_statement";
 const PAIR_KIND: &str = "pair";
+const NAMESPACE_EXPORT_KIND: &str = "namespace_export";
+const TYPE_IDENTIFIER_KIND: &str = "type_identifier";
+
+/// 型を言い当てる式。**型と値の欄を分けていない**ので、どちらの側かは
+/// ノードの種別（`type_identifier` か `identifier` か）で見分ける。
+const ASSERTION_KINDS: [&str; 2] = ["as_expression", "satisfies_expression"];
 /// 中の式の値をそのまま返す包み。**綴りを見る前に剥がす。**
 ///
 /// 括弧と、TypeScript の型だけの注記（`require as NodeRequire` / `require!` /
@@ -381,6 +387,7 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     let is_written_in_a_type = is_written_only_in_a_type(node);
     let is_renamed_on_the_way_in = is_the_imported_side_of_a_rename(node);
     let is_an_object_key = is_an_object_key(node);
+    let is_an_asserted_type = is_the_type_side_of_an_assertion(node);
 
     is_called
         || is_non_loading_member_object
@@ -388,6 +395,28 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
         || is_written_in_a_type
         || is_renamed_on_the_way_in
         || is_an_object_key
+        || is_an_asserted_type
+}
+
+/// そのノードが、型を言い当てる式の**型の側**の綴りか。
+///
+/// `value as require` / `value satisfies require` の型の側は型空間にしかいない。
+///
+/// **値の側は数える。** `require as NodeRequire` の `require` は読み込む関数そのもので、
+/// 捕まえて持ち出せる。木の上では型の側が `type_identifier`、値の側が `identifier` と
+/// **種別が違う**ので、種別で見分けられる（`as_expression` は型と値の欄を分けていない）。
+///
+/// `<require>value` はここへ来ない。型が `type_arguments` の下に置かれるので、
+/// [`TYPE_ONLY_KINDS`] が先に拾う。
+fn is_the_type_side_of_an_assertion(node: Node<'_>) -> bool {
+    if node.kind() != TYPE_IDENTIFIER_KIND {
+        return false;
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+
+    ASSERTION_KINDS.contains(&parent.kind())
 }
 
 /// そのノードが、ローカルの名前を作らない輸入・輸出の綴りか。
@@ -411,7 +440,7 @@ fn is_the_imported_side_of_a_rename(node: Node<'_>) -> bool {
             let is_the_name = parent.child_by_field_name("name") == Some(node);
             is_the_name && parent.child_by_field_name("alias").is_some()
         }
-        EXPORT_SPECIFIER_KIND => is_inside_a_re_export(parent),
+        EXPORT_SPECIFIER_KIND | NAMESPACE_EXPORT_KIND => is_inside_a_re_export(parent),
         _ => false,
     }
 }
@@ -437,11 +466,20 @@ fn is_inside_a_re_export(specifier: Node<'_>) -> bool {
 /// **省略記法（`{ require }`）は数える。** そちらは `shorthand_property_identifier` と
 /// 別の種別で、**名前を参照する**（読み込む関数そのものをオブジェクトへ持ち出せる）。
 fn is_an_object_key(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
+    // 引用符で囲んだ欄の名前は文字列を 1 つ挟む（`{ "require": false }`）
+    let written = outside_a_string_literal(node);
+    let Some(parent) = written.parent() else {
         return false;
     };
 
-    parent.kind() == PAIR_KIND && parent.child_by_field_name("key") == Some(node)
+    parent.kind() == PAIR_KIND && parent.child_by_field_name("key") == Some(written)
+}
+
+/// 文字列リテラルの中の綴りなら、その文字列そのものまで戻る。
+fn outside_a_string_literal(node: Node<'_>) -> Node<'_> {
+    node.parent()
+        .filter(|parent| STRING_LITERAL_KINDS.contains(&parent.kind()))
+        .unwrap_or(node)
 }
 
 /// そのノードが、型空間にだけ置かれた名前か。
@@ -1433,6 +1471,69 @@ abstract class Base { abstract require(path: string): void; }
     const IMPORTS_PAD_AND_LOADER: &str = r#"import { pad } from "./pad";
 import { load } from "./loader";
 "#;
+
+    #[test]
+    fn test_import_set_of_a_file_asserting_a_type_named_require_reaches_the_same_module() {
+        // 型の側の綴りは型空間にしかいない。`<require>value` は `type_arguments` の
+        // 下に来るので既に外れており、残っていたのは `as` と `satisfies` の 2 つ
+        let require_named_in_assertions = r#"import { pad } from "./pad";
+
+type require = string;
+export const asserted = value as require;
+export const checked = value satisfies require;
+"#;
+
+        assert_eq!(
+            import_set(require_named_in_assertions, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_asserting_a_type_onto_require_cannot_be_created() {
+        // 対照。同じ `as_expression` でも**値の側**は読み込む関数そのもので、
+        // 捕まえて持ち出せる。木の上では型の側が `type_identifier`、値の側が
+        // `identifier` と種別が違う
+        let require_captured_through_an_assertion = r#"import { pad } from "./pad";
+const captured = require as NodeRequire;
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(require_captured_through_an_assertion),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_re_exporting_a_namespace_as_require_reaches_the_same_modules() {
+        // 名前空間の再輸出。別名は `export_specifier` ではなく `namespace_export` の
+        // 下に来るが、ローカルの名前を作らないのは同じ
+        let namespace_re_exported_as_require = r#"import { pad } from "./pad";
+export * as require from "./loader";
+"#;
+
+        assert_eq!(
+            import_set(namespace_re_exported_as_require, "src/utils/a.ts"),
+            import_set(IMPORTS_PAD_AND_LOADER, "src/utils/a.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_quoting_an_object_key_require_reaches_the_same_module() {
+        // 引用符で囲んだ欄の名前も欄の名前。木の上では `string` を 1 つ挟むだけで、
+        // 束縛でも参照でもないことは変わらない
+        let require_as_a_quoted_object_key = r#"import { pad } from "./pad";
+const options = { "require": false, retries: 2 };
+"#;
+
+        assert_eq!(
+            import_set(require_as_a_quoted_object_key, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
 
     #[test]
     fn test_import_set_of_a_file_naming_an_object_key_require_reaches_the_same_module() {
