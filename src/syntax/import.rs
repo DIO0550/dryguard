@@ -127,6 +127,9 @@ const MEMBER_EXPRESSION_KIND: &str = "member_expression";
 const UNARY_EXPRESSION_KIND: &str = "unary_expression";
 const SUBSCRIPT_EXPRESSION_KIND: &str = "subscript_expression";
 const IMPORT_SPECIFIER_KIND: &str = "import_specifier";
+const EXPORT_SPECIFIER_KIND: &str = "export_specifier";
+const EXPORT_STATEMENT_KIND: &str = "export_statement";
+const PAIR_KIND: &str = "pair";
 /// 中の式の値をそのまま返す包み。**綴りを見る前に剥がす。**
 ///
 /// 括弧と、TypeScript の型だけの注記（`require as NodeRequire` / `require!` /
@@ -204,7 +207,7 @@ const IMPORT_EXPORT_KINDS: [&str; 4] = [
     "export_specifier",
 ];
 
-const TYPE_ONLY_KINDS: [&str; 14] = [
+const TYPE_ONLY_KINDS: [&str; 15] = [
     "function_type",
     "constructor_type",
     "call_signature",
@@ -219,6 +222,7 @@ const TYPE_ONLY_KINDS: [&str; 14] = [
     "type_annotation",
     "type_parameter",
     "type_parameters",
+    "type_arguments",
 ];
 
 /// 読み込みを起こさないと分かっている、`require` の要素の名前。
@@ -376,33 +380,68 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
         && parent.child_by_field_name("argument") == Some(positioned);
     let is_written_in_a_type = is_written_only_in_a_type(node);
     let is_renamed_on_the_way_in = is_the_imported_side_of_a_rename(node);
+    let is_an_object_key = is_an_object_key(node);
 
     is_called
         || is_non_loading_member_object
         || is_unary_operand
         || is_written_in_a_type
         || is_renamed_on_the_way_in
+        || is_an_object_key
 }
 
-/// そのノードが、別名を付けた輸入の**輸入元の側**か。
+/// そのノードが、ローカルの名前を作らない輸入・輸出の綴りか。
 ///
-/// `import { require as load }` で実行時の名前になるのは `load` だけ。輸入元の綴りは
-/// 束縛を作らないので、数えると測れるファイルが減る。
+/// 2 つある。
 ///
-/// **別名の側（`import { load as require }`）は数える。** そちらは束縛を作る。
+/// **別名を付けた輸入の輸入元の側**（`import { require as load }`）。実行時の名前に
+/// なるのは `load` だけ。**別名の側（`import { load as require }`）は数える。**
+/// 別名が無い `import { require }` も数える。
 ///
-/// 輸出（`export { a as require }`）は見ない。輸出の別名は実行時の名前を作らないが、
-/// 輸入元の側が既にある束縛を指すので、その宣言のところで数えれば足りる。
+/// **輸出元を持つ輸出（再輸出）の綴り**（`export { require as load } from "./x"`）。
+/// 相手のモジュールの輸出名を並べているだけで、このファイルの束縛を 1 つも作らない。
+/// **輸出元を持たない輸出（`export { require as load };`）は数える。** そちらは
+/// このファイルの束縛を指す（CommonJS のファイルなら読み込む関数そのもの）。
 fn is_the_imported_side_of_a_rename(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    if parent.kind() != IMPORT_SPECIFIER_KIND {
-        return false;
+    match parent.kind() {
+        IMPORT_SPECIFIER_KIND => {
+            let is_the_name = parent.child_by_field_name("name") == Some(node);
+            is_the_name && parent.child_by_field_name("alias").is_some()
+        }
+        EXPORT_SPECIFIER_KIND => is_inside_a_re_export(parent),
+        _ => false,
     }
-    let is_the_name = parent.child_by_field_name("name") == Some(node);
+}
 
-    is_the_name && parent.child_by_field_name("alias").is_some()
+/// その輸出の指定が、輸出元を持つ輸出（再輸出）の中にあるか。
+fn is_inside_a_re_export(specifier: Node<'_>) -> bool {
+    let mut ancestor = specifier.parent();
+
+    while let Some(current) = ancestor {
+        if current.kind() == EXPORT_STATEMENT_KIND {
+            return current.child_by_field_name("source").is_some();
+        }
+        ancestor = current.parent();
+    }
+    false
+}
+
+/// そのノードが、オブジェクトの欄の名前か。
+///
+/// `const options = { require: false };` の `require` は束縛でも参照でもない。
+/// あとで読むときは `options.require` の要素アクセスになるので、そちらで数えれば足りる。
+///
+/// **省略記法（`{ require }`）は数える。** そちらは `shorthand_property_identifier` と
+/// 別の種別で、**名前を参照する**（読み込む関数そのものをオブジェクトへ持ち出せる）。
+fn is_an_object_key(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+
+    parent.kind() == PAIR_KIND && parent.child_by_field_name("key") == Some(node)
 }
 
 /// そのノードが、型空間にだけ置かれた名前か。
@@ -1394,6 +1433,84 @@ abstract class Base { abstract require(path: string): void; }
     const IMPORTS_PAD_AND_LOADER: &str = r#"import { pad } from "./pad";
 import { load } from "./loader";
 "#;
+
+    #[test]
+    fn test_import_set_of_a_file_naming_an_object_key_require_reaches_the_same_module() {
+        // オブジェクトの欄の名前は束縛でも参照でもない。あとで読むときは `options.require` の
+        // 要素アクセスになるので、そちらで数えれば足りる
+        let require_as_an_object_key = r#"import { pad } from "./pad";
+const options = { require: false };
+"#;
+
+        assert_eq!(
+            import_set(require_as_an_object_key, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_shorthanding_require_into_an_object_cannot_be_created() {
+        // 対照。省略記法は**名前を参照する**ので、読み込む関数そのものを
+        // オブジェクトへ持ち出せる。欄の名前と同じに扱うと持ち出しを見落とす
+        let require_shorthanded_into_an_object = r#"import { pad } from "./pad";
+const carrier = { require };
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(require_shorthanded_into_an_object),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_passing_require_as_a_type_argument_reaches_the_same_module() {
+        // 型引数も型空間にしかいない。値の引数（`arguments`）とは別の種別
+        let require_passed_as_a_type_argument = r#"import { pad } from "./pad";
+
+type require = string;
+export const parsed = consume<require>();
+"#;
+
+        assert_eq!(
+            import_set(require_passed_as_a_type_argument, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_re_exporting_require_under_another_name_reaches_the_same_modules()
+    {
+        // 輸出元を持つ輸出（再輸出）はローカルの名前を 1 つも作らない。
+        // 綴りは相手のモジュールの輸出名であって、このファイルの束縛ではない
+        let require_re_exported = r#"import { pad } from "./pad";
+export { require as load } from "./loader";
+"#;
+
+        assert_eq!(
+            import_set(require_re_exported, "src/utils/a.ts"),
+            import_set(IMPORTS_PAD_AND_LOADER, "src/utils/a.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_exporting_a_local_require_cannot_be_created() {
+        // 対照。輸出元を持たない輸出は**このファイルの束縛**を指す。CommonJS の
+        // ファイルならそれは読み込む関数そのもので、輸出すると持ち出される
+        let local_require_exported = r#"import { pad } from "./pad";
+export { require as load };
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(local_require_exported),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
 
     #[test]
     fn test_import_set_of_a_file_loading_through_an_escaped_computed_key_cannot_be_created() {
