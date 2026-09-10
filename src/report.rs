@@ -18,6 +18,7 @@ use crate::location::Location;
 use crate::pipeline::{Scan, SkippedFile};
 use crate::semantics::caller_domain::CallerDomains;
 use crate::semantics::resolved_type::UnopenedReason;
+use crate::syntax::import::ImportsUnavailable;
 use crate::syntax::module_distance::ModuleDistance;
 use crate::threshold::Threshold;
 
@@ -197,9 +198,23 @@ fn structural_similarity_text_of(signal: StructuralSimilarity, threshold: Thresh
 fn import_overlap_text_of(signal: ImportOverlap) -> String {
     match signal {
         ImportOverlap::Measured(overlap) => format!("依存先の重なり {overlap}"),
-        ImportOverlap::NoImports => {
-            "依存先の重なりを測れない (依存の宣言を読み取れなかったファイルがある)".to_owned()
+        ImportOverlap::Unavailable(cause) => {
+            format!(
+                "依存先の重なりを測れない ({})",
+                imports_unavailable_text_of(cause)
+            )
         }
+    }
+}
+
+/// 依存先の集合を作れなかった理由。
+///
+/// **利用者が次にすることで分ける。** 宣言が無いのはそのファイルがそうだという話、
+/// 読み取れなかったのは dryguard 側の穴（`rules/architecture.md`「理由は落とさない」）。
+fn imports_unavailable_text_of(cause: ImportsUnavailable) -> &'static str {
+    match cause {
+        ImportsUnavailable::NoDeclarations => "依存の宣言が無いファイルがある",
+        ImportsUnavailable::UnreadableDeclaration => "依存の宣言を読み取れなかったファイルがある",
     }
 }
 
@@ -426,6 +441,7 @@ mod tests {
     use crate::location::Location;
     use crate::pipeline::{Scan, scan_of};
     use crate::similarity::Similarity;
+    use crate::syntax::import::ImportsUnavailable;
     use crate::syntax::module_distance::ModuleDistance;
     use crate::test_support::{line, missing_server, overload_count};
     use crate::threshold::Threshold;
@@ -548,7 +564,29 @@ mod tests {
         // 同じ出方をすると、読者が両者を区別できない
         let text = text_of_separate_directories(
             StructuralSimilarity::Measured(measured(0.94)),
-            ImportOverlap::NoImports,
+            ImportOverlap::Unavailable(ImportsUnavailable::NoDeclarations),
+            DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+        );
+
+        assert!(
+            text.contains(
+                "依存先の重なりを測れない (依存の宣言が無いファイルがある) → どちらでもない"
+            ),
+            "測れなかった理由まで出る: {text}"
+        );
+        assert!(
+            text.contains("構造類似度: 0.94"),
+            "測れたシグナルはそのまま値が出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_unreadable_imports_reports_a_different_reason_from_having_none() {
+        // 対照に「宣言が無い」側の文を置く。理由を畳んで 1 つの文にする実装だと、
+        // 利用者は**書いてあるのに dryguard が読めていない**ことに気付けない
+        let text = text_of_separate_directories(
+            StructuralSimilarity::Measured(measured(0.94)),
+            ImportOverlap::Unavailable(ImportsUnavailable::UnreadableDeclaration),
             DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
         );
 
@@ -556,11 +594,11 @@ mod tests {
             text.contains(
                 "依存先の重なりを測れない (依存の宣言を読み取れなかったファイルがある) → どちらでもない"
             ),
-            "測れなかった理由まで出る: {text}"
+            "読み取れなかったことが理由に出る: {text}"
         );
         assert!(
-            text.contains("構造類似度: 0.94"),
-            "測れたシグナルはそのまま値が出る: {text}"
+            !text.contains("依存の宣言が無いファイルがある"),
+            "宣言が無いときの文とは別の文になる: {text}"
         );
     }
 

@@ -57,26 +57,43 @@ impl ModulePath {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportSet(HashSet<ModulePath>);
 
+/// 依存先の集合を作れなかった理由。
+///
+/// **1 つにまとめない。** 利用者が次にすることが違う。宣言が無いファイルは
+/// そういうファイルだが、読み取れなかったファイルは**書いてあるのに dryguard が
+/// 読めていない**（`rules/architecture.md`「理由は落とさない」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportsUnavailable {
+    /// 依存の宣言が 1 つも書かれていない。
+    NoDeclarations,
+    /// 依存の宣言はあるが、指定子を読み取れなかった。
+    UnreadableDeclaration,
+}
+
 impl ImportSet {
     /// 構文木の import を集めて、解決済みの依存先の集合にする。
     ///
     /// `tree` は importer の構文木、`importer` はそのファイルの位置。
     ///
-    /// **読み取れなかった依存の宣言が 1 つでもあれば `None` を返す。** 欠けたまま
-    /// 集合を返すと、後段はその重なりを測れた値として読む。1 件落ちるだけで
+    /// # Errors
+    ///
+    /// 依存の宣言が 1 つも書かれていなければ [`ImportsUnavailable::NoDeclarations`]。
+    ///
+    /// **読み取れなかった宣言が 1 つでもあれば** [`ImportsUnavailable::UnreadableDeclaration`]。
+    /// 欠けたまま集合を返すと、後段はその重なりを測れた値として読む。1 件落ちるだけで
     /// 重なりは過大にも過小にも動くので、**落ちたことが構造に出ないと区別できない**
     /// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
-    /// 宣言を 1 つも読み取れなかったときも作れないので `None`。
-    pub fn from_tree(tree: &SyntaxTree<'_>, importer: &Path) -> Option<Self> {
-        let paths: HashSet<ModulePath> = specifiers_of(tree)?
+    pub fn from_tree(tree: &SyntaxTree<'_>, importer: &Path) -> Result<Self, ImportsUnavailable> {
+        let specifiers = specifiers_of(tree).ok_or(ImportsUnavailable::UnreadableDeclaration)?;
+        let paths: HashSet<ModulePath> = specifiers
             .iter()
             .map(|specifier| ModulePath::from_specifier(specifier, importer))
             .collect();
 
         if paths.is_empty() {
-            return None;
+            return Err(ImportsUnavailable::NoDeclarations);
         }
-        Some(Self(paths))
+        Ok(Self(paths))
     }
 
     /// 2 つの依存先集合の Jaccard 係数（共通している依存先が、合わせたうちの何割か）。
@@ -108,11 +125,15 @@ const IMPORT_REQUIRE_CLAUSE_KIND: &str = "import_require_clause";
 const CALL_EXPRESSION_KIND: &str = "call_expression";
 const MEMBER_EXPRESSION_KIND: &str = "member_expression";
 const UNARY_EXPRESSION_KIND: &str = "unary_expression";
+/// 括弧だけの式。**式そのものは変えない**ので、綴りを見る前に剥がす。
+const PARENTHESIZED_EXPRESSION_KIND: &str = "parenthesized_expression";
 const IDENTIFIER_KIND: &str = "identifier";
 /// メンバアクセスや、オブジェクト・クラスの要素に書かれた名前。**束縛を作らない。**
 const MEMBER_NAME_KIND: &str = "property_identifier";
 const DYNAMIC_IMPORT_KIND: &str = "import";
 const STRING_FRAGMENT_KIND: &str = "string_fragment";
+/// 引数の並びには現れるが、引数ではないもの。
+const COMMENT_KIND: &str = "comment";
 
 /// 指定子を書ける文字列リテラルの種別。
 ///
@@ -201,18 +222,54 @@ fn is_use_that_cannot_bind(node: Node<'_>) -> bool {
     if node.kind() == MEMBER_NAME_KIND {
         return true;
     }
-    let Some(parent) = node.parent() else {
+    // 括弧は式を変えないので、外まで戻ってから位置を見る（`(require)("./dep")`）
+    let positioned = outside_parentheses(node);
+    let Some(parent) = positioned.parent() else {
         return false;
     };
 
     let is_called = parent.kind() == CALL_EXPRESSION_KIND
-        && parent.child_by_field_name("function") == Some(node);
+        && parent.child_by_field_name("function") == Some(positioned);
     let is_member_object = parent.kind() == MEMBER_EXPRESSION_KIND
-        && parent.child_by_field_name("object") == Some(node);
+        && parent.child_by_field_name("object") == Some(positioned);
     let is_unary_operand = parent.kind() == UNARY_EXPRESSION_KIND
-        && parent.child_by_field_name("argument") == Some(node);
+        && parent.child_by_field_name("argument") == Some(positioned);
 
     is_called || is_member_object || is_unary_operand
+}
+
+/// 包んでいる括弧の外まで遡ったノード。
+fn outside_parentheses(node: Node<'_>) -> Node<'_> {
+    let mut current = node;
+
+    while let Some(parent) = current.parent() {
+        if parent.kind() != PARENTHESIZED_EXPRESSION_KIND {
+            break;
+        }
+        current = parent;
+    }
+    current
+}
+
+/// 包んでいる括弧を剥がした式。
+fn inside_parentheses(node: Node<'_>) -> Node<'_> {
+    let mut current = node;
+
+    while current.kind() == PARENTHESIZED_EXPRESSION_KIND {
+        let Some(inner) = first_expression_child_of(current) else {
+            break;
+        };
+        current = inner;
+    }
+    current
+}
+
+/// そのノードの直下にある最初の式。コメントは式ではないので飛ばす。
+fn first_expression_child_of(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() != COMMENT_KIND)
 }
 
 /// ノード 1 つを依存の宣言として読んだ結果。
@@ -271,20 +328,24 @@ fn calls_dynamic_import(node: Node<'_>) -> bool {
 /// その呼び出しが `require` の綴りを呼んでいるか。
 ///
 /// `registry.require("./pad")` は呼ばれる側が `member_expression` になるので外れる。
+/// 括弧は剥がす（`(require)("./pad")` も同じ呼び出し）。
 fn calls_require(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     if node.kind() != CALL_EXPRESSION_KIND {
         return false;
     }
 
     node.child_by_field_name("function").is_some_and(|called| {
+        let called = inside_parentheses(called);
         called.kind() == IDENTIFIER_KIND && tree.text_of(called) == Some(REQUIRE_FUNCTION_NAME)
     })
 }
 
-/// その呼び出しの引数から読み取った指定子。
+/// その呼び出しの**最初の引数**から読み取った指定子。
 ///
-/// 文字列リテラルを渡していない（`require(name)`）ものも依存の宣言なので、
-/// 読み取れないこととして返す。
+/// **2 つ目以降は見ない。** `require(name, "./fallback")` の `"./fallback"` は
+/// 読み込む先ではないので、拾うと**どちらのファイルも読み込んでいない依存**が
+/// 集合に入る。最初の引数が文字列リテラルでなければ読み取れないこととして返す
+/// （`require(name)` も依存の宣言ではある）。
 fn reading_of_argument<'source>(
     tree: &SyntaxTree<'source>,
     call: Node<'_>,
@@ -292,8 +353,14 @@ fn reading_of_argument<'source>(
     let Some(arguments) = call.child_by_field_name("arguments") else {
         return SpecifierReading::Unreadable;
     };
+    let Some(first) = first_expression_child_of(arguments) else {
+        return SpecifierReading::Unreadable;
+    };
+    if !STRING_LITERAL_KINDS.contains(&first.kind()) {
+        return SpecifierReading::Unreadable;
+    }
 
-    reading_of_first_string_child(tree, arguments)
+    reading_of(tree, first)
 }
 
 /// そのノードの直下にある最初の文字列リテラルから読み取った指定子。
@@ -700,7 +767,7 @@ const stock = require(`./${target}`);
                 &tree_of(real_import_and_a_substituted_require),
                 Path::new("src/utils/a.ts"),
             ),
-            None
+            Err(ImportsUnavailable::UnreadableDeclaration)
         );
     }
 
@@ -715,7 +782,7 @@ const stock = require(`./${target}`);
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(&escaped), Path::new("src/utils/a.ts")),
-            None
+            Err(ImportsUnavailable::UnreadableDeclaration)
         );
     }
 
@@ -737,7 +804,58 @@ const stock = require("./stock");
                 &tree_of(real_import_and_a_rebound_require),
                 Path::new("src/utils/a.ts"),
             ),
-            None
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_require_called_through_parentheses_reaches_the_same_module() {
+        // 括弧は式を変えない。呼ばれる側を綴りで見る前に剥がさないと、この呼び出しは
+        // 宣言として分類されないまま中の `require` が束縛と見なされる
+        let through_parentheses = r#"const pad = (require)("./pad");"#;
+
+        assert_eq!(
+            overlap(
+                through_parentheses,
+                "src/utils/a.ts",
+                IMPORTS_PAD_FROM_SIBLING,
+                "src/utils/b.ts",
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_with_a_nonliteral_first_argument_cannot_be_created() {
+        // 対照に読み取れる import を 1 件置く。2 つ目以降の引数まで探す実装だと
+        // "./fallback" が集合に入る（**どちらのファイルも読み込んでいない依存**）
+        let real_import_and_a_fallback_argument = r#"import { pad } from "./pad";
+const stock = require(target, "./fallback");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(real_import_and_a_fallback_argument),
+                Path::new("src/utils/a.ts"),
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_dynamic_import_with_attributes_reaches_the_same_module() {
+        // 2 つ目の引数（読み込みの属性）は依存先ではない。最初の引数だけを見る規則が
+        // この形を落とさないことを見る
+        let with_attributes = r#"const pad = import("./pad", { with: { type: "json" } });"#;
+
+        assert_eq!(
+            overlap(
+                with_attributes,
+                "src/utils/a.ts",
+                IMPORTS_PAD_FROM_SIBLING,
+                "src/utils/b.ts",
+            ),
+            1.0
         );
     }
 
@@ -825,7 +943,7 @@ const value = 1;
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(commented_out), Path::new("src/utils/a.ts")),
-            None
+            Err(ImportsUnavailable::NoDeclarations)
         );
     }
 
@@ -840,7 +958,7 @@ const value = 1;
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(no_imports), Path::new("src/utils/pad.ts")),
-            None
+            Err(ImportsUnavailable::NoDeclarations)
         );
     }
 }

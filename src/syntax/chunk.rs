@@ -17,7 +17,7 @@ use tree_sitter::Node;
 use crate::line_number::LineNumber;
 use crate::location::Location;
 use crate::source_position::SourcePosition;
-use crate::syntax::import::ImportSet;
+use crate::syntax::import::{ImportSet, ImportsUnavailable};
 use crate::syntax::line_range::LineRange;
 use crate::syntax::token::TokenSequence;
 use crate::syntax::tree::{SyntaxTree, source_position_of};
@@ -40,7 +40,7 @@ pub struct Chunk {
     type_references: Vec<TypeReference>,
     source: String,
     tokens: Option<TokenSequence>,
-    imports: Option<ImportSet>,
+    imports: Result<ImportSet, ImportsUnavailable>,
 }
 
 impl Chunk {
@@ -90,7 +90,12 @@ impl Chunk {
     /// **持つ値をすべてこの 1 つのノードから採る。** 呼び出し側に組み立てさせると、
     /// `lines` と `source` と `tokens` が食い違ったチャンクを作れてしまう
     /// (rules/coding.md「不正な状態を型で表現できなくする」)。
-    fn from_node(node: Node<'_>, path: &Path, source: &str, imports: Option<ImportSet>) -> Self {
+    fn from_node(
+        node: Node<'_>,
+        path: &Path,
+        source: &str,
+        imports: Result<ImportSet, ImportsUnavailable>,
+    ) -> Self {
         let lines = line_range_of(node);
 
         Self {
@@ -171,11 +176,13 @@ impl Chunk {
 
     /// このチャンクがあるファイルの、依存先の集合。
     ///
-    /// import が 1 つも無いファイルでは `None`。空の集合を返さないのは、
-    /// 後段が「依存先が食い違っている」と「材料が無い」を区別できるようにするため
-    /// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
-    pub fn imports(&self) -> Option<&ImportSet> {
-        self.imports.as_ref()
+    /// # Errors
+    ///
+    /// 集合を作れなかったときは、その理由（[`ImportsUnavailable`]）。空の集合を
+    /// 返さないのは、後段が「依存先が食い違っている」と「材料が無い」を区別できる
+    /// ようにするため (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
+    pub fn imports(&self) -> Result<&ImportSet, ImportsUnavailable> {
+        self.imports.as_ref().map_err(|cause| *cause)
     }
 }
 
@@ -948,10 +955,10 @@ export function second(value: number): number {
     fn test_file_chunks_from_a_file_with_an_import_gives_every_chunk_that_dependency() {
         let file_chunks = chunks_at(CONSTANT_OUTSIDE_A_FUNCTION, "src/billing/invoice.ts");
 
-        let dependencies: Vec<Option<&ImportSet>> =
+        let dependencies: Vec<Result<&ImportSet, ImportsUnavailable>> =
             file_chunks.chunks().iter().map(Chunk::imports).collect();
         assert!(
-            dependencies.iter().all(Option::is_some),
+            dependencies.iter().all(Result::is_ok),
             "import はファイル全体から採るので、そのファイルのチャンクすべてが持つ"
         );
     }

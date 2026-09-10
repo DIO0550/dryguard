@@ -31,6 +31,7 @@ use crate::semantics::resolved_type::{
 use crate::semantics::type_signature::{TypeSignatureOutcome, type_signature_outcome_of};
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks};
+use crate::syntax::import::ImportsUnavailable;
 use crate::syntax::module_distance::ModuleDistance;
 use crate::syntax::tree::{Grammar, ParseError, SyntaxTree};
 use crate::threshold::Threshold;
@@ -203,13 +204,21 @@ fn structural_similarity_of(chunk_a: &Chunk, chunk_b: &Chunk) -> StructuralSimil
     StructuralSimilarity::Measured(tokens_a.similarity_with(tokens_b))
 }
 
-/// 依存先集合の Jaccard 係数。どちらかのファイルに import が無ければ測れない。
+/// 依存先集合の Jaccard 係数。どちらかのファイルで集合を作れなければ測れない。
+///
+/// **両側とも作れなかったときは、読み取れなかったほうの理由を出す。**
+/// 宣言が無いのは利用者のファイルがそうだという話だが、読み取れなかったのは
+/// dryguard 側の穴で、**そちらのほうが次にすることに効く**
+/// (`rules/architecture.md`「理由は落とさない」)。
 fn import_overlap_of(chunk_a: &Chunk, chunk_b: &Chunk) -> ImportOverlap {
-    let (Some(imports_a), Some(imports_b)) = (chunk_a.imports(), chunk_b.imports()) else {
-        return ImportOverlap::NoImports;
-    };
-
-    ImportOverlap::Measured(imports_a.jaccard(imports_b))
+    match (chunk_a.imports(), chunk_b.imports()) {
+        (Ok(imports_a), Ok(imports_b)) => ImportOverlap::Measured(imports_a.jaccard(imports_b)),
+        (Err(ImportsUnavailable::UnreadableDeclaration), _)
+        | (_, Err(ImportsUnavailable::UnreadableDeclaration)) => {
+            ImportOverlap::Unavailable(ImportsUnavailable::UnreadableDeclaration)
+        }
+        (Err(cause), _) | (_, Err(cause)) => ImportOverlap::Unavailable(cause),
+    }
 }
 
 /// 候補ペアについて、Stage 1 と Stage 2 の両方を測った結果。
@@ -2022,7 +2031,10 @@ mod tests {
 
         let signals = signals_of(&chunk_a, &chunk_b);
 
-        assert_eq!(signals.import_overlap(), ImportOverlap::NoImports);
+        assert_eq!(
+            signals.import_overlap(),
+            ImportOverlap::Unavailable(ImportsUnavailable::NoDeclarations)
+        );
     }
 
     #[test]
