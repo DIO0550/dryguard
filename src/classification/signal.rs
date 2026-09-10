@@ -110,7 +110,7 @@ pub enum StructuralSimilarity {
 pub enum ImportOverlap {
     /// 測れた重なり。
     Measured(Similarity),
-    /// どちらかのファイルに import が無く、測れなかった。
+    /// どちらかのファイルから依存の宣言を 1 つも読み取れず、測れなかった。
     NoImports,
 }
 

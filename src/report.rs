@@ -190,11 +190,15 @@ fn structural_similarity_text_of(signal: StructuralSimilarity, threshold: Thresh
 }
 
 /// 依存モジュールの重なりの値。測れていなければ、その理由。
+///
+/// **理由を「宣言が無い」と言い切らない。** 読み取れる形は文法が持つ書き方より狭く
+/// (``require(`./${name}`)`` など)、宣言があるのに 1 件も集まらないことがある。
+/// 言い切ると、読む側は「このファイルは何にも依存していない」と受け取る。
 fn import_overlap_text_of(signal: ImportOverlap) -> String {
     match signal {
         ImportOverlap::Measured(overlap) => format!("依存先の重なり {overlap}"),
         ImportOverlap::NoImports => {
-            "依存先の重なりを測れない (import が無いファイルがある)".to_owned()
+            "依存先の重なりを測れない (依存の宣言を読み取れなかったファイルがある)".to_owned()
         }
     }
 }
@@ -550,7 +554,7 @@ mod tests {
 
         assert!(
             text.contains(
-                "依存先の重なりを測れない (import が無いファイルがある) → どちらでもない"
+                "依存先の重なりを測れない (依存の宣言を読み取れなかったファイルがある) → どちらでもない"
             ),
             "測れなかった理由まで出る: {text}"
         );
