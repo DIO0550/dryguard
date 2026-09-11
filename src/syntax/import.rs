@@ -135,10 +135,17 @@ const EXPORT_STATEMENT_KIND: &str = "export_statement";
 const PAIR_KIND: &str = "pair";
 const NAMESPACE_EXPORT_KIND: &str = "namespace_export";
 const JSX_ATTRIBUTE_KIND: &str = "jsx_attribute";
+/// タグの名前を `name` の欄に持つ JSX の要素。
+const JSX_ELEMENT_KINDS: [&str; 3] = [
+    "jsx_opening_element",
+    "jsx_closing_element",
+    "jsx_self_closing_element",
+];
 const NEW_EXPRESSION_KIND: &str = "new_expression";
 const COMPUTED_PROPERTY_NAME_KIND: &str = "computed_property_name";
 /// ラベルの名前。文に付ける名前で、値の名前とは別の名前空間にいる。
 const STATEMENT_IDENTIFIER_KIND: &str = "statement_identifier";
+const ESCAPE_SEQUENCE_KIND: &str = "escape_sequence";
 const TYPE_IDENTIFIER_KIND: &str = "type_identifier";
 
 /// 型を言い当てる式。**型と値の欄を分けていない**ので、どちらの側かは
@@ -225,7 +232,7 @@ const IMPORT_EXPORT_KINDS: [&str; 4] = [
 /// **ここに無い種別は「読み込みかもしれない」側へ落ちる。** 型の中の位置を挙げ
 /// そこねても、測れない側（安全側）へ落ちるだけで済む
 /// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-const TYPE_ONLY_KINDS: [&str; 18] = [
+const TYPE_ONLY_KINDS: [&str; 19] = [
     "function_type",
     "constructor_type",
     "call_signature",
@@ -244,6 +251,7 @@ const TYPE_ONLY_KINDS: [&str; 18] = [
     "implements_clause",
     "array_type",
     "nested_type_identifier",
+    "function_signature",
 ];
 
 /// 読み込みを起こさないと分かっている、`require` の要素の名前。
@@ -434,7 +442,21 @@ fn is_unreadable_computed_key(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     let is_the_index = parent.kind() == SUBSCRIPT_EXPRESSION_KIND
         && parent.child_by_field_name("index") == Some(node);
 
-    is_the_index && unquoted_text_of(tree, node).is_none()
+    is_the_index && unquoted_text_of(tree, node).is_none() && spells_an_escape(node)
+}
+
+/// その文字列リテラルがエスケープを含むか。
+///
+/// **綴りが静的に決まっているかの分かれ目。** エスケープは書いた時点で綴りが決まって
+/// いるので、呼ばれる前に持ち出されても `require` でないとは言えない。
+/// 置換（`` `title-${locale}` ``）や空は**実行時に決まる**ので、`config[key]` と同じく
+/// 呼ばれているときだけ見る（[`is_an_invoked_unreadable_key`]）。
+fn spells_an_escape(literal: Node<'_>) -> bool {
+    let mut cursor = literal.walk();
+
+    literal
+        .named_children(&mut cursor)
+        .any(|child| child.kind() == ESCAPE_SEQUENCE_KIND)
 }
 
 /// そのノードが、エスケープを含む名前か。
@@ -478,9 +500,12 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     };
 
     let is_called = is_invoked(node);
-    let is_non_loading_member_object = parent.kind() == MEMBER_EXPRESSION_KIND
-        && parent.child_by_field_name("object") == Some(positioned)
-        && accesses_a_non_loading_member(tree, parent);
+    let reads_by_name =
+        parent.kind() == MEMBER_EXPRESSION_KIND && accesses_a_non_loading_member(tree, parent);
+    let reads_by_key = parent.kind() == SUBSCRIPT_EXPRESSION_KIND
+        && reads_a_non_loading_member_by_key(tree, parent);
+    let is_non_loading_member_object =
+        parent.child_by_field_name("object") == Some(positioned) && (reads_by_name || reads_by_key);
     let is_unary_operand = parent.kind() == UNARY_EXPRESSION_KIND
         && parent.child_by_field_name("argument") == Some(positioned);
     let is_written_in_a_type = is_written_only_in_a_type(node);
@@ -489,6 +514,7 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     let is_an_asserted_type = is_the_type_side_of_an_assertion(node);
     let is_a_jsx_attribute_name = is_a_jsx_attribute_name(node);
     let is_a_statement_label = node.kind() == STATEMENT_IDENTIFIER_KIND;
+    let is_a_jsx_element_name = is_a_jsx_element_name(node);
 
     is_called
         || is_non_loading_member_object
@@ -499,6 +525,25 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
         || is_an_asserted_type
         || is_a_jsx_attribute_name
         || is_a_statement_label
+        || is_a_jsx_element_name
+}
+
+/// そのノードが、JSX の要素の**タグの名前**か。
+///
+/// 綴りが `require` と一致するのは小文字のときだけで、**小文字のタグは組み込み要素**。
+/// JSX は文字列としてコンパイルするので、束縛も参照も作らない
+/// （大文字で始まるタグは名前を参照するが、そちらは綴りが一致しない）。
+///
+/// 開始・終了・自己閉じの 3 つとも `name` の欄にタグの名前を持つ。
+fn is_a_jsx_element_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if !JSX_ELEMENT_KINDS.contains(&parent.kind()) {
+        return false;
+    }
+
+    parent.child_by_field_name("name") == Some(node)
 }
 
 /// そのノードが、JSX の属性の**名前**か。
@@ -683,6 +728,19 @@ fn accesses_a_non_loading_member(tree: &SyntaxTree<'_>, member: Node<'_>) -> boo
     };
 
     tree.text_of(name)
+        .is_some_and(|text| NON_LOADING_REQUIRE_MEMBERS.contains(&text))
+}
+
+/// その添字アクセスが、読み込みを起こしえない要素を**綴りの読める添字**で読んでいるか。
+///
+/// `require["resolve"]` は `require.resolve` と同じ要素で、書き方が違うだけ。
+/// **読み取れない添字は対象外**（`require` の要素かどうかを決められない）。
+fn reads_a_non_loading_member_by_key(tree: &SyntaxTree<'_>, subscript: Node<'_>) -> bool {
+    let Some(index) = subscript.child_by_field_name("index") else {
+        return false;
+    };
+
+    unquoted_text_of(tree, inside_wrappers(index))
         .is_some_and(|text| NON_LOADING_REQUIRE_MEMBERS.contains(&text))
 }
 
@@ -1776,6 +1834,132 @@ export function scan() {
         assert_eq!(
             import_set(require_as_a_statement_label, "src/utils/formatDate.ts"),
             import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_with_a_require_jsx_tag_reaches_the_same_module() {
+        // 小文字の JSX タグは組み込み要素の名前で、文字列としてコンパイルされる。
+        // 束縛も参照も作らないので、画面に置くだけで依存が落ちてはいけない
+        let require_as_a_jsx_tag = r#"import { pad } from "./pad";
+
+export const Slot = () => <require>x</require>;
+export const Empty = () => <require />;
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tsx_tree_of(require_as_a_jsx_tag),
+                Path::new("src/utils/formatDate.tsx"),
+            ),
+            Ok(import_set(
+                IMPORTS_PAD_FROM_PARENT,
+                "src/report/dateHelper.ts"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_declaring_a_require_overload_reaches_the_same_module() {
+        // 本体を持たない宣言の引数は消える。実装の側だけが実行時の引数を作る
+        let require_in_an_overload_declaration = r#"import { pad } from "./pad";
+
+export function parse(require: string): void;
+export function parse(value: string): void {}
+"#;
+
+        assert_eq!(
+            import_set(
+                require_in_an_overload_declaration,
+                "src/utils/formatDate.ts"
+            ),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_implementing_a_require_overload_cannot_be_created() {
+        // 対照。名前が `require` の実装は `function_declaration` の下に来るので、
+        // 宣言の側を型空間へ寄せても測れない側に残る
+        let require_declared_and_implemented = r#"import { pad } from "./pad";
+export function require(value: string): void;
+export function require(value: string) {}
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(require_declared_and_implemented),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_reading_a_computed_require_member_reaches_the_same_module() {
+        // `require["resolve"]` は `require.resolve` と同じ要素。綴りが読めるなら
+        // 書き方が違うだけで読み込みは起こさない
+        let non_loading_member_read_by_a_computed_key = r#"import { pad } from "./pad";
+require["resolve"]("./pad");
+require["cache"];
+const { pad: padded } = require("./pad");
+"#;
+
+        assert_eq!(
+            import_set(
+                non_loading_member_read_by_a_computed_key,
+                "src/utils/formatDate.ts"
+            ),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_reading_a_loading_member_by_key_cannot_be_created() {
+        // 対照。`require["extensions"]` は読み込みを行う関数そのもの。添字の綴りを
+        // 見ずに要素アクセスを外すと、一覧に無い要素まで測れる側へ落ちる
+        let loading_member_read_by_a_computed_key = r#"import { pad } from "./pad";
+const extend = require["extensions"];
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(loading_member_read_by_a_computed_key),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_reading_a_substituted_computed_key_reaches_the_same_module() {
+        // 置換を持つ添字は**実行時に決まる**ので、`config[key]` と同じ扱い。
+        // 呼ばれていない読み出しで依存を落とすと、ごく普通のコードが測れなくなる
+        let substituted_computed_read = r#"import { pad } from "./pad";
+const title = config[`title-${locale}`];
+"#;
+
+        assert_eq!(
+            import_set(substituted_computed_read, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_holding_an_escaped_computed_key_cannot_be_created() {
+        // 対照。エスケープを含む添字は**綴りが静的に決まっている**ので、呼ばれる前に
+        // 持ち出されても `require` かどうかを決められない
+        let escaped_computed_key_held = r#"import { pad } from "./pad";
+const load = module["require"];
+load("./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(escaped_computed_key_held),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
         );
     }
 
