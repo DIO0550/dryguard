@@ -359,6 +359,16 @@ fn is_an_index_that_cannot_select_require(index: Node<'_>) -> bool {
     if INDEX_KINDS_THAT_CANNOT_SELECT_REQUIRE.contains(&index.kind()) {
         return true;
     }
+    // **演算子は数え上げない。** 数に単項演算子を付けた結果は、数・真偽値・
+    // `"number"` / `"undefined"` のどれかで、**要素の名前が `require` になる組み合わせが無い**。
+    // 中身が名前なら（`handlers[-offset]`）書いた時点では何を選ぶか決まらない
+    if index.kind() == UNARY_EXPRESSION_KIND {
+        return index
+            .child_by_field_name("argument")
+            .is_some_and(|operand| {
+                INDEX_KINDS_THAT_CANNOT_SELECT_REQUIRE.contains(&operand.kind())
+            });
+    }
 
     STRING_LITERAL_KINDS.contains(&index.kind()) && index.named_child_count() == 0
 }
@@ -1029,12 +1039,20 @@ fn is_invoked_through_a_function_member(tree: &SyntaxTree<'_>, node: Node<'_>) -
     let Some(member) = function_member_read_by(tree, access) else {
         return false;
     };
+    // **要素を読んだ式そのものが呼ばれているかを見る。** `X.call` は直に呼ばれても
+    // `X.call.call(X, …)` のように要素越しに呼ばれても、どちらも `X` を呼ぶ
+    if FUNCTION_MEMBERS_THAT_INVOKE.contains(&member) {
+        return is_invoked_on_the_spot(tree, access);
+    }
+    if member != FUNCTION_MEMBER_THAT_BINDS {
+        return false;
+    }
+    // `bind` は返った関数のほうを辿る。呼ばれていなければ持ち出しただけ
     let Some(applied) = invoking_call_of(access) else {
         return false;
     };
 
-    FUNCTION_MEMBERS_THAT_INVOKE.contains(&member)
-        || (member == FUNCTION_MEMBER_THAT_BINDS && is_invoked_on_the_spot(tree, applied))
+    is_invoked_on_the_spot(tree, applied)
 }
 
 /// その要素アクセスが読んでいる要素の名前。読み取れなければ `None`。
@@ -2487,6 +2505,70 @@ handlers[chosen]();
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(named_index), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_calling_a_key_through_nested_call_cannot_be_created() {
+        // `call` は重ねられる。受け手を渡せば、内側の `call` 越しに読み込みが起きる
+        let nested_call = r#"import { pad } from "./pad";
+module["re" + "quire"].call.call(module["re" + "quire"], module, "./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(nested_call), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_applying_a_key_through_nested_call_cannot_be_created() {
+        let nested_apply = r#"import { pad } from "./pad";
+module["re" + "quire"].call.apply(null, [module, "./stock"]);
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(nested_apply), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_invoking_a_negative_index_reaches_the_same_module() {
+        // 数に単項演算子を付けても、選ばれる要素の名前は `"-1"`。`require` にはならない
+        let negative_index = r#"import { pad } from "./pad";
+handlers[-1]();
+"#;
+
+        assert_eq!(
+            import_set(negative_index, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_invoking_a_negated_index_reaches_the_same_module() {
+        // 演算子が何であれ、数に付けた結果の名前は `require` にならない（`"false"`）
+        let negated_index = r#"import { pad } from "./pad";
+handlers[!0]();
+"#;
+
+        assert_eq!(
+            import_set(negated_index, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_invoking_a_negated_name_cannot_be_created() {
+        // 対照。単項演算子の中身が名前なら、書いた時点では何を選ぶか決まらない
+        let negated_name = r#"import { pad } from "./pad";
+handlers[-offset]();
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(negated_name), Path::new("src/utils/a.ts")),
             Err(ImportsUnavailable::ReboundSpelling)
         );
     }
