@@ -658,6 +658,16 @@ fn is_inside_a_re_export(specifier: Node<'_>) -> bool {
 ///
 /// **省略記法（`{ require }`）は数える。** そちらは `shorthand_property_identifier` と
 /// 別の種別で、**名前を参照する**（読み込む関数そのものをオブジェクトへ持ち出せる）。
+///
+/// **書く側（`pair`）だけを外す。** 分解して受ける側（`pair_pattern`）は綴りが同じでも
+/// **欄を読む**ので、`const { require: load } = module;` は `const load = module.require;`
+/// と同じ持ち出しになる。要素アクセスの側を「読み込むかもしれない」に残している以上、
+/// 分解の側だけ外すと**読み込みを 1 件落としたまま集合を返す**。
+///
+/// **Why not（`pair_pattern` の `key` も外す）**: 依存先が食い違う 2 ファイルが
+/// `EXTRACT-CANDIDATE`・重なり `1.00` になる（実測）。束縛を作るのは `load` だけだが、
+/// このモジュールが見ているのは束縛ではなく**読み込みが届きうるか**
+/// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
 fn is_an_object_key(node: Node<'_>) -> bool {
     let written = outside_a_written_key(node);
     let Some(parent) = written.parent() else {
@@ -2246,6 +2256,71 @@ const options = { require: false };
         assert_eq!(
             import_set(require_as_an_object_key, "src/utils/formatDate.ts"),
             import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_destructuring_the_require_key_cannot_be_created() {
+        // 分解して受ける側は欄を**読む**。`const load = module.require;` と同じ持ち出しなので、
+        // 書く側（`{ require: false }`）と同じに扱うと読み込みを 1 件落としたまま集合を返す
+        let require_destructured_out_of_an_object = r#"import { pad } from "./pad";
+const { require: load } = module;
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(require_destructured_out_of_an_object),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_destructuring_the_require_key_in_a_parameter_cannot_be_created() {
+        // 引数で分解しても読む側であることは変わらない。祖先の鎖だけが違う
+        let require_destructured_in_a_parameter = r#"import { pad } from "./pad";
+function wire({ require: load }) {}
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(require_destructured_in_a_parameter),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_destructuring_a_quoted_require_key_cannot_be_created() {
+        // 引用符で囲んでも読む側。書く側の `{ "require": false }` と綴りは同じ
+        let quoted_require_destructured = r#"import { pad } from "./pad";
+const { "require": load } = registry;
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(quoted_require_destructured),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_destructuring_a_computed_require_key_cannot_be_created() {
+        // 計算された欄でも読む側。書く側の `{ ["require"]: false }` と綴りは同じ
+        let computed_require_destructured = r#"import { pad } from "./pad";
+const { ["require"]: load } = registry;
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(computed_require_destructured),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
         );
     }
 
