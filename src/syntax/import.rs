@@ -332,10 +332,11 @@ fn require_spelling_of(tree: &SyntaxTree<'_>) -> RequireSpelling {
 /// 綴りが `require` でも、[`is_use_that_cannot_load`] が挙げる位置なら数えない。
 /// **綴りで比べられない名前は、`require` かどうかを決められないので数える。**
 fn is_require_spelled_outside_a_call(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
-    if is_escaped_name(tree, node)
-        || is_unreadable_computed_key(tree, node)
-        || is_an_invoked_unreadable_key(tree, node)
-    {
+    if is_escaped_name(tree, node) {
+        // 綴りを読めないので `require` かどうかを決められないが、位置で言えることはある
+        return !is_use_that_cannot_load_whatever_it_spells(tree, node);
+    }
+    if is_unreadable_computed_key(tree, node) || is_an_invoked_unreadable_key(tree, node) {
         return true;
     }
     if tree.text_of(node) != Some(REQUIRE_FUNCTION_NAME) {
@@ -438,11 +439,13 @@ fn is_unreadable_computed_key(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     if !STRING_LITERAL_KINDS.contains(&node.kind()) {
         return false;
     }
-    let Some(parent) = node.parent() else {
+    // 包みは値を変えないので、添字の位置は包みの外で見る（`module[("require")]`）
+    let positioned = outside_wrappers(node);
+    let Some(parent) = positioned.parent() else {
         return false;
     };
     let is_the_index = parent.kind() == SUBSCRIPT_EXPRESSION_KIND
-        && parent.child_by_field_name("index") == Some(node);
+        && parent.child_by_field_name("index") == Some(positioned);
 
     is_the_index && unquoted_text_of(tree, node).is_none() && spells_an_escape(node)
 }
@@ -480,9 +483,11 @@ fn is_escaped_name(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
 
 /// そのノードが、**新しい名前も読み込みも作りえない**位置に置かれた名前か。
 ///
-/// 3 つだけ。呼び出しの呼ばれる側（`require("./dep")`。読み込みだが、[`specifier_of`]
-/// が採る）・読み込みを起こしえない要素の受け側（`require.cache` / `require.resolve`）・
-/// 単項演算の対象（`typeof require`）。
+/// 呼び出しの呼ばれる側（`require("./dep")`。読み込みだが、[`specifier_of`] が採る）と、
+/// [`is_use_that_cannot_load_whatever_it_spells`] が挙げる位置。
+///
+/// **綴りが `require` と一致したときだけ使う。** 綴りを読めないときは
+/// [`is_use_that_cannot_load_whatever_it_spells`] のほうを直に呼ぶ（理由はそちらの doc）。
 ///
 /// **「呼ばれていないから inert」は成り立たない。** 呼ばれていない参照は**値として
 /// 持ち出せる**ので、後から呼ばれうる（`const load = module.require.bind(module);`）。
@@ -495,13 +500,28 @@ fn is_escaped_name(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
 /// **ここから漏れた位置は [`RequireSpelling::Rebound`] へ落ちる。** 落ちた先は
 /// 「読み取れない」なので、**値を作らずに測れないと言う**だけで済む。
 fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
+    is_invoked(node) || is_use_that_cannot_load_whatever_it_spells(tree, node)
+}
+
+/// そのノードが、**綴りを読めなくても**読み込みを起こさないと言える位置か。
+///
+/// [`is_use_that_cannot_load`] から**呼ばれる側だけを外した**もの。
+///
+/// **同じ一覧を、安全な倒れ方が違う 2 箇所で使い回さない**
+/// (rules/coding.md)。呼ばれる側を数えなくてよいのは、**綴りが読めれば
+/// [`specifier_of`] が採るから**であって、その位置が無害だからではない。
+/// 綴りを読めないとき（[`is_escaped_name`]）は `specifier_of` も採れないので、
+/// 呼ばれる側を外すと**読み込みを 1 件落としたまま集合を返す**。
+///
+/// 残りの位置は綴りに依らない。型空間・欄の名前・ラベル・JSX の名前は値にならず、
+/// 要素の受け側と単項演算の対象は、その名前が読み込む関数そのものでも読み込みを起こさない。
+fn is_use_that_cannot_load_whatever_it_spells(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     // 包みは値を変えないので、外まで戻ってから位置を見る（`(require)("./dep")`）
     let positioned = outside_wrappers(node);
     let Some(parent) = positioned.parent() else {
         return false;
     };
 
-    let is_called = is_invoked(node);
     let reads_by_name =
         parent.kind() == MEMBER_EXPRESSION_KIND && accesses_a_non_loading_member(tree, parent);
     let reads_by_key = parent.kind() == SUBSCRIPT_EXPRESSION_KIND
@@ -518,8 +538,7 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     let is_a_statement_label = node.kind() == STATEMENT_IDENTIFIER_KIND;
     let is_a_jsx_element_name = is_a_jsx_element_name(node);
 
-    is_called
-        || is_non_loading_member_object
+    is_non_loading_member_object
         || is_unary_operand
         || is_written_in_a_type
         || is_renamed_on_the_way_in
@@ -619,18 +638,24 @@ fn is_the_type_side_of_an_assertion(node: Node<'_>) -> bool {
 /// 相手のモジュールの輸出名を並べているだけで、このファイルの束縛を 1 つも作らない。
 /// **輸出元を持たない輸出（`export { require as load };`）は数える。** そちらは
 /// このファイルの束縛を指す（CommonJS のファイルなら読み込む関数そのもの）。
+///
+/// **綴りは文字列でも書ける**（`import { "require" as load }` / `export { load as "require" }`。
+/// ES2022）。木の上では `string` を 1 つ挟むだけなので、欄を見る前に外まで戻す。
+/// 見る欄は変えない。**文字列で書けるのはローカルの名前にならない側だけ**なので、
+/// 戻したうえで同じ欄を確かめれば、束縛を作る側を取り違えない。
 fn is_the_imported_side_of_a_rename(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
+    let written = outside_a_string_literal(node);
+    let Some(parent) = written.parent() else {
         return false;
     };
     match parent.kind() {
         IMPORT_SPECIFIER_KIND => {
-            let is_the_name = parent.child_by_field_name("name") == Some(node);
+            let is_the_name = parent.child_by_field_name("name") == Some(written);
             is_the_name && parent.child_by_field_name("alias").is_some()
         }
         EXPORT_SPECIFIER_KIND => {
             // 別名の側は輸出される名前でしかなく、輸出元の有無に関わらず束縛を作らない
-            let is_the_alias = parent.child_by_field_name("alias") == Some(node);
+            let is_the_alias = parent.child_by_field_name("alias") == Some(written);
             is_the_alias || is_inside_a_re_export(parent)
         }
         NAMESPACE_EXPORT_KIND => is_inside_a_re_export(parent),
@@ -1717,6 +1742,69 @@ const entry = require(".\\stock");
     }
 
     #[test]
+    fn test_import_set_of_a_file_loading_through_an_escaped_spelling_cannot_be_created() {
+        // 対照。**呼ばれる側だけは、逆立ちがあると扱いが逆になる。** 綴りが読めるときは
+        // `specifier_of` が採るので数えなくてよいが、読めないと `specifier_of` も採れない。
+        // 位置だけを見て無害と答えると、**読み込みを 1 件落としたまま測れたと答える**
+        let escaped_call = "import { pad } from \"./pad\";\nrequ\\u0069re(\"./stock\");\n";
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(escaped_call), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_loading_through_an_escaped_member_cannot_be_created() {
+        // 対照。要素の名前の側は、綴りが読めても読めなくても読み込みかもしれない側に残る
+        // （`module` と `registry` を木の上で区別できない）。逆立ちで緩めない
+        let escaped_member_call =
+            "import { pad } from \"./pad\";\nmodule.requ\\u0069re(\"./stock\");\n";
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(escaped_member_call), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_naming_an_escaped_type_require_reaches_the_same_module() {
+        // 逆立ちを書けるのは名前なので、型空間にも書ける。型は実行時の名前を作らないので、
+        // **綴りが読めるかに関わらず**読み込む関数を持ち出せない
+        let escaped_type_name = "import { pad } from \"./pad\";\ntype requ\\u0069re = string;\nlet handle: requ\\u0069re;\n";
+
+        assert_eq!(
+            import_set(escaped_type_name, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_naming_an_escaped_object_key_reaches_the_same_module() {
+        // 欄を作る側も、綴りが読めるかに関わらず束縛でも参照でもない
+        let escaped_object_key =
+            "import { pad } from \"./pad\";\nconst options = { requ\\u0069re: false };\n";
+
+        assert_eq!(
+            import_set(escaped_object_key, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_labelling_a_statement_with_an_escaped_name_reaches_the_same_module()
+     {
+        // ラベルは別の名前空間にいるので、綴りが読めるかに関わらず値にならない
+        let escaped_label =
+            "import { pad } from \"./pad\";\nrequ\\u0069re: { break requ\\u0069re; }\n";
+
+        assert_eq!(
+            import_set(escaped_label, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
     fn test_import_set_of_a_file_with_a_backslash_outside_a_name_reaches_the_same_module() {
         // 対照。逆立ちが名前の中に無い（正規表現・コメント・文字列の中）ファイルまで
         // 測れなくすると、`\d` を書いただけのファイルが軒並み落ちる
@@ -2501,6 +2589,48 @@ export { load as require };
     }
 
     #[test]
+    fn test_import_set_of_a_file_importing_a_string_named_require_reaches_the_same_modules() {
+        // 輸入元の名前は文字列でも書ける（ES2022）。木の上では `string` を 1 つ挟むだけで、
+        // 実行時の名前になるのが別名だけなのは変わらない
+        let string_named_import = r#"import { pad } from "./pad";
+import { "require" as load } from "./loader";
+"#;
+
+        assert_eq!(
+            import_set(string_named_import, "src/utils/a.ts"),
+            import_set(IMPORTS_PAD_AND_LOADER, "src/utils/a.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_exporting_a_local_name_as_a_string_require_reaches_the_same_module()
+     {
+        // 別名の側が文字列でも、輸出される名前でしかない
+        let local_exported_as_string_require = r#"import { pad } from "./pad";
+const load = 1;
+export { load as "require" };
+"#;
+
+        assert_eq!(
+            import_set(local_exported_as_string_require, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_re_exporting_a_string_named_require_reaches_the_same_modules() {
+        // 再輸出の輸入元が文字列でも、このファイルの束縛は 1 つも作らない
+        let string_named_re_export = r#"import { pad } from "./pad";
+export { "require" as load } from "./loader";
+"#;
+
+        assert_eq!(
+            import_set(string_named_re_export, "src/utils/a.ts"),
+            import_set(IMPORTS_PAD_AND_LOADER, "src/utils/a.ts")
+        );
+    }
+
+    #[test]
     fn test_import_set_of_a_file_exporting_a_local_require_cannot_be_created() {
         // 対照。輸出元を持たない輸出は**このファイルの束縛**を指す。CommonJS の
         // ファイルならそれは読み込む関数そのもので、輸出すると持ち出される
@@ -2528,6 +2658,43 @@ export { require as load };
         assert_eq!(
             ImportSet::from_tree(&tree_of(escaped_computed_key), Path::new("src/utils/a.ts")),
             Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_wrapping_an_escaped_computed_key_cannot_be_created() {
+        // 包みは値を変えないので、添字の位置は包みの外で見る。直下だけを見ると
+        // **呼ばれてもいない添字が素通りし、読み込みを 1 件落としたまま測れたと答える**
+        let wrapped_escaped_key = "import { pad } from \"./pad\";\nconst load = module[(\"requ\\u0069re\")];\nload(\"./stock\");\n";
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(wrapped_escaped_key), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_asserting_an_escaped_computed_key_cannot_be_created() {
+        // 括弧だけではない。`as` も値を変えない包みで、同じ穴が開いていた
+        let asserted_escaped_key = "import { pad } from \"./pad\";\nconst load = module[(\"requ\\u0069re\") as string];\nload(\"./stock\");\n";
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(asserted_escaped_key), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_wrapping_a_plain_computed_key_reaches_the_same_module() {
+        // 対照。包みの外まで戻すのを読み取れる添字にも広げると、`config[("title")]` を
+        // 書いただけのファイルまで落ちる
+        let wrapped_plain_key = r#"import { pad } from "./pad";
+const title = config[("title")];
+"#;
+
+        assert_eq!(
+            import_set(wrapped_plain_key, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
         );
     }
 
