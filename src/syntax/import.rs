@@ -260,7 +260,7 @@ const IMPORT_EXPORT_KINDS: [&str; 4] = [
 /// **ここに無い種別は「読み込みかもしれない」側へ落ちる。** 型の中の位置を挙げ
 /// そこねても、測れない側（安全側）へ落ちるだけで済む
 /// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-const TYPE_ONLY_KINDS: [&str; 19] = [
+const TYPE_ONLY_KINDS: [&str; 17] = [
     "function_type",
     "constructor_type",
     "call_signature",
@@ -277,8 +277,6 @@ const TYPE_ONLY_KINDS: [&str; 19] = [
     "type_parameters",
     "type_arguments",
     "implements_clause",
-    "array_type",
-    "nested_type_identifier",
     "function_signature",
 ];
 
@@ -686,15 +684,28 @@ fn outside_a_jsx_namespace(node: Node<'_>) -> Node<'_> {
 ///
 /// `<require>value` はここへ来ない。型が `type_arguments` の下に置かれるので、
 /// [`TYPE_ONLY_KINDS`] が先に拾う。
+///
+/// **言い当てる型の中を辿る。組み合わせの種別を挙げない。** 言い当てる型は 1 つの型名とは
+/// 限らず（`value as require | null` / `value satisfies require & Marker` / 条件型）、
+/// 挙げていく形だと**型の書き方を 1 つ見つけるたびに測れないファイルが増える**
+/// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+///
+/// 辿った先が言い当てる式なら、**値になる子から来ていなければ型の側**
+/// （[`value_child_of`] が値の子を持っている）。値の側は種別が `identifier` なので
+/// 上の早期 return で先に落ちる。
 fn is_the_type_side_of_an_assertion(node: Node<'_>) -> bool {
     if node.kind() != TYPE_IDENTIFIER_KIND {
         return false;
     }
-    let Some(parent) = node.parent() else {
-        return false;
-    };
+    let mut current = node;
 
-    ASSERTION_KINDS.contains(&parent.kind())
+    while let Some(parent) = current.parent() {
+        if ASSERTION_KINDS.contains(&parent.kind()) {
+            return value_child_of(parent) != Some(current);
+        }
+        current = parent;
+    }
+    false
 }
 
 /// そのノードが、ローカルの名前を作らない輸入・輸出の綴りか。
@@ -1704,6 +1715,53 @@ const loaded = require(`./${name}`);
         assert_eq!(
             ImportSet::from_tree(&tree_of(unreadable_specifier), Path::new("src/utils/a.ts")),
             Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_asserting_a_union_containing_require_reaches_the_same_module() {
+        // 言い当てる型は 1 つの型名とは限らない。組み合わせの種別を挙げていくと、
+        // 型の書き方を 1 つ見つけるたびに測れないファイルが増える
+        let require_in_an_asserted_union = r#"import { pad } from "./pad";
+const handle = value as require | null;
+"#;
+
+        assert_eq!(
+            import_set(require_in_an_asserted_union, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_asserting_an_intersection_containing_require_reaches_the_same_module()
+     {
+        // `satisfies` 側も同じ
+        let require_in_an_asserted_intersection = r#"import { pad } from "./pad";
+const handle = value satisfies require & Marker;
+"#;
+
+        assert_eq!(
+            import_set(
+                require_in_an_asserted_intersection,
+                "src/utils/formatDate.ts"
+            ),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_asserting_a_conditional_type_on_require_reaches_the_same_module() {
+        // 条件型も言い当てる型の中。種別を挙げる形では届かない位置
+        let require_in_an_asserted_conditional = r#"import { pad } from "./pad";
+const handle = value as (require extends Loader ? string : number);
+"#;
+
+        assert_eq!(
+            import_set(
+                require_in_an_asserted_conditional,
+                "src/utils/formatDate.ts"
+            ),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
         );
     }
 
