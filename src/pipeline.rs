@@ -206,9 +206,9 @@ fn structural_similarity_of(chunk_a: &Chunk, chunk_b: &Chunk) -> StructuralSimil
 
 /// 依存先集合の Jaccard 係数。どちらかのファイルで集合を作れなければ測れない。
 ///
-/// **両側とも作れなかったときは、読み取れなかったほうの理由を出す。**
-/// 宣言が無いのは利用者のファイルがそうだという話だが、読み取れなかったのは
-/// dryguard 側の穴で、**そちらのほうが次にすることに効く**
+/// **両側とも作れなかったときは、次にすることが多いほうの理由を出す。**
+/// 読み取れなかったのは dryguard 側の穴、綴りが曖昧なのはこのツールでは測れない
+/// 書き方、宣言が無いのはそういうファイル、の順に効く
 /// (`rules/architecture.md`「理由は落とさない」)。
 fn import_overlap_of(chunk_a: &Chunk, chunk_b: &Chunk) -> ImportOverlap {
     match (chunk_a.imports(), chunk_b.imports()) {
@@ -216,6 +216,10 @@ fn import_overlap_of(chunk_a: &Chunk, chunk_b: &Chunk) -> ImportOverlap {
         (Err(ImportsUnavailable::UnreadableDeclaration), _)
         | (_, Err(ImportsUnavailable::UnreadableDeclaration)) => {
             ImportOverlap::Unavailable(ImportsUnavailable::UnreadableDeclaration)
+        }
+        (Err(ImportsUnavailable::ReboundSpelling), _)
+        | (_, Err(ImportsUnavailable::ReboundSpelling)) => {
+            ImportOverlap::Unavailable(ImportsUnavailable::ReboundSpelling)
         }
         (Err(cause), _) | (_, Err(cause)) => ImportOverlap::Unavailable(cause),
     }
@@ -1985,6 +1989,48 @@ mod tests {
             asked.error.is_some(),
             "落ちたことは理由として残る: {:?}",
             asked.error.map(|error| error.to_string())
+        );
+    }
+
+    #[test]
+    fn test_import_overlap_of_a_rebound_side_and_an_unreadable_side_reports_the_unreadable_one() {
+        // 両側とも測れないとき、**次にすることが多いほうの理由**を出す。
+        // 綴りが曖昧なのは利用者のコードがそうだという話だが、読み取れなかったのは
+        // dryguard 側の穴で、そちらのほうが直す先を指している
+        let rebound = chunk_of(
+            "src/billing/a.ts",
+            2,
+            "function require(name: string): number {\n  return name.length;\n}\n",
+        );
+        let unreadable = chunk_of(
+            "src/inventory/b.ts",
+            2,
+            "export function load(name: string): unknown {\n  return require(`./${name}`);\n}\n",
+        );
+
+        assert_eq!(
+            import_overlap_of(&rebound, &unreadable),
+            ImportOverlap::Unavailable(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_overlap_of_a_rebound_side_and_a_declarationless_side_reports_the_rebound_one() {
+        // 対照。宣言が無いのは「そういうファイル」で、次にすることが一番少ない
+        let rebound = chunk_of(
+            "src/billing/a.ts",
+            2,
+            "function require(name: string): number {\n  return name.length;\n}\n",
+        );
+        let declarationless = chunk_of(
+            "src/inventory/b.ts",
+            1,
+            "export function total(rows: number[]): number {\n  return rows.length;\n}\n",
+        );
+
+        assert_eq!(
+            import_overlap_of(&rebound, &declarationless),
+            ImportOverlap::Unavailable(ImportsUnavailable::ReboundSpelling)
         );
     }
 

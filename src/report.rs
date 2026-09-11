@@ -210,10 +210,14 @@ fn import_overlap_text_of(signal: ImportOverlap) -> String {
 /// 依存先の集合を作れなかった理由。
 ///
 /// **利用者が次にすることで分ける。** 宣言が無いのはそのファイルがそうだという話、
-/// 読み取れなかったのは dryguard 側の穴（`rules/architecture.md`「理由は落とさない」）。
+/// 綴りが曖昧なのはこのツールでは測れない書き方だという話、読み取れなかったのは
+/// dryguard 側の穴（`rules/architecture.md`「理由は落とさない」）。
 fn imports_unavailable_text_of(cause: ImportsUnavailable) -> &'static str {
     match cause {
         ImportsUnavailable::NoDeclarations => "依存の宣言が無いファイルがある",
+        ImportsUnavailable::ReboundSpelling => {
+            "require の綴りが読み込みを指すと言い切れないファイルがある"
+        }
         ImportsUnavailable::UnreadableDeclaration => "依存の宣言を読み取れなかったファイルがある",
     }
 }
@@ -599,6 +603,28 @@ mod tests {
         assert!(
             !text.contains("依存の宣言が無いファイルがある"),
             "宣言が無いときの文とは別の文になる: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_a_rebound_require_reports_a_different_reason_from_being_unreadable() {
+        // 対照に「読み取れなかった」側の文を置く。畳むと、**書いてあるものは
+        // すべて読めている**のに利用者を dryguard の穴のほうへ向けてしまう
+        let text = text_of_separate_directories(
+            StructuralSimilarity::Measured(measured(0.94)),
+            ImportOverlap::Unavailable(ImportsUnavailable::ReboundSpelling),
+            DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+        );
+
+        assert!(
+            text.contains(
+                "依存先の重なりを測れない (require の綴りが読み込みを指すと言い切れないファイルがある) → どちらでもない"
+            ),
+            "綴りが曖昧なことが理由に出る: {text}"
+        );
+        assert!(
+            !text.contains("読み取れなかった"),
+            "読み取れなかったときの文とは別の文になる: {text}"
         );
     }
 

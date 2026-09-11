@@ -62,13 +62,24 @@ pub struct ImportSet(HashSet<ModulePath>);
 
 /// 依存先の集合を作れなかった理由。
 ///
-/// **1 つにまとめない。** 利用者が次にすることが違う。宣言が無いファイルは
-/// そういうファイルだが、読み取れなかったファイルは**書いてあるのに dryguard が
-/// 読めていない**（`rules/architecture.md`「理由は落とさない」）。
+/// **1 つにまとめない。** 利用者が次にすることが違う（`rules/architecture.md`
+/// 「理由は落とさない」）。
+///
+/// | 理由 | 誰の側の話か | 次にすること |
+/// |---|---|---|
+/// | [`Self::NoDeclarations`] | 利用者のファイル | そういうファイル |
+/// | [`Self::ReboundSpelling`] | 利用者のファイル | このツールでは測れない書き方 |
+/// | [`Self::UnreadableDeclaration`] | **dryguard** | 穴として直す |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportsUnavailable {
     /// 依存の宣言が 1 つも書かれていない。
     NoDeclarations,
+    /// 宣言はすべて読み取れたが、`require` の綴りが読み込みを指すと言い切れない。
+    ///
+    /// **[`Self::UnreadableDeclaration`] と混ぜない。** こちらは書いてあるものを
+    /// すべて読めていて、測れないのは綴りが曖昧だから。混ぜると、利用者を
+    /// dryguard の穴のほうへ向けてしまう。
+    ReboundSpelling,
     /// 依存の宣言はあるが、指定子を読み取れなかった。
     UnreadableDeclaration,
 }
@@ -82,12 +93,15 @@ impl ImportSet {
     ///
     /// 依存の宣言が 1 つも書かれていなければ [`ImportsUnavailable::NoDeclarations`]。
     ///
+    /// `require` の綴りが読み込みを指すと言い切れなければ
+    /// [`ImportsUnavailable::ReboundSpelling`]。
+    ///
     /// **読み取れなかった宣言が 1 つでもあれば** [`ImportsUnavailable::UnreadableDeclaration`]。
     /// 欠けたまま集合を返すと、後段はその重なりを測れた値として読む。1 件落ちるだけで
     /// 重なりは過大にも過小にも動くので、**落ちたことが構造に出ないと区別できない**
     /// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
     pub fn from_tree(tree: &SyntaxTree<'_>, importer: &Path) -> Result<Self, ImportsUnavailable> {
-        let specifiers = specifiers_of(tree).ok_or(ImportsUnavailable::UnreadableDeclaration)?;
+        let specifiers = specifiers_of(tree)?;
         let paths: HashSet<ModulePath> = specifiers
             .iter()
             .map(|specifier| ModulePath::from_specifier(specifier, importer))
@@ -299,13 +313,15 @@ enum RequireSpelling {
 ///
 /// **読み取れない宣言が 1 つでもあれば `None` を返す。** 残りだけを返すと、
 /// 呼び出し側は欠けた集合を揃った集合として扱う。
-fn specifiers_of<'source>(tree: &SyntaxTree<'source>) -> Option<Vec<&'source str>> {
+fn specifiers_of<'source>(
+    tree: &SyntaxTree<'source>,
+) -> Result<Vec<&'source str>, ImportsUnavailable> {
     // 綴りが何を指すかはファイル全体を見ないと決まらないので、木を歩く前に 1 回だけ決める。
     // **束縛され直しているかもしれないファイルは、呼び出しを見つけたかに関わらず
-    // 読み取れないとして返す。** 見つけられなかった読み込みがあるかもしれず、
+    // 測れないとして返す。** 見つけられなかった読み込みがあるかもしれず、
     // 「見つけた呼び出しの数」ではそれを言えない
     if require_spelling_of(tree) == RequireSpelling::Rebound {
-        return None;
+        return Err(ImportsUnavailable::ReboundSpelling);
     }
     let mut specifiers = Vec::new();
 
@@ -313,10 +329,12 @@ fn specifiers_of<'source>(tree: &SyntaxTree<'source>) -> Option<Vec<&'source str
         match specifier_of(tree, node) {
             SpecifierReading::NotADeclaration => {}
             SpecifierReading::Specifier(specifier) => specifiers.push(specifier),
-            SpecifierReading::Unreadable => return None,
+            SpecifierReading::Unreadable => {
+                return Err(ImportsUnavailable::UnreadableDeclaration);
+            }
         }
     }
-    Some(specifiers)
+    Ok(specifiers)
 }
 
 /// そのファイルで `require` の綴りが CommonJS の読み込みを指しているか。
@@ -1438,7 +1456,7 @@ const stock = registry.require("./stock");
                 &tree_of(real_import_and_a_call_on_an_object),
                 Path::new("src/utils/a.ts"),
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -1455,7 +1473,7 @@ const stock = module.require("./stock");
                 &tree_of(real_import_and_a_module_require),
                 Path::new("src/utils/a.ts"),
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -1494,7 +1512,7 @@ const handler = registry.require;
                 &tree_of(real_import_and_an_uncalled_member),
                 Path::new("src/utils/a.ts"),
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -1512,7 +1530,7 @@ load("./stock");
                 &tree_of(real_import_and_an_aliased_loader),
                 Path::new("src/utils/a.ts"),
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -1583,7 +1601,7 @@ const stock = require("./stock");
                 &tree_of(real_import_and_a_rebound_require),
                 Path::new("src/utils/a.ts"),
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -1651,6 +1669,40 @@ const stock = require.call(null, "./stock");
                 &tree_of(real_import_and_an_indirect_load),
                 Path::new("src/utils/a.ts"),
             ),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_binding_require_itself_says_the_spelling_is_rebound() {
+        // 宣言はすべて読み取れている。測れないのは**綴りが読み込みを指すと
+        // 言い切れない**からで、dryguard が読めなかったわけではない。
+        // 1 つにまとめると、利用者を dryguard の穴のほうへ向けてしまう
+        let real_import_and_a_local_require = r#"import { pad } from "./pad";
+function require(name: string): number {
+  return name.length;
+}
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(real_import_and_a_local_require),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_with_an_unreadable_specifier_says_the_declaration_is_unreadable() {
+        // 対照。こちらは**書いてあるのに読めていない**ので dryguard 側の穴。
+        // 綴りの曖昧さと同じ理由にすると、直す先が分からなくなる
+        let unreadable_specifier = r#"import { pad } from "./pad";
+const loaded = require(`./${name}`);
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(unreadable_specifier), Path::new("src/utils/a.ts")),
             Err(ImportsUnavailable::UnreadableDeclaration)
         );
     }
@@ -1670,7 +1722,7 @@ const stock = (flag ? require : other)("./stock");
                 &tree_of(real_import_and_an_indirect_require),
                 Path::new("src/utils/a.ts"),
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -1810,7 +1862,7 @@ const entry = require(".\\stock");
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(escaped_binding), Path::new("src/utils/a.ts")),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -1823,7 +1875,7 @@ const entry = require(".\\stock");
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(escaped_call), Path::new("src/utils/a.ts")),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -1836,7 +1888,7 @@ const entry = require(".\\stock");
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(escaped_member_call), Path::new("src/utils/a.ts")),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -1944,7 +1996,7 @@ const held = (class require {}) as unknown;
                 &tree_of(class_named_require_in_an_assertion),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -1960,7 +2012,7 @@ new module["re" + "quire"]("./stock");
                 &tree_of(computed_key_constructed),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -1974,7 +2026,7 @@ const held = new require("./stock");
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(require_constructed), Path::new("src/utils/a.ts")),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2004,7 +2056,7 @@ const options = { [require]: false };
                 &tree_of(require_named_in_a_computed_key),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2123,7 +2175,7 @@ export function require(value: string) {}
                 &tree_of(require_declared_and_implemented),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2159,7 +2211,7 @@ const extend = require["extensions"];
                 &tree_of(loading_member_read_by_a_computed_key),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2191,7 +2243,7 @@ load("./stock");
                 &tree_of(escaped_computed_key_held),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2264,7 +2316,7 @@ export const View = () => <Widget loader={require} />;
                 &tsx_tree_of(require_passed_as_a_jsx_value),
                 Path::new("src/utils/a.tsx"),
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2282,7 +2334,7 @@ export const View = () => <Widget label="require" />;
                 &tsx_tree_of(require_as_a_jsx_attribute_value),
                 Path::new("src/utils/a.tsx"),
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2316,7 +2368,7 @@ class Worker extends require {}
                 &tree_of(require_in_an_extends_clause),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2374,7 +2426,7 @@ const captured = require as NodeRequire;
                 &tree_of(require_captured_through_an_assertion),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2433,7 +2485,7 @@ const { require: load } = module;
                 &tree_of(require_destructured_out_of_an_object),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2449,7 +2501,7 @@ function wire({ require: load }) {}
                 &tree_of(require_destructured_in_a_parameter),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2465,7 +2517,7 @@ const { "require": load } = registry;
                 &tree_of(quoted_require_destructured),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2481,7 +2533,7 @@ const { ["require"]: load } = registry;
                 &tree_of(computed_require_destructured),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2498,7 +2550,7 @@ module["re" + "quire"]("./stock");
                 &tree_of(require_spelled_by_a_computed_key),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2543,7 +2595,7 @@ load("require");
                 &tree_of(require_passed_to_another_call),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2559,7 +2611,7 @@ load("require");
                 &tree_of(require_spelled_in_a_later_argument),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2595,7 +2647,7 @@ const options = { mode: "require" };
                 &tree_of(require_as_an_object_value),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2612,7 +2664,7 @@ const carrier = { require };
                 &tree_of(require_shorthanded_into_an_object),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2716,7 +2768,7 @@ export { require as load };
                 &tree_of(local_require_exported),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2730,7 +2782,7 @@ export { require as load };
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(escaped_computed_key), Path::new("src/utils/a.ts")),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2742,7 +2794,7 @@ export { require as load };
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(wrapped_escaped_key), Path::new("src/utils/a.ts")),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2753,7 +2805,7 @@ export { require as load };
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(asserted_escaped_key), Path::new("src/utils/a.ts")),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2768,7 +2820,7 @@ export { require as load };
                 &tree_of(angle_asserted_escaped_key),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2783,7 +2835,7 @@ export { require as load };
                 &tree_of(escaped_computed_pattern_key),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2797,7 +2849,7 @@ export { require as load };
                 &tree_of(escaped_string_pattern_key),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2811,7 +2863,7 @@ export { require as load };
                 &tree_of(escaped_key_in_a_parameter),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2865,7 +2917,7 @@ const value = module[""];
                 &tree_of(escaped_key_without_a_substitution),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2880,7 +2932,7 @@ const value = module[""];
                 &tree_of(invoked_key_with_a_substitution),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -2939,7 +2991,7 @@ import { load as require } from "./loader";
                 &tree_of(import_aliased_to_require),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -3000,7 +3052,7 @@ import { require } from "./loader";
                 &tree_of(require_imported_as_a_value),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -3017,7 +3069,7 @@ import { type as require } from "./loader";
                 &tree_of(type_aliased_to_require),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -3064,7 +3116,7 @@ class require {
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(class_named_require), Path::new("src/utils/a.ts")),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -3100,7 +3152,7 @@ export function load(require: (path: string) => string): string {
                 &tree_of(require_taken_as_a_parameter),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -3162,7 +3214,7 @@ export function load(require: (path: string) => string): string {
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(sequenced_escaped_key), Path::new("src/utils/a.ts")),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -3194,7 +3246,7 @@ class Loader { require(path: string): string { return path; } }
                 &tree_of(require_defined_on_a_class),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
@@ -3213,7 +3265,7 @@ export import dep = require("./dep");
                 &tree_of(exported_import_equals),
                 Path::new("src/utils/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
