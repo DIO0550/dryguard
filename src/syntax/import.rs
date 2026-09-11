@@ -203,14 +203,22 @@ const WRAPPERS_HOLDING_THE_VALUE_FIRST: [&str; 6] = [
 
 /// 値を変えない包みのうち、**中の式が最後の子**にあるもの。
 ///
-/// 型を先に書く言い当て（`<NodeRequire>require`。最初の子は型）と、順に評価して
-/// 最後を返す並び（`(0, require)`）。
+/// 型を先に書く言い当て（`<NodeRequire>require`。最初の子は型）、順に評価して
+/// 最後を返す並び（`(0, require)`）、代入（`(key = "./dep")` は右辺の値を返す）。
+///
+/// **代入を足す一方で、複合代入（`k += "re"`）は足さない。** 返るのは計算した結果で、
+/// **書かれた綴りではない**。このモジュールが読めるのは書かれた綴りだけなので、
+/// 剥がしても読み取れない側へ落ちるだけだが、**剥がせば読める**という誤解を残さない。
 ///
 /// **上下どちらの走査も同じ表を引く。** 上へ辿る側だけを広げると、`specifier_of` が
 /// 採れない綴りを「呼ばれる側だから無害」と答えることになり、読み込みを落とす
 /// (rules/coding.md「同じ一覧を、安全な倒れ方が違う 2 箇所で使い回さない」の裏返しで、
 /// **ここは 2 つの走査が同じ答えを返さないと壊れる**)。
-const WRAPPERS_HOLDING_THE_VALUE_LAST: [&str; 2] = ["type_assertion", "sequence_expression"];
+const WRAPPERS_HOLDING_THE_VALUE_LAST: [&str; 3] = [
+    "type_assertion",
+    "sequence_expression",
+    "assignment_expression",
+];
 const IDENTIFIER_KIND: &str = "identifier";
 const DYNAMIC_IMPORT_KIND: &str = "import";
 const STRING_FRAGMENT_KIND: &str = "string_fragment";
@@ -2301,6 +2309,90 @@ const dep = require(name);
             Err(ImportsUnavailable::UnreadableDeclaration {
                 line: LineNumber::from_index(1)
             })
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_require_given_an_assigned_specifier_reaches_the_same_module() {
+        // 代入式は**右辺の値をそのまま返す**。包みとして数えないと、読み取れる指定子を
+        // 読み取れない側へ落とす
+        let assigned_specifier = r#"let chosen;
+const dep = require((chosen = "../utils/pad"));
+"#;
+
+        assert_eq!(
+            import_set(assigned_specifier, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_an_assigned_require_reaches_the_same_module() {
+        // 呼ばれる側が代入式でも、値は `require` そのもの
+        let assigned_require = r#"let loader;
+const dep = (loader = require)("../utils/pad");
+"#;
+
+        assert_eq!(
+            import_set(assigned_require, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_invoking_an_assigned_index_reaches_the_same_module() {
+        // 代入式を剥がせば数の添字が見えるので、`require` を選べないと分かる
+        let assigned_index = r#"import { pad } from "./pad";
+let at = 0;
+handlers[(at = 1)]();
+"#;
+
+        assert_eq!(
+            import_set(assigned_index, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_calling_a_reassigned_require_cannot_be_created() {
+        // 対照。呼ばれるのは**右辺**（`helper`）で、`require` は束縛し直されただけ。
+        // 左辺を値と取り違えると、`helper` に渡した綴りを依存として数えてしまう
+        let called_after_reassigning = r#"import { pad } from "./pad";
+(require = helper)("./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(called_after_reassigning),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_assigning_to_require_cannot_be_created() {
+        // 対照。代入の**左辺**は値にならないので剥がさない。剥がすと
+        // 束縛し直しを見落とす
+        let assigned_to_require = r#"import { pad } from "./pad";
+require = helper;
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(assigned_to_require), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_assigning_an_escaped_key_cannot_be_created() {
+        // 代入を剥がさないと、綴りを読み取れない添字が「欄を読む名前」に見えず、
+        // 呼ばれてもいない持ち出しが素通りする
+        let assigned_escaped_key = "import { pad } from \"./pad\";\nlet key;\nconst load = module[(key = \"requ\\u0069re\")];\nload(\"./stock\");\n";
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(assigned_escaped_key), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
