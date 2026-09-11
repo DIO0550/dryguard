@@ -361,11 +361,11 @@ fn specifiers_of<'source>(
     tree: &SyntaxTree<'source>,
 ) -> Result<Vec<&'source str>, ImportsUnavailable> {
     let mut specifiers = Vec::new();
+    let mut unreadable_require_call = None;
 
-    // **宣言を先に見る。** 読み取れない宣言は綴りの曖昧さより先に出す
-    // （ファイルをまたぐときの優先順と揃える。`pipeline::import_overlap_of`）。
-    // 動的 `import` や `import` 文は `require` の綴りに依存しないので、
+    // **綴りに依存しない宣言を先に見る。** 動的 `import` や `import` 文はキーワードなので、
     // 綴りが曖昧なファイルでも**読み取れないことは確かに言える**
+    // （ファイルをまたぐときの優先順と揃える。`pipeline::import_overlap_of`）
     for node in tree.named_descendants() {
         match specifier_of(tree, node) {
             SpecifierReading::NotADeclaration => {}
@@ -375,6 +375,10 @@ fn specifiers_of<'source>(
                     line: LineNumber::from_index(node.start_position().row),
                 });
             }
+            SpecifierReading::UnreadableRequireCall => {
+                unreadable_require_call
+                    .get_or_insert(LineNumber::from_index(node.start_position().row));
+            }
         }
     }
     // 綴りが何を指すかはファイル全体を見ないと決まらないので、集めたあとに 1 回だけ決める。
@@ -383,6 +387,12 @@ fn specifiers_of<'source>(
     // 「見つけた呼び出しの数」ではそれを言えない
     if require_spelling_of(tree) == RequireSpelling::Rebound {
         return Err(ImportsUnavailable::ReboundSpelling);
+    }
+    // **綴りが読み込みを指すと分かってから、`require` の呼び出しの読み取れなさを出す。**
+    // 先に出すと、束縛され直したファイルのローカル関数の呼び出しを
+    // 「読み取れなかった宣言」と呼ぶことになる
+    if let Some(line) = unreadable_require_call {
+        return Err(ImportsUnavailable::UnreadableDeclaration { line });
     }
     Ok(specifiers)
 }
@@ -1093,17 +1103,29 @@ enum SpecifierReading<'source> {
     NotADeclaration,
     /// 読み取れた指定子。
     Specifier(&'source str),
-    /// 依存を宣言しているが、指定子を読み取れなかった。
+    /// 依存を宣言しているが、指定子を読み取れなかった。**`require` の綴りに依存しない形**
+    /// （`import` 文・`export ... from`・動的 `import`・import-equals）。
     ///
     /// **落とさずにここへ出す。** 黙って落とすと、同じファイルの他の宣言だけで
     /// 重なりが測れてしまう (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
     Unreadable,
+    /// `require` の呼び出しに見えるが、指定子を読み取れなかった。
+    ///
+    /// **[`Unreadable`] と分けてある。** 綴りが束縛され直しているファイルでは、この呼び出しは
+    /// **依存の宣言ですらない**（利用者のローカル関数）。まとめて「読み取れなかった宣言がある」と
+    /// 答えると、**確かめていないことを確かめた答えとして出す**ことになり、`--explain` が
+    /// 利用者を dryguard の穴へ向かせる (rules/architecture.md「理由は落とさない」)。
+    ///
+    /// [`Unreadable`]: SpecifierReading::Unreadable
+    UnreadableRequireCall,
 }
 
 /// そのノードが宣言している依存先の指定子。
 ///
-/// **`require` の綴りが束縛され直しているファイルはここへ来ない**
-/// （[`specifiers_of`] が先に読み取れないとして返す）。
+/// **綴りが束縛され直しているファイルもここへ来る。** 何が束縛され直しているかは
+/// ファイル全体を見ないと決まらないので、[`specifiers_of`] が集めたあとに 1 回だけ決める。
+/// `require` の呼び出しから読み取れなかったことは、そのぶん
+/// [`SpecifierReading::UnreadableRequireCall`] として別に返す。
 fn specifier_of<'source>(tree: &SyntaxTree<'source>, node: Node<'_>) -> SpecifierReading<'source> {
     if DEPENDENCY_STATEMENT_KINDS.contains(&node.kind()) {
         let Some(source) = node.child_by_field_name("source") else {
@@ -1118,7 +1140,10 @@ fn specifier_of<'source>(tree: &SyntaxTree<'source>, node: Node<'_>) -> Specifie
         return reading_of_argument(tree, node);
     }
     if calls_require(tree, node) {
-        return reading_of_argument(tree, node);
+        return match reading_of_argument(tree, node) {
+            SpecifierReading::Unreadable => SpecifierReading::UnreadableRequireCall,
+            reading => reading,
+        };
     }
     SpecifierReading::NotADeclaration
 }
@@ -2201,6 +2226,81 @@ const invoke = module["re" + "quire"].bind(null).call;
         assert_eq!(
             import_set(call_retained, "src/utils/formatDate.ts"),
             import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_shadowed_require_given_a_name_blames_the_spelling() {
+        // 綴りが束縛され直しているなら、その呼び出しは依存の宣言ですらない。
+        // 「読み取れなかった宣言がある」と答えると、利用者を dryguard の穴へ向かせる
+        let shadowed_and_dynamic = r#"import { pad } from "./pad";
+function require(path: string): string {
+  return path;
+}
+const dep = require(name);
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(shadowed_and_dynamic), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_shadowed_require_given_a_template_blames_the_spelling() {
+        let shadowed_and_templated = r#"import { pad } from "./pad";
+function require(path: string): string {
+  return path;
+}
+const dep = require(`./${name}`);
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(shadowed_and_templated),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_shadowed_file_with_an_unreadable_import_blames_the_line() {
+        // 対照。動的 `import` はキーワードで、`require` の綴りに依存しない。
+        // 綴りが曖昧でも**読み取れない宣言があることは確かに言える**
+        let shadowed_and_keyworded = r#"import { pad } from "./pad";
+function require(path: string): string {
+  return path;
+}
+const dep = import(`./${name}`);
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(shadowed_and_keyworded),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(4)
+            })
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_an_unshadowed_require_given_a_name_blames_the_line() {
+        // 対照。束縛し直していなければ、読み取れない指定子は本当に宣言のもの
+        let unshadowed_and_dynamic = r#"import { pad } from "./pad";
+const dep = require(name);
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(unshadowed_and_dynamic),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(1)
+            })
         );
     }
 
