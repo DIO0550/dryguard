@@ -145,6 +145,10 @@ const JSX_ELEMENT_KINDS: [&str; 3] = [
 ];
 const NEW_EXPRESSION_KIND: &str = "new_expression";
 const COMPUTED_PROPERTY_NAME_KIND: &str = "computed_property_name";
+/// 分解して受ける側の欄。書く側（`pair`）と違い、**欄を読む**。
+const PAIR_PATTERN_KIND: &str = "pair_pattern";
+/// 型を先に書く言い当て（`<string>"require"`）。値を変えないが、**中の式が最初の子ではない**。
+const TYPE_ASSERTION_KIND: &str = "type_assertion";
 /// ラベルの名前。文に付ける名前で、値の名前とは別の名前空間にいる。
 const STATEMENT_IDENTIFIER_KIND: &str = "statement_identifier";
 const ESCAPE_SEQUENCE_KIND: &str = "escape_sequence";
@@ -426,28 +430,82 @@ fn first_string_child_of(node: Node<'_>) -> Option<Node<'_>> {
         .find(|child| STRING_LITERAL_KINDS.contains(&child.kind()))
 }
 
-/// そのノードが、綴りを読み取れない添字か。
+/// そのノードが、綴りを読み取れない欄の名前か。
 ///
-/// **添字は名前と同じ働きをする。** `module["require"]("./dep")` は
-/// `module.require("./dep")` と同じ読み込みで、綴りが読めれば
+/// **欄を読む名前は、綴って書いても添字で書いても同じ働きをする。**
+/// `module["require"]("./dep")` も `const { require: load } = module` も
+/// `module.require` の読み出しで、綴りが読めれば
 /// [`is_require_spelled_outside_a_call`] の一致が捕まえる。読めないと
 /// **`require` かどうかを決められない**。
 ///
 /// [`KINDS_THAT_CANNOT_SPELL_A_NAME`] が `escape_sequence` を挙げているのは
-/// 「文字列の中の逆立ちは名前ではない」という理由だが、**添字の文字列だけは名前になる**。
+/// 「文字列の中の逆立ちは名前ではない」という理由だが、**欄を読む文字列だけは名前になる**。
 fn is_unreadable_computed_key(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     if !STRING_LITERAL_KINDS.contains(&node.kind()) {
         return false;
     }
-    // 包みは値を変えないので、添字の位置は包みの外で見る（`module[("require")]`）
-    let positioned = outside_wrappers(node);
+
+    reads_a_field_by_this_string(node)
+        && unquoted_text_of(tree, node).is_none()
+        && spells_an_escape(node)
+}
+
+/// その文字列リテラルが、**欄を読む**位置に置かれているか。
+///
+/// 2 つある。添字（`module["require"]`）と、分解して受ける側の欄の名前
+/// （`const { ["require"]: load } = module`）。どちらも欄を読み出す。
+///
+/// **書く側（`pair`）は含めない。** `{ ["require"]: false }` は欄を作るだけで、
+/// 読み出しにならない（`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」の
+/// 適用で、ここは広げると読み取れる普通のコードまで測れなくなる側へ倒れる）。
+fn reads_a_field_by_this_string(node: Node<'_>) -> bool {
+    let positioned = outside_value_preserving_wrappers(node);
     let Some(parent) = positioned.parent() else {
         return false;
     };
-    let is_the_index = parent.kind() == SUBSCRIPT_EXPRESSION_KIND
-        && parent.child_by_field_name("index") == Some(positioned);
+    if parent.kind() == SUBSCRIPT_EXPRESSION_KIND
+        && parent.child_by_field_name("index") == Some(positioned)
+    {
+        return true;
+    }
 
-    is_the_index && unquoted_text_of(tree, node).is_none() && spells_an_escape(node)
+    let written = outside_a_computed_key(positioned);
+    let Some(owner) = written.parent() else {
+        return false;
+    };
+
+    owner.kind() == PAIR_PATTERN_KIND && owner.child_by_field_name("key") == Some(written)
+}
+
+/// 計算された欄を包むものの外まで戻る。
+fn outside_a_computed_key(node: Node<'_>) -> Node<'_> {
+    node.parent()
+        .filter(|parent| parent.kind() == COMPUTED_PROPERTY_NAME_KIND)
+        .unwrap_or(node)
+}
+
+/// 値を変えない包みの外まで遡ったノード。**上へ辿るときだけ**使う。
+///
+/// [`outside_wrappers`] が使う一覧に、型を先に書く言い当て（`<string>"require"`）を足したもの。
+/// あちらの一覧は [`inside_wrappers`] が下へ剥がすのにも使うので、**中の式が最初の子**である
+/// ものしか入れられないが、この形は最初の子が型なので入れられない。
+///
+/// **上へ辿るだけなら、どの子が中の式かを知らなくてよい。** 位置を見るだけの走査に
+/// 一覧を分けているのは、`rules/coding.md`「同じ一覧を、安全な倒れ方が違う 2 箇所で
+/// 使い回さない」の適用（下へ剥がす側は漏れが測れない側へ落ちるが、ここは漏れが
+/// **測れたことにしてしまう**側へ落ちる）。
+fn outside_value_preserving_wrappers(node: Node<'_>) -> Node<'_> {
+    let mut current = node;
+
+    while let Some(parent) = current.parent() {
+        let wraps_without_changing_the_value = TRANSPARENT_WRAPPER_KINDS.contains(&parent.kind())
+            || parent.kind() == TYPE_ASSERTION_KIND;
+        if !wraps_without_changing_the_value {
+            break;
+        }
+        current = parent;
+    }
+    current
 }
 
 /// その文字列リテラルがエスケープを含むか。
@@ -2681,6 +2739,77 @@ export { require as load };
         assert_eq!(
             ImportSet::from_tree(&tree_of(asserted_escaped_key), Path::new("src/utils/a.ts")),
             Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_asserting_an_escaped_computed_key_with_angles_cannot_be_created() {
+        // 型を先に書く言い当ても値を変えない包み。中の式が最初の子ではないので
+        // 剥がす側の一覧には入れられないが、**位置を見るだけの上向きの走査には要らない**
+        let angle_asserted_escaped_key = "import { pad } from \"./pad\";\nconst load = module[<string>\"requ\\u0069re\"];\nload(\"./stock\");\n";
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(angle_asserted_escaped_key),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_destructuring_an_escaped_computed_key_cannot_be_created() {
+        // 分解して受ける側は欄を**読む**。綴りを読み取れないと、それが `require` か
+        // どうかを決められないのは添字と同じ
+        let escaped_computed_pattern_key = "import { pad } from \"./pad\";\nconst { [\"requ\\u0069re\"]: load } = module;\nload(\"./stock\");\n";
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(escaped_computed_pattern_key),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_destructuring_an_escaped_string_key_cannot_be_created() {
+        // 計算された欄を挟まない綴りの欄も、読む側であることは変わらない
+        let escaped_string_pattern_key = "import { pad } from \"./pad\";\nconst { \"requ\\u0069re\": load } = module;\nload(\"./stock\");\n";
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(escaped_string_pattern_key),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_destructuring_an_escaped_key_in_a_parameter_cannot_be_created() {
+        // 引数で分解しても読む側。祖先の鎖だけが違う
+        let escaped_key_in_a_parameter = "import { pad } from \"./pad\";\nfunction wire({ [\"requ\\u0069re\"]: load }) { load(\"./stock\"); }\n";
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(escaped_key_in_a_parameter),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_naming_an_escaped_computed_object_key_reaches_the_same_module() {
+        // 対照。**書く側**は欄を作るだけで、綴りが読めるかに関わらず読み込みを起こさない。
+        // 読む側と同じに扱うと、`{ ["a\u0062c"]: 1 }` を書いただけのファイルが落ちる
+        let escaped_computed_literal_key =
+            "import { pad } from \"./pad\";\nconst options = { [\"requ\\u0069re\"]: false };\n";
+
+        assert_eq!(
+            import_set(escaped_computed_literal_key, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
         );
     }
 
