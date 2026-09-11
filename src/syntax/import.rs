@@ -166,7 +166,6 @@ const STATEMENT_IDENTIFIER_KIND: &str = "statement_identifier";
 const ESCAPE_SEQUENCE_KIND: &str = "escape_sequence";
 /// テンプレートの置換（`` `title-${locale}` `` の `${locale}`）。綴りが**実行時に決まる**印。
 const TEMPLATE_SUBSTITUTION_KIND: &str = "template_substitution";
-const TYPE_IDENTIFIER_KIND: &str = "type_identifier";
 
 /// 型を言い当てる式。**型と値の欄を分けていない**ので、どちらの側かは
 /// ノードの種別（`type_identifier` か `identifier` か）で見分ける。
@@ -314,15 +313,12 @@ enum RequireSpelling {
 fn specifiers_of<'source>(
     tree: &SyntaxTree<'source>,
 ) -> Result<Vec<&'source str>, ImportsUnavailable> {
-    // 綴りが何を指すかはファイル全体を見ないと決まらないので、木を歩く前に 1 回だけ決める。
-    // **束縛され直しているかもしれないファイルは、呼び出しを見つけたかに関わらず
-    // 測れないとして返す。** 見つけられなかった読み込みがあるかもしれず、
-    // 「見つけた呼び出しの数」ではそれを言えない
-    if require_spelling_of(tree) == RequireSpelling::Rebound {
-        return Err(ImportsUnavailable::ReboundSpelling);
-    }
     let mut specifiers = Vec::new();
 
+    // **宣言を先に見る。** 読み取れない宣言は綴りの曖昧さより先に出す
+    // （ファイルをまたぐときの優先順と揃える。`pipeline::import_overlap_of`）。
+    // 動的 `import` や `import` 文は `require` の綴りに依存しないので、
+    // 綴りが曖昧なファイルでも**読み取れないことは確かに言える**
     for node in tree.named_descendants() {
         match specifier_of(tree, node) {
             SpecifierReading::NotADeclaration => {}
@@ -331,6 +327,13 @@ fn specifiers_of<'source>(
                 return Err(ImportsUnavailable::UnreadableDeclaration);
             }
         }
+    }
+    // 綴りが何を指すかはファイル全体を見ないと決まらないので、集めたあとに 1 回だけ決める。
+    // **束縛され直しているかもしれないファイルは、呼び出しを見つけたかに関わらず
+    // 測れないとして返す。** 見つけられなかった読み込みがあるかもしれず、
+    // 「見つけた呼び出しの数」ではそれを言えない
+    if require_spelling_of(tree) == RequireSpelling::Rebound {
+        return Err(ImportsUnavailable::ReboundSpelling);
     }
     Ok(specifiers)
 }
@@ -679,24 +682,22 @@ fn outside_a_jsx_namespace(node: Node<'_>) -> Node<'_> {
 /// `value as require` / `value satisfies require` の型の側は型空間にしかいない。
 ///
 /// **値の側は数える。** `require as NodeRequire` の `require` は読み込む関数そのもので、
-/// 捕まえて持ち出せる。木の上では型の側が `type_identifier`、値の側が `identifier` と
-/// **種別が違う**ので、種別で見分けられる（`as_expression` は型と値の欄を分けていない）。
+/// 捕まえて持ち出せる。
 ///
 /// `<require>value` はここへ来ない。型が `type_arguments` の下に置かれるので、
 /// [`TYPE_ONLY_KINDS`] が先に拾う。
 ///
-/// **言い当てる型の中を辿る。組み合わせの種別を挙げない。** 言い当てる型は 1 つの型名とは
-/// 限らず（`value as require | null` / `value satisfies require & Marker` / 条件型）、
-/// 挙げていく形だと**型の書き方を 1 つ見つけるたびに測れないファイルが増える**
-/// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+/// **言い当てる型の中を辿る。種別を挙げない。** 言い当てる型は 1 つの型名とは限らず
+/// （`value as require | null` / `value satisfies require & Marker` / 条件型 /
+/// リテラル型 `value as "require"`）、挙げていく形だと**型の書き方を 1 つ見つけるたびに
+/// 測れないファイルが増える** (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
 ///
 /// 辿った先が言い当てる式なら、**値になる子から来ていなければ型の側**
-/// （[`value_child_of`] が値の子を持っている）。値の側は種別が `identifier` なので
-/// 上の早期 return で先に落ちる。
+/// （[`value_child_of`] が値の子を持っている）。
+///
+/// **綴りの種別は見ない。** 言い当てる式の値の子の下に無い綴りは、その式の型の中にある。
+/// 種別で先に絞ると、リテラル型（葉が `string_fragment`）が型の側だと言えなくなる。
 fn is_the_type_side_of_an_assertion(node: Node<'_>) -> bool {
-    if node.kind() != TYPE_IDENTIFIER_KIND {
-        return false;
-    }
     let mut current = node;
 
     while let Some(parent) = current.parent() {
@@ -1762,6 +1763,66 @@ const handle = value as (require extends Loader ? string : number);
                 "src/utils/formatDate.ts"
             ),
             import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_with_both_causes_says_the_declaration_is_unreadable() {
+        // 綴りが曖昧でも、**動的 import は綴りに依存しない宣言**。読み取れないなら
+        // それは dryguard の穴で、綴りの曖昧さより先に出す（ファイルをまたぐときの
+        // 優先順と揃える）
+        let both_causes = r#"import { pad } from "./pad";
+function require(name: string): number {
+  return name.length;
+}
+const loaded = import(`./${name}`);
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(both_causes), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_asserting_a_literal_type_named_require_reaches_the_same_module() {
+        // 言い当てる型はリテラル型でも型空間。木の上では `literal_type` を 1 段挟むだけ
+        let require_as_a_literal_type = r#"import { pad } from "./pad";
+const handle = value as "require";
+"#;
+
+        assert_eq!(
+            import_set(require_as_a_literal_type, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_asserting_a_union_of_literal_types_reaches_the_same_module() {
+        // 組み合わせの中でも同じ
+        let require_in_a_literal_union = r#"import { pad } from "./pad";
+const handle = value satisfies "require" | "fs";
+"#;
+
+        assert_eq!(
+            import_set(require_in_a_literal_union, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_asserting_a_type_onto_a_require_string_cannot_be_created() {
+        // 対照。**値の側**の文字列は素の文字列リテラルで、28 巡目の判断どおり名前として数える
+        let require_string_on_the_value_side = r#"import { pad } from "./pad";
+const handle = "require" as string;
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(require_string_on_the_value_side),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
