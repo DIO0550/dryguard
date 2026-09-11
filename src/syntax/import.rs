@@ -135,6 +135,10 @@ const EXPORT_STATEMENT_KIND: &str = "export_statement";
 const PAIR_KIND: &str = "pair";
 const NAMESPACE_EXPORT_KIND: &str = "namespace_export";
 const JSX_ATTRIBUTE_KIND: &str = "jsx_attribute";
+const NEW_EXPRESSION_KIND: &str = "new_expression";
+const COMPUTED_PROPERTY_NAME_KIND: &str = "computed_property_name";
+/// ラベルの名前。文に付ける名前で、値の名前とは別の名前空間にいる。
+const STATEMENT_IDENTIFIER_KIND: &str = "statement_identifier";
 const TYPE_IDENTIFIER_KIND: &str = "type_identifier";
 
 /// 型を言い当てる式。**型と値の欄を分けていない**ので、どちらの側かは
@@ -221,7 +225,7 @@ const IMPORT_EXPORT_KINDS: [&str; 4] = [
 /// **ここに無い種別は「読み込みかもしれない」側へ落ちる。** 型の中の位置を挙げ
 /// そこねても、測れない側（安全側）へ落ちるだけで済む
 /// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-const TYPE_ONLY_KINDS: [&str; 16] = [
+const TYPE_ONLY_KINDS: [&str; 18] = [
     "function_type",
     "constructor_type",
     "call_signature",
@@ -238,6 +242,8 @@ const TYPE_ONLY_KINDS: [&str; 16] = [
     "type_parameters",
     "type_arguments",
     "implements_clause",
+    "array_type",
+    "nested_type_identifier",
 ];
 
 /// 読み込みを起こさないと分かっている、`require` の要素の名前。
@@ -348,7 +354,7 @@ fn is_require_spelled_outside_a_call(tree: &SyntaxTree<'_>, node: Node<'_>) -> b
 /// **Why not（添字を解いて綴りを組み直す）**: 定数畳み込みを持つことになる。
 /// `"re" + "quire"` を解けても、次は `[..."require"].join("")` が来る。
 fn is_an_invoked_unreadable_key(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
-    if node.kind() != SUBSCRIPT_EXPRESSION_KIND || !is_invoked(node) {
+    if node.kind() != SUBSCRIPT_EXPRESSION_KIND || !is_invoked_or_constructed(node) {
         return false;
     }
     let Some(index) = node.child_by_field_name("index") else {
@@ -482,6 +488,7 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     let is_an_object_key = is_an_object_key(node);
     let is_an_asserted_type = is_the_type_side_of_an_assertion(node);
     let is_a_jsx_attribute_name = is_a_jsx_attribute_name(node);
+    let is_a_statement_label = node.kind() == STATEMENT_IDENTIFIER_KIND;
 
     is_called
         || is_non_loading_member_object
@@ -491,6 +498,7 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
         || is_an_object_key
         || is_an_asserted_type
         || is_a_jsx_attribute_name
+        || is_a_statement_label
 }
 
 /// そのノードが、JSX の属性の**名前**か。
@@ -588,13 +596,31 @@ fn is_inside_a_re_export(specifier: Node<'_>) -> bool {
 /// **省略記法（`{ require }`）は数える。** そちらは `shorthand_property_identifier` と
 /// 別の種別で、**名前を参照する**（読み込む関数そのものをオブジェクトへ持ち出せる）。
 fn is_an_object_key(node: Node<'_>) -> bool {
-    // 引用符で囲んだ欄の名前は文字列を 1 つ挟む（`{ "require": false }`）
-    let written = outside_a_string_literal(node);
+    let written = outside_a_written_key(node);
     let Some(parent) = written.parent() else {
         return false;
     };
 
     parent.kind() == PAIR_KIND && parent.child_by_field_name("key") == Some(written)
+}
+
+/// 綴りで書かれた欄の名前を包むものの外まで戻る。
+///
+/// 引用符で囲んだ欄は文字列を 1 つ（`{ "require": false }`）、計算された欄は
+/// さらに 1 つ挟む（`{ ["require"]: false }`）。
+///
+/// **計算された欄を剥がすのは、中が文字列リテラルのときだけ。** 名前を書いた
+/// `{ [require]: 1 }` は**値の参照**なので、剥がすと読み込む関数の持ち出しを見落とす。
+fn outside_a_written_key(node: Node<'_>) -> Node<'_> {
+    let literal = outside_a_string_literal(node);
+    if literal == node {
+        return node;
+    }
+
+    literal
+        .parent()
+        .filter(|parent| parent.kind() == COMPUTED_PROPERTY_NAME_KIND)
+        .unwrap_or(literal)
 }
 
 /// 文字列リテラルの中の綴りなら、その文字列そのものまで戻る。
@@ -658,6 +684,25 @@ fn accesses_a_non_loading_member(tree: &SyntaxTree<'_>, member: Node<'_>) -> boo
 
     tree.text_of(name)
         .is_some_and(|text| NON_LOADING_REQUIRE_MEMBERS.contains(&text))
+}
+
+/// その式が、呼び出しか `new` の呼ばれる側になっているか。
+///
+/// **[`is_invoked`] と分けてある。** あちらは「[`specifier_of`] が採る呼び出しの形か」を
+/// 見ており、`new require("./dep")` を採らない以上そこへ `new` を足すと**依存が黙って落ちる**。
+/// こちらは「読み込みが起きうるか」を見るので、`new` も数える
+/// （`rules/coding.md`「同じ一覧を、安全な倒れ方が違う 2 箇所で使い回さない」）。
+fn is_invoked_or_constructed(node: Node<'_>) -> bool {
+    if is_invoked(node) {
+        return true;
+    }
+    let positioned = outside_wrappers(node);
+    let Some(parent) = positioned.parent() else {
+        return false;
+    };
+
+    parent.kind() == NEW_EXPRESSION_KIND
+        && parent.child_by_field_name("constructor") == Some(positioned)
 }
 
 /// その式が、呼び出しの呼ばれる側になっているか。包みは外へ辿る。
@@ -1619,6 +1664,118 @@ export const Path = () => <p>C:\users</p>;
                 IMPORTS_PAD_FROM_PARENT,
                 "src/report/dateHelper.ts"
             ))
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_asserting_a_wrapped_type_named_require_reaches_the_same_module() {
+        // 言い当ての型が包まれても型空間にいることは変わらない。直接の親だけを見ると
+        // `require[]` や `ns.require` で漏れる
+        let require_wrapped_in_an_assertion = r#"import { pad } from "./pad";
+
+type require = string;
+export const listed = value as require[];
+export const qualified = other as ns.require;
+"#;
+
+        assert_eq!(
+            import_set(require_wrapped_in_an_assertion, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_asserting_a_class_named_require_cannot_be_created() {
+        // 対照。クラス式の名前は `type_identifier` だが**実行時の束縛を作る**。
+        // 言い当ての下にあるからと型空間へ寄せると、持ち出しを見落とす
+        let class_named_require_in_an_assertion = r#"import { pad } from "./pad";
+const held = (class require {}) as unknown;
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(class_named_require_in_an_assertion),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_constructing_a_computed_key_cannot_be_created() {
+        // `new` でも読み込みは起きる。呼び出しの形だけを見ると、綴りを読めない添字が素通りする
+        let computed_key_constructed = r#"import { pad } from "./pad";
+new module["re" + "quire"]("./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(computed_key_constructed),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_constructing_require_cannot_be_created() {
+        // 対照。`new require("./x")` は `specifier_of` が採らないので、
+        // 呼ばれた側と同じに扱うと依存が黙って落ちる
+        let require_constructed = r#"import { pad } from "./pad";
+const held = new require("./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(require_constructed), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_computing_a_static_object_key_reaches_the_same_module() {
+        // 計算された欄でも、綴りが読める文字列なら欄の名前でしかない
+        let require_as_a_computed_object_key = r#"import { pad } from "./pad";
+const options = { ["require"]: false, retries: 2 };
+"#;
+
+        assert_eq!(
+            import_set(require_as_a_computed_object_key, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_computing_an_object_key_from_require_cannot_be_created() {
+        // 対照。計算された欄に**名前**を書くと、それは値の参照。
+        // 文字列かどうかを見ずに剥がすと、読み込む関数の持ち出しを見落とす
+        let require_named_in_a_computed_key = r#"import { pad } from "./pad";
+const options = { [require]: false };
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(require_named_in_a_computed_key),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_labelling_a_statement_require_reaches_the_same_module() {
+        // ラベルは名前だが**別の名前空間**にいる。値を束縛も参照もしない
+        let require_as_a_statement_label = r#"import { pad } from "./pad";
+
+export function scan() {
+  require: for (const row of rows) {
+    break require;
+  }
+}
+"#;
+
+        assert_eq!(
+            import_set(require_as_a_statement_label, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
         );
     }
 
