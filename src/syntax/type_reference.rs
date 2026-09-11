@@ -98,23 +98,29 @@ pub(super) fn type_references_of(nodes: &[Node<'_>], source: &str) -> Vec<TypeRe
     let mut references: Vec<TypeReference> = Vec::new();
 
     for node in nodes {
-        let declared = bound_type_names_of(*node, source);
+        // **束縛は、それを宣言した綴りの中だけに効かせる。** チャンクの型変数は包みまで
+        // 届かず、包みの型変数もチャンクまで届かないので、同じ綴りが両側にあると
+        // **外側の宣言を指している側まで落ちる**（落ちた型名は開かれず、別のファイルの
+        // 同じ綴りと重なる = 偽陽性）
+        for annotated in [annotated_nodes_of(*node), outer_annotated_nodes_of(*node)] {
+            let declared = bound_type_names_of(&annotated, source);
 
-        for annotated in annotated_nodes_of(*node) {
-            for identifier in type_identifiers_of(annotated) {
-                let Some(reference) = type_reference_of(identifier, source) else {
-                    continue;
-                };
-                if declared.contains(reference.name()) {
-                    continue;
+            for node in annotated {
+                for identifier in type_identifiers_of(node) {
+                    let Some(reference) = type_reference_of(identifier, source) else {
+                        continue;
+                    };
+                    if declared.contains(reference.name()) {
+                        continue;
+                    }
+                    if references
+                        .iter()
+                        .any(|kept| kept.name() == reference.name())
+                    {
+                        continue;
+                    }
+                    references.push(reference);
                 }
-                if references
-                    .iter()
-                    .any(|kept| kept.name() == reference.name())
-                {
-                    continue;
-                }
-                references.push(reference);
             }
         }
     }
@@ -122,15 +128,10 @@ pub(super) fn type_references_of(nodes: &[Node<'_>], source: &str) -> Vec<TypeRe
     references
 }
 
-/// 型注釈が書かれうるノード。
+/// そのノード自身のシグネチャに、型注釈が書かれうるノード。
 ///
-/// **hover が答える綴りに現れる型名だけを集める。** 自分の名前を持たないチャンクでは
-/// hover が代入先の名前を指す（`chunk` の `name_node_of`）ので、そこに書かれた注釈
-/// （`const aliased: Handler` の `Handler`）もシグネチャの一部になる。
-///
-/// **名前を探す側と同じ包みを抜ける**（[`unwrapped_parent_of`]）。片方だけが抜けると、
-/// `const f = (…) as (v: Input) => Input` の `Input` を集め損ねる。集め損ねた型名は
-/// 開かれずに比較へ残るので、**別のファイルの同じ綴りの型が単一化可能に出る**（偽陽性）。
+/// **ここが、そのノードの宣言した型変数が届く範囲**（[`bound_type_names_of`] が
+/// 見る相手）。外側に書かれた注釈は [`outer_annotated_nodes_of`] が別に返す。
 fn annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
     let mut annotated = Vec::new();
 
@@ -140,13 +141,25 @@ fn annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
         }
     }
 
-    // 自分の名前を持つチャンクでは、hover は関数自身の型を返す。代入先や包みに注釈が
-    // 付いていても（`const named: Formatter = function inner(…)`）綴りには現れない。
+    annotated
+}
+
+/// そのノードの外側に書かれていて、hover が答える綴りに現れる型注釈。
+///
+/// **自分の名前を持たないチャンクでは hover が代入先の名前を指す**（`chunk` の
+/// `name_node_of`）ので、包みが言い切った型（`as` / `satisfies` / `<T>value` /
+/// インスタンス化の型引数）と代入先の注釈（`const aliased: Handler` の `Handler`）も
+/// シグネチャの一部になる。自分の名前を持つチャンクでは hover が関数自身の型を返すので空。
+///
+/// **名前を探す側と同じ包みを抜ける**（[`unwrapped_parent_of`]）。片方だけが抜けると、
+/// `const f = (…) as (v: Input) => Input` の `Input` を集め損ねる。集め損ねた型名は
+/// 開かれずに比較へ残るので、**別のファイルの同じ綴りの型が単一化可能に出る**（偽陽性）。
+fn outer_annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
     if node.child_by_field_name(NAME_FIELD).is_some() {
-        return annotated;
+        return Vec::new();
     }
 
-    annotated.extend(wrapper_types_of(node));
+    let mut annotated = wrapper_types_of(node);
 
     let assigned =
         unwrapped_parent_of(node).and_then(|parent| parent.child_by_field_name(TYPE_FIELD));
@@ -257,7 +270,11 @@ fn asked_node_of(node: Node<'_>) -> Node<'_> {
     tail.unwrap_or(node)
 }
 
-/// そのシグネチャの中で束縛された型の名前。束縛が無ければ空。
+/// その注釈の中で束縛された型の名前。束縛が無ければ空。
+///
+/// `annotated` は 1 つの範囲に収まる注釈のノード（[`annotated_nodes_of`] か
+/// [`outer_annotated_nodes_of`] のどちらか片方）。**渡された注釈そのものから採る。**
+/// 別の範囲の注釈まで混ぜると、同じ綴りの束縛が**外側の宣言を指している側まで落とす**。
 ///
 /// 束縛は 3 通りある。型変数の宣言（`<T>`）・マップ型の束縛（`[K in "a"]`）・
 /// 条件型が捕まえる名前（`infer U`）。
@@ -278,10 +295,10 @@ fn asked_node_of(node: Node<'_>) -> Node<'_> {
 ///
 /// 制約に書かれた型名（`<T extends Amount>` の `Amount`、`[K in Keys]` の `Keys`）は
 /// 束縛された名前ではないので、集める側に残る。
-fn bound_type_names_of(node: Node<'_>, source: &str) -> BTreeSet<String> {
+fn bound_type_names_of(annotated: &[Node<'_>], source: &str) -> BTreeSet<String> {
     let mut bound = BTreeSet::new();
 
-    for annotated in annotated_nodes_of(node) {
+    for annotated in annotated.iter().copied() {
         for declarations in nodes_of_kind(annotated, TYPE_PARAMETERS_FIELD) {
             let mut cursor = declarations.walk();
             let declared: Vec<Node<'_>> = declarations.named_children(&mut cursor).collect();

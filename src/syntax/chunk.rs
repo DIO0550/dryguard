@@ -1565,6 +1565,42 @@ export function scale(a: unknown, rate?: unknown): unknown {
     }
 
     #[test]
+    fn test_chunk_type_references_keep_a_wrapper_type_spelled_like_a_type_variable_of_the_chunk() {
+        // 包みに書かれた `Shape` は外側の宣言を指す。チャンクが宣言した型変数の綴りと
+        // 重なっても、**包みはその型変数の届く範囲の外**なので落とせない
+        let colliding_spellings =
+            "export const made = (<Shape>(value: Shape): Shape => value)<Shape>;\n";
+
+        let chunk = chunk_at(colliding_spellings, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Shape"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_keep_a_type_of_the_chunk_spelled_like_a_type_variable_of_the_wrapper()
+     {
+        // 逆向き。チャンクに書かれた `Shape` は外側の宣言を指し、包みが宣言した
+        // 型変数はそこまで届かない
+        let colliding_spellings = "export const asserted = ((value: Shape): Shape => value) as <Shape>(v: Shape) => Shape;\n";
+
+        let chunk = chunk_at(colliding_spellings, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Shape"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_leave_out_a_type_variable_the_wrapper_declares() {
+        // 対照は上の 2 件。綴りが重なっていなければ、包みが宣言した型変数は
+        // その綴りの中でだけ意味を持つので数えない
+        let declared_in_the_wrapper =
+            "export const asserted = ((value: Text): Text => value) as <T>(v: T) => T;\n";
+
+        let chunk = chunk_at(declared_in_the_wrapper, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Text"]);
+    }
+
+    #[test]
     fn test_chunk_type_references_of_a_named_chunk_leave_out_the_type_written_in_the_wrapper() {
         // 対照は上の 4 件。自分の名前を持つので hover は関数自身の型を返し、
         // 包みに書かれた型は綴りに現れない
