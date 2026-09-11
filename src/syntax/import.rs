@@ -164,16 +164,20 @@ const STRING_FRAGMENT_KIND: &str = "string_fragment";
 /// コメント。引数の並びには現れるが、引数ではない。
 const COMMENT_KIND: &str = "comment";
 
-/// 逆立ちが**書かれていて当たり前**の葉の種別。
+/// **名前を書けない**葉の種別。
 ///
 /// 正規表現（`/\d+/`）・コメント・文字列の中のエスケープ・JSX の地の文（`C:\users`）。
-/// **どれも名前を書けない場所。** ここに無い葉に逆立ちがあれば、それは名前に書かれた
-/// エスケープ（`require`）で、**綴りでは比べられない**。
+/// どれも中身は綴りであって名前ではないので、**束縛も読み込みも作れない**。
 ///
-/// **一覧を空にすると、逆立ちを持つファイルはすべて測れない側へ落ちる**（安全側）。
-/// 足しそこねても存在しない依存を作らない
-/// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-const KINDS_THAT_SPELL_BACKSLASHES: [&str; 4] =
+/// 見る場所は 2 つ。[`is_escaped_name`] は「ここの逆立ちは名前ではない」として使い、
+/// [`is_require_spelled_outside_a_call`] は「ここの `require` は名前ではない」として使う。
+///
+/// **2 箇所とも、一覧が広すぎると同じ向きへ倒れる。** 名前の書ける葉を足してしまえば、
+/// 前者は名前のエスケープを、後者は本物の束縛を見逃す（どちらも偽陽性）。
+/// 逆に足しそこねたときは 2 箇所とも測れない側（安全側）へ落ちるので、
+/// **同じ一覧を共有してよい**（rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」。
+/// 同じ規約が禁じているのは、**安全な倒れ方が違う** 2 箇所での使い回し）。
+const KINDS_THAT_CANNOT_SPELL_A_NAME: [&str; 4] =
     [COMMENT_KIND, "regex_pattern", "escape_sequence", "jsx_text"];
 
 /// 指定子を書ける文字列リテラルの種別。
@@ -321,6 +325,9 @@ fn is_require_spelled_outside_a_call(tree: &SyntaxTree<'_>, node: Node<'_>) -> b
     if tree.text_of(node) != Some(REQUIRE_FUNCTION_NAME) {
         return false;
     }
+    if KINDS_THAT_CANNOT_SPELL_A_NAME.contains(&node.kind()) {
+        return false;
+    }
     if is_a_dependency_literal(tree, node) {
         return false;
     }
@@ -409,7 +416,7 @@ fn first_string_child_of(node: Node<'_>) -> Option<Node<'_>> {
 /// [`is_require_spelled_outside_a_call`] の一致が捕まえる。読めないと
 /// **`require` かどうかを決められない**。
 ///
-/// [`KINDS_THAT_SPELL_BACKSLASHES`] が `escape_sequence` を外しているのは
+/// [`KINDS_THAT_CANNOT_SPELL_A_NAME`] が `escape_sequence` を挙げているのは
 /// 「文字列の中の逆立ちは名前ではない」という理由だが、**添字の文字列だけは名前になる**。
 fn is_unreadable_computed_key(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     if !STRING_LITERAL_KINDS.contains(&node.kind()) {
@@ -435,7 +442,7 @@ fn is_escaped_name(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     if node.named_child_count() != 0 {
         return false;
     }
-    if KINDS_THAT_SPELL_BACKSLASHES.contains(&node.kind()) {
+    if KINDS_THAT_CANNOT_SPELL_A_NAME.contains(&node.kind()) {
         return false;
     }
     tree.text_of(node).is_some_and(|text| text.contains('\\'))
@@ -1612,6 +1619,40 @@ export const Path = () => <p>C:\users</p>;
                 IMPORTS_PAD_FROM_PARENT,
                 "src/report/dateHelper.ts"
             ))
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_with_require_in_jsx_text_reaches_the_same_module() {
+        // JSX の地の文は名前を書けない場所。画面に `require` と表示するだけで
+        // そのファイルの依存が測れなくなると、無関係な文言で判定が落ちる
+        let require_in_jsx_text = r#"import { pad } from "./pad";
+
+export const Help = () => <p>require</p>;
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tsx_tree_of(require_in_jsx_text),
+                Path::new("src/utils/formatDate.tsx"),
+            ),
+            Ok(import_set(
+                IMPORTS_PAD_FROM_PARENT,
+                "src/report/dateHelper.ts"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_matching_require_in_a_regex_reaches_the_same_module() {
+        // 正規表現の中身も名前を書けない場所。綴りが一致しても束縛も読み込みも作らない
+        let require_in_a_regex = r#"import { pad } from "./pad";
+const mentionsRequire = /require/;
+"#;
+
+        assert_eq!(
+            import_set(require_in_a_regex, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
         );
     }
 
