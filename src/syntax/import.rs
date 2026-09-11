@@ -181,7 +181,7 @@ const ASSERTION_KINDS: [&str; 2] = ["as_expression", "satisfies_expression"];
 /// **値が書かれている子が最初の子**にある包み。**綴りを見る前に剥がす。**
 ///
 /// 括弧、TypeScript の型だけの注記（`require as NodeRequire` / `require!` /
-/// `require satisfies NodeRequire`）、`await`。
+/// `require satisfies NodeRequire` / `require<T>`）、`await`。
 /// **値になる子の位置で 2 つに分かれる**（[`WRAPPERS_HOLDING_THE_VALUE_LAST`]）。
 ///
 /// **`await` だけは値をそのまま返すとは限らない**（Promise は解ける）。それでも
@@ -192,12 +192,13 @@ const ASSERTION_KINDS: [&str; 2] = ["as_expression", "satisfies_expression"];
 /// **ここから漏れた包みは [`RequireSpelling::Rebound`] へ落ちる。** 落ちた先は
 /// 「読み取れない」なので、**値を作らずに測れないと言う**だけで済む
 /// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-const WRAPPERS_HOLDING_THE_VALUE_FIRST: [&str; 5] = [
+const WRAPPERS_HOLDING_THE_VALUE_FIRST: [&str; 6] = [
     "parenthesized_expression",
     "as_expression",
     "satisfies_expression",
     "non_null_expression",
     "await_expression",
+    "instantiation_expression",
 ];
 
 /// 値を変えない包みのうち、**中の式が最後の子**にあるもの。
@@ -305,6 +306,17 @@ const TYPE_ONLY_KINDS: [&str; 17] = [
 /// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
 const NON_LOADING_REQUIRE_MEMBERS: [&str; 3] = ["resolve", "cache", "main"];
 
+/// 呼ばれる側を**その場で呼ぶ** `Function.prototype` の要素の名前。
+///
+/// **[`NON_LOADING_REQUIRE_MEMBERS`] と別の一覧にしてある。** あちらは
+/// 綴りが読める `require` の要素のうち**読み込まない**ものを外す許可リストで、
+/// こちらは綴りを読み取れない添字が**呼ばれている**ことを見つける拒否リスト。
+/// 漏れたときに倒れる向きが逆なので使い回さない
+/// （`rules/coding.md`「同じ一覧を、安全な倒れ方が違う 2 箇所で使い回さない」）。
+///
+/// `bind` は入れない（[`is_invoked_through_a_function_member`]）。
+const FUNCTION_MEMBERS_THAT_INVOKE: [&str; 2] = ["call", "apply"];
+
 /// そのファイルで `require` の綴りが何を指しているか。
 ///
 /// `require` は予約語ではないので、綴りだけでは CommonJS の読み込みだと言えない
@@ -409,10 +421,14 @@ fn is_require_spelled_outside_a_call(tree: &SyntaxTree<'_>, node: Node<'_>) -> b
 /// `const load = module[key]; load("./dep");` は漏れるが、漏れは
 /// [`RequireSpelling::Rebound`] ではなく**取りこぼし**になる。
 ///
+/// **`call` / `apply` 越しも呼ばれている**（[`is_invoked_through_a_function_member`]）。
+///
 /// **Why not（添字を解いて綴りを組み直す）**: 定数畳み込みを持つことになる。
 /// `"re" + "quire"` を解けても、次は `[..."require"].join("")` が来る。
 fn is_an_invoked_unreadable_key(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
-    if node.kind() != SUBSCRIPT_EXPRESSION_KIND || !is_invoked_or_constructed(node) {
+    let called_here =
+        is_invoked_or_constructed(node) || is_invoked_through_a_function_member(tree, node);
+    if node.kind() != SUBSCRIPT_EXPRESSION_KIND || !called_here {
         return false;
     }
     let Some(index) = node.child_by_field_name("index") else {
@@ -913,6 +929,51 @@ fn is_invoked_or_constructed(node: Node<'_>) -> bool {
 
     parent.kind() == NEW_EXPRESSION_KIND
         && parent.child_by_field_name("constructor") == Some(positioned)
+}
+
+/// その式が、`call` / `apply` を通してその場で呼ばれているか。
+///
+/// `module["re" + "quire"].call(null, "./dep")` は読み込みだが、添字の親は
+/// `member_expression` なので [`is_invoked`] では見つからない。
+///
+/// **`bind` は入れない。** その場では呼ばず値を返すだけなので、
+/// `const load = module[key].bind(null); load("./dep");` は「呼ばずに持ち出して
+/// 後で呼ぶ」形になり、18 巡目に**残すと決着した族**に当たる。
+///
+/// **要素の綴りは 2 通りある**（`.call` と `["call"]`）。同じことが起きるので
+/// 綴り方で分けない（`rules/naming.md`「`require` を `import` と別の語にしない」と同じ形）。
+///
+/// **ここから漏れた呼び方**（`Reflect.apply(module[k], …)` など）**も同じ族。**
+/// 呼ぶ相手を別の関数へ渡す形は、追うのにデータフロー解析が要る。
+fn is_invoked_through_a_function_member(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
+    let positioned = outside_wrappers(node);
+    let Some(access) = positioned.parent() else {
+        return false;
+    };
+    if access.child_by_field_name("object") != Some(positioned) {
+        return false;
+    }
+    let Some(member) = function_member_read_by(tree, access) else {
+        return false;
+    };
+
+    FUNCTION_MEMBERS_THAT_INVOKE.contains(&member) && is_invoked(access)
+}
+
+/// その要素アクセスが読んでいる要素の名前。読み取れなければ `None`。
+///
+/// 綴りで書く形（`.call`）と添字で書く形（`["call"]`）の両方を受ける。
+fn function_member_read_by<'source>(
+    tree: &SyntaxTree<'source>,
+    access: Node<'_>,
+) -> Option<&'source str> {
+    match access.kind() {
+        MEMBER_EXPRESSION_KIND => tree.text_of(access.child_by_field_name("property")?),
+        SUBSCRIPT_EXPRESSION_KIND => {
+            unquoted_text_of(tree, inside_wrappers(access.child_by_field_name("index")?))
+        }
+        _ => None,
+    }
 }
 
 /// その式が、呼び出しの呼ばれる側になっているか。包みは外へ辿る。
@@ -1869,6 +1930,110 @@ const handle = "require" as string;
                 Path::new("src/utils/a.ts")
             ),
             Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_instantiating_an_unreadable_computed_key_cannot_be_created() {
+        // 型引数だけを与える式は実行時に消えるが、包みとして数えないと
+        // 呼ばれている添字が「呼ばれていない」に見える
+        let instantiated_key = r#"import { pad } from "./pad";
+const load = (module["re" + "quire"]<unknown>)("./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(instantiated_key), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_an_instantiated_require_reaches_the_same_module() {
+        // 呼ばれる側が型引数を伴っても、値は `require` そのもの
+        let instantiated_require = r#"const load = (require<unknown>)("../utils/pad");
+"#;
+
+        assert_eq!(
+            import_set(instantiated_require, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_instantiating_a_readable_computed_key_reaches_the_same_module() {
+        // 対照。読み取れる添字は型引数が付いても落とさない
+        let readable_key = r#"import { pad } from "./pad";
+const title = (config["title"]<string>)();
+"#;
+
+        assert_eq!(
+            import_set(readable_key, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_calling_an_unreadable_computed_key_cannot_be_created() {
+        // `call` は呼ばれる側を**その場で呼ぶ**。直に呼ぶのと同じ読み込みが起きる
+        let called_through_call = r#"import { pad } from "./pad";
+module["re" + "quire"].call(null, "./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(called_through_call), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_applying_an_unreadable_computed_key_cannot_be_created() {
+        let called_through_apply = r#"import { pad } from "./pad";
+module["re" + "quire"].apply(null, ["./stock"]);
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(called_through_apply), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_reaching_call_by_an_index_cannot_be_created() {
+        // 同じ `call` を添字で書いた形。綴り方が違うだけで起きることは同じ
+        let call_by_index = r#"import { pad } from "./pad";
+module["re" + "quire"]["call"](null, "./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(call_by_index), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_binding_an_unreadable_computed_key_reaches_the_same_module() {
+        // 対照。`bind` はその場で呼ばず、値を持ち出すだけ。18 巡目に
+        // 「呼ばずに持ち出す形は残す」と決着した族に当たる
+        let bound_key = r#"import { pad } from "./pad";
+const load = module["re" + "quire"].bind(null);
+"#;
+
+        assert_eq!(
+            import_set(bound_key, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_calling_a_method_on_a_computed_key_reaches_the_same_module() {
+        // 対照。呼ばれているのは添字が返した値の**要素**であって、値そのものではない
+        let method_on_key = r#"import { pad } from "./pad";
+const shown = items[index].map((row) => row);
+"#;
+
+        assert_eq!(
+            import_set(method_on_key, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
         );
     }
 
