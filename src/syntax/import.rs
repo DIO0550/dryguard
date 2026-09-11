@@ -152,6 +152,8 @@ const TYPE_ASSERTION_KIND: &str = "type_assertion";
 /// ラベルの名前。文に付ける名前で、値の名前とは別の名前空間にいる。
 const STATEMENT_IDENTIFIER_KIND: &str = "statement_identifier";
 const ESCAPE_SEQUENCE_KIND: &str = "escape_sequence";
+/// テンプレートの置換（`` `title-${locale}` `` の `${locale}`）。綴りが**実行時に決まる**印。
+const TEMPLATE_SUBSTITUTION_KIND: &str = "template_substitution";
 const TYPE_IDENTIFIER_KIND: &str = "type_identifier";
 
 /// 型を言い当てる式。**型と値の欄を分けていない**ので、どちらの側かは
@@ -447,7 +449,7 @@ fn is_unreadable_computed_key(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
 
     reads_a_field_by_this_string(node)
         && unquoted_text_of(tree, node).is_none()
-        && spells_an_escape(node)
+        && spells_a_static_name(node)
 }
 
 /// その文字列リテラルが、**欄を読む**位置に置かれているか。
@@ -508,18 +510,29 @@ fn outside_value_preserving_wrappers(node: Node<'_>) -> Node<'_> {
     current
 }
 
-/// その文字列リテラルがエスケープを含むか。
+/// その文字列リテラルの綴りが、**書いた時点で決まっている**か。
 ///
-/// **綴りが静的に決まっているかの分かれ目。** エスケープは書いた時点で綴りが決まって
+/// **呼ばれているかを見る／見ないの分かれ目。** エスケープは書いた時点で綴りが決まって
 /// いるので、呼ばれる前に持ち出されても `require` でないとは言えない。
 /// 置換（`` `title-${locale}` ``）や空は**実行時に決まる**ので、`config[key]` と同じく
 /// 呼ばれているときだけ見る（[`is_an_invoked_unreadable_key`]）。
-fn spells_an_escape(literal: Node<'_>) -> bool {
+///
+/// **置換が 1 つでもあれば、エスケープが混ざっていても実行時に決まる**
+/// （`` config[`titlei-${locale}`] ``）。エスケープの有無だけで決めると、
+/// 呼ばれてもいない普通の動的な読み出しまで測れなくなる。
+fn spells_a_static_name(literal: Node<'_>) -> bool {
     let mut cursor = literal.walk();
+    let mut has_an_escape = false;
 
-    literal
-        .named_children(&mut cursor)
-        .any(|child| child.kind() == ESCAPE_SEQUENCE_KIND)
+    for child in literal.named_children(&mut cursor) {
+        if child.kind() == TEMPLATE_SUBSTITUTION_KIND {
+            return false;
+        }
+        if child.kind() == ESCAPE_SEQUENCE_KIND {
+            has_an_escape = true;
+        }
+    }
+    has_an_escape
 }
 
 /// そのノードが、エスケープを含む名前か。
@@ -2810,6 +2823,62 @@ export { require as load };
         assert_eq!(
             import_set(escaped_computed_literal_key, "src/utils/formatDate.ts"),
             import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_substituting_into_an_escaped_key_reaches_the_same_module() {
+        // 置換が 1 つでもあれば、綴りは**実行時に決まる**。エスケープが混ざっていても
+        // 書いた時点では決まらないので、`config[key]` と同じく呼ばれているときだけ見る
+        let escaped_key_with_a_substitution =
+            "import { pad } from \"./pad\";\nconst title = config[`title\\u0069-${locale}`];\n";
+
+        assert_eq!(
+            import_set(escaped_key_with_a_substitution, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_reading_an_empty_computed_key_reaches_the_same_module() {
+        // 対照。中身が空の綴りは読み取れないが、**エスケープも置換も無い**。
+        // 読み取れないだけで静的と決めると、`module[""]` を書いただけのファイルが落ちる
+        let empty_computed_key = r#"import { pad } from "./pad";
+const value = module[""];
+"#;
+
+        assert_eq!(
+            import_set(empty_computed_key, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_escaping_a_key_without_substituting_cannot_be_created() {
+        // 対照。置換が無ければ綴りは書いた時点で決まる。呼ばれていなくても測れない
+        let escaped_key_without_a_substitution = "import { pad } from \"./pad\";\nconst load = module[`requ\\u0069re`];\nload(\"./stock\");\n";
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(escaped_key_without_a_substitution),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_invoking_a_substituted_escaped_key_cannot_be_created() {
+        // 対照。実行時に決まる綴りでも、**呼ばれていれば**読み込みを落とせない
+        let invoked_key_with_a_substitution =
+            "import { pad } from \"./pad\";\nmodule[`requ\\u0069re${x}`](\"./stock\");\n";
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(invoked_key_with_a_substitution),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration)
         );
     }
 
