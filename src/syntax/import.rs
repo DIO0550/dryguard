@@ -147,8 +147,6 @@ const NEW_EXPRESSION_KIND: &str = "new_expression";
 const COMPUTED_PROPERTY_NAME_KIND: &str = "computed_property_name";
 /// 分解して受ける側の欄。書く側（`pair`）と違い、**欄を読む**。
 const PAIR_PATTERN_KIND: &str = "pair_pattern";
-/// 型を先に書く言い当て（`<string>"require"`）。値を変えないが、**中の式が最初の子ではない**。
-const TYPE_ASSERTION_KIND: &str = "type_assertion";
 /// ラベルの名前。文に付ける名前で、値の名前とは別の名前空間にいる。
 const STATEMENT_IDENTIFIER_KIND: &str = "statement_identifier";
 const ESCAPE_SEQUENCE_KIND: &str = "escape_sequence";
@@ -163,20 +161,28 @@ const ASSERTION_KINDS: [&str; 2] = ["as_expression", "satisfies_expression"];
 ///
 /// 括弧と、TypeScript の型だけの注記（`require as NodeRequire` / `require!` /
 /// `require satisfies NodeRequire`）。どれも実行時の値は中の式そのもの。
-/// **どれも最初の子が中の式**なので、1 つの規則で剥がせる。
+/// **値になる子の位置で 2 つに分かれる**（[`WRAPPERS_HOLDING_THE_VALUE_LAST`]）。
 ///
 /// **ここから漏れた包みは [`RequireSpelling::Rebound`] へ落ちる。** 落ちた先は
 /// 「読み取れない」なので、**値を作らずに測れないと言う**だけで済む
 /// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-///
-/// **Why not（`<NodeRequire>require` / `(0, require)` も入れる）**: 前者は最初の子が型、
-/// 後者は値が最後の子で、剥がし方が違う。上の落ち方で足りるので規則を増やさない。
-const TRANSPARENT_WRAPPER_KINDS: [&str; 4] = [
+const WRAPPERS_HOLDING_THE_VALUE_FIRST: [&str; 4] = [
     "parenthesized_expression",
     "as_expression",
     "satisfies_expression",
     "non_null_expression",
 ];
+
+/// 値を変えない包みのうち、**中の式が最後の子**にあるもの。
+///
+/// 型を先に書く言い当て（`<NodeRequire>require`。最初の子は型）と、順に評価して
+/// 最後を返す並び（`(0, require)`）。
+///
+/// **上下どちらの走査も同じ表を引く。** 上へ辿る側だけを広げると、`specifier_of` が
+/// 採れない綴りを「呼ばれる側だから無害」と答えることになり、読み込みを落とす
+/// (rules/coding.md「同じ一覧を、安全な倒れ方が違う 2 箇所で使い回さない」の裏返しで、
+/// **ここは 2 つの走査が同じ答えを返さないと壊れる**)。
+const WRAPPERS_HOLDING_THE_VALUE_LAST: [&str; 2] = ["type_assertion", "sequence_expression"];
 const IDENTIFIER_KIND: &str = "identifier";
 const DYNAMIC_IMPORT_KIND: &str = "import";
 const STRING_FRAGMENT_KIND: &str = "string_fragment";
@@ -461,7 +467,7 @@ fn is_unreadable_computed_key(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
 /// 読み出しにならない（`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」の
 /// 適用で、ここは広げると読み取れる普通のコードまで測れなくなる側へ倒れる）。
 fn reads_a_field_by_this_string(node: Node<'_>) -> bool {
-    let positioned = outside_value_preserving_wrappers(node);
+    let positioned = outside_wrappers(node);
     let Some(parent) = positioned.parent() else {
         return false;
     };
@@ -484,30 +490,6 @@ fn outside_a_computed_key(node: Node<'_>) -> Node<'_> {
     node.parent()
         .filter(|parent| parent.kind() == COMPUTED_PROPERTY_NAME_KIND)
         .unwrap_or(node)
-}
-
-/// 値を変えない包みの外まで遡ったノード。**上へ辿るときだけ**使う。
-///
-/// [`outside_wrappers`] が使う一覧に、型を先に書く言い当て（`<string>"require"`）を足したもの。
-/// あちらの一覧は [`inside_wrappers`] が下へ剥がすのにも使うので、**中の式が最初の子**である
-/// ものしか入れられないが、この形は最初の子が型なので入れられない。
-///
-/// **上へ辿るだけなら、どの子が中の式かを知らなくてよい。** 位置を見るだけの走査に
-/// 一覧を分けているのは、`rules/coding.md`「同じ一覧を、安全な倒れ方が違う 2 箇所で
-/// 使い回さない」の適用（下へ剥がす側は漏れが測れない側へ落ちるが、ここは漏れが
-/// **測れたことにしてしまう**側へ落ちる）。
-fn outside_value_preserving_wrappers(node: Node<'_>) -> Node<'_> {
-    let mut current = node;
-
-    while let Some(parent) = current.parent() {
-        let wraps_without_changing_the_value = TRANSPARENT_WRAPPER_KINDS.contains(&parent.kind())
-            || parent.kind() == TYPE_ASSERTION_KIND;
-        if !wraps_without_changing_the_value {
-            break;
-        }
-        current = parent;
-    }
-    current
 }
 
 /// その文字列リテラルの綴りが、**書いた時点で決まっている**か。
@@ -903,7 +885,7 @@ fn outside_wrappers(node: Node<'_>) -> Node<'_> {
     let mut current = node;
 
     while let Some(parent) = current.parent() {
-        if !TRANSPARENT_WRAPPER_KINDS.contains(&parent.kind()) {
+        if value_child_of(parent) != Some(current) {
             break;
         }
         current = parent;
@@ -911,14 +893,34 @@ fn outside_wrappers(node: Node<'_>) -> Node<'_> {
     current
 }
 
+/// その包みの中で、値になる子。包みでなければ `None`。
+///
+/// **上へ辿る側も下へ剥がす側も、この 1 つを引く。** 片方だけが知っている包みがあると、
+/// 「呼ばれる側だから `specifier_of` が採る」という前提が崩れる。
+fn value_child_of(wrapper: Node<'_>) -> Option<Node<'_>> {
+    if WRAPPERS_HOLDING_THE_VALUE_FIRST.contains(&wrapper.kind()) {
+        return first_expression_child_of(wrapper);
+    }
+    if WRAPPERS_HOLDING_THE_VALUE_LAST.contains(&wrapper.kind()) {
+        return last_expression_child_of(wrapper);
+    }
+    None
+}
+
+/// そのノードの直下にある最後の式。コメントは式ではないので飛ばす。
+fn last_expression_child_of(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() != COMMENT_KIND)
+        .last()
+}
+
 /// 包みを剥がした中の式。
 fn inside_wrappers(node: Node<'_>) -> Node<'_> {
     let mut current = node;
 
-    while TRANSPARENT_WRAPPER_KINDS.contains(&current.kind()) {
-        let Some(inner) = first_expression_child_of(current) else {
-            break;
-        };
+    while let Some(inner) = value_child_of(current) {
         current = inner;
     }
     current
@@ -1655,12 +1657,12 @@ const stock = require.call(null, "./stock");
 
     #[test]
     fn test_import_set_of_a_file_wrapping_require_in_an_unpeeled_form_cannot_be_created() {
-        // 対照に読み取れる import を 1 件置く。剥がせない包み（値が最後の子にある
-        // 順次評価）は呼び出しとして分類されないが、**綴りは束縛の側へ落ちる**ので
-        // ファイルごと測れないになる。ここが崩れると、包みの形を 1 つ見つけるたびに
+        // 対照に読み取れる import を 1 件置く。**一覧に無い包み**（値を選ぶ条件式）は
+        // 呼び出しとして分類されないが、**綴りは束縛の側へ落ちる**のでファイルごと
+        // 測れないになる。ここが崩れると、包みの形を 1 つ見つけるたびに
         // 欠けた集合で測ることになる
         let real_import_and_an_indirect_require = r#"import { pad } from "./pad";
-const stock = (0, require)("./stock");
+const stock = (flag ? require : other)("./stock");
 "#;
 
         assert_eq!(
@@ -3111,6 +3113,69 @@ export function load(require: (path: string) => string): string {
 
         assert_eq!(
             import_set(parenthesized_specifier, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_require_given_an_angle_asserted_specifier_reaches_the_same_module() {
+        // 型を先に書く言い当ても値を変えない包み。`as` の形だけ剥がして
+        // こちらを剥がさないと、同じ指定子が書き方の違いで読み取れなくなる
+        let angle_asserted_specifier = r#"const pad = require(<string>"./pad");
+"#;
+
+        assert_eq!(
+            import_set(angle_asserted_specifier, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_require_given_a_sequenced_specifier_reaches_the_same_module() {
+        // 順に評価して最後を返す並びも、値は最後の子そのもの
+        let sequenced_specifier = r#"const pad = require((0, "./pad"));
+"#;
+
+        assert_eq!(
+            import_set(sequenced_specifier, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_sequenced_require_reaches_the_same_module() {
+        // 呼ばれる側が並びでも、値は `require` そのもの
+        let sequenced_callee = r#"const pad = (0, require)("./pad");
+"#;
+
+        assert_eq!(
+            import_set(sequenced_callee, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_sequencing_an_escaped_computed_key_cannot_be_created() {
+        // 並びの**最後**の値が添字になる。剥がさないと、呼ばれてもいない持ち出しが
+        // 素通りして読み込みを 1 件落とす
+        let sequenced_escaped_key = "import { pad } from \"./pad\";\nconst load = module[(0, \"requ\\u0069re\")];\nload(\"./stock\");\n";
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(sequenced_escaped_key), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::UnreadableDeclaration)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_sequencing_a_key_before_an_escaped_string_reaches_the_same_module()
+    {
+        // 対照。**最後でない**値は添字にならない。並びを丸ごと剥がすと、
+        // 添字ですらない綴りを添字と取り違える
+        let escaped_string_before_the_key =
+            "import { pad } from \"./pad\";\nconst value = module[(\"requ\\u0069re\", 0)];\n";
+
+        assert_eq!(
+            import_set(escaped_string_before_the_key, "src/utils/formatDate.ts"),
             import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
         );
     }
