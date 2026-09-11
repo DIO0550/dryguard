@@ -320,10 +320,10 @@ const FUNCTION_MEMBERS_THAT_INVOKE: [&str; 2] = ["call", "apply"];
 
 /// 呼ばれる側を**その場では呼ばず**、束縛した関数を返す `Function.prototype` の要素の名前。
 ///
-/// **返った関数をその場で呼ぶかで扱いが分かれる。** `module[key].bind(null)("./dep")` は
-/// 読み込みそのものだが、`const load = module[key].bind(null);` は「呼ばずに持ち出して
-/// 後で呼ぶ」形で、18 巡目に**残すと決着した族**に当たる
-/// （[`is_invoked_through_a_function_member`]）。
+/// **返った関数がその場で呼ばれるかで扱いが分かれる。** `module[key].bind(null)("./dep")` /
+/// `module[key].bind(null).call(null, "./dep")` は読み込みそのものだが、
+/// `const load = module[key].bind(null);` は「呼ばずに持ち出して後で呼ぶ」形で、
+/// 18 巡目に**残すと決着した族**に当たる（[`is_invoked_through_a_function_member`]）。
 const FUNCTION_MEMBER_THAT_BINDS: &str = "bind";
 
 /// 添字に書かれたときに、**選ばれる要素の名前が `require` になりえない**リテラルの種別。
@@ -442,14 +442,12 @@ fn is_require_spelled_outside_a_call(tree: &SyntaxTree<'_>, node: Node<'_>) -> b
 /// `const load = module[key]; load("./dep");` は漏れるが、漏れは
 /// [`RequireSpelling::Rebound`] ではなく**取りこぼし**になる。
 ///
-/// **`call` / `apply` 越しも呼ばれている**（[`is_invoked_through_a_function_member`]）。
+/// **`call` / `apply` / `bind` 越しも呼ばれている**（[`is_invoked_on_the_spot`]）。
 ///
 /// **Why not（添字を解いて綴りを組み直す）**: 定数畳み込みを持つことになる。
 /// `"re" + "quire"` を解けても、次は `[..."require"].join("")` が来る。
 fn is_an_invoked_unreadable_key(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
-    let called_here =
-        is_invoked_or_constructed(node) || is_invoked_through_a_function_member(tree, node);
-    if node.kind() != SUBSCRIPT_EXPRESSION_KIND || !called_here {
+    if node.kind() != SUBSCRIPT_EXPRESSION_KIND || !is_invoked_on_the_spot(tree, node) {
         return false;
     }
     let Some(index) = node.child_by_field_name("index") else {
@@ -956,14 +954,29 @@ fn is_invoked_or_constructed(node: Node<'_>) -> bool {
         && parent.child_by_field_name("constructor") == Some(positioned)
 }
 
-/// その式が、`call` / `apply` を通してその場で呼ばれているか。
+/// その式の値が、**持ち出されずにその場で呼ばれる**か。
+///
+/// 直に呼ぶ・`new` する形（[`is_invoked_or_constructed`]）と、`Function.prototype` の
+/// 要素を通す形（[`is_invoked_through_a_function_member`]）をまとめて見る。
+///
+/// **「呼ばれているか」を尋ねる側はここだけを見る。** 呼び方は `.call` / `.apply` /
+/// `bind` と重ねられるので、片方だけを見ると重ねた形が漏れる。
+fn is_invoked_on_the_spot(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
+    is_invoked_or_constructed(node) || is_invoked_through_a_function_member(tree, node)
+}
+
+/// その式が、`Function.prototype` の要素を通してその場で呼ばれているか。
 ///
 /// `module["re" + "quire"].call(null, "./dep")` は読み込みだが、添字の親は
 /// `member_expression` なので [`is_invoked`] では見つからない。
 ///
-/// **`bind` は入れない。** その場では呼ばず値を返すだけなので、
+/// **`bind` は返った関数がその場で呼ばれるかまで見る。** `bind` 自体は値を返すだけなので、
 /// `const load = module[key].bind(null); load("./dep");` は「呼ばずに持ち出して
-/// 後で呼ぶ」形になり、18 巡目に**残すと決着した族**に当たる。
+/// 後で呼ぶ」形で、18 巡目に**残すと決着した族**に当たる。
+///
+/// **返った関数の呼び方も重ねられる**（`bind(null).call(…)` / `bind(null).bind(null)(…)`）。
+/// [`is_invoked_on_the_spot`] を通して辿るので、重ねた形も同じ 1 つの条件で拾う。
+/// 辿る先は必ず木の上へ進むので止まる。
 ///
 /// **要素の綴りは 2 通りある**（`.call` と `["call"]`）。同じことが起きるので
 /// 綴り方で分けない（`rules/naming.md`「`require` を `import` と別の語にしない」と同じ形）。
@@ -986,7 +999,7 @@ fn is_invoked_through_a_function_member(tree: &SyntaxTree<'_>, node: Node<'_>) -
     };
 
     FUNCTION_MEMBERS_THAT_INVOKE.contains(&member)
-        || (member == FUNCTION_MEMBER_THAT_BINDS && is_invoked_or_constructed(applied))
+        || (member == FUNCTION_MEMBER_THAT_BINDS && is_invoked_on_the_spot(tree, applied))
 }
 
 /// その要素アクセスが読んでいる要素の名前。読み取れなければ `None`。
@@ -2137,6 +2150,57 @@ handlers[1 + 1]();
         assert_eq!(
             ImportSet::from_tree(&tree_of(computed_index), Path::new("src/utils/a.ts")),
             Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_calling_a_bound_unreadable_key_cannot_be_created() {
+        // `bind` が返した関数は `call` 越しにも呼べる。呼ばれ方が 1 段増えただけ
+        let bound_then_called = r#"import { pad } from "./pad";
+module["re" + "quire"].bind(null).call(null, "./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(bound_then_called), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_applying_a_bound_unreadable_key_cannot_be_created() {
+        let bound_then_applied = r#"import { pad } from "./pad";
+module["re" + "quire"].bind(null).apply(null, ["./stock"]);
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(bound_then_applied), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_rebinding_a_bound_unreadable_key_cannot_be_created() {
+        // `bind` は重ねられる。最後にその場で呼ばれていれば読み込みは起きる
+        let bound_twice = r#"import { pad } from "./pad";
+module["re" + "quire"].bind(null).bind(null)("./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(bound_twice), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_retaining_call_on_a_bound_key_reaches_the_same_module() {
+        // 対照。`call` を持ち出しただけで呼んでいないので、18 巡目の決着の族に留まる
+        let call_retained = r#"import { pad } from "./pad";
+const invoke = module["re" + "quire"].bind(null).call;
+"#;
+
+        assert_eq!(
+            import_set(call_retained, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
         );
     }
 
