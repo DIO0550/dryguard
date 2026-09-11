@@ -158,6 +158,57 @@ pub(super) fn source_position_of(node: Node<'_>, source: &str) -> Option<SourceP
     ))
 }
 
+/// 値をそのまま通すだけで、包んだ式の名前を変えないノードの種別。
+///
+/// **grammar が持つ閉じた集合。** `expression` / `primary_expression` の subtype のうち、
+/// 「包みを外しても同じ値を指す」ものがこれで尽きる（`tree-sitter-typescript 0.23.2` の
+/// `node-types.json` を数えた）。hover の接頭辞のようにサーバごとに増える一覧ではない。
+///
+/// **一覧から漏れた種別はそこで探索が止まる**（名前の位置が取れない = 偽陰性）
+/// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+///
+/// **Why not（`sequence_expression` を入れる）**: 値になるのは最後の 1 つだけで、
+/// 種別だけでは決まらない（位置を見る判定になる）。
+const TRANSPARENT_EXPRESSION_KINDS: [&str; 6] = [
+    "parenthesized_expression",
+    "as_expression",
+    "satisfies_expression",
+    "non_null_expression",
+    "type_assertion",
+    "instantiation_expression",
+];
+
+/// そのノードを包んでいる、値を通すだけの式。内側から順に並ぶ。包まれていなければ空。
+///
+/// **歩き方と同じく、包みの一覧もここ 1 箇所に置く。** 名前を探す側（`syntax::chunk`）と
+/// 型名を集める側（`syntax::type_reference`）が**同じ包みを抜けないと**、
+/// hover が答える綴りに現れる型名（`as` に書いた型など）を集め損ねる。
+pub(super) fn transparent_wrappers_of(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut wrappers = Vec::new();
+    let mut current = node;
+
+    while let Some(parent) = current.parent() {
+        if !TRANSPARENT_EXPRESSION_KINDS.contains(&parent.kind()) {
+            break;
+        }
+        wrappers.push(parent);
+        current = parent;
+    }
+
+    wrappers
+}
+
+/// そのノードを包んでいる式をすべて抜けた先の親。包まれていなければ親そのもの。
+/// 親が無ければ `None`。
+pub(super) fn unwrapped_parent_of(node: Node<'_>) -> Option<Node<'_>> {
+    let outermost = transparent_wrappers_of(node)
+        .last()
+        .copied()
+        .unwrap_or(node);
+
+    outermost.parent()
+}
+
 /// 構文木を作れなかった理由。
 ///
 /// 2 つに分けているのは直す先が違うため。grammar が弾かれたのは依存の版の問題で、

@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use tree_sitter::Node;
 
 use crate::source_position::SourcePosition;
-use crate::syntax::tree::source_position_of;
+use crate::syntax::tree::{source_position_of, transparent_wrappers_of, unwrapped_parent_of};
 
 /// 型名 1 つを表すノードの種別。
 ///
@@ -127,6 +127,10 @@ pub(super) fn type_references_of(nodes: &[Node<'_>], source: &str) -> Vec<TypeRe
 /// **hover が答える綴りに現れる型名だけを集める。** 自分の名前を持たないチャンクでは
 /// hover が代入先の名前を指す（`chunk` の `name_node_of`）ので、そこに書かれた注釈
 /// （`const aliased: Handler` の `Handler`）もシグネチャの一部になる。
+///
+/// **名前を探す側と同じ包みを抜ける**（[`unwrapped_parent_of`]）。片方だけが抜けると、
+/// `const f = (…) as (v: Input) => Input` の `Input` を集め損ねる。集め損ねた型名は
+/// 開かれずに比較へ残るので、**別のファイルの同じ綴りの型が単一化可能に出る**（偽陽性）。
 fn annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
     let mut annotated = Vec::new();
 
@@ -136,20 +140,47 @@ fn annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
         }
     }
 
-    // 自分の名前を持つチャンクでは、hover は関数自身の型を返す。代入先に注釈が
+    // 自分の名前を持つチャンクでは、hover は関数自身の型を返す。代入先や包みに注釈が
     // 付いていても（`const named: Formatter = function inner(…)`）綴りには現れない。
     if node.child_by_field_name(NAME_FIELD).is_some() {
         return annotated;
     }
 
-    let assigned = node
-        .parent()
-        .and_then(|parent| parent.child_by_field_name(TYPE_FIELD));
+    annotated.extend(wrapper_types_of(node));
+
+    let assigned =
+        unwrapped_parent_of(node).and_then(|parent| parent.child_by_field_name(TYPE_FIELD));
     if let Some(assigned) = assigned {
         annotated.push(assigned);
     }
 
     annotated
+}
+
+/// そのノードを包んでいる式が書いている型。内側の包みのものから順に並ぶ。
+///
+/// `as` / `satisfies` が言い切った型・`<T>value` の型引数・インスタンス化に渡した型引数が
+/// これで、**どれも hover が答える綴りに現れる**。
+///
+/// **包んでいる式から降りてきた子だけを外す。** 包みの種別ごとに型の載る場所を数え上げると、
+/// フィールド名を持つもの（`instantiation_expression` の `type_arguments`）と持たないもの
+/// （`as_expression`）で別々の引き方が要る。**残りの名前付きの子は型だけ**なので、
+/// 降りてきた側を外せば種別を見ずに済む。
+fn wrapper_types_of(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut types = Vec::new();
+    let mut inner = node;
+
+    for wrapper in transparent_wrappers_of(node) {
+        let mut cursor = wrapper.walk();
+        types.extend(
+            wrapper
+                .named_children(&mut cursor)
+                .filter(|child| child.id() != inner.id()),
+        );
+        inner = wrapper;
+    }
+
+    types
 }
 
 /// その部分木にある型名のノードを、書かれた順に返す。

@@ -20,7 +20,7 @@ use crate::source_position::SourcePosition;
 use crate::syntax::import::{ImportSet, ImportsUnavailable};
 use crate::syntax::line_range::LineRange;
 use crate::syntax::token::TokenSequence;
-use crate::syntax::tree::{SyntaxTree, source_position_of};
+use crate::syntax::tree::{SyntaxTree, source_position_of, unwrapped_parent_of};
 use crate::syntax::type_reference::{TypeReference, type_references_of};
 
 /// 比較の単位。関数・メソッド 1 つ分のソースと、それがどこにあったか。
@@ -318,26 +318,6 @@ const OVERLOAD_DECLARATION_KINDS: [&str; 2] = ["function_signature", "method_sig
 /// 名前を載せるフィールド。
 const NAME_FIELD: &str = "name";
 
-/// 値をそのまま通すだけで、包んだ式の名前を変えないノードの種別。
-///
-/// **grammar が持つ閉じた集合。** `expression` / `primary_expression` の subtype のうち、
-/// 「包みを外しても同じ値を指す」ものがこれで尽きる（`tree-sitter-typescript 0.23.2` の
-/// `node-types.json` を数えた）。hover の接頭辞のようにサーバごとに増える一覧ではない。
-///
-/// **一覧から漏れた種別はそこで探索が止まり、名前の位置が取れない**（偽陰性）
-/// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-///
-/// **Why not（`sequence_expression` を入れる）**: 値になるのは最後の 1 つだけで、
-/// 種別だけでは決まらない（位置を見る判定になる）。
-const TRANSPARENT_EXPRESSION_KINDS: [&str; 6] = [
-    "parenthesized_expression",
-    "as_expression",
-    "satisfies_expression",
-    "non_null_expression",
-    "type_assertion",
-    "instantiation_expression",
-];
-
 /// クラスの静的なメンバーを表す修飾子の種別。
 const STATIC_MODIFIER: &str = "static";
 
@@ -373,7 +353,7 @@ fn name_position_of(node: Node<'_>, source: &str) -> Option<SourcePosition> {
 /// 代入先を指すと**変数に書かれた型**が返るので、注釈が付いていれば
 /// （`const named: Formatter = function inner(…)`）関数自身の型ではなくその注釈を見ることになる。
 ///
-/// 名前を探すのは[値を通すだけの包み](TRANSPARENT_EXPRESSION_KINDS)を抜けた先。
+/// 名前を探すのは値を通すだけの包みを抜けた先（[`unwrapped_parent_of`]）。
 /// `const wrapped = ((…) => …) as Formatter` は、包みの位置で止めると
 /// **サーバは答えられるのに尋ねに行けない**。
 fn name_node_of(node: Node<'_>) -> Option<Node<'_>> {
@@ -390,21 +370,6 @@ fn name_node_of(node: Node<'_>) -> Option<Node<'_>> {
     }
 
     assigned_name_of(parent)
-}
-
-/// そのノードを包んでいる式をすべて抜けた先の親。包まれていなければ親そのもの。
-/// 親が無ければ `None`。
-///
-/// **1 段ではなく繰り返す。** 包みは重なる（`(((f) as T))!` は括弧・`as`・括弧・非 null の
-/// 4 段）ので、1 段だけ抜ける形では重なった分で止まる。
-fn unwrapped_parent_of(node: Node<'_>) -> Option<Node<'_>> {
-    let mut parent = node.parent()?;
-
-    while TRANSPARENT_EXPRESSION_KINDS.contains(&parent.kind()) {
-        parent = parent.parent()?;
-    }
-
-    Some(parent)
 }
 
 /// そのチャンクのオーバーロード宣言の、名前が置かれている位置。ソースに書かれた順。
@@ -1544,6 +1509,72 @@ export function scale(a: unknown, rate?: unknown): unknown {
         let chunk = chunk_at(assigned, "a.ts:1").expect("切り出せる");
 
         assert_eq!(type_names_of(&chunk), vec!["Handler"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_through_a_wrapper_cover_the_annotation_it_is_assigned_to() {
+        // 包みの先に注釈がある形。包みで止めると `Handler` を集め損ね、
+        // 開かれない綴りが比較に残る
+        let wrapped_then_annotated =
+            "export const aliased: Handler = ((value) => value.length)!;\n";
+
+        let chunk = chunk_at(wrapped_then_annotated, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Handler"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_cover_the_type_written_in_an_as_expression() {
+        // 言い切った型は代入先ではなく包みに書かれている。hover が返すのはこちらの型
+        let asserted =
+            "export const asserted = ((value: any): any => value) as (v: Input) => Output;\n";
+
+        let chunk = chunk_at(asserted, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Input", "Output"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_cover_the_type_written_in_a_satisfies_expression() {
+        let checked =
+            "export const checked = ((value: any): any => value) satisfies (v: Input) => Output;\n";
+
+        let chunk = chunk_at(checked, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Input", "Output"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_cover_the_type_written_in_an_angle_bracket_assertion() {
+        let angled = "export const angled = <(v: Input) => Output>((value: any): any => value);\n";
+
+        let chunk = chunk_at(angled, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Input", "Output"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_cover_the_type_arguments_it_was_instantiated_with() {
+        // 型変数は宣言したこのシグネチャの中でだけ意味を持つので数えない。
+        // 渡した側（`Input`）は別のファイルで宣言されうるので数える
+        let instantiated = "export const made = (<T>(value: T): T => value)<Input>;\n";
+
+        let chunk = chunk_at(instantiated, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Input"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_of_a_named_chunk_leave_out_the_type_written_in_the_wrapper() {
+        // 対照は上の 4 件。自分の名前を持つので hover は関数自身の型を返し、
+        // 包みに書かれた型は綴りに現れない
+        let named_then_asserted = "const named = (function inner(value: Text): Text {\n\
+                                   \x20 return value;\n\
+                                   }) as (v: Other) => Other;\n";
+
+        let chunk = chunk_at(named_then_asserted, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Text"]);
     }
 
     #[test]
