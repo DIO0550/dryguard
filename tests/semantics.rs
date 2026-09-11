@@ -601,6 +601,23 @@ fn test_compare_with_an_lsp_opens_a_type_alias_that_replaces_the_whole_signature
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_traces_a_type_name_written_only_in_the_wrapper() {
+    // 言い切った型は包みの側にしか書かれていない。名前を探す側だけが包みを抜けると、
+    // `Shape` が解決の対象に入らず宣言の場所も付かない。**別々のファイルの `Shape` が
+    // 同じ綴りで並び、単一化可能に出る**（偽陽性）
+    let shaped_a = fixture("wrapped/shapedA.ts", 8);
+    let shaped_b = fixture("wrapped/shapedB.ts", 6);
+
+    let measured = measured_with_an_lsp(&shaped_a, &shaped_b);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_an_lsp_opens_a_type_alias_declared_outside_the_pair_root() {
     // 候補ペアが同じディレクトリにあると、根はそのディレクトリになる。エイリアスは
     // 兄弟ディレクトリで宣言されているので、**根の下だけを開かせる形では解決できない**
