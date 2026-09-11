@@ -186,6 +186,18 @@ const STRING_LITERAL_KINDS: [&str; 2] = ["string", "template_string"];
 /// CommonJS が依存を読み込む関数の名前。
 const REQUIRE_FUNCTION_NAME: &str = "require";
 
+/// 型だけを運ぶ輸入・輸出に置かれる印。**名前のないノード**として木に出る。
+const TYPE_ONLY_MARKER_KIND: &str = "type";
+
+/// 印を探す先の種別。文にも個々の名前にも付けられる
+/// （`import type { require }` と `import { type require }`）。
+const IMPORT_EXPORT_KINDS: [&str; 4] = [
+    "import_statement",
+    "import_specifier",
+    "export_statement",
+    "export_specifier",
+];
+
 /// 型の中でしか現れない構文の種別。
 ///
 /// **この下に書かれた名前は、実行時の値を束縛しない。** 要素の宣言
@@ -205,18 +217,6 @@ const REQUIRE_FUNCTION_NAME: &str = "require";
 /// **ここに無い種別は「読み込みかもしれない」側へ落ちる。** 型の中の位置を挙げ
 /// そこねても、測れない側（安全側）へ落ちるだけで済む
 /// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-/// 型だけを運ぶ輸入・輸出に置かれる印。**名前のないノード**として木に出る。
-const TYPE_ONLY_MARKER_KIND: &str = "type";
-
-/// 印を探す先の種別。文にも個々の名前にも付けられる
-/// （`import type { require }` と `import { type require }`）。
-const IMPORT_EXPORT_KINDS: [&str; 4] = [
-    "import_statement",
-    "import_specifier",
-    "export_statement",
-    "export_specifier",
-];
-
 const TYPE_ONLY_KINDS: [&str; 16] = [
     "function_type",
     "constructor_type",
@@ -452,7 +452,7 @@ fn is_escaped_name(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
 /// 要素の名前（`module.require` / `registry.require`）を inert と言えないのはこのため
 /// （`module` と `registry` を木の上で区別できない）。
 ///
-/// **型の中で宣言された要素の名前だけは別**（[`TYPE_MEMBER_KINDS`]）。値を持たないので
+/// **型の中で宣言された要素の名前だけは別**（[`TYPE_ONLY_KINDS`]）。値を持たないので
 /// 持ち出せず、その型を使う側の `loader.require(…)` は要素アクセスとして別に数える。
 ///
 /// **ここから漏れた位置は [`RequireSpelling::Rebound`] へ落ちる。** 落ちた先は
@@ -831,10 +831,6 @@ fn unquoted_text_of<'source>(
     tree.text_of(*only)
 }
 
-/// その指定子が importer の位置から解決するものか。
-///
-/// 区切りを伴わない `.` と `..` も相対指定。`.` を漏らすと、別々のディレクトリの
-/// 入口が畳まれずに 1 つの依存先（`.`）になり、**依存していない先を共有している**ことになる。
 /// 区切りを `/` に揃えた綴り。逆立ちを含まなければ借りたまま返す。
 ///
 /// CommonJS は Windows の区切りで書いた相対指定（`require(".\\stock")`）も
@@ -852,6 +848,10 @@ fn with_forward_separators(specifier: &str) -> Cow<'_, str> {
     Cow::Owned(specifier.replace('\\', "/"))
 }
 
+/// その指定子が importer の位置から解決するものか。
+///
+/// 区切りを伴わない `.` と `..` も相対指定。`.` を漏らすと、別々のディレクトリの
+/// 入口が畳まれずに 1 つの依存先（`.`）になり、**依存していない先を共有している**ことになる。
 fn is_relative(specifier: &str) -> bool {
     let starts_with_a_step = specifier.starts_with("./") || specifier.starts_with("../");
     let is_a_bare_step = specifier == "." || specifier == "..";
