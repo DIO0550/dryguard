@@ -31,6 +31,7 @@ use crate::semantics::resolved_type::{
 use crate::semantics::type_signature::{TypeSignatureOutcome, type_signature_outcome_of};
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks};
+use crate::syntax::import::ImportsUnavailable;
 use crate::syntax::module_distance::ModuleDistance;
 use crate::syntax::tree::{Grammar, ParseError, SyntaxTree};
 use crate::threshold::Threshold;
@@ -203,13 +204,25 @@ fn structural_similarity_of(chunk_a: &Chunk, chunk_b: &Chunk) -> StructuralSimil
     StructuralSimilarity::Measured(tokens_a.similarity_with(tokens_b))
 }
 
-/// 依存先集合の Jaccard 係数。どちらかのファイルに import が無ければ測れない。
+/// 依存先集合の Jaccard 係数。どちらかのファイルで集合を作れなければ測れない。
+///
+/// **両側とも作れなかったときは、次にすることが多いほうの理由を出す。**
+/// 読み取れなかったのは dryguard 側の穴、綴りが曖昧なのはこのツールでは測れない
+/// 書き方、宣言が無いのはそういうファイル、の順に効く
+/// (`rules/architecture.md`「理由は落とさない」)。
 fn import_overlap_of(chunk_a: &Chunk, chunk_b: &Chunk) -> ImportOverlap {
-    let (Some(imports_a), Some(imports_b)) = (chunk_a.imports(), chunk_b.imports()) else {
-        return ImportOverlap::NoImports;
-    };
-
-    ImportOverlap::Measured(imports_a.jaccard(imports_b))
+    match (chunk_a.imports(), chunk_b.imports()) {
+        (Ok(imports_a), Ok(imports_b)) => ImportOverlap::Measured(imports_a.jaccard(imports_b)),
+        (Err(unreadable @ ImportsUnavailable::UnreadableDeclaration { .. }), _)
+        | (_, Err(unreadable @ ImportsUnavailable::UnreadableDeclaration { .. })) => {
+            ImportOverlap::Unavailable(unreadable)
+        }
+        (Err(ImportsUnavailable::ReboundSpelling), _)
+        | (_, Err(ImportsUnavailable::ReboundSpelling)) => {
+            ImportOverlap::Unavailable(ImportsUnavailable::ReboundSpelling)
+        }
+        (Err(cause), _) | (_, Err(cause)) => ImportOverlap::Unavailable(cause),
+    }
 }
 
 /// 候補ペアについて、Stage 1 と Stage 2 の両方を測った結果。
@@ -1817,6 +1830,7 @@ mod tests {
 
     use crate::classification::DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
     use crate::classification::verdict::Verdict;
+    use crate::line_number::LineNumber;
     use crate::semantics::resolved_type::TracedTypeNames;
     use crate::semantics::type_signature::normalized_outcome_of;
     use crate::similarity::Similarity;
@@ -1979,6 +1993,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_import_overlap_of_a_rebound_side_and_an_unreadable_side_reports_the_unreadable_one() {
+        // 両側とも測れないとき、**次にすることが多いほうの理由**を出す。
+        // 綴りが曖昧なのは利用者のコードがそうだという話だが、読み取れなかったのは
+        // dryguard 側の穴で、そちらのほうが直す先を指している
+        let rebound = chunk_of(
+            "src/billing/a.ts",
+            2,
+            "function require(name: string): number {\n  return name.length;\n}\n",
+        );
+        let unreadable = chunk_of(
+            "src/inventory/b.ts",
+            2,
+            "export function load(name: string): unknown {\n  return require(`./${name}`);\n}\n",
+        );
+
+        assert_eq!(
+            import_overlap_of(&rebound, &unreadable),
+            ImportOverlap::Unavailable(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(1)
+            })
+        );
+    }
+
+    #[test]
+    fn test_import_overlap_of_a_rebound_side_and_a_declarationless_side_reports_the_rebound_one() {
+        // 対照。宣言が無いのは「そういうファイル」で、次にすることが一番少ない
+        let rebound = chunk_of(
+            "src/billing/a.ts",
+            2,
+            "function require(name: string): number {\n  return name.length;\n}\n",
+        );
+        let declarationless = chunk_of(
+            "src/inventory/b.ts",
+            1,
+            "export function total(rows: number[]): number {\n  return rows.length;\n}\n",
+        );
+
+        assert_eq!(
+            import_overlap_of(&rebound, &declarationless),
+            ImportOverlap::Unavailable(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
     /// ファイルを読まずにチャンクを作る。
     ///
     /// `Chunk::find_enclosing` は構文木を引数で受けるので、実ファイルが要るのは
@@ -2022,7 +2080,10 @@ mod tests {
 
         let signals = signals_of(&chunk_a, &chunk_b);
 
-        assert_eq!(signals.import_overlap(), ImportOverlap::NoImports);
+        assert_eq!(
+            signals.import_overlap(),
+            ImportOverlap::Unavailable(ImportsUnavailable::NoDeclarations)
+        );
     }
 
     #[test]

@@ -361,6 +361,7 @@ mod tests {
     use crate::classification::verdict::Verdict;
     use crate::semantics::caller_domain::CallerDomains;
     use crate::similarity::Similarity;
+    use crate::syntax::import::ImportsUnavailable;
     use crate::syntax::module_distance::ModuleDistance;
     use crate::threshold::Threshold;
 
@@ -519,7 +520,7 @@ mod tests {
         // ドメインの一致 / 不一致を決めない
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
-            ImportOverlap::NoImports,
+            ImportOverlap::Unavailable(ImportsUnavailable::NoDeclarations),
             separate_directories(),
         );
 
@@ -615,7 +616,7 @@ mod tests {
         // 取れて初めて別ドメインと言える
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
-            ImportOverlap::NoImports,
+            ImportOverlap::Unavailable(ImportsUnavailable::NoDeclarations),
             separate_directories(),
         )
         .with_semantics(
@@ -668,7 +669,7 @@ mod tests {
     fn signals_of_a_caller_only_domain_match() -> Signals {
         Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
-            ImportOverlap::NoImports,
+            ImportOverlap::Unavailable(ImportsUnavailable::NoDeclarations),
             separate_directories(),
         )
     }
@@ -1043,7 +1044,7 @@ mod tests {
     fn test_classification_without_imports_leans_the_import_reason_neither_way() {
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
-            ImportOverlap::NoImports,
+            ImportOverlap::Unavailable(ImportsUnavailable::NoDeclarations),
             separate_directories(),
         );
 
@@ -1053,7 +1054,7 @@ mod tests {
             leans(
                 &classification,
                 &Reason::ImportOverlap {
-                    signal: ImportOverlap::NoImports,
+                    signal: ImportOverlap::Unavailable(ImportsUnavailable::NoDeclarations),
                     lean: Lean::Neither,
                 }
             ),

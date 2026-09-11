@@ -66,8 +66,8 @@ if structurally_similar && domains_differ { ... }
 | `reason` | 判定を傾けた根拠 1 件。シグナルの値と、それが傾けた向きの組 |
 | `lean` | シグナルが判定を傾けた向き（共通化する側 / しない側 / どちらでもない） |
 | `domain` | ドメイン。ディレクトリ構造からの推定と `dryguard.toml` の宣言で決まる |
-| `import` | 依存の宣言。ソースに書かれた `import` / `export ... from` そのもの |
-| `specifier` | `from` の後ろに書かれた文字列（`"./pad"`）。**解決前** |
+| `import` | 依存の宣言。ソースに書かれた `import` / `export ... from` / `require` そのもの |
+| `specifier` | 依存の宣言が依存先として書いている文字列（`from` の後ろ・`require` の引数。`"./pad"`）。**解決前** |
 | `module path` | 指定子を importer の位置から解決した依存先（`src/utils/pad`）。**解決後** |
 | `module distance` | 2 つのファイルを隔てているディレクトリの段数 |
 | `frame` | LSP のストリーム上の 1 通分。`Content-Length` ヘッダと、それが数えた本文 |
@@ -115,6 +115,17 @@ if structurally_similar && domains_differ { ... }
 書いた人の位置に依存し、解決後は依存しない。同じ依存先が別の綴りで書かれるので、
 **解決前のまま比べると共有している依存を「別物」と数える**（`ModulePath` を
 newtype にしているのはこのため）。
+
+**`require` を `import` と別の語にしない。** 書き方は違うが、どちらも
+`ModulePath`（解決後）へ畳んだ時点で同じ依存先を指す。別の語にすると集合も分かれ、
+**同じ依存先を書き方の違いで別物と数える**ことになり、`specifier` と `module path` を
+分けている理由（解決前の綴りのまま比べない）とぶつかる。TypeScript の import-equals 形式
+（`import dep = require("./dep")`）も同じ扱いにする。
+
+**Why not（`dependency` のような上位語を足して 3 語にする）**: `import` が指す範囲を
+狭いまま残すと、`ImportSet` / `ImportOverlap` / `--explain` の見出しがどちらの語に
+属するのかを 1 つずつ決め直すことになる。語を増やす前に既にある語で言えないかを
+先に確かめる（この節の最後）。
 
 **`frame` と `payload` を混ぜない。** 区切りを付ける側（`lsp::framing`）と中身を読む側
 （`lsp::message`）はモジュールが別で、**失敗の直し先も別**（`Content-Length` が壊れているのと、

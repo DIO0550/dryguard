@@ -9,6 +9,7 @@ use std::num::NonZeroUsize;
 use crate::semantics::caller_domain::CallerDomains;
 use crate::semantics::resolved_type::UnopenedReason;
 use crate::similarity::Similarity;
+use crate::syntax::import::ImportsUnavailable;
 use crate::syntax::module_distance::ModuleDistance;
 
 /// 1 つのペアについて測ったシグナル一式。
@@ -110,8 +111,11 @@ pub enum StructuralSimilarity {
 pub enum ImportOverlap {
     /// 測れた重なり。
     Measured(Similarity),
-    /// どちらかのファイルに import が無く、測れなかった。
-    NoImports,
+    /// どちらかのファイルで依存先の集合を作れず、測れなかった。
+    ///
+    /// **理由を落とさない。** 宣言が無いのと、書いてあるのに読み取れなかったのとで
+    /// **利用者が次にすることが違う** (`rules/architecture.md`「理由は落とさない」)。
+    Unavailable(ImportsUnavailable),
 }
 
 /// Stage 2 へ届かなかった理由。
