@@ -135,6 +135,8 @@ const EXPORT_STATEMENT_KIND: &str = "export_statement";
 const PAIR_KIND: &str = "pair";
 const NAMESPACE_EXPORT_KIND: &str = "namespace_export";
 const JSX_ATTRIBUTE_KIND: &str = "jsx_attribute";
+/// 名前空間つきの名前（`<Widget require:mode="x" />` / `<require:tag />`）。
+const JSX_NAMESPACE_NAME_KIND: &str = "jsx_namespace_name";
 /// タグの名前を `name` の欄に持つ JSX の要素。
 const JSX_ELEMENT_KINDS: [&str; 3] = [
     "jsx_opening_element",
@@ -536,14 +538,15 @@ fn is_use_that_cannot_load(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
 ///
 /// 開始・終了・自己閉じの 3 つとも `name` の欄にタグの名前を持つ。
 fn is_a_jsx_element_name(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
+    let written = outside_a_jsx_namespace(node);
+    let Some(parent) = written.parent() else {
         return false;
     };
     if !JSX_ELEMENT_KINDS.contains(&parent.kind()) {
         return false;
     }
 
-    parent.child_by_field_name("name") == Some(node)
+    parent.child_by_field_name("name") == Some(written)
 }
 
 /// そのノードが、JSX の属性の**名前**か。
@@ -558,14 +561,29 @@ fn is_a_jsx_element_name(node: Node<'_>) -> bool {
 /// **Why not（欄の名前と同じく文字列の外まで戻す）**: JSX に引用符つきの属性名は無いので、
 /// 戻しても答えが変わらない。`is_an_object_key` が戻すのは `{ "require": false }` があるため。
 fn is_a_jsx_attribute_name(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
+    let written = outside_a_jsx_namespace(node);
+    let Some(parent) = written.parent() else {
         return false;
     };
     if parent.kind() != JSX_ATTRIBUTE_KIND {
         return false;
     }
 
-    parent.named_child(0) == Some(node)
+    parent.named_child(0) == Some(written)
+}
+
+/// 名前空間つきの名前の中の綴りなら、その名前そのものまで戻る。
+///
+/// `<Widget require:mode="x" />` も `<Widget ns:require="x" />` も、綴りは属性の名前の
+/// 一部でしかない。タグ（`<require:tag />`）も同じで、**前半・後半のどちらから来ても
+/// 同じ位置へ戻る**。
+///
+/// JSX で名前空間つきの名前が置けるのはタグと属性の名前だけなので、
+/// 戻した先が値になることはない。
+fn outside_a_jsx_namespace(node: Node<'_>) -> Node<'_> {
+    node.parent()
+        .filter(|parent| parent.kind() == JSX_NAMESPACE_NAME_KIND)
+        .unwrap_or(node)
 }
 
 /// そのノードが、型を言い当てる式の**型の側**の綴りか。
@@ -1834,6 +1852,49 @@ export function scan() {
         assert_eq!(
             import_set(require_as_a_statement_label, "src/utils/formatDate.ts"),
             import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_namespacing_a_jsx_attribute_with_require_reaches_the_same_module()
+    {
+        // 名前空間つきの属性は、前半も後半も属性の名前の一部でしかない
+        let require_in_a_namespaced_attribute = r#"import { pad } from "./pad";
+
+export const Prefixed = () => <Widget require:mode="x" />;
+export const Suffixed = () => <Widget ns:require="x" />;
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tsx_tree_of(require_in_a_namespaced_attribute),
+                Path::new("src/utils/formatDate.tsx"),
+            ),
+            Ok(import_set(
+                IMPORTS_PAD_FROM_PARENT,
+                "src/report/dateHelper.ts"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_namespacing_a_jsx_tag_with_require_reaches_the_same_module() {
+        // タグの名前空間も同じ。**指摘は属性だけだったが、タグ側も同じ形で漏れていた**
+        let require_in_a_namespaced_tag = r#"import { pad } from "./pad";
+
+export const Prefixed = () => <require:tag />;
+export const Suffixed = () => <ns:require />;
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tsx_tree_of(require_in_a_namespaced_tag),
+                Path::new("src/utils/formatDate.tsx"),
+            ),
+            Ok(import_set(
+                IMPORTS_PAD_FROM_PARENT,
+                "src/report/dateHelper.ts"
+            ))
         );
     }
 
