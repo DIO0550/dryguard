@@ -213,9 +213,9 @@ fn structural_similarity_of(chunk_a: &Chunk, chunk_b: &Chunk) -> StructuralSimil
 fn import_overlap_of(chunk_a: &Chunk, chunk_b: &Chunk) -> ImportOverlap {
     match (chunk_a.imports(), chunk_b.imports()) {
         (Ok(imports_a), Ok(imports_b)) => ImportOverlap::Measured(imports_a.jaccard(imports_b)),
-        (Err(ImportsUnavailable::UnreadableDeclaration), _)
-        | (_, Err(ImportsUnavailable::UnreadableDeclaration)) => {
-            ImportOverlap::Unavailable(ImportsUnavailable::UnreadableDeclaration)
+        (Err(unreadable @ ImportsUnavailable::UnreadableDeclaration { .. }), _)
+        | (_, Err(unreadable @ ImportsUnavailable::UnreadableDeclaration { .. })) => {
+            ImportOverlap::Unavailable(unreadable)
         }
         (Err(ImportsUnavailable::ReboundSpelling), _)
         | (_, Err(ImportsUnavailable::ReboundSpelling)) => {
@@ -1830,6 +1830,7 @@ mod tests {
 
     use crate::classification::DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
     use crate::classification::verdict::Verdict;
+    use crate::line_number::LineNumber;
     use crate::semantics::resolved_type::TracedTypeNames;
     use crate::semantics::type_signature::normalized_outcome_of;
     use crate::similarity::Similarity;
@@ -2010,7 +2011,9 @@ mod tests {
 
         assert_eq!(
             import_overlap_of(&rebound, &unreadable),
-            ImportOverlap::Unavailable(ImportsUnavailable::UnreadableDeclaration)
+            ImportOverlap::Unavailable(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(1)
+            })
         );
     }
 

@@ -212,14 +212,17 @@ fn import_overlap_text_of(signal: ImportOverlap) -> String {
 /// **利用者が次にすることで分ける。** 宣言が無いのはそのファイルがそうだという話、
 /// 綴りが曖昧なのはこのツールでは測れない書き方だという話、読み取れなかったのは
 /// dryguard 側の穴（`rules/architecture.md`「理由は落とさない」）。
-fn imports_unavailable_text_of(cause: ImportsUnavailable) -> &'static str {
+fn imports_unavailable_text_of(cause: ImportsUnavailable) -> String {
     match cause {
         ImportsUnavailable::NoDeclarations => "依存の宣言が無いファイルがある",
         ImportsUnavailable::ReboundSpelling => {
             "require の綴りが読み込みを指すと言い切れないファイルがある"
         }
-        ImportsUnavailable::UnreadableDeclaration => "依存の宣言を読み取れなかったファイルがある",
+        ImportsUnavailable::UnreadableDeclaration { line } => {
+            return format!("{line} 行目の依存の宣言を読み取れなかったファイルがある");
+        }
     }
+    .to_owned()
 }
 
 /// モジュール距離の値。段数は必ず取れるので、測れなかった形にはならない。
@@ -438,6 +441,8 @@ fn suggestion_of(verdict: Verdict) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::line_number::LineNumber;
     use std::path::{Path, PathBuf};
 
     use crate::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
@@ -590,13 +595,15 @@ mod tests {
         // 利用者は**書いてあるのに dryguard が読めていない**ことに気付けない
         let text = text_of_separate_directories(
             StructuralSimilarity::Measured(measured(0.94)),
-            ImportOverlap::Unavailable(ImportsUnavailable::UnreadableDeclaration),
+            ImportOverlap::Unavailable(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(11),
+            }),
             DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
         );
 
         assert!(
             text.contains(
-                "依存先の重なりを測れない (依存の宣言を読み取れなかったファイルがある) → どちらでもない"
+                "依存先の重なりを測れない (12 行目の依存の宣言を読み取れなかったファイルがある) → どちらでもない"
             ),
             "読み取れなかったことが理由に出る: {text}"
         );

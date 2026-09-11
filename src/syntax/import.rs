@@ -11,6 +11,7 @@ use std::path::{Component, Path};
 
 use tree_sitter::Node;
 
+use crate::line_number::LineNumber;
 use crate::similarity::Similarity;
 use crate::syntax::tree::SyntaxTree;
 
@@ -81,7 +82,14 @@ pub enum ImportsUnavailable {
     /// dryguard の穴のほうへ向けてしまう。
     ReboundSpelling,
     /// 依存の宣言はあるが、指定子を読み取れなかった。
-    UnreadableDeclaration,
+    ///
+    /// **どの行かを持つ。** 宣言は 1 ファイルに複数あるので、「どこかのファイルで
+    /// 読み取れなかった」だけでは**直す先も、dryguard の穴を再現する手がかりも
+    /// 渡せない**（`rules/coding.md`「バリアントが持つ値は直すために要る情報に限る」）。
+    UnreadableDeclaration {
+        /// 読み取れなかった宣言が書かれている行。
+        line: LineNumber,
+    },
 }
 
 impl ImportSet {
@@ -324,7 +332,9 @@ fn specifiers_of<'source>(
             SpecifierReading::NotADeclaration => {}
             SpecifierReading::Specifier(specifier) => specifiers.push(specifier),
             SpecifierReading::Unreadable => {
-                return Err(ImportsUnavailable::UnreadableDeclaration);
+                return Err(ImportsUnavailable::UnreadableDeclaration {
+                    line: LineNumber::from_index(node.start_position().row),
+                });
             }
         }
     }
@@ -1576,7 +1586,9 @@ const stock = require(`./${target}`);
                 &tree_of(real_import_and_a_substituted_require),
                 Path::new("src/utils/a.ts"),
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(1)
+            })
         );
     }
 
@@ -1591,7 +1603,9 @@ const stock = require(`./${target}`);
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(&escaped), Path::new("src/utils/a.ts")),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(0)
+            })
         );
     }
 
@@ -1715,7 +1729,9 @@ const loaded = require(`./${name}`);
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(unreadable_specifier), Path::new("src/utils/a.ts")),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(1)
+            })
         );
     }
 
@@ -1767,6 +1783,28 @@ const handle = value as (require extends Loader ? string : number);
     }
 
     #[test]
+    fn test_import_set_of_a_file_with_an_unreadable_declaration_says_which_line() {
+        // 「どこかのファイルの宣言を読み取れなかった」だけでは、**直す先も、
+        // dryguard の穴を再現する手がかりも渡せない**。読み取れなかった宣言は
+        // 複数ある宣言のうちの 1 つなので、行が要る
+        let unreadable_on_the_fourth_line = r#"import { pad } from "./pad";
+import { clock } from "./clock";
+
+const loaded = require(`./${name}`);
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(unreadable_on_the_fourth_line),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(3)
+            })
+        );
+    }
+
+    #[test]
     fn test_import_set_of_a_file_with_both_causes_says_the_declaration_is_unreadable() {
         // 綴りが曖昧でも、**動的 import は綴りに依存しない宣言**。読み取れないなら
         // それは dryguard の穴で、綴りの曖昧さより先に出す（ファイルをまたぐときの
@@ -1780,7 +1818,9 @@ const loaded = import(`./${name}`);
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(both_causes), Path::new("src/utils/a.ts")),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(4)
+            })
         );
     }
 
@@ -1858,7 +1898,9 @@ const stock = require(target, "./fallback");
                 &tree_of(real_import_and_a_fallback_argument),
                 Path::new("src/utils/a.ts"),
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(1)
+            })
         );
     }
 
@@ -1968,7 +2010,9 @@ const entry = require(".\\stock");
                 &tree_of(requires_a_windows_relative_path),
                 Path::new("src/billing/a.ts")
             ),
-            Err(ImportsUnavailable::UnreadableDeclaration)
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(1)
+            })
         );
     }
 
