@@ -178,20 +178,26 @@ const TEMPLATE_SUBSTITUTION_KIND: &str = "template_substitution";
 /// 型を言い当てる式。**型と値の欄を分けていない**ので、どちらの側かは
 /// ノードの種別（`type_identifier` か `identifier` か）で見分ける。
 const ASSERTION_KINDS: [&str; 2] = ["as_expression", "satisfies_expression"];
-/// 中の式の値をそのまま返す包み。**綴りを見る前に剥がす。**
+/// **値が書かれている子が最初の子**にある包み。**綴りを見る前に剥がす。**
 ///
-/// 括弧と、TypeScript の型だけの注記（`require as NodeRequire` / `require!` /
-/// `require satisfies NodeRequire`）。どれも実行時の値は中の式そのもの。
+/// 括弧、TypeScript の型だけの注記（`require as NodeRequire` / `require!` /
+/// `require satisfies NodeRequire`）、`await`。
 /// **値になる子の位置で 2 つに分かれる**（[`WRAPPERS_HOLDING_THE_VALUE_LAST`]）。
+///
+/// **`await` だけは値をそのまま返すとは限らない**（Promise は解ける）。それでも
+/// ここに入れてよいのは、**このモジュールが読むのは書かれた綴りだけ**だから。
+/// `await "./dep"` の値は書かれた綴りそのもので、`await somePromise` は綴りを
+/// 読み取れない側へ落ちる（どちらに入れても答えが変わらない）。
 ///
 /// **ここから漏れた包みは [`RequireSpelling::Rebound`] へ落ちる。** 落ちた先は
 /// 「読み取れない」なので、**値を作らずに測れないと言う**だけで済む
 /// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-const WRAPPERS_HOLDING_THE_VALUE_FIRST: [&str; 4] = [
+const WRAPPERS_HOLDING_THE_VALUE_FIRST: [&str; 5] = [
     "parenthesized_expression",
     "as_expression",
     "satisfies_expression",
     "non_null_expression",
+    "await_expression",
 ];
 
 /// 値を変えない包みのうち、**中の式が最後の子**にあるもの。
@@ -1862,6 +1868,79 @@ const handle = "require" as string;
                 &tree_of(require_string_on_the_value_side),
                 Path::new("src/utils/a.ts")
             ),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_awaiting_an_escaped_computed_key_cannot_be_created() {
+        // `await` は Promise を解くが、**綴りとして書かれている値はそのまま**。
+        // 包みとして数えないと、呼ばれてもいない持ち出しが素通りする
+        let awaited_escaped_key = "import { pad } from \"./pad\";\nasync function wire() {\n  const load = module[await \"requ\\u0069re\"];\n  load(\"./stock\");\n}\n";
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(awaited_escaped_key), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_an_awaited_require_reaches_the_same_module() {
+        // 呼ばれる側が `await` に包まれても、値は `require` そのもの
+        let awaited_callee = r#"import { pad } from "../utils/pad";
+async function wire() {
+  return (await require)("./pad");
+}
+"#;
+
+        assert_eq!(
+            import_set(awaited_callee, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_require_given_an_awaited_specifier_reaches_the_same_module() {
+        // 指定子の側も同じ
+        let awaited_specifier = r#"async function wire() {
+  return require(await "./pad");
+}
+"#;
+
+        assert_eq!(
+            import_set(awaited_specifier, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_awaiting_a_plain_computed_key_reaches_the_same_module() {
+        // 対照。読み取れる添字は落とさない
+        let awaited_plain_key = r#"import { pad } from "./pad";
+async function wire() {
+  return config[await "title"];
+}
+"#;
+
+        assert_eq!(
+            import_set(awaited_plain_key, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_awaiting_require_itself_cannot_be_created() {
+        // 対照。`await require` は読み込む関数そのものを取り出す。包みを剥がしても
+        // 置かれている位置は変わらないので、持ち出しとして数える
+        let awaited_require = r#"import { pad } from "./pad";
+async function wire() {
+  const loader = await require;
+  return loader;
+}
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(awaited_require), Path::new("src/utils/a.ts")),
             Err(ImportsUnavailable::ReboundSpelling)
         );
     }

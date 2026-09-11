@@ -214,15 +214,14 @@ fn import_overlap_text_of(signal: ImportOverlap) -> String {
 /// dryguard 側の穴（`rules/architecture.md`「理由は落とさない」）。
 fn imports_unavailable_text_of(cause: ImportsUnavailable) -> String {
     match cause {
-        ImportsUnavailable::NoDeclarations => "依存の宣言が無いファイルがある",
+        ImportsUnavailable::NoDeclarations => "依存の宣言が無いファイルがある".to_owned(),
         ImportsUnavailable::ReboundSpelling => {
-            "require の綴りが読み込みを指すと言い切れないファイルがある"
+            "require の綴りが読み込みを指すと言い切れないファイルがある".to_owned()
         }
         ImportsUnavailable::UnreadableDeclaration { line } => {
-            return format!("{line} 行目の依存の宣言を読み取れなかったファイルがある");
+            format!("{line} 行目の依存の宣言を読み取れなかったファイルがある")
         }
     }
-    .to_owned()
 }
 
 /// モジュール距離の値。段数は必ず取れるので、測れなかった形にはならない。
