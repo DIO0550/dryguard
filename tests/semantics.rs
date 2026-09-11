@@ -211,6 +211,28 @@ fn test_two_functions_taking_unions_of_different_members_are_not_unifiable() {
     assert!(!unifiable(&either, &widened));
 }
 
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_a_chunk_wrapped_in_transparent_expressions_is_unifiable_with_the_same_type_written_plainly()
+{
+    // 包みを抜けないと名前の位置が取れず、シグネチャがそもそも付かない。
+    // 抜けた先の名前に hover が答えるところまでを見る
+    let asserted = fixture("wrapped/asserted.ts", 3);
+    let plain = fixture("wrapped/plain.ts", 2);
+
+    assert!(unifiable(&asserted, &plain));
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_a_chunk_wrapped_in_transparent_expressions_is_not_unifiable_with_another_type() {
+    // 対照は上のテスト。包みを抜けた先で本当に尋ねていれば、型が違えば重ならない
+    let asserted = fixture("wrapped/asserted.ts", 3);
+    let widened = fixture("wrapped/widened.ts", 2);
+
+    assert!(!unifiable(&asserted, &widened));
+}
+
 /// そのチャンクの呼び出し元のファイル。サーバに尋ねて集める。
 fn reference_paths_of(session: &mut Session, chunk: &Chunk) -> Vec<PathBuf> {
     let document = document(chunk.path());
