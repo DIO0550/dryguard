@@ -314,8 +314,29 @@ const NON_LOADING_REQUIRE_MEMBERS: [&str; 3] = ["resolve", "cache", "main"];
 /// 漏れたときに倒れる向きが逆なので使い回さない
 /// （`rules/coding.md`「同じ一覧を、安全な倒れ方が違う 2 箇所で使い回さない」）。
 ///
-/// `bind` は入れない（[`is_invoked_through_a_function_member`]）。
+/// `bind` はここに入れない。返った関数がその場で呼ばれたときだけ数える
+/// （[`FUNCTION_MEMBER_THAT_BINDS`]）。
 const FUNCTION_MEMBERS_THAT_INVOKE: [&str; 2] = ["call", "apply"];
+
+/// 呼ばれる側を**その場では呼ばず**、束縛した関数を返す `Function.prototype` の要素の名前。
+///
+/// **返った関数をその場で呼ぶかで扱いが分かれる。** `module[key].bind(null)("./dep")` は
+/// 読み込みそのものだが、`const load = module[key].bind(null);` は「呼ばずに持ち出して
+/// 後で呼ぶ」形で、18 巡目に**残すと決着した族**に当たる
+/// （[`is_invoked_through_a_function_member`]）。
+const FUNCTION_MEMBER_THAT_BINDS: &str = "bind";
+
+/// 添字に書かれたときに、**選ばれる要素の名前が `require` になりえない**リテラルの種別。
+///
+/// 数を添字に書くと要素の名前は `"0"` のような綴りになるので、`require` を選べない。
+/// 綴りを読み取れない添字（[`is_an_invoked_unreadable_key`]）より先に外しておかないと、
+/// `handlers[0]()` のような普通のコードでそのファイルが測れなくなる。
+///
+/// **書いた時点で値が決まるリテラルだけを並べる。** `handlers[1 + 1]()` のように
+/// 計算する形は入れない（定数畳み込みを持つことになる）。ここから漏れた形は
+/// 測れない側（偽陰性）へ落ちる
+/// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+const INDEX_KINDS_THAT_CANNOT_SPELL_REQUIRE: [&str; 1] = ["number"];
 
 /// そのファイルで `require` の綴りが何を指しているか。
 ///
@@ -434,8 +455,12 @@ fn is_an_invoked_unreadable_key(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
     let Some(index) = node.child_by_field_name("index") else {
         return false;
     };
+    let written = inside_wrappers(index);
+    if INDEX_KINDS_THAT_CANNOT_SPELL_REQUIRE.contains(&written.kind()) {
+        return false;
+    }
 
-    unquoted_text_of(tree, inside_wrappers(index)).is_none()
+    unquoted_text_of(tree, written).is_none()
 }
 
 /// そのノードが、[`specifier_of`] が指定子として読む文字列リテラルの中身か。
@@ -956,8 +981,12 @@ fn is_invoked_through_a_function_member(tree: &SyntaxTree<'_>, node: Node<'_>) -
     let Some(member) = function_member_read_by(tree, access) else {
         return false;
     };
+    let Some(applied) = invoking_call_of(access) else {
+        return false;
+    };
 
-    FUNCTION_MEMBERS_THAT_INVOKE.contains(&member) && is_invoked(access)
+    FUNCTION_MEMBERS_THAT_INVOKE.contains(&member)
+        || (member == FUNCTION_MEMBER_THAT_BINDS && is_invoked_or_constructed(applied))
 }
 
 /// その要素アクセスが読んでいる要素の名前。読み取れなければ `None`。
@@ -978,13 +1007,17 @@ fn function_member_read_by<'source>(
 
 /// その式が、呼び出しの呼ばれる側になっているか。包みは外へ辿る。
 fn is_invoked(node: Node<'_>) -> bool {
-    let positioned = outside_wrappers(node);
-    let Some(parent) = positioned.parent() else {
-        return false;
-    };
+    invoking_call_of(node).is_some()
+}
 
-    parent.kind() == CALL_EXPRESSION_KIND
-        && parent.child_by_field_name("function") == Some(positioned)
+/// その式を呼んでいる呼び出し。呼ばれていなければ `None`。包みは外へ辿る。
+fn invoking_call_of(node: Node<'_>) -> Option<Node<'_>> {
+    let positioned = outside_wrappers(node);
+    let parent = positioned.parent()?;
+
+    (parent.kind() == CALL_EXPRESSION_KIND
+        && parent.child_by_field_name("function") == Some(positioned))
+    .then_some(parent)
 }
 
 /// 包んでいる包みの外まで遡ったノード。
@@ -2034,6 +2067,76 @@ const shown = items[index].map((row) => row);
         assert_eq!(
             import_set(method_on_key, "src/utils/formatDate.ts"),
             import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_invoking_a_bound_unreadable_key_cannot_be_created() {
+        // `bind` が返した関数をその場で呼べば、直に呼ぶのと同じ読み込みが起きる
+        let bound_then_invoked = r#"import { pad } from "./pad";
+module["re" + "quire"].bind(null)("./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(bound_then_invoked), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_constructing_a_bound_unreadable_key_cannot_be_created() {
+        let bound_then_constructed = r#"import { pad } from "./pad";
+const made = new (module["re" + "quire"].bind(null))("./stock");
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(
+                &tree_of(bound_then_constructed),
+                Path::new("src/utils/a.ts")
+            ),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_require_written_in_a_method_body_reaches_the_same_module() {
+        // 対照。名前だけを外し、中身は今までどおり走査する
+        let require_in_a_body = r#"const handlers = {
+  load() {
+    return require("../utils/pad");
+  },
+};
+"#;
+
+        assert_eq!(
+            import_set(require_in_a_body, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_invoking_a_numeric_index_reaches_the_same_module() {
+        // 数の添字は要素の名前が `"0"` になるので、**`require` を選べない**
+        let numeric_index = r#"import { pad } from "./pad";
+handlers[0]();
+"#;
+
+        assert_eq!(
+            import_set(numeric_index, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_invoking_a_computed_numeric_index_cannot_be_created() {
+        // 対照。計算された添字は書いた時点で綴りが決まらないので、測れない側のまま
+        let computed_index = r#"import { pad } from "./pad";
+handlers[1 + 1]();
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(computed_index), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
         );
     }
 
