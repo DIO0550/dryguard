@@ -336,15 +336,32 @@ const FUNCTION_MEMBER_THAT_BINDS: &str = "bind";
 
 /// 添字に書かれたときに、**選ばれる要素の名前が `require` になりえない**リテラルの種別。
 ///
-/// 数を添字に書くと要素の名前は `"0"` のような綴りになるので、`require` を選べない。
+/// 要素の名前は `"0"` / `"true"` / `"false"` / `"null"` になるので、`require` を選べない。
+///
+/// **書いた時点で値が決まるリテラルだけを並べる。** `handlers[1 + 1]()` のように
+/// 計算する形は入れない（定数畳み込みを持つことになる）。
+/// **識別子（`handlers[undefined]()`）も入れない。** 綴りが何であれ中身は名前の参照で、
+/// 書いた時点では何を選ぶか決まらない。
+const INDEX_KINDS_THAT_CANNOT_SELECT_REQUIRE: [&str; 4] = ["number", "true", "false", "null"];
+
+/// その添字が、**`require` を選べない**と書いた時点で言い切れるか。
+///
 /// 綴りを読み取れない添字（[`is_an_invoked_unreadable_key`]）より先に外しておかないと、
 /// `handlers[0]()` のような普通のコードでそのファイルが測れなくなる。
 ///
-/// **書いた時点で値が決まるリテラルだけを並べる。** `handlers[1 + 1]()` のように
-/// 計算する形は入れない（定数畳み込みを持つことになる）。ここから漏れた形は
-/// 測れない側（偽陰性）へ落ちる
+/// **空の文字列（`handlers[""]()`）もここに入る。** 断片を持たないので
+/// [`unquoted_text_of`] は読み取れないと答えるが、**読み取れないのではなく
+/// 読み取った結果が空**で、名前は `""` になる。
+///
+/// ここから漏れた形は測れない側（偽陰性）へ落ちる
 /// (rules/coding.md「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-const INDEX_KINDS_THAT_CANNOT_SPELL_REQUIRE: [&str; 1] = ["number"];
+fn is_an_index_that_cannot_select_require(index: Node<'_>) -> bool {
+    if INDEX_KINDS_THAT_CANNOT_SELECT_REQUIRE.contains(&index.kind()) {
+        return true;
+    }
+
+    STRING_LITERAL_KINDS.contains(&index.kind()) && index.named_child_count() == 0
+}
 
 /// そのファイルで `require` の綴りが何を指しているか。
 ///
@@ -472,7 +489,7 @@ fn is_an_invoked_unreadable_key(tree: &SyntaxTree<'_>, node: Node<'_>) -> bool {
         return false;
     };
     let written = inside_wrappers(index);
-    if INDEX_KINDS_THAT_CANNOT_SPELL_REQUIRE.contains(&written.kind()) {
+    if is_an_index_that_cannot_select_require(written) {
         return false;
     }
 
@@ -2392,6 +2409,84 @@ require = helper;
 
         assert_eq!(
             ImportSet::from_tree(&tree_of(assigned_escaped_key), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_invoking_a_false_index_reaches_the_same_module() {
+        // 真偽値の添字は要素の名前が `"false"` になるので、`require` を選べない
+        let false_index = r#"import { pad } from "./pad";
+handlers[false]();
+"#;
+
+        assert_eq!(
+            import_set(false_index, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_invoking_a_null_index_reaches_the_same_module() {
+        let null_index = r#"import { pad } from "./pad";
+handlers[null]();
+"#;
+
+        assert_eq!(
+            import_set(null_index, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_invoking_a_true_index_reaches_the_same_module() {
+        let true_index = r#"import { pad } from "./pad";
+handlers[true]();
+"#;
+
+        assert_eq!(
+            import_set(true_index, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_invoking_an_empty_index_reaches_the_same_module() {
+        // 空の文字列は名前が `""` になる。読み取れないのではなく、**読み取った結果が空**
+        let empty_index = r#"import { pad } from "./pad";
+handlers[""]();
+"#;
+
+        assert_eq!(
+            import_set(empty_index, "src/utils/formatDate.ts"),
+            import_set(IMPORTS_PAD_FROM_PARENT, "src/report/dateHelper.ts")
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_invoking_an_undefined_index_cannot_be_created() {
+        // 対照。`undefined` は予約語ではなく**束縛し直せる**ので、綴りだけでは
+        // そこにある値が決まらない
+        let undefined_index = r#"import { pad } from "./pad";
+handlers[undefined]();
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(undefined_index), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
+    fn test_import_set_of_a_file_invoking_a_named_index_cannot_be_created() {
+        // 対照。名前で引く添字は**書いた時点では何を選ぶか決まらない**。
+        // これを外すと 18 巡目に決着した族が丸ごと測れる側へ戻る
+        let named_index = r#"import { pad } from "./pad";
+handlers[chosen]();
+"#;
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(named_index), Path::new("src/utils/a.ts")),
             Err(ImportsUnavailable::ReboundSpelling)
         );
     }
