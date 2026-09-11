@@ -318,6 +318,26 @@ const OVERLOAD_DECLARATION_KINDS: [&str; 2] = ["function_signature", "method_sig
 /// 名前を載せるフィールド。
 const NAME_FIELD: &str = "name";
 
+/// 値をそのまま通すだけで、包んだ式の名前を変えないノードの種別。
+///
+/// **grammar が持つ閉じた集合。** `expression` / `primary_expression` の subtype のうち、
+/// 「包みを外しても同じ値を指す」ものがこれで尽きる（`tree-sitter-typescript 0.23.2` の
+/// `node-types.json` を数えた）。hover の接頭辞のようにサーバごとに増える一覧ではない。
+///
+/// **一覧から漏れた種別はそこで探索が止まり、名前の位置が取れない**（偽陰性）
+/// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+///
+/// **Why not（`sequence_expression` を入れる）**: 値になるのは最後の 1 つだけで、
+/// 種別だけでは決まらない（位置を見る判定になる）。
+const TRANSPARENT_EXPRESSION_KINDS: [&str; 6] = [
+    "parenthesized_expression",
+    "as_expression",
+    "satisfies_expression",
+    "non_null_expression",
+    "type_assertion",
+    "instantiation_expression",
+];
+
 /// クラスの静的なメンバーを表す修飾子の種別。
 const STATIC_MODIFIER: &str = "static";
 
@@ -352,12 +372,16 @@ fn name_position_of(node: Node<'_>, source: &str) -> Option<SourcePosition> {
 /// **Why（自分の名前を先に見る）**: `const named = function inner(…) {}` は両方持つ。
 /// 代入先を指すと**変数に書かれた型**が返るので、注釈が付いていれば
 /// （`const named: Formatter = function inner(…)`）関数自身の型ではなくその注釈を見ることになる。
+///
+/// 名前を探すのは[値を通すだけの包み](TRANSPARENT_EXPRESSION_KINDS)を抜けた先。
+/// `const wrapped = ((…) => …) as Formatter` は、包みの位置で止めると
+/// **サーバは答えられるのに尋ねに行けない**。
 fn name_node_of(node: Node<'_>) -> Option<Node<'_>> {
     if let Some(name) = node.child_by_field_name(NAME_FIELD) {
         return Some(name);
     }
 
-    let parent = node.parent()?;
+    let parent = unwrapped_parent_of(node)?;
     if let Some(name) = parent
         .child_by_field_name(NAME_FIELD)
         .or_else(|| parent.child_by_field_name("key"))
@@ -366,6 +390,21 @@ fn name_node_of(node: Node<'_>) -> Option<Node<'_>> {
     }
 
     assigned_name_of(parent)
+}
+
+/// そのノードを包んでいる式をすべて抜けた先の親。包まれていなければ親そのもの。
+/// 親が無ければ `None`。
+///
+/// **1 段ではなく繰り返す。** 包みは重なる（`(((f) as T))!` は括弧・`as`・括弧・非 null の
+/// 4 段）ので、1 段だけ抜ける形では重なった分で止まる。
+fn unwrapped_parent_of(node: Node<'_>) -> Option<Node<'_>> {
+    let mut parent = node.parent()?;
+
+    while TRANSPARENT_EXPRESSION_KINDS.contains(&parent.kind()) {
+        parent = parent.parent()?;
+    }
+
+    Some(parent)
 }
 
 /// そのチャンクのオーバーロード宣言の、名前が置かれている位置。ソースに書かれた順。
@@ -1056,6 +1095,136 @@ function broken() {
             positions,
             vec![Some((1, 16)), None],
             "無名のコールバックだけが名前の位置を持たない"
+        );
+    }
+
+    #[test]
+    fn test_chunk_wrapped_in_parentheses_points_at_the_name_it_is_assigned_to() {
+        // 括弧はアロー関数と代入先の間に挟まるだけで、名前を変えない
+        let parenthesized = "export const wrapped = ((value: string): string => value);\n";
+
+        let chunk = chunk_at(parenthesized, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((1, 13)));
+    }
+
+    #[test]
+    fn test_chunk_asserted_with_as_points_at_the_name_it_is_assigned_to() {
+        let asserted = "export const asserted = ((value: string): string => value) as (v: string) => string;\n";
+
+        let chunk = chunk_at(asserted, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((1, 13)));
+    }
+
+    #[test]
+    fn test_chunk_checked_with_satisfies_points_at_the_name_it_is_assigned_to() {
+        let checked = "export const checked = ((value: string): string => value) satisfies (v: string) => string;\n";
+
+        let chunk = chunk_at(checked, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((1, 13)));
+    }
+
+    #[test]
+    fn test_chunk_asserted_as_non_null_points_at_the_name_it_is_assigned_to() {
+        let non_null = "export const nonNull = ((value: string): string => value)!;\n";
+
+        let chunk = chunk_at(non_null, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((1, 13)));
+    }
+
+    #[test]
+    fn test_chunk_asserted_with_angle_brackets_points_at_the_name_it_is_assigned_to() {
+        // `<T>value` 形の型アサーション。TSX の grammar では JSX の開始タグになるので
+        // TypeScript の grammar でしか現れない
+        let angled =
+            "export const angled = <(v: string) => string>((value: string): string => value);\n";
+
+        let chunk = chunk_at(angled, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((1, 13)));
+    }
+
+    #[test]
+    fn test_chunk_instantiated_with_type_arguments_points_at_the_name_it_is_assigned_to() {
+        let instantiated = "export const instantiated = (<T>(value: T): T => value)<string>;\n";
+
+        let chunk = chunk_at(instantiated, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((1, 13)));
+    }
+
+    #[test]
+    fn test_chunk_wrapped_in_stacked_wrappers_points_at_the_name_it_is_assigned_to() {
+        // 包みは重なる。1 段だけ抜ける形だと、ここで止まって名前が取れない
+        let stacked = "export const stacked = (((value: string): string => value) as (v: string) => string)!;\n";
+
+        let chunk = chunk_at(stacked, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((1, 13)));
+    }
+
+    #[test]
+    fn test_chunk_wrapped_before_a_property_assignment_points_at_the_property_name() {
+        // 包みを抜けた先が代入。左辺全体ではなくプロパティを指すのは包みが無いときと同じ
+        let wrapped_then_assigned =
+            "obj.handler = ((value: string): string => value) as (v: string) => string;\n";
+
+        let chunk = chunk_at(wrapped_then_assigned, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((1, 4)));
+    }
+
+    #[test]
+    fn test_chunk_wrapped_as_an_object_property_points_at_the_property_name() {
+        let wrapped_property =
+            "export const handlers = { format: ((value: string): string => value)! };\n";
+
+        let chunk = chunk_at(wrapped_property, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((1, 26)));
+    }
+
+    #[test]
+    fn test_chunk_wrapped_in_a_sequence_expression_has_no_name_position() {
+        // 対照として同じソースに包みだけを通した形を 1 件置く。並びになった側だけが
+        // 名前を持たない（値になるのは最後の 1 つで、種別だけでは決まらない）
+        let wrapped_then_sequenced = "export const wrapped = ((value: string): string => value);\n\
+             export const sequenced = (0, (value: string): string => value);\n";
+
+        let file_chunks = chunks_at(wrapped_then_sequenced, "a.ts");
+
+        let positions: Vec<Option<(usize, usize)>> = file_chunks
+            .chunks()
+            .iter()
+            .map(name_position_of_chunk)
+            .collect();
+        assert_eq!(
+            positions,
+            vec![Some((1, 13)), None],
+            "並びの中のアロー関数だけが名前の位置を持たない"
+        );
+    }
+
+    #[test]
+    fn test_chunk_wrapped_as_a_call_argument_has_no_name_position() {
+        // 対照は 1 行目。括弧は同じでも、引数の括弧は値を通す包みではない
+        let wrapped_then_passed = "export const wrapped = ((value: string): string => value);\n\
+             run(((value: string): string => value));\n";
+
+        let file_chunks = chunks_at(wrapped_then_passed, "a.ts");
+
+        let positions: Vec<Option<(usize, usize)>> = file_chunks
+            .chunks()
+            .iter()
+            .map(name_position_of_chunk)
+            .collect();
+        assert_eq!(
+            positions,
+            vec![Some((1, 13)), None],
+            "引数として渡されたアロー関数だけが名前の位置を持たない"
         );
     }
 
