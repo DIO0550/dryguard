@@ -98,11 +98,7 @@ pub(super) fn type_references_of(nodes: &[Node<'_>], source: &str) -> Vec<TypeRe
     let mut references: Vec<TypeReference> = Vec::new();
 
     for node in nodes {
-        // **束縛は、それを宣言した綴りの中だけに効かせる。** チャンクの型変数は包みまで
-        // 届かず、包みの型変数もチャンクまで届かないので、同じ綴りが両側にあると
-        // **外側の宣言を指している側まで落ちる**（落ちた型名は開かれず、別のファイルの
-        // 同じ綴りと重なる = 偽陽性）
-        for annotated in [annotated_nodes_of(*node), outer_annotated_nodes_of(*node)] {
+        for annotated in annotation_scopes_of(*node) {
             let declared = bound_type_names_of(&annotated, source);
 
             for node in annotated {
@@ -128,10 +124,31 @@ pub(super) fn type_references_of(nodes: &[Node<'_>], source: &str) -> Vec<TypeRe
     references
 }
 
+/// 型注釈が書かれうるノードを、**型変数の束縛が届く範囲ごとに**分けたもの。
+///
+/// 1 つ目はそのノード自身のシグネチャ。型変数の宣言・引数・戻り値は 1 つの範囲で、
+/// `<T>` が引数と戻り値の両方に届く。続くのは外側に書かれた注釈で、**1 つずつが別の範囲**。
+/// 包みが言い切った型と代入先の注釈は互いに独立していて、片方の型変数がもう片方まで届かない
+/// （`const f: Handler = (…) as <Handler>(x: Handler) => Handler` の 2 つの `Handler`）。
+///
+/// **範囲をまたいで束縛を効かせると、外側の宣言を指している側まで落ちる。** 落ちた型名は
+/// 開かれず宣言の場所も付かないので、**別のファイルの同じ綴りと重なる**（偽陽性）。
+fn annotation_scopes_of(node: Node<'_>) -> Vec<Vec<Node<'_>>> {
+    let mut scopes = vec![annotated_nodes_of(node)];
+
+    scopes.extend(
+        outer_annotated_nodes_of(node)
+            .into_iter()
+            .map(|annotated| vec![annotated]),
+    );
+
+    scopes
+}
+
 /// そのノード自身のシグネチャに、型注釈が書かれうるノード。
 ///
-/// **ここが、そのノードの宣言した型変数が届く範囲**（[`bound_type_names_of`] が
-/// 見る相手）。外側に書かれた注釈は [`outer_annotated_nodes_of`] が別に返す。
+/// **まとめて 1 つの範囲になる**（[`annotation_scopes_of`]）。外側に書かれた注釈は
+/// [`outer_annotated_nodes_of`] が別に返す。
 fn annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
     let mut annotated = Vec::new();
 
@@ -145,6 +162,7 @@ fn annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
 }
 
 /// そのノードの外側に書かれていて、hover が答える綴りに現れる型注釈。
+/// **1 つずつが別の範囲**（[`annotation_scopes_of`]）。
 ///
 /// **自分の名前を持たないチャンクでは hover が代入先の名前を指す**（`chunk` の
 /// `name_node_of`）ので、包みが言い切った型（`as` / `satisfies` / `<T>value` /

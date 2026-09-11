@@ -1589,6 +1589,18 @@ export function scale(a: unknown, rate?: unknown): unknown {
     }
 
     #[test]
+    fn test_chunk_type_references_keep_an_annotation_spelled_like_a_type_variable_of_the_wrapper() {
+        // 包みが言い切った型と代入先の注釈は互いに独立した範囲。包みの型変数は
+        // 代入先まで届かないので、綴りが重なっても代入先の `Handler` は落とせない
+        let colliding_outer_spellings =
+            "export const f: Handler = ((x: any) => x) as <Handler>(x: Handler) => Handler;\n";
+
+        let chunk = chunk_at(colliding_outer_spellings, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Handler"]);
+    }
+
+    #[test]
     fn test_chunk_type_references_leave_out_a_type_variable_the_wrapper_declares() {
         // 対照は上の 2 件。綴りが重なっていなければ、包みが宣言した型変数は
         // その綴りの中でだけ意味を持つので数えない
