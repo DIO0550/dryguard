@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use tree_sitter::Node;
 
 use crate::source_position::SourcePosition;
-use crate::syntax::tree::source_position_of;
+use crate::syntax::tree::{source_position_of, transparent_wrappers_of, unwrapped_parent_of};
 
 /// 型名 1 つを表すノードの種別。
 ///
@@ -98,23 +98,25 @@ pub(super) fn type_references_of(nodes: &[Node<'_>], source: &str) -> Vec<TypeRe
     let mut references: Vec<TypeReference> = Vec::new();
 
     for node in nodes {
-        let declared = bound_type_names_of(*node, source);
+        for annotated in annotation_scopes_of(*node) {
+            let declared = bound_type_names_of(&annotated, source);
 
-        for annotated in annotated_nodes_of(*node) {
-            for identifier in type_identifiers_of(annotated) {
-                let Some(reference) = type_reference_of(identifier, source) else {
-                    continue;
-                };
-                if declared.contains(reference.name()) {
-                    continue;
+            for node in annotated {
+                for identifier in type_identifiers_of(node) {
+                    let Some(reference) = type_reference_of(identifier, source) else {
+                        continue;
+                    };
+                    if declared.contains(reference.name()) {
+                        continue;
+                    }
+                    if references
+                        .iter()
+                        .any(|kept| kept.name() == reference.name())
+                    {
+                        continue;
+                    }
+                    references.push(reference);
                 }
-                if references
-                    .iter()
-                    .any(|kept| kept.name() == reference.name())
-                {
-                    continue;
-                }
-                references.push(reference);
             }
         }
     }
@@ -122,11 +124,31 @@ pub(super) fn type_references_of(nodes: &[Node<'_>], source: &str) -> Vec<TypeRe
     references
 }
 
-/// 型注釈が書かれうるノード。
+/// 型注釈が書かれうるノードを、**型変数の束縛が届く範囲ごとに**分けたもの。
 ///
-/// **hover が答える綴りに現れる型名だけを集める。** 自分の名前を持たないチャンクでは
-/// hover が代入先の名前を指す（`chunk` の `name_node_of`）ので、そこに書かれた注釈
-/// （`const aliased: Handler` の `Handler`）もシグネチャの一部になる。
+/// 1 つ目はそのノード自身のシグネチャ。型変数の宣言・引数・戻り値は 1 つの範囲で、
+/// `<T>` が引数と戻り値の両方に届く。続くのは外側に書かれた注釈で、**1 つずつが別の範囲**。
+/// 包みが言い切った型と代入先の注釈は互いに独立していて、片方の型変数がもう片方まで届かない
+/// （`const f: Handler = (…) as <Handler>(x: Handler) => Handler` の 2 つの `Handler`）。
+///
+/// **範囲をまたいで束縛を効かせると、外側の宣言を指している側まで落ちる。** 落ちた型名は
+/// 開かれず宣言の場所も付かないので、**別のファイルの同じ綴りと重なる**（偽陽性）。
+fn annotation_scopes_of(node: Node<'_>) -> Vec<Vec<Node<'_>>> {
+    let mut scopes = vec![annotated_nodes_of(node)];
+
+    scopes.extend(
+        outer_annotated_nodes_of(node)
+            .into_iter()
+            .map(|annotated| vec![annotated]),
+    );
+
+    scopes
+}
+
+/// そのノード自身のシグネチャに、型注釈が書かれうるノード。
+///
+/// **まとめて 1 つの範囲になる**（[`annotation_scopes_of`]）。外側に書かれた注釈は
+/// [`outer_annotated_nodes_of`] が別に返す。
 fn annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
     let mut annotated = Vec::new();
 
@@ -136,20 +158,60 @@ fn annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
         }
     }
 
-    // 自分の名前を持つチャンクでは、hover は関数自身の型を返す。代入先に注釈が
-    // 付いていても（`const named: Formatter = function inner(…)`）綴りには現れない。
+    annotated
+}
+
+/// そのノードの外側に書かれていて、hover が答える綴りに現れる型注釈。
+/// **1 つずつが別の範囲**（[`annotation_scopes_of`]）。
+///
+/// **自分の名前を持たないチャンクでは hover が代入先の名前を指す**（`chunk` の
+/// `name_node_of`）ので、包みが言い切った型（`as` / `satisfies` / `<T>value` /
+/// インスタンス化の型引数）と代入先の注釈（`const aliased: Handler` の `Handler`）も
+/// シグネチャの一部になる。自分の名前を持つチャンクでは hover が関数自身の型を返すので空。
+///
+/// **名前を探す側と同じ包みを抜ける**（[`unwrapped_parent_of`]）。片方だけが抜けると、
+/// `const f = (…) as (v: Input) => Input` の `Input` を集め損ねる。集め損ねた型名は
+/// 開かれずに比較へ残るので、**別のファイルの同じ綴りの型が単一化可能に出る**（偽陽性）。
+fn outer_annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
     if node.child_by_field_name(NAME_FIELD).is_some() {
-        return annotated;
+        return Vec::new();
     }
 
-    let assigned = node
-        .parent()
-        .and_then(|parent| parent.child_by_field_name(TYPE_FIELD));
+    let mut annotated = wrapper_types_of(node);
+
+    let assigned =
+        unwrapped_parent_of(node).and_then(|parent| parent.child_by_field_name(TYPE_FIELD));
     if let Some(assigned) = assigned {
         annotated.push(assigned);
     }
 
     annotated
+}
+
+/// そのノードを包んでいる式が書いている型。内側の包みのものから順に並ぶ。
+///
+/// `as` / `satisfies` が言い切った型・`<T>value` の型引数・インスタンス化に渡した型引数が
+/// これで、**どれも hover が答える綴りに現れる**。
+///
+/// **包んでいる式から降りてきた子だけを外す。** 包みの種別ごとに型の載る場所を数え上げると、
+/// フィールド名を持つもの（`instantiation_expression` の `type_arguments`）と持たないもの
+/// （`as_expression`）で別々の引き方が要る。**残りの名前付きの子は型だけ**なので、
+/// 降りてきた側を外せば種別を見ずに済む。
+fn wrapper_types_of(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut types = Vec::new();
+    let mut inner = node;
+
+    for wrapper in transparent_wrappers_of(node) {
+        let mut cursor = wrapper.walk();
+        types.extend(
+            wrapper
+                .named_children(&mut cursor)
+                .filter(|child| child.id() != inner.id()),
+        );
+        inner = wrapper;
+    }
+
+    types
 }
 
 /// その部分木にある型名のノードを、書かれた順に返す。
@@ -226,7 +288,11 @@ fn asked_node_of(node: Node<'_>) -> Node<'_> {
     tail.unwrap_or(node)
 }
 
-/// そのシグネチャの中で束縛された型の名前。束縛が無ければ空。
+/// その注釈の中で束縛された型の名前。束縛が無ければ空。
+///
+/// `annotated` は 1 つの範囲に収まる注釈のノード（[`annotated_nodes_of`] か
+/// [`outer_annotated_nodes_of`] のどちらか片方）。**渡された注釈そのものから採る。**
+/// 別の範囲の注釈まで混ぜると、同じ綴りの束縛が**外側の宣言を指している側まで落とす**。
 ///
 /// 束縛は 3 通りある。型変数の宣言（`<T>`）・マップ型の束縛（`[K in "a"]`）・
 /// 条件型が捕まえる名前（`infer U`）。
@@ -247,10 +313,10 @@ fn asked_node_of(node: Node<'_>) -> Node<'_> {
 ///
 /// 制約に書かれた型名（`<T extends Amount>` の `Amount`、`[K in Keys]` の `Keys`）は
 /// 束縛された名前ではないので、集める側に残る。
-fn bound_type_names_of(node: Node<'_>, source: &str) -> BTreeSet<String> {
+fn bound_type_names_of(annotated: &[Node<'_>], source: &str) -> BTreeSet<String> {
     let mut bound = BTreeSet::new();
 
-    for annotated in annotated_nodes_of(node) {
+    for annotated in annotated.iter().copied() {
         for declarations in nodes_of_kind(annotated, TYPE_PARAMETERS_FIELD) {
             let mut cursor = declarations.walk();
             let declared: Vec<Node<'_>> = declarations.named_children(&mut cursor).collect();
