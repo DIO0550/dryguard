@@ -1885,6 +1885,18 @@ const handle = "require" as string;
     }
 
     #[test]
+    fn test_import_set_of_a_file_awaiting_a_wrapped_escaped_computed_key_cannot_be_created() {
+        // 包みは入れ子になる。1 段だけ剥がす形だと、`await` の中の括弧と
+        // 言い当てで同じ持ち出しがもう一度素通りする
+        let wrapped_escaped_key = "import { pad } from \"./pad\";\nasync function wire() {\n  const load = module[await (\"requ\\u0069re\" as string)];\n  load(\"./stock\");\n}\n";
+
+        assert_eq!(
+            ImportSet::from_tree(&tree_of(wrapped_escaped_key), Path::new("src/utils/a.ts")),
+            Err(ImportsUnavailable::ReboundSpelling)
+        );
+    }
+
+    #[test]
     fn test_import_set_of_an_awaited_require_reaches_the_same_module() {
         // 呼ばれる側が `await` に包まれても、値は `require` そのもの
         let awaited_callee = r#"import { pad } from "../utils/pad";
