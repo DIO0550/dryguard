@@ -1,9 +1,9 @@
-const noop = (value: string): void => {
-  void value;
-};
-
 export class Holder {
-  get handler(): (value: string) => void {
-    return noop;
+  set handler(value: (message: string) => void) {
+    const kept = value;
+    const seen = kept;
+    void seen;
+    void kept;
+    void value;
   }
 }
