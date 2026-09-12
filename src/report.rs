@@ -245,9 +245,6 @@ fn type_signature_text_of(signal: TypeSignatureMatch) -> Option<String> {
         TypeSignatureMatch::UnreadableHover => "測れない (hover の応答を読めない)",
         TypeSignatureMatch::UnreadableSignature => "測れない (返った綴りを読み解けない)",
         TypeSignatureMatch::HoverNotProvided => "測れない (サーバが hover を提供していない)",
-        TypeSignatureMatch::AccessorSignature => {
-            "測れない (アクセサに返るのはプロパティの型で、呼べる型ではない)"
-        }
         TypeSignatureMatch::UnopenedTypeName { reason } => unopened_text_of(reason),
         // 本数は測れなかった相手そのものなので、綴りに埋め込む。**「オーバーロードが
         // 揃わない」だけでは、利用者はどれだけ足りないのかを見られない**
@@ -876,25 +873,6 @@ mod tests {
                 "型シグネチャ: 測れない (比較に残る型名を開けない: typeDefinition の応答を読めない) → どちらでもない"
             ),
             "読めなかったことが理由として出る: {text}"
-        );
-    }
-
-    #[test]
-    fn test_text_of_with_an_accessor_says_so_instead_of_blaming_the_spelling() {
-        // 対照は 1 つ上のテスト（こちら側の穴）。アクセサが測れないのは穴ではなく
-        // **hover が返すものがそもそも呼べる型ではない**からで、直す先が違う
-        let text = text_of_accidental_duplication_with_semantics(
-            TypeSignatureMatch::AccessorSignature,
-            CallerDomainOverlap::Unavailable {
-                reason: SemanticsUnavailable::NotAsked,
-            },
-        );
-
-        assert!(
-            text.contains(
-                "型シグネチャ: 測れない (アクセサに返るのはプロパティの型で、呼べる型ではない) → どちらでもない"
-            ),
-            "アクセサであることが理由として出る: {text}"
         );
     }
 

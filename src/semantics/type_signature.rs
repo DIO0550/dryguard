@@ -22,7 +22,7 @@ use crate::semantics::resolved_type::{
 };
 use crate::source_position::SourcePosition;
 use crate::syntax::type_spelling::{names_only_types, substituted_spelling_of, type_name_spans_of};
-use crate::syntax::type_structure::{Callable, SignatureKind};
+use crate::syntax::type_structure::{Callable, SignatureKind, TypeStructure};
 
 /// 綴りの末尾に付く、隠れているオーバーロードの件数の要約を開く印。
 const OVERLOAD_COUNT_PREFIX: &str = "(+";
@@ -42,7 +42,8 @@ const CONSTRUCTOR_KEYWORD: &str = "constructor";
 /// 構築シグネチャの値形を導く語（`new (value: string) => Result`）。
 const NEW_KEYWORD: &str = "new";
 
-/// アクセサの綴りを導く接頭辞（`(getter) Holder.value: string`）。
+/// アクセサの綴りを導く接頭辞（`(getter) Holder.value: string`）と、
+/// その接頭辞が言っている読み書きの向き。
 ///
 /// **この一覧は増えない。** TypeScript のアクセサは `get` / `set` の 2 つで尽きる
 /// （`signature_kind_of` が `constructor` / `new` の 2 つだけを見ているのと同じ形）。
@@ -50,10 +51,16 @@ const NEW_KEYWORD: &str = "new";
 /// `rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」が前提にしている
 /// 「一覧は文法が持つ形の数だけ増え続ける」に当たらない。
 ///
+/// **向きを接頭辞と一緒に持つ。** 見分けた後に向きを引き直すと、接頭辞の一覧と
+/// 向きの一覧を 2 つ揃えることになり、片方だけが増えうる。
+///
 /// **Why not（呼べる型として読んでよい接頭辞の許可リストにする）**: 漏れは偽陰性側へ
 /// 倒れるが、`function` / `const` / `(method)` / `(property)` … を並べることになり、
 /// [`SplitSignature::from_spelling`] が接頭辞を列挙しないと決めた理由とぶつかる。
-const ACCESSOR_PREFIXES: [&str; 2] = ["(getter)", "(setter)"];
+const ACCESSOR_PREFIXES: [(&str, AccessorAccess); 2] = [
+    ("(getter)", AccessorAccess::Read),
+    ("(setter)", AccessorAccess::Written),
+];
 
 /// どこで書かれても同じ型を指す綴り。
 ///
@@ -86,7 +93,7 @@ const PREDEFINED_TYPES: [&str; 12] = [
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeSignatureOutcome {
-    /// 呼べる型シグネチャを揃えて正規化できた。
+    /// チャンクの型を揃えて正規化できた。
     Normalized(OverloadSet),
     /// サーバが数えた本数と、揃えられた本数が食い違う。
     ///
@@ -124,25 +131,9 @@ pub enum TypeSignatureOutcome {
         /// 開けなかった理由。
         reason: UnopenedReason,
     },
-    /// チャンクがアクセサで、綴りが**呼べる型ではない**。
-    ///
-    /// hover はアクセサに**プロパティとしての型**を返す（`(getter) C.value: string`）。
-    /// チャンクのほうはアクセサ関数なので、`get value(): T` の呼べる型は `() => T`、
-    /// `set value(next: T)` は `(T) => void` と、**1 段ずれる**。
-    ///
-    /// **綴りのまま割ると偽陽性になる。** 型が関数型だと
-    /// （`(getter) C.handler: (a: string) => void`）、[`SplitSignature`] が
-    /// プロパティの型のほうの括弧組を引数リストとして掴み、**同じ引数を取るメソッドと
-    /// 単一化可能に出る**。
-    ///
-    /// **理由を落として [`Self::UnreadableSignature`] にしない。** あちらは
-    /// dryguard 側の穴で、こちらは**まだ扱えていない形**。1 つにまとめると、
-    /// 利用者を直す先の違う場所へ向けてしまう
-    /// (`rules/architecture.md`「理由は落とさない」)。
-    AccessorSignature,
 }
 
-/// その名前で呼べる型シグネチャを揃えて、正規化した形にする。
+/// その名前が持つ型シグネチャを揃えて、正規化した形にする。
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
 /// `Chunk::name_position` が指す識別子の位置、`overload_positions` は
@@ -282,12 +273,6 @@ pub fn normalized_outcome_of(
 /// 差し込みで消えた型名も、正規化で落ちる関数の名前も、比較には残らないので
 /// 答えを変えない。
 fn single_outcome_of(spelling: &str, traced: &TracedTypeNames) -> TypeSignatureOutcome {
-    // **割る前に落とす。** 割った後で接頭辞を見ても、掴まれた括弧組は
-    // プロパティの型のほうなので手遅れ（[`TypeSignatureOutcome::AccessorSignature`]）
-    if is_accessor_spelling(spelling) {
-        return TypeSignatureOutcome::AccessorSignature;
-    }
-
     let Some(normalized) = NormalizedSignature::from_spelling(spelling, traced) else {
         return unreadable_outcome_of(spelling, traced);
     };
@@ -305,15 +290,76 @@ fn single_outcome_of(spelling: &str, traced: &TracedTypeNames) -> TypeSignatureO
     TypeSignatureOutcome::Normalized(OverloadSet::of_one(normalized.signature))
 }
 
-/// その綴りが、アクセサに対する hover の答えか。
+/// アクセサが読む側か書く側か。
 ///
-/// `text` は件数の要約を剥がした綴り。
-fn is_accessor_spelling(text: &str) -> bool {
-    let text = text.trim_start();
+/// **[`ChunkType`] と別に持つ。** あちらは読んだ型を一緒に持つ形で、こちらは
+/// **綴りを読む前に接頭辞だけで決まる**（[`ACCESSOR_PREFIXES`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessorAccess {
+    /// 読む側（`(getter)`）。
+    Read,
+    /// 書く側（`(setter)`）。
+    Written,
+}
 
-    ACCESSOR_PREFIXES
-        .iter()
-        .any(|prefix| text.starts_with(prefix))
+impl AccessorAccess {
+    /// メンバーとしての型を、その向きのチャンクの型にする。
+    fn chunk_type_of(self, member_type: TypeStructure) -> ChunkType {
+        match self {
+            Self::Read => ChunkType::Read(member_type),
+            Self::Written => ChunkType::Written(member_type),
+        }
+    }
+}
+
+/// アクセサに返った綴りを、メンバーとしての型と、それが言うチャンクの型に割った形。
+///
+/// hover はアクセサに**プロパティとしての型**を返す（`(getter) C.value: string`）。
+/// チャンクのほうはアクセサ関数なので、`get value(): T` の呼べる型は `() => T` と
+/// **1 段ずれる**。割った右辺を型 1 つ分として読み、**呼べる型としては読まない**
+/// (`rules/naming.md`「`accessor` を、関数を持つプロパティと混ぜない」)。
+struct AccessorSpelling<'text> {
+    /// メンバーとしての型の綴り（`type spelling`）。
+    member_type: &'text str,
+    /// その綴りが言っている読み書きの向き。
+    access: AccessorAccess,
+}
+
+impl<'text> AccessorSpelling<'text> {
+    /// 件数の要約を剥がした綴りから割る。アクセサの綴りでなければ `None`。
+    ///
+    /// **接頭辞を落としてから、深さ 0 の最初の `:` で割る。** メンバーの名前に続く `:` が
+    /// 型の手前の区切りで、型の中の `:`（引数リスト・オブジェクト型）は深さで外れる。
+    ///
+    /// **割る前に接頭辞を見る。** [`SplitSignature`] は型が関数型だと
+    /// （`(getter) C.handler: (a: string) => void`）プロパティの型のほうの括弧組を
+    /// 引数リストとして掴むので、割った後では手遅れになる。
+    fn from_spelling(text: &'text str) -> Option<Self> {
+        let text = text.trim_start();
+        let (prefix, access) = ACCESSOR_PREFIXES
+            .iter()
+            .find(|(prefix, _)| text.starts_with(prefix))?;
+
+        let named = text.get(prefix.len()..)?;
+        let separator = SignatureScan::new(named).top_level_index_of(':')?;
+        let member_type = named.get(separator + ':'.len_utf8()..)?.trim();
+
+        Some(Self {
+            member_type,
+            access: *access,
+        })
+    }
+
+    /// メンバーとしての型を開いて読んだ、まだ付け替えていないチャンクの型。
+    /// 型として読めない綴りでは `None`。
+    fn to_chunk_type(&self, resolved: &ResolvedTypes) -> Option<ChunkType> {
+        let opened = opened_spelling_of(self.member_type, resolved)?;
+
+        Some(
+            self.access
+                .chunk_type_of(TypeStructure::from_spelling(&opened)?),
+        )
+    }
 }
 
 /// 件数の要約を剥がした綴りと、サーバが数えた本数。
@@ -401,7 +447,8 @@ fn unopened_annotation_reason_of(text: &str, traced: &TracedTypeNames) -> Option
         .find_map(|name| traced.unopened_reason_of(name))
 }
 
-/// 1 つの名前で呼べる型シグネチャの並び。オーバーロードされていなければ 1 本。
+/// 1 つの名前が持つ型シグネチャの並び。オーバーロードされていなければ 1 本
+/// （アクセサはオーバーロードできないので常に 1 本）。
 ///
 /// **比較の単位はこちら**（[`TypeSignature`] ではない）。hover が綴るのは 1 本だけなので、
 /// 1 本だけを比べると**隠れているオーバーロードが違う 2 つを単一化可能と答える**。
@@ -448,18 +495,63 @@ impl OverloadSet {
     }
 }
 
+/// そのチャンクが外から使われる形。
+///
+/// **アクセサに呼べる型を持たせない。** hover が返すのはメンバーとしての型で、
+/// `get value(): T` の呼べる型（`() => T`）は**どこにも書かれていない**。
+/// 合成すると、実在しない型を比較の材料にすることになる
+/// (`rules/coding.md`「不正な状態を型で表現できなくする」)。
+///
+/// **読む側と書く側を分ける。** `o.value` と `o.value = x` は差し替えられないので、
+/// 同じ型でも共通化の候補としては重ならない。畳むと**同じ型の getter と setter が
+/// 単一化可能に出る**（偽陽性）ので、漏れが偽陰性へ倒れる側へ寄せる
+/// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+///
+/// **Why not（向きを印として [`TypeSignature`] の側に持つ）**: アクセサが呼べる型を
+/// 持っているという嘘が型の中に残る。印を読み落とした比較が書けてしまうので、
+/// 持てる形のほうを分ける。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChunkType {
+    /// 呼ぶ / `new` する（`f(a)` / `new C(a)`）。
+    Callable(Callable),
+    /// 読む（`get value(): T` の `T`）。
+    Read(TypeStructure),
+    /// 書く（`set value(next: T)` の `T`）。
+    Written(TypeStructure),
+}
+
+impl ChunkType {
+    /// 型変数を出現順に付け替え、可換な並びを固定した形。
+    /// 綴りのまま持っている部分を読めなければ `None`。
+    fn normalized(self) -> Option<Self> {
+        Some(match self {
+            Self::Callable(callable) => Self::Callable(callable.normalized()?),
+            Self::Read(member_type) => Self::Read(member_type.normalized()?),
+            Self::Written(member_type) => Self::Written(member_type.normalized()?),
+        })
+    }
+
+    /// 綴りに残っている型名。綴りのまま持っている部分を読めなければ `None`。
+    fn type_names(&self) -> Option<BTreeSet<String>> {
+        match self {
+            Self::Callable(callable) => callable.type_names(),
+            Self::Read(member_type) | Self::Written(member_type) => member_type.type_names(),
+        }
+    }
+}
+
 /// 単一化の可否を比べられる形に直した型シグネチャ 1 本。
 ///
 /// 引数名を落とし、型変数を出現順に付け替えてある。**比べる相手は
 /// [`OverloadSet`]** で、この 1 本だけを外から比べることはない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeSignature {
-    /// 呼べる型の構造。
+    /// そのチャンクが外から使われる形。
     ///
     /// **綴りではなく構造で持つ。** 同じ型に 2 通り以上の綴りがある
     /// （共用体の並び・冗長な括弧・タプルのラベル）ので、綴りの一致で比べると
     /// **書かれ方の違いが型の違いに見える**（`syntax::type_structure`）。
-    callable: Callable,
+    chunk_type: ChunkType,
     /// 綴りに残った型名が、それぞれどこで宣言されているか。**名前順**。
     ///
     /// **綴りは書いた人の位置に依存する。** 別々のモジュールが同じ局所名で構造の違う型を
@@ -500,19 +592,18 @@ impl NormalizedSignature {
     /// そこだけ割る前に開く（[`opened_annotation_of`]）。
     fn from_spelling(spelling: &str, traced: &TracedTypeNames) -> Option<Self> {
         let resolved = traced.resolved();
-        let opened = opened_annotation_of(&flattened(spelling), resolved);
-        let written = SplitSignature::from_spelling(&opened)?;
-
-        // 差し込みは型 1 つ分の綴りに対して行うので、接頭辞を落として呼べる型へ組み直す
-        let opened = opened_spelling_of(&written.to_callable_type()?, resolved)?;
-        let read = Callable::from_spelling(&opened)?;
+        let flattened = flattened(spelling);
+        let read = match AccessorSpelling::from_spelling(&flattened) {
+            Some(accessor) => accessor.to_chunk_type(resolved)?,
+            None => ChunkType::Callable(callable_read_of(&flattened, resolved)?),
+        };
 
         // **数えるのは付け替えの前。** 付け替えた後の綴り（`%0`）は型として読めないので、
         // 綴りのまま持っている部分から型名を拾えなくなる
         let remaining_type_names = remaining_type_names_of(&read)?;
 
         let signature = TypeSignature {
-            callable: read.normalized()?,
+            chunk_type: read.normalized()?,
             declarations: declarations_named_in(&remaining_type_names, traced.declared()),
         };
 
@@ -523,10 +614,26 @@ impl NormalizedSignature {
     }
 }
 
+/// 呼べる型として読んだ、まだ付け替えていない形。呼べる型として読めなければ `None`。
+///
+/// `flattened` は空白を畳んだ綴り。
+///
+/// **シグネチャ全体がエイリアスに置き換わる形（`const aliased: Handler`）は
+/// 引数リストを持たず割れない**ので、そこだけ割る前に開く（[`opened_annotation_of`]）。
+fn callable_read_of(flattened: &str, resolved: &ResolvedTypes) -> Option<Callable> {
+    let opened = opened_annotation_of(flattened, resolved);
+    let written = SplitSignature::from_spelling(&opened)?;
+
+    // 差し込みは型 1 つ分の綴りに対して行うので、接頭辞を落として呼べる型へ組み直す
+    let opened = opened_spelling_of(&written.to_callable_type()?, resolved)?;
+
+    Callable::from_spelling(&opened)
+}
+
 /// 比較に残る型の綴りに現れる型名を、名前順に集める。
 /// 綴りのまま持っている部分を読めなければ `None`。
 ///
-/// `read` は差し込みを終えて構造として読んだ、まだ付け替えていないシグネチャ。
+/// `read` は差し込みを終えて構造として読んだ、まだ付け替えていないチャンクの型。
 ///
 /// **見るのは差し込んだ後。** 差し込みで消えた名前まで数えると、どちらも `number` に
 /// 開かれた 2 つが宣言の場所の違いで別物になり、**エイリアスを開いた意味が消える**。
@@ -535,7 +642,7 @@ impl NormalizedSignature {
 /// 含まれる。名前が型名と同じ綴りで型引数を取ると（`function Amount<T>(…)`）、
 /// **比較には残らない綴りを根拠に別物と答える**ことになる。構造から採れば、
 /// 型が書かれる場所だけを歩くのでその名前は入らない。
-fn remaining_type_names_of(read: &Callable) -> Option<BTreeSet<String>> {
+fn remaining_type_names_of(read: &ChunkType) -> Option<BTreeSet<String>> {
     Some(
         read.type_names()?
             .into_iter()
@@ -1147,44 +1254,98 @@ mod tests {
     }
 
     #[test]
-    fn test_normalized_outcome_of_a_getter_holding_a_function_type_is_not_read_as_a_callable_type()
-    {
-        // チャンクはアクセサ関数（`() => ((a: string) => void)`）なのに、綴りは
-        // プロパティとしての型を言う。割ると**同じ引数のメソッドと単一化可能に出る**
-        assert_eq!(
-            normalized_outcome_of(
-                &signature_text("(getter) Holder.handler: (a: string) => void"),
-                &TracedTypeNames::default()
-            ),
-            TypeSignatureOutcome::AccessorSignature
-        );
-    }
-
-    #[test]
-    fn test_normalized_outcome_of_a_setter_holding_a_function_type_is_not_read_as_a_callable_type()
-    {
-        // getter と同じ形。書く側のアクセサも綴りはプロパティの型で、
-        // チャンク（`(T) => void`）とは 1 段ずれる
-        assert_eq!(
-            normalized_outcome_of(
-                &signature_text("(setter) Holder.handler: (a: string) => void"),
-                &TracedTypeNames::default()
-            ),
-            TypeSignatureOutcome::AccessorSignature
-        );
-    }
-
-    #[test]
-    fn test_normalized_outcome_of_an_accessor_is_not_reported_as_an_unreadable_spelling() {
-        // 関数型でないアクセサは割れずに落ちるが、**理由は dryguard 側の穴ではない**。
-        // 混ぜると、利用者を直す先の違う場所へ向けてしまう
+    fn test_normalized_outcome_of_a_getter_is_read_as_the_type_it_reads() {
+        // アクセサに返るのは**メンバーとしての型**。呼べる型として割らず、
+        // 型 1 つ分として読む。メンバーの名前と持ち主の名前は比較に残らない
         assert_eq!(
             normalized_outcome_of(
                 &signature_text("(getter) Holder.value: string"),
                 &TracedTypeNames::default()
             ),
-            TypeSignatureOutcome::AccessorSignature
+            TypeSignatureOutcome::Normalized(signature("(getter) Other.kept: string"))
         );
+    }
+
+    #[test]
+    fn test_a_getter_is_not_unifiable_with_a_setter_of_the_same_type() {
+        // 対照は 1 つ上のテスト。読む側と書く側は差し替えられないので、
+        // 同じ型でも共通化の候補としては重ねない
+        assert!(!unifiable(
+            "(getter) Holder.value: string",
+            "(setter) Holder.value: string"
+        ));
+    }
+
+    #[test]
+    fn test_a_getter_holding_a_function_type_is_not_unifiable_with_a_method_of_the_same_arguments()
+    {
+        // チャンクはアクセサ関数（`() => ((a: string) => void)`）なのに、綴りは
+        // プロパティとしての型を言う。割ると**同じ引数のメソッドと単一化可能に出る**
+        assert!(!unifiable(
+            "(getter) Holder.handler: (a: string) => void",
+            "(method) Notifier.notify(a: string): void"
+        ));
+    }
+
+    #[test]
+    fn test_a_setter_holding_a_function_type_is_not_unifiable_with_a_method_of_the_same_arguments()
+    {
+        // getter と同じ形。書く側のアクセサも綴りはプロパティの型で、
+        // チャンク（`((a: string) => void) => void`）とは 1 段ずれる
+        assert!(!unifiable(
+            "(setter) Holder.handler: (a: string) => void",
+            "(method) Notifier.notify(a: string): void"
+        ));
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_getter_keeping_an_unopened_type_name_is_unmeasurable() {
+        // 呼べる型の綴りと同じ扱い。開けていれば重なったかもしれないので、
+        // 綴りのまま比べた結果を答えにしない
+        let traced = TracedTypeNames::default()
+            .with_unopened(vec![unopened("Amount", UnopenedReason::NoDeclarationSite)]);
+
+        assert_eq!(
+            normalized_outcome_of(&signature_text("(getter) Holder.value: Amount"), &traced),
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::NoDeclarationSite
+            }
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_getter_opening_the_type_name_is_normalized() {
+        // 対照は 1 つ上のテスト。差し込みで綴りから消えた型名は比較に残らない
+        assert_eq!(
+            normalized_outcome_of(
+                &signature_text("(getter) Holder.value: Amount"),
+                &TracedTypeNames::default().with_resolved(resolving("Amount", "number"))
+            ),
+            TypeSignatureOutcome::Normalized(signature("(getter) Holder.value: number"))
+        );
+    }
+
+    #[test]
+    fn test_two_getters_naming_one_spelling_declared_in_separate_files_are_not_unifiable() {
+        // 綴りは書いた人の位置に依存する。宣言の場所を持たないと、別々のモジュールが
+        // それぞれ export した `Local` を同じ型として重ねてしまう
+        let billing = signature_declaring(
+            "(getter) Invoice.user: User",
+            &[declared("User", "/repo/src/billing/user.ts", 1)],
+        );
+        let report = signature_declaring(
+            "(getter) Statement.user: User",
+            &[declared("User", "/repo/src/report/user.ts", 1)],
+        );
+
+        assert!(!billing.is_unifiable_with(&report));
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_getter_whose_type_cannot_be_read_is_unreadable() {
+        // 読めない綴りは dryguard 側の穴。アクセサだからという理由で
+        // 別の答えにしない（測れる形になった後は、測れない理由も呼べる型と同じ）
+        assert!(unreadable("(getter) Holder.value: { id string }"));
     }
 
     #[test]
