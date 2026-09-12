@@ -246,6 +246,11 @@ fn type_signature_text_of(signal: TypeSignatureMatch) -> Option<String> {
         TypeSignatureMatch::UnreadableSignature => "測れない (返った綴りを読み解けない)",
         TypeSignatureMatch::HoverNotProvided => "測れない (サーバが hover を提供していない)",
         TypeSignatureMatch::UnopenedTypeName { reason } => unopened_text_of(reason),
+        // **直す先を出す。** 開けなかったのとは違い、サーバの側でできることは無く、
+        // 対象のコードに注釈を書くと尋ねる位置ができる
+        TypeSignatureMatch::UntracedTypeName => {
+            "測れない (比較に残る型名がソースに書かれていない: 型注釈を書くと辿れる)"
+        }
         // 本数は測れなかった相手そのものなので、綴りに埋め込む。**「オーバーロードが
         // 揃わない」だけでは、利用者はどれだけ足りないのかを見られない**
         TypeSignatureMatch::OverloadSetMiscounted { counted, found } => {

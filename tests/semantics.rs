@@ -23,7 +23,7 @@ use dryguard::lsp::{
 use dryguard::pipeline::{MeasuredPair, chunk_pair_of, measured_pair_of};
 use dryguard::report::text_of;
 use dryguard::semantics::caller_domain::CallerDomains;
-use dryguard::semantics::resolved_type::TracedTypeNames;
+use dryguard::semantics::resolved_type::traced_type_names_of;
 use dryguard::semantics::type_signature::{
     OverloadSet, TypeSignatureOutcome, type_signature_outcome_of,
 };
@@ -84,9 +84,13 @@ fn session_over(paths: &[PathBuf]) -> Session {
 
 /// そのチャンクの型シグネチャを、サーバに尋ねて正規化したもの。
 ///
-/// **型名は解決せず、宣言も辿らない。** ここで見たいのは返った綴りを正規化して
-/// 比べるところまでで、解決と宣言の突き合わせまで含めた形は
-/// `measured_with_an_lsp` を使うテストが見る。
+/// **宣言までは辿るが、エイリアスは開かない。** ここで見たいのは返った綴りを正規化して
+/// 比べるところまでで、開いた綴りを差し込んだ形は `measured_with_an_lsp` を使うテストが見る。
+///
+/// **辿るところまでは省けない。** 書かれた型名を尋ねずに渡すと、比較に残る綴りの型名が
+/// 「そもそも尋ねていない」に当たり、正規化まで進まずに `UntracedTypeName` になる
+/// （`rules/architecture.md`「どこまでを「取れなかった」に数えるか」）。**本番でも
+/// 書かれた型名は必ず尋ねる**ので、尋ねていない状態を渡すほうが実態から離れている。
 fn type_signature_of(session: &mut Session, chunk: &Chunk) -> OverloadSet {
     let document = document(chunk.path());
     if session.open_document(&document).is_err() {
@@ -99,12 +103,15 @@ fn type_signature_of(session: &mut Session, chunk: &Chunk) -> OverloadSet {
             chunk.path().display()
         );
     };
+    let Ok(traced) = traced_type_names_of(session, &document, chunk.type_references()) else {
+        panic!("書かれた型名を尋ねられる: {}", chunk.path().display());
+    };
     let asked = type_signature_outcome_of(
         session,
         &document,
         position,
         chunk.overload_name_positions(),
-        &TracedTypeNames::default(),
+        &traced,
     );
     let Ok(TypeSignatureOutcome::Normalized(overloads)) = asked else {
         panic!(
@@ -151,8 +158,12 @@ fn test_two_date_formatting_functions_have_unifiable_type_signatures() {
 fn test_two_functions_taking_types_from_separate_domains_are_not_unifiable() {
     // 対照は上のテスト。構造は同じだが、受け取る型が別ドメインのもので
     // `(Invoice) => number` と `(Stock) => number` になる
-    let discounts_an_invoice = fixture("billing/discount.ts", 5);
-    let reorders_stock = fixture("inventory/reorder.ts", 5);
+    //
+    // **`references/src/` 側の同じ組を使う。** こちらは共通の祖先に tsconfig.json が
+    // あるので、書かれた型名の宣言までサーバが答える。印の無い `tests/fixtures/` 直下の
+    // 組では `NoDeclarationSite` になり、**本番でも比較まで進まない**（実測）
+    let discounts_an_invoice = fixture("references/src/billing/discount.ts", 5);
+    let reorders_stock = fixture("references/src/inventory/reorder.ts", 5);
 
     assert!(!unifiable(&discounts_an_invoice, &reorders_stock));
 }
@@ -756,6 +767,42 @@ fn test_compare_with_an_lsp_does_not_unify_two_interfaces_of_different_types_spe
     assert_eq!(
         measured.signals().type_signature_match(),
         TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_does_not_unify_two_inferred_return_types_spelled_alike() {
+    // どちらのファイルも自分だけの `class Receipt` を export していて、中身は別物
+    // （`{ invoiceId: string }` と `{ rowCount: number }`）。**戻り値の注釈を省いているので、
+    // hover が綴る `Receipt` は構文木のどこにも無く**、尋ねる位置を作れない
+    // （`syntax::type_reference`）。綴りのまま比べると単一化可能に出る（偽陽性）
+    let builds_a_billing_receipt = fixture("references/src/billing/inferred.ts", 5);
+    let builds_a_report_receipt = fixture("references/src/report/inferred.ts", 5);
+
+    let measured = measured_with_an_lsp(&builds_a_billing_receipt, &builds_a_report_receipt);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::UntracedTypeName
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_unifies_two_generic_functions_of_the_same_shape() {
+    // 対照は上のテスト。**型変数にも辿った記録は無いが、辿る相手が居ない。**
+    // これを「尋ねていない」に数えると、戻り値を注釈したジェネリック関数まで
+    // まとめて測れない側へ落ちる（`rules/architecture.md`
+    // 「どこまでを「取れなかった」に数えるか」）
+    let takes_the_first = fixture("references/src/billing/firstOf.ts", 1);
+    let takes_the_head = fixture("references/src/inventory/headOf.ts", 1);
+
+    let measured = measured_with_an_lsp(&takes_the_first, &takes_the_head);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
     );
 }
 

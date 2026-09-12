@@ -801,6 +801,8 @@ fn type_signature_match_of(
         | (_, TypeSignatureOutcome::UnopenedTypeName { reason }) => {
             TypeSignatureMatch::UnopenedTypeName { reason: *reason }
         }
+        (TypeSignatureOutcome::UntracedTypeName, _)
+        | (_, TypeSignatureOutcome::UntracedTypeName) => TypeSignatureMatch::UntracedTypeName,
     }
 }
 
