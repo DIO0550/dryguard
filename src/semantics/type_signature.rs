@@ -131,6 +131,25 @@ pub enum TypeSignatureOutcome {
         /// 開けなかった理由。
         reason: UnopenedReason,
     },
+    /// **比較に残る綴りに現れる**型名を、そもそも尋ねていない。
+    ///
+    /// 戻り値の注釈を省いた関数では、hover の綴りに推論された型名が現れるのに
+    /// **構文木のどこにもその名前が無く**、`typeDefinition` を向ける位置を作れない
+    /// （`syntax::type_reference`）。綴りのまま比べると、**別々のファイルが同じ綴りで
+    /// 宣言した構造の違う型が単一化可能に出る**（偽陽性）。
+    ///
+    /// **[`TypeSignatureOutcome::UnopenedTypeName`] と混ぜない。** あちらは
+    /// 尋ねた結果辿れなかったもので、**利用者が次にすることが違う**
+    /// （`rules/naming.md`「`untraced type name` と `unopened` を混ぜない」）。
+    ///
+    /// **束縛された型変数はここに来ない。** 辿る相手が居ないので記録が無いのは
+    /// 当たり前で、`syntax::type_structure` が型名から外している。
+    ///
+    /// **Why not（どの型名だったかを持つ）**: このバリアントは
+    /// `classification::signal::TypeSignatureMatch` まで運ばれ、あちらは `Copy`。
+    /// 綴りを持たせると `Copy` が外れ、判定の側が文字列を持ち回ることになる。
+    /// 直す先は綴りによらず同じ（**その型に注釈を書く**）ので、名前は答えを変えない。
+    UntracedTypeName,
 }
 
 /// その名前が持つ型シグネチャを揃えて、正規化した形にする。
@@ -287,7 +306,37 @@ fn single_outcome_of(spelling: &str, traced: &TracedTypeNames) -> TypeSignatureO
         return TypeSignatureOutcome::UnopenedTypeName { reason };
     }
 
+    // **開けなかった型名を先に見る。** どちらも「測れない」だが、開けなかった理由のほうが
+    // 利用者の次の手（サーバを替える / ファイルを読めるようにする）に直結する
+    let untraced = normalized
+        .traceable_type_names
+        .iter()
+        .any(|name| !is_traced(name, traced));
+
+    if untraced {
+        return TypeSignatureOutcome::UntracedTypeName;
+    }
+
     TypeSignatureOutcome::Normalized(OverloadSet::of_one(normalized.signature))
+}
+
+/// その型名を宣言まで辿ろうとした記録があるか。
+///
+/// 宣言の場所が取れた・開いた綴りが取れた・開けなかった、の**どれかに入っていれば
+/// 尋ねている**。どれにも無ければ `syntax` がその名前を集めておらず、**そもそも
+/// 尋ねていない**（`syntax::type_reference` は**ソースに書かれた型名しか集められない**）。
+///
+/// **束縛された型変数はここへ来ない。** `syntax::type_structure` が型名から外すので、
+/// 比較に残る綴りの型名に現れない。
+fn is_traced(name: &str, traced: &TracedTypeNames) -> bool {
+    let declared = traced
+        .declared()
+        .iter()
+        .any(|declaration| declaration.name() == name);
+    let opened = traced.resolved().resolved_of(name).is_some();
+    let unopened = traced.unopened_reason_of(name).is_some();
+
+    declared || opened || unopened
 }
 
 /// アクセサが読む側か書く側か。
@@ -532,6 +581,15 @@ impl ChunkType {
     }
 
     /// 綴りに残っている型名。綴りのまま持っている部分を読めなければ `None`。
+    fn traceable_type_names(&self) -> Option<BTreeSet<String>> {
+        match self {
+            Self::Callable(callable) => callable.traceable_type_names(),
+            Self::Read(member_type) | Self::Written(member_type) => {
+                member_type.traceable_type_names()
+            }
+        }
+    }
+
     fn type_names(&self) -> Option<BTreeSet<String>> {
         match self {
             Self::Callable(callable) => callable.type_names(),
@@ -572,6 +630,13 @@ struct NormalizedSignature {
     signature: TypeSignature,
     /// 名前順。並びを綴りに任せると、同じ 2 つが尋ねた順で違う理由を出す。
     remaining_type_names: BTreeSet<String>,
+    /// 比較に残る綴りに現れた型名のうち、**宣言を辿る相手になりうるもの**。名前順。
+    ///
+    /// **[`NormalizedSignature::remaining_type_names`] と別に持つ。** あちらは
+    /// 綴りのまま持つ部分の中で束縛された名前まで数えるので、そのまま
+    /// 「尋ねたか」を見ると**辿る相手が居ない名前を「尋ねていない」と答える**
+    /// （`syntax::type_structure` の `SpelledBinders`）。
+    traceable_type_names: BTreeSet<String>,
 }
 
 impl NormalizedSignature {
@@ -601,6 +666,7 @@ impl NormalizedSignature {
         // **数えるのは付け替えの前。** 付け替えた後の綴り（`%0`）は型として読めないので、
         // 綴りのまま持っている部分から型名を拾えなくなる
         let remaining_type_names = remaining_type_names_of(&read)?;
+        let traceable_type_names = traceable_type_names_of(&read)?;
 
         let signature = TypeSignature {
             chunk_type: read.normalized()?,
@@ -610,6 +676,7 @@ impl NormalizedSignature {
         Some(Self {
             signature,
             remaining_type_names,
+            traceable_type_names,
         })
     }
 }
@@ -645,6 +712,22 @@ fn callable_read_of(flattened: &str, resolved: &ResolvedTypes) -> Option<Callabl
 fn remaining_type_names_of(read: &ChunkType) -> Option<BTreeSet<String>> {
     Some(
         read.type_names()?
+            .into_iter()
+            .filter(|name| !PREDEFINED_TYPES.contains(&name.as_str()))
+            .collect(),
+    )
+}
+
+/// 比較に残る型の綴りに現れる型名のうち、**宣言を辿る相手になりうるもの**を名前順に集める。
+/// 綴りのまま持っている部分を読めなければ `None`。
+///
+/// [`remaining_type_names_of`] との違いは、**綴りのまま持つ部分の中で束縛された名前**
+/// （`infer U` / マップ型の `K in …`）を外すところだけ。型変数と同じく**辿る相手が居ない**ので、
+/// 数えると注釈を書いてあるジェネリック関数まで「尋ねていない」側へ落ちる
+/// （`syntax::type_structure` の `SpelledBinders`）。
+fn traceable_type_names_of(read: &ChunkType) -> Option<BTreeSet<String>> {
+    Some(
+        read.traceable_type_names()?
             .into_iter()
             .filter(|name| !PREDEFINED_TYPES.contains(&name.as_str()))
             .collect(),
@@ -1090,17 +1173,52 @@ mod tests {
     use crate::semantics::resolved_type::UnopenedTypeName;
     use crate::test_support::{declaration_site, overload_count, signature_text};
 
-    /// テストが渡す綴りは読み取れる前提で組み立てる。辿った型名は無い。
+    /// テストが渡す綴りは読み取れる前提で組み立てる。**書かれた型名はすべて辿れた前提。**
+    ///
+    /// **本番では、ソースに書かれた型名は必ず尋ねる**（`pipeline` が
+    /// `Chunk::type_references` を渡す）。辿った記録がまったく無い型名が比較に残るのは
+    /// **ソースに書かれていない型名のときだけ**なので、そちらは
+    /// [`TypeSignatureOutcome::UntracedTypeName`] の側のテストで見る。
     fn signature(text: &str) -> OverloadSet {
-        signature_tracing(text, &TracedTypeNames::default())
+        signature_tracing(text, &tracing_all(text))
     }
 
-    /// 解決した型名を差し込んでから組み立てる。
+    /// その綴りに現れる識別子を、すべて同じ場所で宣言されたことにした結果。
+    ///
+    /// **多めに宣言してよい。** 比較に残る綴りに現れない名前の宣言は
+    /// [`declarations_named_in`] が落とすので、答えを変えない。
+    fn tracing_all(text: &str) -> TracedTypeNames {
+        let declarations = identifiers_of(text)
+            .into_iter()
+            .map(|name| declared(&name, "/repo/src/written.ts", 1))
+            .collect();
+
+        TracedTypeNames::new(declarations, Vec::new())
+    }
+
+    /// その綴りに現れる識別子。**型名かどうかは見分けない**（[`tracing_all`]）。
+    ///
+    /// 修飾された型名（`money.Amount`）は**そのままの綴りと、`.` で割った先の両方**を
+    /// 返す。集める側が 1 つとして数えるのは前者だが（`syntax::type_reference`）、
+    /// 多めに宣言しても答えは変わらない。
+    fn identifiers_of(text: &str) -> Vec<String> {
+        let qualified = text.split(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '_' && character != '.'
+        });
+
+        qualified
+            .flat_map(|word| std::iter::once(word).chain(word.split('.')))
+            .filter(|word| {
+                word.starts_with(|first: char| first.is_ascii_alphabetic() || first == '_')
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// 解決した型名を差し込んでから組み立てる。**書かれた型名はすべて辿れた前提**
+    /// （[`signature`] と同じ理由）。
     fn signature_with(text: &str, resolved: &ResolvedTypes) -> OverloadSet {
-        signature_tracing(
-            text,
-            &TracedTypeNames::default().with_resolved(resolved.clone()),
-        )
+        signature_tracing(text, &tracing_all(text).with_resolved(resolved.clone()))
     }
 
     /// 綴りに書かれた型名の宣言まで持たせて組み立てる。
@@ -1137,6 +1255,59 @@ mod tests {
     /// 開けなかった型名 1 つ分。
     fn unopened(name: &str, reason: UnopenedReason) -> UnopenedTypeName {
         UnopenedTypeName::new(name.to_owned(), reason)
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_keeping_a_type_name_never_traced_is_unmeasurable() {
+        // 戻り値の注釈を省くと、hover の綴りに構文木のどこにも無い型名が現れる。
+        // 綴りのまま比べると、別々のファイルの同じ綴りが単一化可能に出る（偽陽性）
+        let outcome = normalized_outcome_of(
+            &signature_text("const build: (x: number) => Result"),
+            &TracedTypeNames::default(),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::UntracedTypeName);
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_using_only_its_own_type_variables_is_normalized() {
+        // 型変数は辿る相手が居ないので、記録が無いのは当たり前。これを「尋ねていない」に
+        // 数えると、ジェネリック関数がまとめて測れない側へ落ちる
+        let outcome = normalized_outcome_of(
+            &signature_text("function id<T>(x: T): T"),
+            &TracedTypeNames::default(),
+        );
+
+        assert!(matches!(outcome, TypeSignatureOutcome::Normalized(_)));
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_written_with_keyword_types_alone_is_normalized() {
+        let outcome = normalized_outcome_of(
+            &signature_text("function len(a: string): number"),
+            &TracedTypeNames::default(),
+        );
+
+        assert!(matches!(outcome, TypeSignatureOutcome::Normalized(_)));
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_answers_the_unopened_name_before_the_untraced_one() {
+        // どちらも「測れない」だが、開けなかった理由のほうが利用者の次の手に直結する
+        let traced = TracedTypeNames::default()
+            .with_unopened(vec![unopened("Amount", UnopenedReason::NoDeclarationSite)]);
+
+        let outcome = normalized_outcome_of(
+            &signature_text("function priced(a: Amount): Inferred"),
+            &traced,
+        );
+
+        assert_eq!(
+            outcome,
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::NoDeclarationSite,
+            }
+        );
     }
 
     #[test]
@@ -2406,6 +2577,10 @@ mod tests {
     fn test_two_signatures_naming_types_declared_in_separate_files_are_not_unifiable() {
         // `interface` は hover が構造を展開しないので、綴りは両側とも `User` になる。
         // **綴りだけを見ると別ドメインの 2 つが単一化可能に出る**（偽陽性）
+        //
+        // **比べるのは宣言の場所どうしだけ。** 宣言が付かない型名が比較に残ることは
+        // 無く、尋ねて辿れなければ `UnopenedTypeName`、尋ねていなければ
+        // `UntracedTypeName` として、比較へ来る前に「測れない」になる
         let billing = signature_declaring(
             "function labelUser(value: User): string",
             &[declared("User", "/repo/src/billing/user.ts", 1)],
@@ -2669,26 +2844,6 @@ mod tests {
         );
 
         assert!(!first.is_unifiable_with(&second));
-    }
-
-    #[test]
-    fn test_a_signature_whose_declaration_came_back_is_not_unifiable_with_one_whose_did_not() {
-        // 片側でしか宣言を辿れていない。**確かめられていないものを重なる側へ倒さない**
-        let located = signature_declaring(
-            "function labelUser(value: User): string",
-            &[declared("User", "/repo/src/billing/user.ts", 1)],
-        );
-
-        assert!(!located.is_unifiable_with(&signature("function labelUser(value: User): string")));
-    }
-
-    #[test]
-    fn test_two_signatures_whose_declarations_did_not_come_back_compare_their_spellings() {
-        // 対照は上のテスト。両側とも材料が無いので、**材料が無いことを「別の記号である
-        // 証拠」にしない**（どの型名も開けない状態は `TypeSignatureOutcome` の側が出す）
-        let unlocated = signature("function labelUser(value: User): string");
-
-        assert!(unlocated.is_unifiable_with(&signature("function nameUser(value: User): string")));
     }
 
     #[test]

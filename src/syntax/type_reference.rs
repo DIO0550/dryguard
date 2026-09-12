@@ -61,6 +61,12 @@ const INFER_TYPE_KIND: &str = "infer_type";
 /// 名前を載せるフィールド。
 const NAME_FIELD: &str = "name";
 
+/// コンストラクタがメンバーとして持つ名前。
+const CONSTRUCTOR_NAME: &str = "constructor";
+
+/// クラスの本体を表すノードの種別。メンバーの 1 つ上に来る。
+const CLASS_BODY_KIND: &str = "class_body";
+
 /// 型注釈を載せるフィールド。
 const TYPE_FIELD: &str = "type";
 
@@ -129,6 +135,53 @@ pub(super) fn type_references_of(nodes: &[Node<'_>], source: &str) -> Vec<TypeRe
     }
 
     references
+}
+
+/// hover がコンストラクタの綴りに載せる、囲むクラス側の型名。
+/// コンストラクタでなければ空。
+///
+/// hover はコンストラクタに `constructor Box<T extends Shape>(value: T): Box<T>` を返す。
+/// **クラスの名前も、クラスが宣言した型変数の制約も、メソッドのノードの中には書かれていない**
+/// が、**囲むクラスの宣言には書かれている**ので `typeDefinition` を向ける位置はそこに作れる。
+/// 足さないと、クラスのコンストラクタが 1 つ残らず「尋ねていない型名が残っている」側へ落ちる
+/// （`rules/architecture.md`「どこまでを「取れなかった」に数えるか」）。しかも
+/// **コンストラクタに戻り値の注釈は書けない**ので、利用者に示せる直し先が無くなる。
+///
+/// **クラスのノードを [`type_references_of`] に渡してよい。** [`annotated_nodes_of`] が
+/// 見るのは `type_parameters` / `parameters` / `return_type` の 3 フィールドで、
+/// クラスが持つのは 1 つ目だけ。**継承した型（`extends` / `implements`）と他のメンバーの
+/// 注釈はそこに入らない**ので、hover の綴りに現れない型名まで集まることはない。
+pub(super) fn constructed_class_references_of(node: Node<'_>, source: &str) -> Vec<TypeReference> {
+    let Some(class) = constructed_class_of(node, source) else {
+        return Vec::new();
+    };
+
+    // 型変数の制約・既定の型。宣言そのもの（`T`）は束縛として外れる
+    let mut references = type_references_of(&[class], source);
+
+    let named = class
+        .child_by_field_name(NAME_FIELD)
+        .and_then(|name| type_reference_of(name, source));
+    if let Some(named) = named {
+        references.push(named);
+    }
+
+    references
+}
+
+/// そのコンストラクタが構築するクラスの宣言。コンストラクタでなければ `None`。
+fn constructed_class_of<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let member = node.child_by_field_name(NAME_FIELD)?;
+    if source.get(member.byte_range())? != CONSTRUCTOR_NAME {
+        return None;
+    }
+
+    let body = node.parent()?;
+    if body.kind() != CLASS_BODY_KIND {
+        return None;
+    }
+
+    body.parent()
 }
 
 /// 型注釈が書かれうるノードを、**型変数の束縛が届く範囲ごとに**分けたもの。

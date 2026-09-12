@@ -275,27 +275,65 @@ impl Callable {
 
     /// 綴りに残っている型名。綴りのまま持っている部分を読めなければ `None`。
     ///
-    /// **宣言された型変数の名前は数えない。** このシグネチャの中でだけ意味を持つので、
-    /// 宣言を辿る相手ではない（`syntax::type_reference` が集める側でも外している）。
+    /// **束縛された型変数の名前は数えない。宣言だけでなく使用も。** このシグネチャの
+    /// 中でだけ意味を持つので、宣言を辿る相手ではない（`syntax::type_reference` が
+    /// 集める側でも外している）。**数えると、集める側が外したぶんが
+    /// 「尋ねていない型名」に見える**（`semantics::type_signature`）。
+    ///
+    /// **外側で束縛された型変数は残る。** そのシグネチャからは辿れないので、
+    /// 落とすと**別のファイルの同じ綴りと重なる**（偽陽性）。
     ///
     /// **読めなかったことを空の集合で表さない。** 名前が 1 つも無いことと、
     /// 名前を数えられなかったことは別
     /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
     pub(crate) fn type_names(&self) -> Option<BTreeSet<String>> {
+        self.free_type_names_of(&mut Vec::new(), SpelledBinders::Counted)
+    }
+
+    /// 綴りに残っている型名のうち、**宣言を辿る相手になりうるもの**。
+    /// 綴りのまま持っている部分を読めなければ `None`。
+    ///
+    /// [`Callable::type_names`] との違いは、**綴りのまま持つ部分の中で束縛された名前**
+    /// （`infer U` / マップ型の `K in …`）を外すところだけ（[`SpelledBinders`]）。
+    pub(crate) fn traceable_type_names(&self) -> Option<BTreeSet<String>> {
+        self.free_type_names_of(&mut Vec::new(), SpelledBinders::Skipped)
+    }
+
+    /// `scopes` が束縛していない型名。
+    ///
+    /// 自分の型変数でスコープを 1 つ積んでから降りる（[`Callable::renamed`] と同じ形）。
+    fn free_type_names_of(
+        &self,
+        scopes: &mut Vec<BTreeSet<String>>,
+        binders: SpelledBinders,
+    ) -> Option<BTreeSet<String>> {
         let mut names = BTreeSet::new();
+
+        scopes.push(
+            self.type_parameters
+                .iter()
+                .map(|declared| declared.name.clone())
+                .collect(),
+        );
 
         for declared in &self.type_parameters {
             for annotated in [&declared.constraint, &declared.default]
                 .into_iter()
                 .flatten()
             {
-                names.extend(annotated.type_names()?);
+                names.extend(annotated.free_type_names_of(scopes, binders)?);
             }
         }
         for parameter in &self.parameters {
-            names.extend(parameter.annotated_type.type_names()?);
+            names.extend(
+                parameter
+                    .annotated_type
+                    .free_type_names_of(scopes, binders)?,
+            );
         }
-        names.extend(self.return_type.type_names()?);
+        names.extend(self.return_type.free_type_names_of(scopes, binders)?);
+
+        scopes.pop();
 
         Some(names)
     }
@@ -430,36 +468,61 @@ impl TypeStructure {
     }
 
     /// 綴りに残っている型名。綴りのまま持っている部分を読めなければ `None`。
+    ///
+    /// **入れ子の呼べる型が束縛した型変数は数えない**（[`Callable::type_names`]）。
     pub(crate) fn type_names(&self) -> Option<BTreeSet<String>> {
+        self.free_type_names_of(&mut Vec::new(), SpelledBinders::Counted)
+    }
+
+    /// 綴りに残っている型名のうち、**宣言を辿る相手になりうるもの**
+    /// （[`Callable::traceable_type_names`]）。
+    pub(crate) fn traceable_type_names(&self) -> Option<BTreeSet<String>> {
+        self.free_type_names_of(&mut Vec::new(), SpelledBinders::Skipped)
+    }
+
+    /// `scopes` が束縛していない型名。
+    fn free_type_names_of(
+        &self,
+        scopes: &mut Vec<BTreeSet<String>>,
+        binders: SpelledBinders,
+    ) -> Option<BTreeSet<String>> {
         let mut names = BTreeSet::new();
 
         match self {
-            Self::Callable(callable) => names.extend(callable.type_names()?),
+            Self::Callable(callable) => {
+                names.extend(callable.free_type_names_of(scopes, binders)?);
+            }
             Self::Union(members) | Self::Intersection(members) => {
                 for member in members {
-                    names.extend(member.type_names()?);
+                    names.extend(member.free_type_names_of(scopes, binders)?);
                 }
             }
             Self::Tuple(elements) => {
                 for element in elements {
-                    names.extend(element.element.type_names()?);
+                    names.extend(element.element.free_type_names_of(scopes, binders)?);
                 }
             }
-            Self::Array(element) => names.extend(element.type_names()?),
+            Self::Array(element) => names.extend(element.free_type_names_of(scopes, binders)?),
             Self::Named { name, arguments } => {
-                names.insert(name.clone());
+                if !is_bound_in(scopes, name) {
+                    names.insert(name.clone());
+                }
                 for argument in arguments {
-                    names.extend(argument.type_names()?);
+                    names.extend(argument.free_type_names_of(scopes, binders)?);
                 }
             }
             Self::Predicate { narrowed, .. } => {
                 if let Some(narrowed) = narrowed {
-                    names.extend(narrowed.type_names()?);
+                    names.extend(narrowed.free_type_names_of(scopes, binders)?);
                 }
             }
             Self::Spelled(spelling) => {
-                for span in type_name_spans_of(spelling)? {
-                    names.insert(spelling.get(span)?.to_owned());
+                for span in binders.spans_of(spelling)? {
+                    let name = spelling.get(span)?;
+                    if is_bound_in(scopes, name) {
+                        continue;
+                    }
+                    names.insert(name.to_owned());
                 }
             }
         }
@@ -605,6 +668,40 @@ fn renamed_spelling(spelling: &str, scopes: &mut TypeVariableScopes) -> Option<S
     renamed.push_str(spelling.get(copied..)?);
 
     Some(renamed)
+}
+
+/// 綴りのまま持つ部分の中で束縛された名前（`infer U` / マップ型の `K in …`）を、
+/// 返す型名に数えるかどうか。
+///
+/// **数えるかどうかで倒れる向きが逆になるので、消費する側ごとに選ぶ**
+/// （`rules/coding.md`「同じ一覧を、安全な倒れ方が違う 2 箇所で使い回さない」）。
+/// 宣言を突き合わせる側は外しすぎると**隠された外側の名前まで落ちて別の記号が重なる**
+/// （偽陽性）ので数え、宣言を辿る相手を見る側は数えると**辿る相手が居ない名前を
+/// 「尋ねていない」と答える**（偽陰性）ので外す。
+#[derive(Clone, Copy)]
+enum SpelledBinders {
+    /// 型名として数える。
+    Counted,
+    /// 数えない。
+    Skipped,
+}
+
+impl SpelledBinders {
+    /// その綴りの中で、型名が書かれている範囲。
+    fn spans_of(self, spelling: &str) -> Option<Vec<Range<usize>>> {
+        match self {
+            Self::Counted => type_name_spans_of(spelling),
+            Self::Skipped => substitutable_type_name_spans_of(spelling),
+        }
+    }
+}
+
+/// その名前が、積んであるどれかのスコープで型変数として束縛されているか。
+///
+/// **内側から探す必要は無い。** 知りたいのは束縛されているかどうかだけで、
+/// どのスコープが隠しているかは要らない（付け替える [`TypeVariableScopes`] とはそこが違う）。
+fn is_bound_in(scopes: &[BTreeSet<String>], name: &str) -> bool {
+    scopes.iter().any(|scope| scope.contains(name))
 }
 
 /// 付け替え後の型変数の綴り。
@@ -1379,6 +1476,73 @@ mod tests {
             "<T>(x: { T: string; value: T }) => void",
             "<U>(x: { U: string; value: U }) => void"
         ));
+    }
+
+    #[test]
+    fn test_the_traceable_type_names_of_a_callable_type_leave_out_a_name_bound_by_infer() {
+        // 条件型は綴りのまま持つので、`infer U` の `U` は綴りの中で束縛されている。
+        // 辿る相手が居ないのは型変数と同じで、数えると**注釈を書いてある
+        // ジェネリック関数まで測れない側へ落ちる**
+        let read = Callable::from_spelling("<T>(x: T) => T extends Promise<infer U> ? U : never")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(
+            read.traceable_type_names(),
+            Some(["Promise"].into_iter().map(str::to_owned).collect())
+        );
+    }
+
+    #[test]
+    fn test_the_type_names_of_a_callable_type_hold_a_name_bound_by_infer() {
+        // 対照は上のテスト。**宣言を突き合わせる側は外さない。** 外しすぎると、
+        // 同じ綴りの束縛に隠された外側の名前まで落ちて別の記号が重なる（偽陽性）
+        let read = Callable::from_spelling("<T>(x: T) => T extends Promise<infer U> ? U : never")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(
+            read.type_names(),
+            Some(["Promise", "U"].into_iter().map(str::to_owned).collect())
+        );
+    }
+
+    #[test]
+    fn test_the_type_names_of_a_callable_type_leave_out_the_type_variables_it_uses() {
+        // 束縛された型変数は宣言を辿る相手ではない。残すと、尋ねていない型名と
+        // 見分けが付かなくなる（`semantics::type_signature`）
+        let read = Callable::from_spelling("<T>(x: T) => T")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(read.type_names(), Some(BTreeSet::new()));
+    }
+
+    #[test]
+    fn test_the_type_names_of_a_callable_type_leave_out_the_type_variables_of_a_nested_callable() {
+        // キーワードの型は残る（落とすのは `semantics::type_signature` の側）
+        let read = Callable::from_spelling("<T>(cb: <U>(u: U) => T) => void")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(
+            read.type_names(),
+            Some(["void"].into_iter().map(str::to_owned).collect())
+        );
+    }
+
+    #[test]
+    fn test_the_type_names_of_a_callable_type_keep_a_type_variable_bound_outside_it() {
+        // 外側の関数が束縛した型変数は、このシグネチャからは辿れない。落とすと
+        // 別のファイルの同じ綴りと重なる（偽陽性）
+        let read = Callable::from_spelling("(x: number) => Boxed<R>")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(
+            read.type_names(),
+            Some(
+                ["Boxed", "R", "number"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            )
+        );
     }
 
     #[test]
