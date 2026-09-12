@@ -844,6 +844,22 @@ fn test_compare_with_an_lsp_does_not_unify_two_constructors_of_classes_spelled_a
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_measures_a_constructor_of_a_class_declaring_a_constrained_variable() {
+    // hover は `constructor Crated<T extends Shape>(value: T): Crated<T>` を返す。
+    // **制約の `Shape` もクラスの宣言に書かれている**ので、測れない側へ落とさない
+    let crates_a_charge = fixture("references/src/billing/crated.ts", 6);
+    let crates_a_stock = fixture("references/src/inventory/crated.ts", 6);
+
+    let measured = measured_with_an_lsp(&crates_a_charge, &crates_a_stock);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_an_lsp_unifies_two_functions_taking_one_interface_from_separate_domains() {
     // 対照は上のテスト。**綴りが同じことを拒んでいるのではなく、指している記号が別な
     // ことを拒んでいる。** こちらは report 側が billing の `User` を輸入していて、

@@ -137,23 +137,40 @@ pub(super) fn type_references_of(nodes: &[Node<'_>], source: &str) -> Vec<TypeRe
     references
 }
 
-/// hover がコンストラクタの戻り値として綴る、囲むクラスの名前。
-/// コンストラクタでない / クラスが名前を持たないなら `None`。
+/// hover がコンストラクタの綴りに載せる、囲むクラス側の型名。
+/// コンストラクタでなければ空。
 ///
-/// **綴りは hover に現れるのに、メソッドのノードの中には書かれていない。** だが
-/// **書かれているのは囲むクラスの宣言**なので、`typeDefinition` を向ける位置はそこに作れる。
+/// hover はコンストラクタに `constructor Box<T extends Shape>(value: T): Box<T>` を返す。
+/// **クラスの名前も、クラスが宣言した型変数の制約も、メソッドのノードの中には書かれていない**
+/// が、**囲むクラスの宣言には書かれている**ので `typeDefinition` を向ける位置はそこに作れる。
 /// 足さないと、クラスのコンストラクタが 1 つ残らず「尋ねていない型名が残っている」側へ落ちる
 /// （`rules/architecture.md`「どこまでを「取れなかった」に数えるか」）。しかも
 /// **コンストラクタに戻り値の注釈は書けない**ので、利用者に示せる直し先が無くなる。
 ///
-/// **Why not（クラスのノードごと [`type_references_of`] に渡す）**: クラスが宣言した
-/// 型変数・実装した interface・他のメンバーの注釈まで型名として集まる。
-/// hover の綴りに現れるのはクラスの名前だけなので、**比較に残らない綴りを根拠に
-/// 測れないと答える**ことになる。
-pub(super) fn constructed_class_reference_of(
-    node: Node<'_>,
-    source: &str,
-) -> Option<TypeReference> {
+/// **クラスのノードを [`type_references_of`] に渡してよい。** [`annotated_nodes_of`] が
+/// 見るのは `type_parameters` / `parameters` / `return_type` の 3 フィールドで、
+/// クラスが持つのは 1 つ目だけ。**継承した型（`extends` / `implements`）と他のメンバーの
+/// 注釈はそこに入らない**ので、hover の綴りに現れない型名まで集まることはない。
+pub(super) fn constructed_class_references_of(node: Node<'_>, source: &str) -> Vec<TypeReference> {
+    let Some(class) = constructed_class_of(node, source) else {
+        return Vec::new();
+    };
+
+    // 型変数の制約・既定の型。宣言そのもの（`T`）は束縛として外れる
+    let mut references = type_references_of(&[class], source);
+
+    let named = class
+        .child_by_field_name(NAME_FIELD)
+        .and_then(|name| type_reference_of(name, source));
+    if let Some(named) = named {
+        references.push(named);
+    }
+
+    references
+}
+
+/// そのコンストラクタが構築するクラスの宣言。コンストラクタでなければ `None`。
+fn constructed_class_of<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
     let member = node.child_by_field_name(NAME_FIELD)?;
     if source.get(member.byte_range())? != CONSTRUCTOR_NAME {
         return None;
@@ -164,7 +181,7 @@ pub(super) fn constructed_class_reference_of(
         return None;
     }
 
-    type_reference_of(body.parent()?.child_by_field_name(NAME_FIELD)?, source)
+    body.parent()
 }
 
 /// 型注釈が書かれうるノードを、**型変数の束縛が届く範囲ごとに**分けたもの。

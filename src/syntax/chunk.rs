@@ -22,7 +22,7 @@ use crate::syntax::line_range::LineRange;
 use crate::syntax::token::TokenSequence;
 use crate::syntax::tree::{SyntaxTree, source_position_of, unwrapped_parent_of};
 use crate::syntax::type_reference::{
-    TypeReference, constructed_class_reference_of, type_references_of,
+    TypeReference, constructed_class_references_of, type_references_of,
 };
 
 /// 比較の単位。関数・メソッド 1 つ分のソースと、それがどこにあったか。
@@ -387,24 +387,23 @@ fn overload_name_positions_of(node: Node<'_>, source: &str) -> Vec<SourcePositio
 
 /// そのチャンクのシグネチャで、宣言を辿る相手になる型名。
 ///
-/// **コンストラクタは囲むクラスの名前も足す。** hover は戻り値の型としてその綴りを返すのに、
-/// メソッドのノードの中には書かれていない（[`constructed_class_reference_of`]）。
+/// **コンストラクタは囲むクラス側の型名も足す。** hover は戻り値の型とクラスの型変数の制約を
+/// 綴りに載せるのに、メソッドのノードの中には書かれていない（[`constructed_class_references_of`]）。
 ///
 /// **同じ綴りが既にあれば足さない。** 尋ねる先は綴りごとに 1 箇所あればよい
 /// （`type_references_of` が同じ理由で 1 つにまとめている）。
 fn chunk_type_references_of(node: Node<'_>, source: &str) -> Vec<TypeReference> {
     let mut references = type_references_of(&signature_nodes_of(node, source), source);
 
-    let Some(constructed) = constructed_class_reference_of(node, source) else {
-        return references;
-    };
-    if references
-        .iter()
-        .any(|kept| kept.name() == constructed.name())
-    {
-        return references;
+    for constructed in constructed_class_references_of(node, source) {
+        if references
+            .iter()
+            .any(|kept| kept.name() == constructed.name())
+        {
+            continue;
+        }
+        references.push(constructed);
     }
-    references.push(constructed);
 
     references
 }
@@ -1726,6 +1725,21 @@ export function scale(a: unknown, rate?: unknown): unknown {
         let chunk = chunk_at(constructed, "a.ts:2").expect("切り出せる");
 
         assert_eq!(type_names_of(&chunk), vec!["Box"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_of_a_constructor_hold_the_constraints_of_the_class() {
+        // hover は `constructor Box<T extends Shape>(value: T): Box<T>` を返す。制約の
+        // `Shape` もクラスの宣言に書かれているので、尋ねる位置はある
+        //
+        // `T` はコンストラクタ自身の引数の注釈から入る（束縛しているのはクラスの側で、
+        // このノードのスコープでは自由な名前）。**比較に残る綴りでは束縛されている**ので、
+        // 多く尋ねるだけで答えは変わらない（`syntax::type_structure`）
+        let constrained = "export class Box<T extends Shape> {\n  constructor(value: T) {\n    void value;\n  }\n}\n";
+
+        let chunk = chunk_at(constrained, "a.ts:2").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["T", "Shape", "Box"]);
     }
 
     #[test]
