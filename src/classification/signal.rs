@@ -67,7 +67,7 @@ impl Signals {
         }
     }
 
-    /// 正規化トークン集合で測った構造の似かた。
+    /// 正規化トークン列の gram の重なりで測った構造の似かた。
     pub fn structural_similarity(&self) -> StructuralSimilarity {
         self.structural_similarity
     }
