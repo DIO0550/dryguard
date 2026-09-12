@@ -61,6 +61,12 @@ const INFER_TYPE_KIND: &str = "infer_type";
 /// 名前を載せるフィールド。
 const NAME_FIELD: &str = "name";
 
+/// コンストラクタがメンバーとして持つ名前。
+const CONSTRUCTOR_NAME: &str = "constructor";
+
+/// クラスの本体を表すノードの種別。メンバーの 1 つ上に来る。
+const CLASS_BODY_KIND: &str = "class_body";
+
 /// 型注釈を載せるフィールド。
 const TYPE_FIELD: &str = "type";
 
@@ -129,6 +135,36 @@ pub(super) fn type_references_of(nodes: &[Node<'_>], source: &str) -> Vec<TypeRe
     }
 
     references
+}
+
+/// hover がコンストラクタの戻り値として綴る、囲むクラスの名前。
+/// コンストラクタでない / クラスが名前を持たないなら `None`。
+///
+/// **綴りは hover に現れるのに、メソッドのノードの中には書かれていない。** だが
+/// **書かれているのは囲むクラスの宣言**なので、`typeDefinition` を向ける位置はそこに作れる。
+/// 足さないと、クラスのコンストラクタが 1 つ残らず「尋ねていない型名が残っている」側へ落ちる
+/// （`rules/architecture.md`「どこまでを「取れなかった」に数えるか」）。しかも
+/// **コンストラクタに戻り値の注釈は書けない**ので、利用者に示せる直し先が無くなる。
+///
+/// **Why not（クラスのノードごと [`type_references_of`] に渡す）**: クラスが宣言した
+/// 型変数・実装した interface・他のメンバーの注釈まで型名として集まる。
+/// hover の綴りに現れるのはクラスの名前だけなので、**比較に残らない綴りを根拠に
+/// 測れないと答える**ことになる。
+pub(super) fn constructed_class_reference_of(
+    node: Node<'_>,
+    source: &str,
+) -> Option<TypeReference> {
+    let member = node.child_by_field_name(NAME_FIELD)?;
+    if source.get(member.byte_range())? != CONSTRUCTOR_NAME {
+        return None;
+    }
+
+    let body = node.parent()?;
+    if body.kind() != CLASS_BODY_KIND {
+        return None;
+    }
+
+    type_reference_of(body.parent()?.child_by_field_name(NAME_FIELD)?, source)
 }
 
 /// 型注釈が書かれうるノードを、**型変数の束縛が届く範囲ごとに**分けたもの。

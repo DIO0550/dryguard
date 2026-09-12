@@ -21,7 +21,9 @@ use crate::syntax::import::{ImportSet, ImportsUnavailable};
 use crate::syntax::line_range::LineRange;
 use crate::syntax::token::TokenSequence;
 use crate::syntax::tree::{SyntaxTree, source_position_of, unwrapped_parent_of};
-use crate::syntax::type_reference::{TypeReference, type_references_of};
+use crate::syntax::type_reference::{
+    TypeReference, constructed_class_reference_of, type_references_of,
+};
 
 /// 比較の単位。関数・メソッド 1 つ分のソースと、それがどこにあったか。
 ///
@@ -103,7 +105,7 @@ impl Chunk {
             lines,
             name_position: name_position_of(node, source),
             overload_name_positions: overload_name_positions_of(node, source),
-            type_references: type_references_of(&signature_nodes_of(node, source), source),
+            type_references: chunk_type_references_of(node, source),
             source: source_of_lines(source, lines),
             tokens: TokenSequence::from_node(node),
             imports,
@@ -381,6 +383,30 @@ fn overload_name_positions_of(node: Node<'_>, source: &str) -> Vec<SourcePositio
         .into_iter()
         .filter_map(|declaration| name_position_of(declaration, source))
         .collect()
+}
+
+/// そのチャンクのシグネチャで、宣言を辿る相手になる型名。
+///
+/// **コンストラクタは囲むクラスの名前も足す。** hover は戻り値の型としてその綴りを返すのに、
+/// メソッドのノードの中には書かれていない（[`constructed_class_reference_of`]）。
+///
+/// **同じ綴りが既にあれば足さない。** 尋ねる先は綴りごとに 1 箇所あればよい
+/// （`type_references_of` が同じ理由で 1 つにまとめている）。
+fn chunk_type_references_of(node: Node<'_>, source: &str) -> Vec<TypeReference> {
+    let mut references = type_references_of(&signature_nodes_of(node, source), source);
+
+    let Some(constructed) = constructed_class_reference_of(node, source) else {
+        return references;
+    };
+    if references
+        .iter()
+        .any(|kept| kept.name() == constructed.name())
+    {
+        return references;
+    }
+    references.push(constructed);
+
+    references
 }
 
 /// そのチャンクの型が書かれているノード。実装のノードと、そのオーバーロード宣言。
@@ -1688,6 +1714,29 @@ export function scale(a: unknown, rate?: unknown): unknown {
 
         // `money.` の分だけ後ろを指す
         assert_eq!(asked.character(), 36);
+    }
+
+    #[test]
+    fn test_chunk_type_references_of_a_constructor_hold_the_class_it_constructs() {
+        // hover は `constructor Box(value: string): Box` を返す。戻り値の `Box` は
+        // メソッドの中に書かれていないが、囲むクラスの宣言に書かれている
+        let constructed =
+            "export class Box {\n  constructor(value: string) {\n    void value;\n  }\n}\n";
+
+        let chunk = chunk_at(constructed, "a.ts:2").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Box"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_of_a_method_leave_out_the_class_it_belongs_to() {
+        // 対照は上のテスト。**普通のメソッドの戻り値は囲むクラスではない**ので、
+        // クラスの名前は hover の綴りに現れない
+        let method = "export class Box {\n  sized(value: string): number {\n    return value.length;\n  }\n}\n";
+
+        let chunk = chunk_at(method, "a.ts:2").expect("切り出せる");
+
+        assert!(chunk.type_references().is_empty());
     }
 
     #[test]

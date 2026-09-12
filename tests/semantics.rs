@@ -826,6 +826,24 @@ fn test_compare_with_an_lsp_unifies_two_generic_functions_binding_a_name_inside_
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_does_not_unify_two_constructors_of_classes_spelled_alike() {
+    // hover はコンストラクタに `constructor Carton(amount: string): Carton` を返す。
+    // **戻り値の `Carton` はメソッドのノードの中に書かれていない**が、囲むクラスの宣言に
+    // 書かれているので尋ねる位置はある。**測れないにせず、宣言の場所で別の記号と分ける**
+    // （コンストラクタに戻り値の注釈は書けないので、測れないにすると直し先が無くなる）
+    let boxes_a_charge = fixture("references/src/billing/carton.ts", 4);
+    let boxes_a_stock = fixture("references/src/inventory/carton.ts", 4);
+
+    let measured = measured_with_an_lsp(&boxes_a_charge, &boxes_a_stock);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_an_lsp_unifies_two_functions_taking_one_interface_from_separate_domains() {
     // 対照は上のテスト。**綴りが同じことを拒んでいるのではなく、指している記号が別な
     // ことを拒んでいる。** こちらは report 側が billing の `User` を輸入していて、
