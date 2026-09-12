@@ -291,7 +291,8 @@ fn type_signature_lean_of(signal: TypeSignatureMatch) -> Lean {
         | TypeSignatureMatch::UnreadableSignature
         | TypeSignatureMatch::HoverNotProvided
         | TypeSignatureMatch::UnopenedTypeName { .. }
-        | TypeSignatureMatch::OverloadSetMiscounted { .. } => Lean::Neither,
+        | TypeSignatureMatch::OverloadSetMiscounted { .. }
+        | TypeSignatureMatch::AccessorSignature => Lean::Neither,
     }
 }
 

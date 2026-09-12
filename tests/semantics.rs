@@ -550,6 +550,50 @@ fn test_compare_with_an_lsp_finds_the_accidental_duplication_not_unifiable() {
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_does_not_compare_an_accessor_as_a_callable_type() {
+    // hover は `(setter) Holder.handler: (message: string) => void` を返す。綴りのまま
+    // 割ると `(string) => void` になり、**下のテストが単一化可能と示すメソッドと
+    // 同じ形**になってしまう（偽陽性）。チャンクはアクセサ関数なので、呼べる型は
+    // `((string) => void) => void` で 1 段ずれている。
+    //
+    // **セッターで書く。** ゲッターは引数を取れないので本体をメソッドと同じ形にできず、
+    // 構造類似度が閾値に届かずに候補ペアから外れる（綴りを読む手前で降りるため、
+    // このテストが見たいものに届かない）。ゲッターの綴りは
+    // `semantics::type_signature` のモジュール内テストが見る
+    let holds_a_handler = fixture("accessors/holder.ts", 2);
+    let notifies = fixture("accessors/notifier.ts", 2);
+
+    let measured = measured_with_an_lsp(&holds_a_handler, &notifies);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::AccessorSignature
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_still_compares_a_property_holding_a_function_type() {
+    // 対照は上のテスト。hover が返す綴りの形は同じ（`(property) Keeper.held:
+    // (value: string) => void`）だが、**チャンクはアロー関数自身**なのでメンバーの型が
+    // そのままチャンクの型になる。**ここが単一化可能に出ることが、上のペアを
+    // 落とさなければ偽陽性になることの根拠**でもある
+    //
+    // 3 つのフィクスチャは本体を揃えてある。揃えないと構造類似度が閾値に届かず、
+    // **綴りを読む手前で降りて**どちらのテストも見たいものに届かない
+    let holds_a_handler = fixture("accessors/keeper.ts", 2);
+    let notifies = fixture("accessors/notifier.ts", 2);
+
+    let measured = measured_with_an_lsp(&holds_a_handler, &notifies);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_an_lsp_opens_a_type_alias_written_on_a_parameter() {
     // hover が返すのは `function scaleAmount(amount: Amount, factor: number): Amount` で、
     // `Amount` は展開されない。解決しないと `(Amount, number) => Amount` と

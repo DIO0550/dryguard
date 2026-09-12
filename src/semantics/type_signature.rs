@@ -42,6 +42,19 @@ const CONSTRUCTOR_KEYWORD: &str = "constructor";
 /// 構築シグネチャの値形を導く語（`new (value: string) => Result`）。
 const NEW_KEYWORD: &str = "new";
 
+/// アクセサの綴りを導く接頭辞（`(getter) Holder.value: string`）。
+///
+/// **この一覧は増えない。** TypeScript のアクセサは `get` / `set` の 2 つで尽きる
+/// （`signature_kind_of` が `constructor` / `new` の 2 つだけを見ているのと同じ形）。
+/// 残る risk は綴りが増えることではなく**サーバが綴りを変えること**なので、
+/// `rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」が前提にしている
+/// 「一覧は文法が持つ形の数だけ増え続ける」に当たらない。
+///
+/// **Why not（呼べる型として読んでよい接頭辞の許可リストにする）**: 漏れは偽陰性側へ
+/// 倒れるが、`function` / `const` / `(method)` / `(property)` … を並べることになり、
+/// [`SplitSignature::from_spelling`] が接頭辞を列挙しないと決めた理由とぶつかる。
+const ACCESSOR_PREFIXES: [&str; 2] = ["(getter)", "(setter)"];
+
 /// どこで書かれても同じ型を指す綴り。
 ///
 /// TypeScript の文法が持つ組み込みの型で、**宣言を辿らずに意味が決まる**。
@@ -111,6 +124,22 @@ pub enum TypeSignatureOutcome {
         /// 開けなかった理由。
         reason: UnopenedReason,
     },
+    /// チャンクがアクセサで、綴りが**呼べる型ではない**。
+    ///
+    /// hover はアクセサに**プロパティとしての型**を返す（`(getter) C.value: string`）。
+    /// チャンクのほうはアクセサ関数なので、`get value(): T` の呼べる型は `() => T`、
+    /// `set value(next: T)` は `(T) => void` と、**1 段ずれる**。
+    ///
+    /// **綴りのまま割ると偽陽性になる。** 型が関数型だと
+    /// （`(getter) C.handler: (a: string) => void`）、[`SplitSignature`] が
+    /// プロパティの型のほうの括弧組を引数リストとして掴み、**同じ引数を取るメソッドと
+    /// 単一化可能に出る**。
+    ///
+    /// **理由を落として [`Self::UnreadableSignature`] にしない。** あちらは
+    /// dryguard 側の穴で、こちらは**まだ扱えていない形**。1 つにまとめると、
+    /// 利用者を直す先の違う場所へ向けてしまう
+    /// (`rules/architecture.md`「理由は落とさない」)。
+    AccessorSignature,
 }
 
 /// その名前で呼べる型シグネチャを揃えて、正規化した形にする。
@@ -253,6 +282,12 @@ pub fn normalized_outcome_of(
 /// 差し込みで消えた型名も、正規化で落ちる関数の名前も、比較には残らないので
 /// 答えを変えない。
 fn single_outcome_of(spelling: &str, traced: &TracedTypeNames) -> TypeSignatureOutcome {
+    // **割る前に落とす。** 割った後で接頭辞を見ても、掴まれた括弧組は
+    // プロパティの型のほうなので手遅れ（[`TypeSignatureOutcome::AccessorSignature`]）
+    if is_accessor_spelling(spelling) {
+        return TypeSignatureOutcome::AccessorSignature;
+    }
+
     let Some(normalized) = NormalizedSignature::from_spelling(spelling, traced) else {
         return unreadable_outcome_of(spelling, traced);
     };
@@ -268,6 +303,17 @@ fn single_outcome_of(spelling: &str, traced: &TracedTypeNames) -> TypeSignatureO
     }
 
     TypeSignatureOutcome::Normalized(OverloadSet::of_one(normalized.signature))
+}
+
+/// その綴りが、アクセサに対する hover の答えか。
+///
+/// `text` は件数の要約を剥がした綴り。
+fn is_accessor_spelling(text: &str) -> bool {
+    let text = text.trim_start();
+
+    ACCESSOR_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
 }
 
 /// 件数の要約を剥がした綴りと、サーバが数えた本数。
@@ -1097,6 +1143,61 @@ mod tests {
                 &traced
             ),
             TypeSignatureOutcome::UnreadableSignature
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_getter_holding_a_function_type_is_not_read_as_a_callable_type()
+    {
+        // チャンクはアクセサ関数（`() => ((a: string) => void)`）なのに、綴りは
+        // プロパティとしての型を言う。割ると**同じ引数のメソッドと単一化可能に出る**
+        assert_eq!(
+            normalized_outcome_of(
+                &signature_text("(getter) Holder.handler: (a: string) => void"),
+                &TracedTypeNames::default()
+            ),
+            TypeSignatureOutcome::AccessorSignature
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_setter_holding_a_function_type_is_not_read_as_a_callable_type()
+    {
+        // getter と同じ形。書く側のアクセサも綴りはプロパティの型で、
+        // チャンク（`(T) => void`）とは 1 段ずれる
+        assert_eq!(
+            normalized_outcome_of(
+                &signature_text("(setter) Holder.handler: (a: string) => void"),
+                &TracedTypeNames::default()
+            ),
+            TypeSignatureOutcome::AccessorSignature
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_an_accessor_is_not_reported_as_an_unreadable_spelling() {
+        // 関数型でないアクセサは割れずに落ちるが、**理由は dryguard 側の穴ではない**。
+        // 混ぜると、利用者を直す先の違う場所へ向けてしまう
+        assert_eq!(
+            normalized_outcome_of(
+                &signature_text("(getter) Holder.value: string"),
+                &TracedTypeNames::default()
+            ),
+            TypeSignatureOutcome::AccessorSignature
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_property_holding_a_function_type_is_still_normalized() {
+        // 対照は上の 3 つ。**綴りの形は同じ**（`名前: 関数型`）だが、この位置の
+        // チャンクはアロー関数自身なので、メンバーの型がそのままチャンクの型になる。
+        // 接頭辞を見ずに `名前: 型` の形ごと落とすと、ここまで測れなくなる
+        assert_eq!(
+            normalized_outcome_of(
+                &signature_text("(property) Holder.handler: (a: string) => void"),
+                &TracedTypeNames::default()
+            ),
+            TypeSignatureOutcome::Normalized(signature("(a: string) => void"))
         );
     }
 
