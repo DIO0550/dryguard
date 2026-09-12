@@ -246,14 +246,7 @@ impl Callable {
     /// （[`Callable::normalized`]）。分けてあるのは、**綴りに残る型名を数えるのが
     /// 付け替えの前**だから（付け替え後の `%0` は型として読めない）。
     pub(crate) fn from_spelling(spelling: &str) -> Option<Self> {
-        let wrapped = Wrapped::from_spelling(spelling)?;
-        let tree = SyntaxTree::from_source(wrapped.text(), Grammar::TypeScript).ok()?;
-        if tree.has_error() {
-            return None;
-        }
-
-        let node = spanning_node(&tree, wrapped.span())?;
-        match structured(node, wrapped.text())? {
+        match TypeStructure::from_spelling(spelling)? {
             TypeStructure::Callable(callable) => Some(callable),
             TypeStructure::Union(_)
             | TypeStructure::Intersection(_)
@@ -405,8 +398,39 @@ impl Parameter {
 }
 
 impl TypeStructure {
+    /// 型 1 つ分として読める綴りから読む。型として読めない綴りでは `None`。
+    ///
+    /// `spelling` は型 1 つ分の綴り（`type spelling`）。**呼べる型に限らない**ので、
+    /// メンバーとしての型（アクセサに返る綴りの `:` の右辺）もここで読む。
+    ///
+    /// **Why（呼べる型もここを通す）**: 構文木にする手順は綴りが何を表していても同じで、
+    /// 呼べる型かどうかは読んだ後の形で分かる（[`Callable::from_spelling`]）。
+    /// 2 箇所に置くと、包み方（[`Wrapped`]）を替えたときに片方だけが古くなる。
+    pub(crate) fn from_spelling(spelling: &str) -> Option<Self> {
+        let wrapped = Wrapped::from_spelling(spelling)?;
+        let tree = SyntaxTree::from_source(wrapped.text(), Grammar::TypeScript).ok()?;
+        if tree.has_error() {
+            return None;
+        }
+
+        structured(spanning_node(&tree, wrapped.span())?, wrapped.text())
+    }
+
+    /// 型変数を出現順に付け替え、共用体の並びを固定した形。
+    /// 綴りのまま持っている部分を読めなければ `None`。
+    ///
+    /// **外側に型変数の宣言を置かない。** 型 1 つ分の綴りの中で宣言されるのは、
+    /// 入れ子の呼べる型が自分で宣言した型変数だけ（[`Callable::renamed`] がその都度
+    /// スコープを開く）。ここで宣言されていない名前は、**どこかで宣言された型名**なので
+    /// 付け替えない。
+    pub(crate) fn normalized(self) -> Option<Self> {
+        let mut scopes = TypeVariableScopes::new();
+
+        Some(self.renamed(&mut scopes)?.sorted())
+    }
+
     /// 綴りに残っている型名。綴りのまま持っている部分を読めなければ `None`。
-    fn type_names(&self) -> Option<BTreeSet<String>> {
+    pub(crate) fn type_names(&self) -> Option<BTreeSet<String>> {
         let mut names = BTreeSet::new();
 
         match self {
@@ -1017,6 +1041,14 @@ mod tests {
         normalized(one) == normalized(other)
     }
 
+    /// テストが渡す綴りは型 1 つ分として読み取れる前提で、正規化まで済ませる。
+    fn normalized_type(spelling: &str) -> TypeStructure {
+        TypeStructure::from_spelling(spelling)
+            .expect("テストが渡す綴りは型 1 つ分として読み取れる")
+            .normalized()
+            .expect("テストが渡す綴りは正規化できる")
+    }
+
     #[test]
     fn test_a_callable_type_differing_only_in_parameter_names_reads_as_the_same_structure() {
         assert!(same_structure(
@@ -1042,6 +1074,37 @@ mod tests {
     #[test]
     fn test_a_spelling_that_is_not_a_callable_type_cannot_be_read() {
         assert_eq!(Callable::from_spelling("string | number"), None);
+    }
+
+    #[test]
+    fn test_a_spelling_that_is_not_a_callable_type_still_reads_as_a_type_structure() {
+        // 対照は 1 つ上のテスト。呼べる型でない綴りも型 1 つ分としては読めるので、
+        // **書かれ方の違い（共用体の並び）はここでも落ちる**
+        assert_eq!(
+            normalized_type("string | number"),
+            normalized_type("number | string")
+        );
+    }
+
+    #[test]
+    fn test_a_type_name_written_alone_is_not_renamed_like_a_type_variable() {
+        // 型 1 つ分の綴りの外側に型変数の宣言は無い。付け替えると、
+        // **どこかで宣言された別々の型名が同じ `%0` になる**
+        assert_ne!(normalized_type("Amount"), normalized_type("Total"));
+    }
+
+    #[test]
+    fn test_a_type_variable_declared_inside_a_standalone_type_is_renamed() {
+        // 対照は 1 つ上のテスト。入れ子の呼べる型が自分で宣言した名前は付け替わる
+        assert_eq!(
+            normalized_type("(<T>(value: T) => T)[]"),
+            normalized_type("(<U>(other: U) => U)[]")
+        );
+    }
+
+    #[test]
+    fn test_a_standalone_type_that_does_not_read_as_a_type_cannot_be_read() {
+        assert_eq!(TypeStructure::from_spelling("(a: ) => void"), None);
     }
 
     #[test]

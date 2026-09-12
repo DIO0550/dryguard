@@ -191,12 +191,6 @@ pub enum TypeSignatureMatch {
         /// 開けなかった理由。
         reason: UnopenedReason,
     },
-    /// どちらかのチャンクがアクセサで、hover が返すのが**呼べる型ではない**。
-    ///
-    /// アクセサに返るのはプロパティとしての型なので、チャンク（アクセサ関数）の
-    /// 呼べる型とは 1 段ずれる。**綴りのまま比べると、関数型を持つアクセサが
-    /// 同じ引数のメソッドと単一化可能に出る**（`semantics::type_signature`）。
-    AccessorSignature,
 }
 
 /// 呼び出し元ドメインの重なりのシグナル（Stage 2）。

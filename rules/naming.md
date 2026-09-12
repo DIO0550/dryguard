@@ -98,10 +98,11 @@ if structurally_similar && domains_differ { ... }
 | `type structure` | `type spelling` を構文木から読んだ形。**書かれ方の違い**（括弧・引数名・タプルのラベル・共用体の並び）を落としてある |
 | `callable` | 呼べる型（関数型・構築型）1 つ分の `type structure`。型変数・引数・戻り値を持つ |
 | `spelled type` | `type structure` のうち、**分解せず綴りのまま持つ**もの。比較も綴りで行う |
-| `type signature` | 引数名を落とし、型変数を出現順に付け替えた形。**正規化後** |
+| `chunk type` | チャンクが外から使われる形。呼べる型（`callable`）・読める型（getter）・書ける型（setter）のどれか |
+| `type signature` | `chunk type` から引数名を落とし、型変数を出現順に付け替えた形。**正規化後** |
 | `overload declaration` | 本体を持たない同名のシグネチャの宣言。実装と同じスコープに並ぶ |
 | `overload count` | hover が綴りの末尾に付ける、**綴られていない**オーバーロードの本数の要約（`(+1 overload)`） |
-| `overload set` | 1 つの名前で呼べる `type signature` の並び。オーバーロードされていなければ 1 本。**比較はこれで行う** |
+| `overload set` | 1 つの名前が持つ `type signature` の並び。オーバーロードされていなければ 1 本（アクセサは常に 1 本）。**比較はこれで行う** |
 | `unifiable` | 2 つの `overload set` が同じ型構造に重なること（単一化可能） |
 
 `snippet` / `fragment` / `candidate`（chunk の意味で）/ `label`（verdict の意味で）は使わない。
@@ -163,6 +164,13 @@ JSON が壊れているのは違う話）。1 語で呼ぶと、どちらの層�
 アクセサ関数なので**1 段ずれる**（`get value(): T` の呼べる型は `() => T`）。
 1 語で呼ぶと、綴りを割って読んでよいかが言えなくなり、**関数型を持つアクセサが
 同じ引数のメソッドと単一化可能に出る**（偽陽性）。
+
+**読める型と書ける型を混ぜない。** どちらもメンバーとしての型の綴りで、同じメンバーに
+対で書かれていても hover はそれぞれ `(getter)` / `(setter)` を返す（`(property)` に
+畳まれない。typescript-language-server 6.0.0 で実測）。だが `o.value` と `o.value = x` は
+**差し替えられない**ので、1 語で呼ぶと**同じ型の getter と setter が単一化可能に出る**
+（偽陽性）。綴りからは同じメンバーの対かどうかも分からないので、別のメンバーの読みと
+書きまで重なる。
 
 **見分けるのは接頭辞で、割る前に行う。** 割った後では、掴まれた括弧組が
 プロパティの型のほうになっていて手遅れになる。接頭辞の一覧（`(getter)` / `(setter)`）は

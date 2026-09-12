@@ -550,11 +550,11 @@ fn test_compare_with_an_lsp_finds_the_accidental_duplication_not_unifiable() {
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
-fn test_compare_with_an_lsp_does_not_compare_an_accessor_as_a_callable_type() {
+fn test_compare_with_an_lsp_does_not_find_an_accessor_unifiable_with_a_method() {
     // hover は `(setter) Holder.handler: (message: string) => void` を返す。綴りのまま
     // 割ると `(string) => void` になり、**下のテストが単一化可能と示すメソッドと
-    // 同じ形**になってしまう（偽陽性）。チャンクはアクセサ関数なので、呼べる型は
-    // `((string) => void) => void` で 1 段ずれている。
+    // 同じ形**になってしまう（偽陽性）。チャンクはアクセサ関数なので、書ける型は
+    // 綴りが言うとおりの `(string) => void` で、呼べる型とは重ならない。
     //
     // **セッターで書く。** ゲッターは引数を取れないので本体をメソッドと同じ形にできず、
     // 構造類似度が閾値に届かずに候補ペアから外れる（綴りを読む手前で降りるため、
@@ -567,7 +567,23 @@ fn test_compare_with_an_lsp_does_not_compare_an_accessor_as_a_callable_type() {
 
     assert_eq!(
         measured.signals().type_signature_match(),
-        TypeSignatureMatch::AccessorSignature
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_finds_two_setters_of_one_type_unifiable() {
+    // 対照は 1 つ上のテスト。**アクセサ同士なら測れる。** 書ける型が同じ 2 つは
+    // 重なるので、「アクセサだから測れない」とは答えない
+    let holds_a_handler = fixture("accessors/holder.ts", 2);
+    let relays = fixture("accessors/relay.ts", 2);
+
+    let measured = measured_with_an_lsp(&holds_a_handler, &relays);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
     );
 }
 
