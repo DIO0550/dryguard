@@ -795,6 +795,8 @@ fn type_signature_match_of(
         | (_, TypeSignatureOutcome::UnopenedTypeName { reason }) => {
             TypeSignatureMatch::UnopenedTypeName { reason: *reason }
         }
+        (TypeSignatureOutcome::AccessorSignature, _)
+        | (_, TypeSignatureOutcome::AccessorSignature) => TypeSignatureMatch::AccessorSignature,
     }
 }
 
@@ -1896,6 +1898,23 @@ mod tests {
             TypeSignatureMatch::UnopenedTypeName {
                 reason: UnopenedReason::TypeDefinitionNotProvided
             }
+        );
+    }
+
+    #[test]
+    fn test_asked_semantics_do_not_call_a_pair_unifiable_when_one_side_is_an_accessor() {
+        // 対照は下のテスト。**相手が読めていても答えにしない。** アクセサの綴りは
+        // プロパティの型なので、重なって見えても比べた相手が違う
+        let asked = asked_semantics_of_outcomes(
+            Ok(TypeSignatureOutcome::AccessorSignature),
+            Ok(normalized("function sumOf(amounts: number[]): number")),
+            answered(CallerDomainsOutcome::NoReferences),
+            answered(CallerDomainsOutcome::NoReferences),
+        );
+
+        assert_eq!(
+            asked.type_signature_match,
+            TypeSignatureMatch::AccessorSignature
         );
     }
 

@@ -550,6 +550,42 @@ fn test_compare_with_an_lsp_finds_the_accidental_duplication_not_unifiable() {
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_does_not_compare_a_getter_as_a_callable_type() {
+    // hover は `(getter) Holder.handler: (value: string) => void` を返す。綴りのまま
+    // 割ると `(string) => void` になり、**下の 2 つ目のテストが単一化可能と示す
+    // メソッドと同じ形**になってしまう（偽陽性）。チャンクはアクセサ関数なので
+    // 呼べる型は `() => ((string) => void)` で、1 段ずれている
+    let holds_a_handler = fixture("accessors/holder.ts", 6);
+    let notifies = fixture("accessors/notifier.ts", 2);
+
+    let measured = measured_with_an_lsp(&holds_a_handler, &notifies);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::AccessorSignature
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_still_compares_a_property_holding_a_function_type() {
+    // 対照は上のテスト。hover が返す綴りの形は同じ（`(property) Keeper.held:
+    // (value: string) => void`）だが、**チャンクはアロー関数自身**なのでメンバーの型が
+    // そのままチャンクの型になる。**ここが単一化可能に出ることが、上のペアを
+    // 落とさなければ偽陽性になることの根拠**でもある
+    let holds_a_handler = fixture("accessors/keeper.ts", 2);
+    let notifies = fixture("accessors/notifier.ts", 2);
+
+    let measured = measured_with_an_lsp(&holds_a_handler, &notifies);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_an_lsp_opens_a_type_alias_written_on_a_parameter() {
     // hover が返すのは `function scaleAmount(amount: Amount, factor: number): Amount` で、
     // `Amount` は展開されない。解決しないと `(Amount, number) => Amount` と
