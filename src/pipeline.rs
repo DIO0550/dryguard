@@ -765,6 +765,12 @@ fn document_of(chunk: &Chunk, source: &str) -> Result<SourceDocument, SemanticsE
 ///
 /// **片方でも正規化できていなければ「単一化不能」にしない。** 比べていないので、
 /// 取れなかった理由をそのまま出す（2 つとも取れていなければ、上の枝の理由）。
+///
+/// **環境を直しても変わらない理由を先に出す。** 他の理由は往復と読み取りについての
+/// もので、サーバを替える・ファイルを読めるようにすれば変わりうる。アクセサだけは
+/// **このツールがまだ扱えない形**なので、後ろに置くと「相手側を直してもう一度」を
+/// 促してしまい、直しても同じペアは測れないままになる
+/// (`rules/architecture.md`「理由は落とさない」)。
 fn type_signature_match_of(
     signature_a: &TypeSignatureOutcome,
     signature_b: &TypeSignatureOutcome,
@@ -774,6 +780,8 @@ fn type_signature_match_of(
             TypeSignatureOutcome::Normalized(normalized_a),
             TypeSignatureOutcome::Normalized(normalized_b),
         ) => unifiable_match_of(normalized_a.is_unifiable_with(normalized_b)),
+        (TypeSignatureOutcome::AccessorSignature, _)
+        | (_, TypeSignatureOutcome::AccessorSignature) => TypeSignatureMatch::AccessorSignature,
         (TypeSignatureOutcome::NoTypeThere, _) | (_, TypeSignatureOutcome::NoTypeThere) => {
             TypeSignatureMatch::NoTypeThere
         }
@@ -795,8 +803,6 @@ fn type_signature_match_of(
         | (_, TypeSignatureOutcome::UnopenedTypeName { reason }) => {
             TypeSignatureMatch::UnopenedTypeName { reason: *reason }
         }
-        (TypeSignatureOutcome::AccessorSignature, _)
-        | (_, TypeSignatureOutcome::AccessorSignature) => TypeSignatureMatch::AccessorSignature,
     }
 }
 
@@ -1908,6 +1914,26 @@ mod tests {
         let asked = asked_semantics_of_outcomes(
             Ok(TypeSignatureOutcome::AccessorSignature),
             Ok(normalized("function sumOf(amounts: number[]): number")),
+            answered(CallerDomainsOutcome::NoReferences),
+            answered(CallerDomainsOutcome::NoReferences),
+        );
+
+        assert_eq!(
+            asked.type_signature_match,
+            TypeSignatureMatch::AccessorSignature
+        );
+    }
+
+    #[test]
+    fn test_asked_semantics_report_the_accessor_ahead_of_a_reason_the_user_could_act_on() {
+        // 対照は上のテスト（相手が読めている場合）。**相手側の理由を出すと、直して
+        // もう一度走らせても同じペアは測れないまま**になる。アクセサは環境を直しても
+        // 変わらないので、こちらを先に出す
+        let asked = asked_semantics_of_outcomes(
+            Ok(TypeSignatureOutcome::AccessorSignature),
+            Ok(TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::TypeDefinitionNotProvided,
+            }),
             answered(CallerDomainsOutcome::NoReferences),
             answered(CallerDomainsOutcome::NoReferences),
         );
