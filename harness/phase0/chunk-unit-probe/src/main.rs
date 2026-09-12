@@ -38,7 +38,7 @@ const FUNCTION_KINDS: [&str; 6] = [
 /// ブロックとして拾うノードの種別。
 ///
 /// 波括弧そのもの（`statement_block`）ではなく**それを持つ文**を採る。`for (..) {` の
-/// 見出し行はブロックの意味の一部で、落とすと条件の違う 2 つのループが同じトークン集合になる。
+/// 見出し行はブロックの意味の一部で、落とすと条件の違う 2 つのループが同じトークン列になる。
 const BLOCK_KINDS: [&str; 7] = [
     "if_statement",
     "for_statement",
@@ -324,8 +324,8 @@ fn missed_pairs_of<'unit>(
     missed
 }
 
-/// 単位の大きさの分布。短い単位ほど構文語がトークン集合を占める（Issue #86）ので、
-/// 単位を落とすとその影響がどれだけ増えるかをここで見る。
+/// 単位の大きさの分布。単位を落とすと 1 単位から切り出せる gram が減るので、候補の増え方が
+/// ここに効く（Issue #86: 3-gram で数えると短いほど候補になりにくい）。
 fn print_size_distribution(units: &[Unit], label: &str) {
     if units.is_empty() {
         println!("{label}: なし");
