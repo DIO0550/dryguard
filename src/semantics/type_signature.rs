@@ -309,7 +309,7 @@ fn single_outcome_of(spelling: &str, traced: &TracedTypeNames) -> TypeSignatureO
     // **開けなかった型名を先に見る。** どちらも「測れない」だが、開けなかった理由のほうが
     // 利用者の次の手（サーバを替える / ファイルを読めるようにする）に直結する
     let untraced = normalized
-        .remaining_type_names
+        .traceable_type_names
         .iter()
         .any(|name| !is_traced(name, traced));
 
@@ -581,6 +581,15 @@ impl ChunkType {
     }
 
     /// 綴りに残っている型名。綴りのまま持っている部分を読めなければ `None`。
+    fn traceable_type_names(&self) -> Option<BTreeSet<String>> {
+        match self {
+            Self::Callable(callable) => callable.traceable_type_names(),
+            Self::Read(member_type) | Self::Written(member_type) => {
+                member_type.traceable_type_names()
+            }
+        }
+    }
+
     fn type_names(&self) -> Option<BTreeSet<String>> {
         match self {
             Self::Callable(callable) => callable.type_names(),
@@ -621,6 +630,13 @@ struct NormalizedSignature {
     signature: TypeSignature,
     /// 名前順。並びを綴りに任せると、同じ 2 つが尋ねた順で違う理由を出す。
     remaining_type_names: BTreeSet<String>,
+    /// 比較に残る綴りに現れた型名のうち、**宣言を辿る相手になりうるもの**。名前順。
+    ///
+    /// **[`NormalizedSignature::remaining_type_names`] と別に持つ。** あちらは
+    /// 綴りのまま持つ部分の中で束縛された名前まで数えるので、そのまま
+    /// 「尋ねたか」を見ると**辿る相手が居ない名前を「尋ねていない」と答える**
+    /// （`syntax::type_structure` の `SpelledBinders`）。
+    traceable_type_names: BTreeSet<String>,
 }
 
 impl NormalizedSignature {
@@ -650,6 +666,7 @@ impl NormalizedSignature {
         // **数えるのは付け替えの前。** 付け替えた後の綴り（`%0`）は型として読めないので、
         // 綴りのまま持っている部分から型名を拾えなくなる
         let remaining_type_names = remaining_type_names_of(&read)?;
+        let traceable_type_names = traceable_type_names_of(&read)?;
 
         let signature = TypeSignature {
             chunk_type: read.normalized()?,
@@ -659,6 +676,7 @@ impl NormalizedSignature {
         Some(Self {
             signature,
             remaining_type_names,
+            traceable_type_names,
         })
     }
 }
@@ -694,6 +712,22 @@ fn callable_read_of(flattened: &str, resolved: &ResolvedTypes) -> Option<Callabl
 fn remaining_type_names_of(read: &ChunkType) -> Option<BTreeSet<String>> {
     Some(
         read.type_names()?
+            .into_iter()
+            .filter(|name| !PREDEFINED_TYPES.contains(&name.as_str()))
+            .collect(),
+    )
+}
+
+/// 比較に残る型の綴りに現れる型名のうち、**宣言を辿る相手になりうるもの**を名前順に集める。
+/// 綴りのまま持っている部分を読めなければ `None`。
+///
+/// [`remaining_type_names_of`] との違いは、**綴りのまま持つ部分の中で束縛された名前**
+/// （`infer U` / マップ型の `K in …`）を外すところだけ。型変数と同じく**辿る相手が居ない**ので、
+/// 数えると注釈を書いてあるジェネリック関数まで「尋ねていない」側へ落ちる
+/// （`syntax::type_structure` の `SpelledBinders`）。
+fn traceable_type_names_of(read: &ChunkType) -> Option<BTreeSet<String>> {
+    Some(
+        read.traceable_type_names()?
             .into_iter()
             .filter(|name| !PREDEFINED_TYPES.contains(&name.as_str()))
             .collect(),

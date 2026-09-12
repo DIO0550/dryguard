@@ -808,6 +808,24 @@ fn test_compare_with_an_lsp_unifies_two_generic_functions_of_the_same_shape() {
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_unifies_two_generic_functions_binding_a_name_inside_a_conditional_type()
+{
+    // 条件型は綴りのまま持つので、`infer U` の `U` は綴りの中で束縛されている。
+    // **戻り値まで注釈してあるのに測れない側へ落ちないこと**を見る（型変数と同じく
+    // 辿る相手が居ない。`syntax::type_structure` の `SpelledBinders`）
+    let unwraps_charged = fixture("references/src/billing/unwrapped.ts", 1);
+    let unwraps_stocked = fixture("references/src/inventory/unwrapped.ts", 1);
+
+    let measured = measured_with_an_lsp(&unwraps_charged, &unwraps_stocked);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_an_lsp_unifies_two_functions_taking_one_interface_from_separate_domains() {
     // 対照は上のテスト。**綴りが同じことを拒んでいるのではなく、指している記号が別な
     // ことを拒んでいる。** こちらは report 側が billing の `User` を輸入していて、
