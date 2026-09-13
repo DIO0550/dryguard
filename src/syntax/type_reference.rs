@@ -174,7 +174,7 @@ pub(super) fn constructed_class_references_of(node: Node<'_>, source: &str) -> V
 }
 
 /// そのコンストラクタが構築するクラスの宣言。コンストラクタでなければ `None`。
-fn constructed_class_of<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+pub(super) fn constructed_class_of<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
     let member = node.child_by_field_name(NAME_FIELD)?;
     if source.get(member.byte_range())? != CONSTRUCTOR_NAME {
         return None;
@@ -236,7 +236,7 @@ fn annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
 /// **名前を探す側と同じ包みを抜ける**（[`unwrapped_parent_of`]）。片方だけが抜けると、
 /// `const f = (…) as (v: Input) => Input` の `Input` を集め損ねる。集め損ねた型名は
 /// 開かれずに比較へ残るので、**別のファイルの同じ綴りの型が単一化可能に出る**（偽陽性）。
-fn outer_annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
+pub(super) fn outer_annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
     if node.child_by_field_name(NAME_FIELD).is_some() {
         return Vec::new();
     }
