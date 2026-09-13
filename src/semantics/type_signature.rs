@@ -334,8 +334,12 @@ fn single_outcome_of(
     // **注釈を省いた位置の型名は、綴りで引かずに「尋ねていない」へ倒す。** 同じ綴りが
     // 書かれた位置にもあると `is_traced` は `true` を返すが、それは**別の出現**を
     // 尋ねた記録でしかない（`rules/architecture.md`「どこまでを「取れなかった」に数えるか」）
-    let inferred_value_type =
-        value_type == ValueTypeAnnotation::Omitted && !normalized.value_type_names.is_empty();
+    // 差し込む前の綴りを読めなかったときは、型名が在ったかもしれないほうへ倒す
+    let value_type_holds_a_name = normalized
+        .value_type_names
+        .as_ref()
+        .is_none_or(|names| !names.is_empty());
+    let inferred_value_type = value_type == ValueTypeAnnotation::Omitted && value_type_holds_a_name;
 
     // **開けなかった型名を先に見る。** どちらも「測れない」だが、開けなかった理由のほうが
     // 利用者の次の手（サーバを替える / ファイルを読めるようにする）に直結する
@@ -700,12 +704,20 @@ struct NormalizedSignature {
     /// （`syntax::type_structure::Callable::names_only_types`）。
     names_only_types: bool,
     /// **値の型の位置**に現れた型名のうち、宣言を辿る相手になりうるもの。名前順。
+    /// 差し込む前の綴りを読めなければ `None`。
     ///
-    /// [`NormalizedSignature::traceable_type_names`] の部分集合。**注釈が省かれていれば、
-    /// ここに入った型名はソースのどこにも書かれていない**ので、綴りで引く
-    /// [`is_traced`] は別の出現の記録を返す（`rules/architecture.md`
+    /// **注釈が省かれていれば、ここに入った型名はソースのどこにも書かれていない**ので、
+    /// 綴りで引く [`is_traced`] は別の出現の記録を返す（`rules/architecture.md`
     /// 「どこまでを「取れなかった」に数えるか」）。
-    value_type_names: BTreeSet<String>,
+    ///
+    /// **数えるのは差し込む前。** 差し込みは綴りで引くので、**引数に書かれたエイリアスの
+    /// 右辺が、同じ綴りの推論された戻り値にも入る**。差し込んだ後で数えると、
+    /// 開かれた側が消えて「値の型に型名が無い」に見える。
+    ///
+    /// **読めなかったことを空の集合で表さない。** 型名が 1 つも無いことと、
+    /// 数えられなかったことは別で、後者は注釈が省かれていれば「測れない」へ倒す
+    /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+    value_type_names: Option<BTreeSet<String>>,
 }
 
 impl NormalizedSignature {
@@ -736,7 +748,7 @@ impl NormalizedSignature {
         // 綴りのまま持っている部分から型名を拾えなくなる
         let remaining_type_names = remaining_type_names_of(&read)?;
         let traceable_type_names = traceable_type_names_of(&read)?;
-        let value_type_names = value_type_names_of(&read)?;
+        let value_type_names = spelled_value_type_names_of(&flattened);
         let names_only_types = read.names_only_types()?;
 
         let signature = TypeSignature {
@@ -807,14 +819,29 @@ fn traceable_type_names_of(read: &ChunkType) -> Option<BTreeSet<String>> {
     )
 }
 
-/// **値の型の位置**に現れる型名のうち、宣言を辿る相手になりうるものを名前順に集める。
-/// 綴りのまま持っている部分を読めなければ `None`。
+/// **サーバが返した綴りのまま**読んだ、値の型の位置に現れる型名のうち、宣言を辿る相手に
+/// なりうるものを名前順に。差し込む前の綴りをチャンクの型として読めなければ `None`。
 ///
-/// `read` は差し込みを終えて構造として読んだ、まだ付け替えていないチャンクの型。
+/// `flattened` は空白を畳んだ、接頭辞の付いたままの綴り。
+///
+/// **差し込みを通さない。** 差し込みは綴りで引くので、引数に書かれたエイリアスの右辺が
+/// **同じ綴りの、推論された戻り値にも入る**。差し込んだ後で数えると、開かれた側が
+/// 型名として残らず「値の型に型名が無い」に見える（`type Receipt = …` を引数に注釈し、
+/// 別モジュールの同名の型を返す関数がこれで単一化可能に出ていた）。
 ///
 /// [`traceable_type_names_of`] と同じくキーワードの型を外す。**`function f(x: A) { return 1; }`
 /// の推論された戻り値（`number`）まで数えると、注釈を省いただけで測れない側へ落ちる。**
-fn value_type_names_of(read: &ChunkType) -> Option<BTreeSet<String>> {
+///
+/// **Why not（差し込んだ後の構造から数える）**: 残りの 2 つの集合と同じ経路で済むが、
+/// 上のとおり**差し込みが出現を区別しない**ので、この Issue が塞ぐはずの穴が
+/// エイリアス越しにそのまま残る。
+fn spelled_value_type_names_of(flattened: &str) -> Option<BTreeSet<String>> {
+    let spelled = ResolvedTypes::default();
+    let read = match AccessorSpelling::from_spelling(flattened) {
+        Some(accessor) => accessor.to_chunk_type(&spelled)?,
+        None => ChunkType::Callable(callable_read_of(flattened, &spelled)?),
+    };
+
     Some(
         read.value_type_names()?
             .into_iter()
@@ -1408,6 +1435,21 @@ mod tests {
             &signature_text("function build(a: Amount): Amount"),
             ValueTypeAnnotation::Omitted,
             &tracing_all("Amount"),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::UntracedTypeName);
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_inferring_a_return_type_opened_from_a_parameter_alias_is_unmeasurable()
+     {
+        // 引数に書かれた `Amount` が開けるエイリアスだと、差し込みは**綴りで引く**ので
+        // 推論された戻り値の `Amount` にも右辺が入る。差し込んだ後で数えると
+        // 値の型に型名が残らず、エイリアス越しに偽陽性がそのまま通る
+        let outcome = normalized_outcome_of(
+            &signature_text("function build(a: Amount): Amount"),
+            ValueTypeAnnotation::Omitted,
+            &tracing_one("Amount", "{ shared: number }", "/repo/src/written.ts"),
         );
 
         assert_eq!(outcome, TypeSignatureOutcome::UntracedTypeName);

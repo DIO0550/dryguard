@@ -236,7 +236,7 @@ fn annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
 /// **名前を探す側と同じ包みを抜ける**（[`unwrapped_parent_of`]）。片方だけが抜けると、
 /// `const f = (…) as (v: Input) => Input` の `Input` を集め損ねる。集め損ねた型名は
 /// 開かれずに比較へ残るので、**別のファイルの同じ綴りの型が単一化可能に出る**（偽陽性）。
-pub(super) fn outer_annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
+fn outer_annotated_nodes_of(node: Node<'_>) -> Vec<Node<'_>> {
     if node.child_by_field_name(NAME_FIELD).is_some() {
         return Vec::new();
     }

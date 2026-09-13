@@ -20,10 +20,11 @@ use crate::source_position::SourcePosition;
 use crate::syntax::import::{ImportSet, ImportsUnavailable};
 use crate::syntax::line_range::LineRange;
 use crate::syntax::token::TokenSequence;
-use crate::syntax::tree::{SyntaxTree, source_position_of, unwrapped_parent_of};
+use crate::syntax::tree::{
+    SyntaxTree, source_position_of, transparent_wrappers_of, unwrapped_parent_of,
+};
 use crate::syntax::type_reference::{
-    TypeReference, constructed_class_of, constructed_class_references_of, outer_annotated_nodes_of,
-    type_references_of,
+    TypeReference, constructed_class_of, constructed_class_references_of, type_references_of,
 };
 
 /// 比較の単位。関数・メソッド 1 つ分のソースと、それがどこにあったか。
@@ -391,6 +392,18 @@ const PARAMETERS_FIELD: &str = "parameters";
 /// 型注釈を載せるフィールド。
 const TYPE_FIELD: &str = "type";
 
+/// **書かれた型をその式の型として言い切る**包みの種別。
+///
+/// `x as T` と `<T>x` の 2 つで、どちらも hover が返す綴りは書かれた `T` になる。
+///
+/// **許可リストにする。** 値を通すだけの包み（`syntax::tree` の
+/// `TRANSPARENT_EXPRESSION_KINDS`）には**型を言い切らないもの**が混じっており、
+/// `satisfies` は書かれた型と照らし合わせるだけで**推論された型をそのまま残す**
+/// （`tsc 5.9.3` で実測: `((x: R) => makeA()) satisfies (x: R) => unknown` の型は
+/// `(x: R) => string`）。一覧から漏れた種別は「省かれている」へ倒れる（偽陰性）
+/// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+const TYPE_ASSERTION_KINDS: [&str; 2] = ["as_expression", "type_assertion"];
+
 /// 指定行を含むチャンクノードのうち、もっとも内側のもの。1 つも無ければ `None`。
 ///
 /// 内側かどうかはバイト範囲の短さで決める。入れ子になったノードは必ず外側の範囲に
@@ -472,9 +485,9 @@ fn overload_declarations_at(node: Node<'_>, source: &str) -> Vec<OverloadDeclara
 /// 漏れは偽陰性（測れる答えを 1 つ落とす）に倒れる
 /// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
 fn value_type_annotation_of(node: Node<'_>, source: &str) -> ValueTypeAnnotation {
-    // 外側の注釈が綴り全体を決める形（`const handler: Handler = (x) => x`）。
-    // hover はその注釈を返すので、戻り値の位置にも推論された型名は現れない
-    if !outer_annotated_nodes_of(node).is_empty() {
+    // 外側の型が綴り全体を決める形（`const handler: Handler = (x) => x`）。
+    // hover はその型を返すので、戻り値の位置にも推論された型名は現れない
+    if outer_type_decides_the_spelling(node) {
         return ValueTypeAnnotation::Written;
     }
 
@@ -495,6 +508,30 @@ fn value_type_annotation_of(node: Node<'_>, source: &str) -> ValueTypeAnnotation
     }
 
     ValueTypeAnnotation::Omitted
+}
+
+/// そのチャンクの外側に書かれた型が、hover の綴り全体を決めるか。
+///
+/// **自分の名前を持つチャンクでは決めない。** hover はその名前を指すので、返るのは
+/// 関数自身の型になる（[`name_node_of`] の Why と同じ分かれ目）。
+///
+/// 決めるのは 2 つ。**型を言い切る包み**（[`TYPE_ASSERTION_KINDS`]）と、
+/// **代入先の型注釈**（`const handler: Handler = …`）。
+///
+/// **言い切る包みは 1 つでもあれば決まる。** `((x) => x) as A satisfies B` の型は `A` で、
+/// 外側に `satisfies` が重なっても言い切った型のほうが残る。
+fn outer_type_decides_the_spelling(node: Node<'_>) -> bool {
+    if node.child_by_field_name(NAME_FIELD).is_some() {
+        return false;
+    }
+
+    let asserted = transparent_wrappers_of(node)
+        .iter()
+        .any(|wrapper| TYPE_ASSERTION_KINDS.contains(&wrapper.kind()));
+    let assigned =
+        unwrapped_parent_of(node).and_then(|parent| parent.child_by_field_name(TYPE_FIELD));
+
+    asserted || assigned.is_some()
 }
 
 /// そのノードが、プロパティへ書く側のアクセサか。
@@ -1520,6 +1557,30 @@ function broken() {
     #[test]
     fn test_an_arrow_function_asserted_by_a_wrapper_writes_its_value_type() {
         let asserted = "const build = ((x) => x) as Builder;\n";
+
+        assert_eq!(
+            value_type_of(asserted, "a.ts:1"),
+            ValueTypeAnnotation::Written
+        );
+    }
+
+    #[test]
+    fn test_an_arrow_function_only_checked_by_satisfies_omits_its_value_type() {
+        // 対照は 1 つ上のテスト。包みを `as` から `satisfies` に替えただけの違い。
+        // **`satisfies` は書かれた型と照らし合わせるだけで、推論された型をそのまま残す**
+        // （`tsc 5.9.3` で実測）ので、戻り値の位置には推論された型名が現れる
+        let checked = "const build = ((x: Amount) => x) satisfies (x: Amount) => unknown;\n";
+
+        assert_eq!(
+            value_type_of(checked, "a.ts:1"),
+            ValueTypeAnnotation::Omitted
+        );
+    }
+
+    #[test]
+    fn test_an_arrow_function_asserted_then_checked_by_satisfies_writes_its_value_type() {
+        // 言い切った型は外側に `satisfies` が重なっても残る（型は `Builder`）
+        let asserted = "const build = ((x) => x) as Builder satisfies unknown;\n";
 
         assert_eq!(
             value_type_of(asserted, "a.ts:1"),
