@@ -198,6 +198,30 @@ pub enum UntracedReason {
     NoTracedRecord,
 }
 
+/// 2 つの理由のうち、`--explain` に出すほう。
+///
+/// **確かめてある理由を、確かめられていない理由で覆わない。**
+/// [`UntracedReason::OmittedValueTypeAnnotation`] は注釈が無いことを構文木から
+/// 確かめてあるので、直す先を言い切れる。[`UntracedReason::NoTracedRecord`] を
+/// 先に出すと、**確かめてある原因まで「区別できない」という文で覆う**。
+///
+/// **渡された順に任せない。** ペアの両側が別の理由で「尋ねていない」に倒れたとき、
+/// 受け取った順で決めると **`compare` の引数を入れ替えただけで案内が変わる**
+/// （`scan` では候補ペアの並び順で変わる）。
+///
+/// [`single_outcome_of`] が 1 本の綴りの中で付けている順序と同じ。
+pub fn reported_untraced_reason_of(left: UntracedReason, right: UntracedReason) -> UntracedReason {
+    match (left, right) {
+        (UntracedReason::OmittedValueTypeAnnotation, _)
+        | (_, UntracedReason::OmittedValueTypeAnnotation) => {
+            UntracedReason::OmittedValueTypeAnnotation
+        }
+        (UntracedReason::NoTracedRecord, UntracedReason::NoTracedRecord) => {
+            UntracedReason::NoTracedRecord
+        }
+    }
+}
+
 /// その名前が持つ型シグネチャを揃えて、正規化した形にする。
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
@@ -388,6 +412,7 @@ fn single_outcome_of(
     // **確かめてある理由を先に出す。** ここは注釈が無いことを構文木から確かめてあるので、
     // 直す先を言い切ってよい。両方に当たるときに下の枝を先に出すと、
     // **確かめてある原因を「区別できない」という文で覆う**ことになる
+    // （ペアの両側から 1 つを選ぶ側は [`reported_untraced_reason_of`] が同じ順序を持つ）
     if inferred_value_type {
         return TypeSignatureOutcome::UntracedTypeName {
             reason: UntracedReason::OmittedValueTypeAnnotation,
@@ -1526,6 +1551,38 @@ mod tests {
             TypeSignatureOutcome::UntracedTypeName {
                 reason: UntracedReason::OmittedValueTypeAnnotation
             }
+        );
+    }
+
+    #[test]
+    fn test_reported_untraced_reason_of_a_confirmed_and_an_unconfirmed_one_answers_the_confirmed_one()
+     {
+        // 注釈が無いのは構文木から確かめてある。記録が無いだけのほうで覆うと、
+        // 確かめてある原因に「区別できない」という文が出る
+        let confirmed = UntracedReason::OmittedValueTypeAnnotation;
+        let unconfirmed = UntracedReason::NoTracedRecord;
+
+        assert_eq!(
+            reported_untraced_reason_of(confirmed, unconfirmed),
+            UntracedReason::OmittedValueTypeAnnotation
+        );
+        assert_eq!(
+            reported_untraced_reason_of(unconfirmed, confirmed),
+            UntracedReason::OmittedValueTypeAnnotation,
+            "渡す順を入れ替えても同じ理由を返す"
+        );
+    }
+
+    #[test]
+    fn test_reported_untraced_reason_of_two_unconfirmed_ones_answers_the_unconfirmed_one() {
+        // 対照は 1 つ上のテスト。**確かめてある側が無ければ、言い切らないほうが残る**。
+        // ここで確かめてある側を返すと、注釈が書かれているチャンクに嘘の案内が出る
+        assert_eq!(
+            reported_untraced_reason_of(
+                UntracedReason::NoTracedRecord,
+                UntracedReason::NoTracedRecord
+            ),
+            UntracedReason::NoTracedRecord
         );
     }
 

@@ -28,7 +28,9 @@ use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outco
 use crate::semantics::resolved_type::{
     TypeDeclaration, UnopenedReason, UnopenedTypeName, opened_type_names_of, traced_type_names_of,
 };
-use crate::semantics::type_signature::{TypeSignatureOutcome, type_signature_outcome_of};
+use crate::semantics::type_signature::{
+    TypeSignatureOutcome, reported_untraced_reason_of, type_signature_outcome_of,
+};
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks};
 use crate::syntax::import::ImportsUnavailable;
@@ -808,6 +810,14 @@ fn type_signature_match_of(
         | (_, TypeSignatureOutcome::UnopenedTypeName { reason }) => {
             TypeSignatureMatch::UnopenedTypeName { reason: *reason }
         }
+        (
+            TypeSignatureOutcome::UntracedTypeName { reason: reason_a },
+            TypeSignatureOutcome::UntracedTypeName { reason: reason_b },
+        ) => TypeSignatureMatch::UntracedTypeName {
+            // **両側が別の理由なら、確かめてあるほうを出す。** 受け取った順で決めると、
+            // `compare` の引数を入れ替えただけで案内が変わる
+            reason: reported_untraced_reason_of(*reason_a, *reason_b),
+        },
         (TypeSignatureOutcome::UntracedTypeName { reason }, _)
         | (_, TypeSignatureOutcome::UntracedTypeName { reason }) => {
             TypeSignatureMatch::UntracedTypeName { reason: *reason }
@@ -1849,7 +1859,7 @@ mod tests {
     use crate::classification::verdict::Verdict;
     use crate::line_number::LineNumber;
     use crate::semantics::resolved_type::TracedTypeNames;
-    use crate::semantics::type_signature::normalized_outcome_of;
+    use crate::semantics::type_signature::{UntracedReason, normalized_outcome_of};
     use crate::similarity::Similarity;
     use crate::syntax::chunk::ValueTypeAnnotation;
     use crate::test_support::{line, missing_server, overload_count, signature_text};
@@ -2173,6 +2183,40 @@ mod tests {
         );
 
         assert_eq!(matched, TypeSignatureMatch::SiteDependentSpelling);
+    }
+
+    #[test]
+    fn test_type_signature_match_of_two_untraced_reasons_does_not_depend_on_the_pair_order() {
+        // 両側が別の理由で「尋ねていない」に倒れた形。受け取った順で決めると、
+        // **`compare` の引数を入れ替えただけで案内が変わる**。確かめてある側
+        // （注釈が無いと構文木から分かっている）を、確かめられていない側で覆わない
+        let omitted_first = type_signature_match_of(
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation,
+            },
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord,
+            },
+        );
+        let no_record_first = type_signature_match_of(
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord,
+            },
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation,
+            },
+        );
+
+        assert_eq!(
+            omitted_first,
+            TypeSignatureMatch::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation
+            }
+        );
+        assert_eq!(
+            no_record_first, omitted_first,
+            "引数の順を入れ替えても同じ理由が出る"
+        );
     }
 
     #[test]
