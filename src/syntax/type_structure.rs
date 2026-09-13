@@ -1487,6 +1487,16 @@ mod tests {
     }
 
     #[test]
+    fn test_a_union_of_one_type_variable_written_in_the_other_order_reads_as_the_same_structure() {
+        // 下の 2 本が固定する限界の対照。番号の付き方が並びで変わらなければ落ちるので、
+        // 「型変数が絡むと並びが残る」ではない（`rules/naming.md` の `type structure`）
+        assert!(
+            same_structure("<T>(x: T | string) => void", "<T>(x: string | T) => void"),
+            "型変数が 1 つだけの共用体でも、書かれた並びが構造に残るようになった"
+        );
+    }
+
+    #[test]
     fn test_a_union_of_members_declaring_type_variables_written_in_the_other_order_reads_as_a_different_structure()
      {
         // 既知の限界（#195）。番号は出現順に振るので、相手がそれぞれ型変数を宣言していると
