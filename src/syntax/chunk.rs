@@ -584,50 +584,69 @@ fn assigned_target_annotation_of<'tree>(node: Node<'tree>, source: &str) -> Opti
     }
     let name = source.get(assigned.byte_range())?;
 
+    // **いちばん内側の束縛で止める。** 隠している宣言を飛び越えると、
+    // 外側の別の変数の注釈を、この代入の綴りを決めたものとして読むことになる
     let mut scope = parent.parent();
     while let Some(current) = scope {
-        if let Some(annotation) = annotation_declared_for(current, name, source) {
-            return Some(annotation);
+        match binding_declared_in(current, name, source) {
+            DeclaredBinding::Absent => scope = current.parent(),
+            DeclaredBinding::Unannotated => return None,
+            DeclaredBinding::Annotated(annotation) => return Some(annotation),
         }
-        scope = current.parent();
     }
 
     None
 }
 
-/// そのノードの直下で、その名前に書かれている型注釈。宣言が無い / 注釈が無ければ `None`。
+/// スコープ 1 つ分を見た、その名前の束縛。
+///
+/// **「宣言が無い」と「宣言はあるが注釈が無い」を同じ値で表さない。** 1 つにまとめると、
+/// 隠している宣言を飛び越えて**外側の別の変数の注釈**を拾う
+/// (`rules/coding.md`「不正な状態を型で表現できなくする」)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclaredBinding<'tree> {
+    /// その名前を宣言していない。外側のスコープを続けて見る。
+    Absent,
+    /// その名前を宣言しているが、型注釈が無い。**外側は見ない。**
+    Unannotated,
+    /// 型注釈付きで宣言している。
+    Annotated(Node<'tree>),
+}
+
+/// そのノードの直下で、その名前がどう宣言されているか。
 ///
 /// `scope` は探す範囲のノード、`name` は代入先の綴り、`source` はファイル全体のソース。
 ///
 /// **直下だけを見る。** 文はスコープの直接の子に並ぶので、入れ子まで降りると
 /// 別のスコープの同名の宣言を拾う。**包みの中の宣言**（`export let handler: Handler;`）は
 /// ここでは見つからず、「省かれている」へ倒れる（偽陰性）。
-fn annotation_declared_for<'tree>(
+fn binding_declared_in<'tree>(
     scope: Node<'tree>,
     name: &str,
     source: &str,
-) -> Option<Node<'tree>> {
+) -> DeclaredBinding<'tree> {
     let mut cursor = scope.walk();
 
-    scope.named_children(&mut cursor).find_map(|statement| {
+    let declarator = scope.named_children(&mut cursor).find_map(|statement| {
         if !DECLARATION_KINDS.contains(&statement.kind()) {
             return None;
         }
 
         let mut declared = statement.walk();
-        statement
-            .named_children(&mut declared)
-            .find_map(|declarator| {
-                if declarator.kind() != DECLARATOR_KIND {
-                    return None;
-                }
-                if declared_name_of(declarator, source) != Some(name) {
-                    return None;
-                }
+        statement.named_children(&mut declared).find(|declarator| {
+            declarator.kind() == DECLARATOR_KIND
+                && declared_name_of(*declarator, source) == Some(name)
+        })
+    });
 
-                declarator.child_by_field_name(TYPE_FIELD)
-            })
-    })
+    let Some(declarator) = declarator else {
+        return DeclaredBinding::Absent;
+    };
+
+    match declarator.child_by_field_name(TYPE_FIELD) {
+        Some(annotation) => DeclaredBinding::Annotated(annotation),
+        None => DeclaredBinding::Unannotated,
+    }
 }
 
 /// そのノードが、プロパティへ書く側のアクセサか。
@@ -1726,6 +1745,29 @@ function broken() {
         assert_eq!(
             value_type_of(declared, "a.ts:2"),
             ValueTypeAnnotation::Omitted
+        );
+    }
+
+    #[test]
+    fn test_an_arrow_function_assigned_to_a_shadowing_bare_name_omits_its_value_type() {
+        // 内側の宣言が外側の同名を**隠している**。飛び越えて外側の注釈を拾うと、
+        // 別の変数の注釈をこの代入の綴りを決めたものとして読むことになる
+        let shadowed = "let build: Builder = (x) => x;\nexport function setup() {\n  let build = (x: Amount) => x;\n  build = (x: Amount) => x;\n  return build;\n}\n";
+
+        assert_eq!(
+            value_type_of(shadowed, "a.ts:4"),
+            ValueTypeAnnotation::Omitted
+        );
+    }
+
+    #[test]
+    fn test_an_arrow_function_assigned_to_a_shadowing_annotated_name_writes_its_value_type() {
+        // 対照は上のテスト。内側の宣言に注釈を足しただけの違い
+        let shadowed = "let build: Builder = (x) => x;\nexport function setup() {\n  let build: (x: Amount) => Amount = (x) => x;\n  build = (x: Amount) => x;\n  return build;\n}\n";
+
+        assert_eq!(
+            value_type_of(shadowed, "a.ts:4"),
+            ValueTypeAnnotation::Written
         );
     }
 
