@@ -1487,6 +1487,28 @@ mod tests {
     }
 
     #[test]
+    fn test_a_union_whose_members_declare_type_variables_reads_as_a_different_structure_when_written_in_the_other_order()
+     {
+        // 既知の限界（#181）。番号は出現順に振るので、相手がそれぞれ型変数を宣言していると
+        // 書かれた順で別の番号が付く。並べ替えは付け替えの後なので同じ型のまま残らない
+        assert!(!same_structure(
+            "(cb: (<T>(x: T) => T) | (<U>(x: U) => U[])) => void",
+            "(cb: (<U>(x: U) => U[]) | (<T>(x: T) => T)) => void"
+        ));
+    }
+
+    #[test]
+    fn test_a_union_of_type_variables_bound_outside_reads_as_a_different_structure_when_written_in_the_other_order()
+     {
+        // 同じ限界（#181）が、相手が型変数を宣言していなくても出る形。実コーパス
+        // （rxjs 7.8.1 の `src`）で出たのはこちらだけなので、両方を固定する
+        assert!(!same_structure(
+            "<V, A>(acc: V | A) => A",
+            "<V, A>(acc: A | V) => A"
+        ));
+    }
+
+    #[test]
     fn test_a_type_variable_inside_an_array_type_is_renamed() {
         assert!(same_structure("<T>(x: T[]) => void", "<U>(x: U[]) => void"));
     }
