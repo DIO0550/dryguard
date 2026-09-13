@@ -392,6 +392,16 @@ const PARAMETERS_FIELD: &str = "parameters";
 /// 型注釈を載せるフィールド。
 const TYPE_FIELD: &str = "type";
 
+/// 引数リストが並べる、引数 1 つ分のノードの種別。
+///
+/// **コメントも引数リストの名前付きの子になる**（`set value(/* why */ next: T)`）ので、
+/// 名前付きの子をそのまま数えると**注釈を書いてある setter が「省かれている」側へ落ちる**。
+///
+/// **許可リストにする。** 一覧から漏れた種別は本数が合わなくなり、
+/// 「省かれている」へ倒れる（偽陰性）
+/// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+const PARAMETER_KINDS: [&str; 2] = ["required_parameter", "optional_parameter"];
+
 /// **書かれた型をその式の型として言い切る**包みの種別。
 ///
 /// `x as T` と `<T>x` の 2 つで、どちらも hover が返す綴りは書かれた `T` になる。
@@ -560,8 +570,11 @@ fn sole_parameter_annotation_of(node: Node<'_>) -> ValueTypeAnnotation {
     };
 
     let mut cursor = parameters.walk();
-    let named: Vec<Node<'_>> = parameters.named_children(&mut cursor).collect();
-    let [sole] = named.as_slice() else {
+    let declared: Vec<Node<'_>> = parameters
+        .named_children(&mut cursor)
+        .filter(|child| PARAMETER_KINDS.contains(&child.kind()))
+        .collect();
+    let [sole] = declared.as_slice() else {
         return ValueTypeAnnotation::Omitted;
     };
 
@@ -1519,6 +1532,19 @@ function broken() {
 
         assert_eq!(
             value_type_of(annotated, "a.ts:2"),
+            ValueTypeAnnotation::Written
+        );
+    }
+
+    #[test]
+    fn test_a_setter_with_a_comment_in_its_parameter_list_still_writes_its_value_type() {
+        // **コメントも引数リストの名前付きの子になる。** そのまま数えると本数が合わず、
+        // 注釈を書いてある setter が「省かれている」側へ落ちる
+        let commented =
+            "class Holder {\n  set value(/* why */ next: Amount) {\n    void next;\n  }\n}\n";
+
+        assert_eq!(
+            value_type_of(commented, "a.ts:2"),
             ValueTypeAnnotation::Written
         );
     }

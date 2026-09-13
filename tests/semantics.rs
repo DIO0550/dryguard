@@ -794,11 +794,12 @@ fn test_compare_with_an_lsp_does_not_unify_an_inferred_return_type_spelled_like_
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_an_lsp_unifies_the_same_pair_once_the_return_type_is_annotated() {
-    // 対照は上のテスト。**戻り値の注釈を書き足しただけ**の違いで、hover が綴るのは
-    // どちらも `function echoReceipt(received: Receipt): Receipt`。これが落ちるなら、
+    // 対照は上のテスト。**本体は 1 行も違わず、戻り値の注釈だけを書き足してある**
+    // （`diff` が 1 行だけを出す）。注釈を書けば hover が綴る戻り値は共有の `Receipt` に
+    // なるので、同じ本体でも答えが変わる。これが落ちるなら、
     // 「注釈を省いた出現だけを尋ねていない側へ倒す」が効きすぎている
-    let echoes_a_billing_receipt = fixture("references/src/billing/annotated.ts", 3);
-    let echoes_a_report_receipt = fixture("references/src/report/annotated.ts", 3);
+    let echoes_a_billing_receipt = fixture("references/src/billing/annotated.ts", 4);
+    let echoes_a_report_receipt = fixture("references/src/report/annotated.ts", 4);
 
     let measured = measured_with_an_lsp(&echoes_a_billing_receipt, &echoes_a_report_receipt);
 

@@ -1,7 +1,7 @@
 import { Receipt } from "../shared/receipt";
-import { buildReceipt } from "./inferred";
+import { buildLocal } from "./localReceipt";
 
 export function echoReceipt(received: Receipt) {
   void received;
-  return buildReceipt(0);
+  return buildLocal();
 }
