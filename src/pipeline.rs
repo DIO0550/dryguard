@@ -29,7 +29,7 @@ use crate::semantics::resolved_type::{
     TypeDeclaration, UnopenedReason, UnopenedTypeName, opened_type_names_of, traced_type_names_of,
 };
 use crate::semantics::type_signature::{
-    TypeSignatureOutcome, reported_untraced_reason_of, type_signature_outcome_of,
+    TypeSignatureOutcome, UntracedReason, type_signature_outcome_of,
 };
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks};
@@ -821,6 +821,32 @@ fn type_signature_match_of(
         (TypeSignatureOutcome::UntracedTypeName { reason }, _)
         | (_, TypeSignatureOutcome::UntracedTypeName { reason }) => {
             TypeSignatureMatch::UntracedTypeName { reason: *reason }
+        }
+    }
+}
+
+/// ペアの両側が「尋ねていない」に倒れたとき、`--explain` に出すほうの理由。
+///
+/// **確かめてある理由を、確かめられていない理由で覆わない。**
+/// [`UntracedReason::OmittedValueTypeAnnotation`] は注釈が無いことを構文木から
+/// 確かめてあるので、直す先を言い切れる。[`UntracedReason::NoTracedRecord`] を
+/// 先に出すと、**確かめてある原因まで「区別できない」という文で覆う**。
+///
+/// **渡された順に任せない。** 受け取った順で決めると、**`compare` の引数を
+/// 入れ替えただけで案内が変わる**（`scan` では候補ペアの並び順で変わる）。
+///
+/// **[`type_signature_match_of`] と同じモジュールに置く。** ペアの両側から 1 つを選ぶ
+/// 並びはここが全部持っており、片方だけ別のモジュールへ出すと**理由を足したときに
+/// 並びが 2 箇所へ散る**。片側ずつの outcome を作るところまでが `semantics` の担当
+/// (`rules/architecture.md` の責務の表)。
+fn reported_untraced_reason_of(left: UntracedReason, right: UntracedReason) -> UntracedReason {
+    match (left, right) {
+        (UntracedReason::OmittedValueTypeAnnotation, _)
+        | (_, UntracedReason::OmittedValueTypeAnnotation) => {
+            UntracedReason::OmittedValueTypeAnnotation
+        }
+        (UntracedReason::NoTracedRecord, UntracedReason::NoTracedRecord) => {
+            UntracedReason::NoTracedRecord
         }
     }
 }
@@ -1859,7 +1885,7 @@ mod tests {
     use crate::classification::verdict::Verdict;
     use crate::line_number::LineNumber;
     use crate::semantics::resolved_type::TracedTypeNames;
-    use crate::semantics::type_signature::{UntracedReason, normalized_outcome_of};
+    use crate::semantics::type_signature::normalized_outcome_of;
     use crate::similarity::Similarity;
     use crate::syntax::chunk::ValueTypeAnnotation;
     use crate::test_support::{line, missing_server, overload_count, signature_text};
@@ -2216,6 +2242,27 @@ mod tests {
         assert_eq!(
             no_record_first, omitted_first,
             "引数の順を入れ替えても同じ理由が出る"
+        );
+    }
+
+    #[test]
+    fn test_type_signature_match_of_two_unconfirmed_untraced_reasons_keeps_the_unconfirmed_one() {
+        // 対照は 1 つ上のテスト。**確かめてある側が無ければ、言い切らないほうが残る。**
+        // ここで確かめてある側を出すと、注釈が書かれているチャンクに嘘の案内が出る
+        let matched = type_signature_match_of(
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord,
+            },
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord,
+            },
+        );
+
+        assert_eq!(
+            matched,
+            TypeSignatureMatch::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord
+            }
         );
     }
 
