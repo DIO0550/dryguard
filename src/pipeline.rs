@@ -810,43 +810,27 @@ fn type_signature_match_of(
         | (_, TypeSignatureOutcome::UnopenedTypeName { reason }) => {
             TypeSignatureMatch::UnopenedTypeName { reason: *reason }
         }
+        // **確かめてある理由を先に出す。** 注釈が省かれているのは構文木から確かめてあるので、
+        // 記録が無いだけのほうで覆うと、確かめてある原因に「区別できない」という文が出る。
+        // **理由をパターンで先に掴む。** 受け取った順に任せると、下の or パターンが
+        // 左側を掴むので、`compare` の引数を入れ替えただけで案内が変わる
         (
-            TypeSignatureOutcome::UntracedTypeName { reason: reason_a },
-            TypeSignatureOutcome::UntracedTypeName { reason: reason_b },
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation,
+            },
+            _,
+        )
+        | (
+            _,
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation,
+            },
         ) => TypeSignatureMatch::UntracedTypeName {
-            // **両側が別の理由なら、確かめてあるほうを出す。** 受け取った順で決めると、
-            // `compare` の引数を入れ替えただけで案内が変わる
-            reason: reported_untraced_reason_of(*reason_a, *reason_b),
+            reason: UntracedReason::OmittedValueTypeAnnotation,
         },
         (TypeSignatureOutcome::UntracedTypeName { reason }, _)
         | (_, TypeSignatureOutcome::UntracedTypeName { reason }) => {
             TypeSignatureMatch::UntracedTypeName { reason: *reason }
-        }
-    }
-}
-
-/// ペアの両側が「尋ねていない」に倒れたとき、`--explain` に出すほうの理由。
-///
-/// **確かめてある理由を、確かめられていない理由で覆わない。**
-/// [`UntracedReason::OmittedValueTypeAnnotation`] は注釈が無いことを構文木から
-/// 確かめてあるので、直す先を言い切れる。[`UntracedReason::NoTracedRecord`] を
-/// 先に出すと、**確かめてある原因まで「区別できない」という文で覆う**。
-///
-/// **渡された順に任せない。** 受け取った順で決めると、**`compare` の引数を
-/// 入れ替えただけで案内が変わる**（`scan` では候補ペアの並び順で変わる）。
-///
-/// **[`type_signature_match_of`] と同じモジュールに置く。** ペアの両側から 1 つを選ぶ
-/// 並びはここが全部持っており、片方だけ別のモジュールへ出すと**理由を足したときに
-/// 並びが 2 箇所へ散る**。片側ずつの outcome を作るところまでが `semantics` の担当
-/// (`rules/architecture.md` の責務の表)。
-fn reported_untraced_reason_of(left: UntracedReason, right: UntracedReason) -> UntracedReason {
-    match (left, right) {
-        (UntracedReason::OmittedValueTypeAnnotation, _)
-        | (_, UntracedReason::OmittedValueTypeAnnotation) => {
-            UntracedReason::OmittedValueTypeAnnotation
-        }
-        (UntracedReason::NoTracedRecord, UntracedReason::NoTracedRecord) => {
-            UntracedReason::NoTracedRecord
         }
     }
 }

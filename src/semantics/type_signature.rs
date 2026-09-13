@@ -161,9 +161,12 @@ pub enum TypeSignatureOutcome {
     /// 辿らない。綴りのまま比べると、**別々のファイルの構造の違う `localValue` が
     /// 単一化可能に出る**（偽陽性）。
     ///
-    /// **[`TypeSignatureOutcome::UntracedTypeName`] と混ぜない。** あちらは型名なので
-    /// 尋ねる位置を作れる（注釈を書けば辿れる）が、こちらは**型名にするところから要る**
+    /// **[`TypeSignatureOutcome::UntracedTypeName`] と混ぜない。** あちらは**型名ではある**ので
+    /// 注釈を書けば尋ねる位置ができうるが、こちらは**型名にするところから要る**
     /// （`rules/naming.md`「`site-dependent spelling` を `untraced type name` と混ぜない」）。
+    ///
+    /// **あちらが必ず注釈で直るとは限らない。** [`UntracedReason::NoTracedRecord`] は
+    /// **注釈が書かれているのに集め損ねた**形を含む。それでも「型名かどうか」の線は動かない。
     SiteDependentSpelling,
 }
 
@@ -368,9 +371,11 @@ fn single_outcome_of(
         return TypeSignatureOutcome::UnopenedTypeName { reason };
     }
 
-    // **「尋ねていない」より先に見る。** どちらも対象のコードに注釈を書く話だが、
-    // こちらは**型に名前を付ける一手が余分に要る**。手数の多いほうを先に出さないと、
-    // 注釈を書いた利用者が同じ「測れない」で戻ってくる
+    // **「尋ねていない」より先に見る。** こちらは**型に名前を付けるところから要る**ので、
+    // 注釈を書けば位置ができうる側より手数が多い。手数の多いほうを先に出さないと、
+    // 注釈を書いた利用者が同じ「測れない」で戻ってくる。
+    // **「尋ねていない」側が必ず注釈で直るわけではない**（`UntracedReason::NoTracedRecord`）が、
+    // 型名ですらないこちらは**どう書いても位置ができない**ので、並びは変わらない
     if !normalized.names_only_types {
         return TypeSignatureOutcome::SiteDependentSpelling;
     }

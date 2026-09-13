@@ -212,8 +212,9 @@ pub enum TypeSignatureMatch {
     /// 型名のノードにならないので辿る位置を作れない。綴りのまま比べると、**別々の
     /// ファイルの構造の違う値が単一化可能に出る**（偽陽性）。
     ///
-    /// **`UntracedTypeName` と混ぜない。** あちらは型名なので尋ねる位置を作れるが、
-    /// こちらは**型名にするところから要る**（`rules/naming.md`
+    /// **`UntracedTypeName` と混ぜない。** あちらは**型名ではある**ので注釈を書けば
+    /// 尋ねる位置ができうるが（集め損ねていただけのこともある）、こちらは
+    /// **型名にするところから要る**（`rules/naming.md`
     /// 「`site-dependent spelling` を `untraced type name` と混ぜない」）。
     SiteDependentSpelling,
 }
