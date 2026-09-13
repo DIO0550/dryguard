@@ -766,11 +766,13 @@ fn document_of(chunk: &Chunk, source: &str) -> Result<SourceDocument, SemanticsE
 /// **片方でも正規化できていなければ「単一化不能」にしない。** 比べていないので、
 /// 取れなかった理由をそのまま出す（2 つとも取れていなければ、上の枝の理由）。
 ///
-/// **並びの軸は「環境を直しても変わらない理由を先に出す」。** 今ある理由はどれも
-/// 往復と読み取りについてのもの（サーバを替える・ファイルを読めるようにすれば
-/// 変わりうる）なので、この軸では差が付かない。**チャンクの形そのものを理由にする
-/// 枝を足すときは、先頭側に置く**
+/// **並びの軸は「環境を直しても変わらない理由を先に出す」。** 綴りが場所に依存するのは
+/// チャンクの形そのものなので、往復と読み取りについての理由（サーバを替える・
+/// ファイルを読めるようにすれば変わりうる）より先に置く
 /// (`rules/architecture.md`「理由は落とさない」)。
+///
+/// **[`TypeSignatureOutcome::UntracedTypeName`] も形の理由だが、末尾に置いたままにしてある。**
+/// 動かすとこの関数が今出している理由が変わるので、そこだけ別の変更で見る。
 fn type_signature_match_of(
     signature_a: &TypeSignatureOutcome,
     signature_b: &TypeSignatureOutcome,
@@ -780,6 +782,10 @@ fn type_signature_match_of(
             TypeSignatureOutcome::Normalized(normalized_a),
             TypeSignatureOutcome::Normalized(normalized_b),
         ) => unifiable_match_of(normalized_a.is_unifiable_with(normalized_b)),
+        (TypeSignatureOutcome::SiteDependentSpelling, _)
+        | (_, TypeSignatureOutcome::SiteDependentSpelling) => {
+            TypeSignatureMatch::SiteDependentSpelling
+        }
         (TypeSignatureOutcome::NoTypeThere, _) | (_, TypeSignatureOutcome::NoTypeThere) => {
             TypeSignatureMatch::NoTypeThere
         }
@@ -2133,6 +2139,32 @@ mod tests {
         ClientError::ServerNotFound {
             program: name.to_owned(),
         }
+    }
+
+    #[test]
+    fn test_type_signature_match_of_a_site_dependent_spelling_outranks_a_reason_the_server_can_change()
+     {
+        // 並びの軸は「環境を直しても変わらない理由を先に出す」。サーバがその位置に型を
+        // 持たないのは往復の話だが、綴りが場所に依存するのはチャンクの形そのもの
+        let matched = type_signature_match_of(
+            &TypeSignatureOutcome::NoTypeThere,
+            &TypeSignatureOutcome::SiteDependentSpelling,
+        );
+
+        assert_eq!(matched, TypeSignatureMatch::SiteDependentSpelling);
+    }
+
+    #[test]
+    fn test_type_signature_match_of_a_site_dependent_spelling_outranks_an_unopened_type_name() {
+        // 開けなかったのはサーバやファイルの側の話で、直せば変わりうる
+        let matched = type_signature_match_of(
+            &TypeSignatureOutcome::SiteDependentSpelling,
+            &TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::NoDeclarationSite,
+            },
+        );
+
+        assert_eq!(matched, TypeSignatureMatch::SiteDependentSpelling);
     }
 
     #[test]
