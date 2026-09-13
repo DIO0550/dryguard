@@ -21,6 +21,7 @@ use crate::semantics::resolved_type::{
     ResolvedTypes, TracedTypeNames, TypeDeclaration, UnopenedReason,
 };
 use crate::source_position::SourcePosition;
+use crate::syntax::chunk::{OverloadDeclaration, ValueTypeAnnotation};
 use crate::syntax::type_spelling::{names_only_types, substituted_spelling_of, type_name_spans_of};
 use crate::syntax::type_structure::{Callable, SignatureKind, TypeStructure};
 
@@ -167,9 +168,18 @@ pub enum TypeSignatureOutcome {
 /// その名前が持つ型シグネチャを揃えて、正規化した形にする。
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
-/// `Chunk::name_position` が指す識別子の位置、`overload_positions` は
-/// `Chunk::overload_name_positions` が指すオーバーロード宣言の名前の位置。
-/// `traced` は `semantics::resolved_type` が型名を宣言まで辿った結果。
+/// `Chunk::name_position` が指す識別子の位置、`value_type` は `Chunk::value_type_annotation`
+/// が答えるそのチャンクの値の型の注釈の有無、`overloads` は
+/// `Chunk::overload_declarations` が返すオーバーロード宣言（名前の位置と、**その宣言の**
+/// 値の型の注釈の有無）。`traced` は `semantics::resolved_type` が型名を宣言まで辿った結果。
+///
+/// **`value_type` が使われるのはオーバーロードされていないときだけ。** 宣言が並ぶときは
+/// hover を宣言 1 つずつに向けるので、注釈の有無も `overloads` が持つ側を見る。
+///
+/// **注釈が省かれていれば、値の型の位置に出た型名は辿った記録を綴りで引かない**
+/// （[`TypeSignatureOutcome::UntracedTypeName`] になる）。書かれていない出現が、
+/// 同じ綴りの書かれた出現の記録に乗るのを防ぐため
+/// (`rules/architecture.md`「どこまでを「取れなかった」に数えるか」)。
 ///
 /// **オーバーロードされていれば、宣言 1 つずつに尋ねる。** 実装の位置を指した hover は
 /// 1 本目しか返さず、残りは件数の要約になる（typescript-language-server 6.0.0 で実測）。
@@ -183,7 +193,8 @@ pub fn type_signature_outcome_of(
     session: &mut Session,
     document: &SourceDocument,
     position: SourcePosition,
-    overload_positions: &[SourcePosition],
+    value_type: ValueTypeAnnotation,
+    overloads: &[OverloadDeclaration],
     traced: &TracedTypeNames,
 ) -> Result<TypeSignatureOutcome, ClientError> {
     let signature_text = match asked_signature_text_of(session, document, position)? {
@@ -192,28 +203,26 @@ pub fn type_signature_outcome_of(
     };
 
     let counted = CountedSignature::from_spelling(signature_text.as_str());
-    let not_overloaded = counted.overloads == ALONE && overload_positions.is_empty();
+    let not_overloaded = counted.overloads == ALONE && overloads.is_empty();
     if not_overloaded {
-        return Ok(single_outcome_of(counted.spelling, traced));
+        return Ok(single_outcome_of(counted.spelling, value_type, traced));
     }
 
-    if counted.overloads.get() != overload_positions.len() {
+    if counted.overloads.get() != overloads.len() {
         return Ok(TypeSignatureOutcome::OverloadSetMiscounted {
             counted: counted.overloads,
-            found: overload_positions.len(),
+            found: overloads.len(),
         });
     }
 
-    overload_set_outcome_of(
-        session,
-        document,
-        overload_positions,
-        counted.overloads,
-        traced,
-    )
+    overload_set_outcome_of(session, document, overloads, counted.overloads, traced)
 }
 
 /// オーバーロード宣言 1 つずつに尋ねて、呼べる型シグネチャの集合にする。
+///
+/// **値の型の注釈は宣言ごとに見る。** 戻り値の注釈を省いた宣言と書いた宣言が並びうるので、
+/// 1 つにまとめると**書いた側の注釈で省いた側を測れたことにする**
+/// (`rules/architecture.md`「どこまでを「取れなかった」に数えるか」)。
 ///
 /// **1 本でも揃わなければ、その 1 本を測れなかった理由をそのまま返す。** 集合として
 /// 比べる相手が欠けたまま比べると、確かめられなかったことを答えとして出すことになる
@@ -225,21 +234,22 @@ pub fn type_signature_outcome_of(
 fn overload_set_outcome_of(
     session: &mut Session,
     document: &SourceDocument,
-    positions: &[SourcePosition],
+    overloads: &[OverloadDeclaration],
     counted: NonZeroUsize,
     traced: &TracedTypeNames,
 ) -> Result<TypeSignatureOutcome, ClientError> {
-    let mut signatures = Vec::with_capacity(positions.len());
+    let mut signatures = Vec::with_capacity(overloads.len());
 
-    for position in positions {
-        let signature_text = match asked_signature_text_of(session, document, *position)? {
-            Ok(signature_text) => signature_text,
-            Err(outcome) => return Ok(outcome),
-        };
+    for overload in overloads {
+        let signature_text =
+            match asked_signature_text_of(session, document, overload.name_position())? {
+                Ok(signature_text) => signature_text,
+                Err(outcome) => return Ok(outcome),
+            };
 
         // 宣言の位置を指した hover にも件数の要約が付く。剥がさないと戻り値の型として読めない
         let declared = CountedSignature::from_spelling(signature_text.as_str());
-        match single_outcome_of(declared.spelling, traced) {
+        match single_outcome_of(declared.spelling, overload.value_type_annotation(), traced) {
             TypeSignatureOutcome::Normalized(normalized) => {
                 signatures.extend(normalized.into_signatures());
             }
@@ -284,6 +294,7 @@ fn asked_signature_text_of(
 /// 1 つしか無いので、隠れているオーバーロードを取りに行けない。
 pub fn normalized_outcome_of(
     signature_text: &SignatureText,
+    value_type: ValueTypeAnnotation,
     traced: &TracedTypeNames,
 ) -> TypeSignatureOutcome {
     let counted = CountedSignature::from_spelling(signature_text.as_str());
@@ -294,7 +305,7 @@ pub fn normalized_outcome_of(
         };
     }
 
-    single_outcome_of(counted.spelling, traced)
+    single_outcome_of(counted.spelling, value_type, traced)
 }
 
 /// 件数の要約を剥がした綴り 1 本を、1 本だけの集合へ正規化した結果。
@@ -303,7 +314,11 @@ pub fn normalized_outcome_of(
 /// (`rules/architecture.md`「どこまでを「取れなかった」に数えるか」)。
 /// 差し込みで消えた型名も、正規化で落ちる関数の名前も、比較には残らないので
 /// 答えを変えない。
-fn single_outcome_of(spelling: &str, traced: &TracedTypeNames) -> TypeSignatureOutcome {
+fn single_outcome_of(
+    spelling: &str,
+    value_type: ValueTypeAnnotation,
+    traced: &TracedTypeNames,
+) -> TypeSignatureOutcome {
     let Some(normalized) = NormalizedSignature::from_spelling(spelling, traced) else {
         return unreadable_outcome_of(spelling, traced);
     };
@@ -325,12 +340,23 @@ fn single_outcome_of(spelling: &str, traced: &TracedTypeNames) -> TypeSignatureO
         return TypeSignatureOutcome::SiteDependentSpelling;
     }
 
+    // **注釈を省いた位置の型名は、綴りで引かずに「尋ねていない」へ倒す。** 同じ綴りが
+    // 書かれた位置にもあると `is_traced` は `true` を返すが、それは**別の出現**を
+    // 尋ねた記録でしかない（`rules/architecture.md`「どこまでを「取れなかった」に数えるか」）
+    // 差し込む前の綴りを読めなかったときは、型名が在ったかもしれないほうへ倒す
+    let value_type_holds_a_name = normalized
+        .value_type_names
+        .as_ref()
+        .is_none_or(|names| !names.is_empty());
+    let inferred_value_type = value_type == ValueTypeAnnotation::Omitted && value_type_holds_a_name;
+
     // **開けなかった型名を先に見る。** どちらも「測れない」だが、開けなかった理由のほうが
     // 利用者の次の手（サーバを替える / ファイルを読めるようにする）に直結する
-    let untraced = normalized
-        .traceable_type_names
-        .iter()
-        .any(|name| !is_traced(name, traced));
+    let untraced = inferred_value_type
+        || normalized
+            .traceable_type_names
+            .iter()
+            .any(|name| !is_traced(name, traced));
 
     if untraced {
         return TypeSignatureOutcome::UntracedTypeName;
@@ -616,6 +642,21 @@ impl ChunkType {
         }
     }
 
+    /// **値の型の位置**に残っている型名のうち、宣言を辿る相手になりうるもの。
+    /// 綴りのまま持っている部分を読めなければ `None`。
+    ///
+    /// **アクセサはメンバーとしての型がまるごと値の型。** 読む側は `get value(): T` の `T`、
+    /// 書く側は `set value(next: T)` の `T` で、どちらも hover が綴るのはその 1 つだけ
+    /// （`rules/naming.md`「`accessor` を、関数を持つプロパティと混ぜない」）。
+    fn value_type_names(&self) -> Option<BTreeSet<String>> {
+        match self {
+            Self::Callable(callable) => callable.value_type_names(),
+            Self::Read(member_type) | Self::Written(member_type) => {
+                member_type.traceable_type_names()
+            }
+        }
+    }
+
     /// 比較に残る綴りが、型の名前だけで書かれているか。
     /// 綴りのまま持っている部分を読めなければ `None`。
     fn names_only_types(&self) -> Option<bool> {
@@ -671,6 +712,21 @@ struct NormalizedSignature {
     /// 型名のノードにならないので、どちらの集合にも入らないまま綴りで比べられる
     /// （`syntax::type_structure::Callable::names_only_types`）。
     names_only_types: bool,
+    /// **値の型の位置**に現れた型名のうち、宣言を辿る相手になりうるもの。名前順。
+    /// 差し込む前の綴りを読めなければ `None`。
+    ///
+    /// **注釈が省かれていれば、ここに入った型名はソースのどこにも書かれていない**ので、
+    /// 綴りで引く [`is_traced`] は別の出現の記録を返す（`rules/architecture.md`
+    /// 「どこまでを「取れなかった」に数えるか」）。
+    ///
+    /// **数えるのは差し込む前。** 差し込みは綴りで引くので、**引数に書かれたエイリアスの
+    /// 右辺が、同じ綴りの推論された戻り値にも入る**。差し込んだ後で数えると、
+    /// 開かれた側が消えて「値の型に型名が無い」に見える。
+    ///
+    /// **読めなかったことを空の集合で表さない。** 型名が 1 つも無いことと、
+    /// 数えられなかったことは別で、後者は注釈が省かれていれば「測れない」へ倒す
+    /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+    value_type_names: Option<BTreeSet<String>>,
 }
 
 impl NormalizedSignature {
@@ -701,6 +757,7 @@ impl NormalizedSignature {
         // 綴りのまま持っている部分から型名を拾えなくなる
         let remaining_type_names = remaining_type_names_of(&read)?;
         let traceable_type_names = traceable_type_names_of(&read)?;
+        let value_type_names = spelled_value_type_names_of(&flattened);
         let names_only_types = read.names_only_types()?;
 
         let signature = TypeSignature {
@@ -713,6 +770,7 @@ impl NormalizedSignature {
             remaining_type_names,
             traceable_type_names,
             names_only_types,
+            value_type_names,
         })
     }
 }
@@ -764,6 +822,37 @@ fn remaining_type_names_of(read: &ChunkType) -> Option<BTreeSet<String>> {
 fn traceable_type_names_of(read: &ChunkType) -> Option<BTreeSet<String>> {
     Some(
         read.traceable_type_names()?
+            .into_iter()
+            .filter(|name| !PREDEFINED_TYPES.contains(&name.as_str()))
+            .collect(),
+    )
+}
+
+/// **サーバが返した綴りのまま**読んだ、値の型の位置に現れる型名のうち、宣言を辿る相手に
+/// なりうるものを名前順に。差し込む前の綴りをチャンクの型として読めなければ `None`。
+///
+/// `flattened` は空白を畳んだ、接頭辞の付いたままの綴り。
+///
+/// **差し込みを通さない。** 差し込みは綴りで引くので、引数に書かれたエイリアスの右辺が
+/// **同じ綴りの、推論された戻り値にも入る**。差し込んだ後で数えると、開かれた側が
+/// 型名として残らず「値の型に型名が無い」に見える（`type Receipt = …` を引数に注釈し、
+/// 別モジュールの同名の型を返す関数がこれで単一化可能に出ていた）。
+///
+/// [`traceable_type_names_of`] と同じくキーワードの型を外す。**`function f(x: A) { return 1; }`
+/// の推論された戻り値（`number`）まで数えると、注釈を省いただけで測れない側へ落ちる。**
+///
+/// **Why not（差し込んだ後の構造から数える）**: 残りの 2 つの集合と同じ経路で済むが、
+/// 上のとおり**差し込みが出現を区別しない**ので、この Issue が塞ぐはずの穴が
+/// エイリアス越しにそのまま残る。
+fn spelled_value_type_names_of(flattened: &str) -> Option<BTreeSet<String>> {
+    let spelled = ResolvedTypes::default();
+    let read = match AccessorSpelling::from_spelling(flattened) {
+        Some(accessor) => accessor.to_chunk_type(&spelled)?,
+        None => ChunkType::Callable(callable_read_of(flattened, &spelled)?),
+    };
+
+    Some(
+        read.value_type_names()?
             .into_iter()
             .filter(|name| !PREDEFINED_TYPES.contains(&name.as_str()))
             .collect(),
@@ -1268,7 +1357,7 @@ mod tests {
     /// 型名を辿った結果を渡して組み立てる。
     fn signature_tracing(text: &str, traced: &TracedTypeNames) -> OverloadSet {
         let TypeSignatureOutcome::Normalized(signature) =
-            normalized_outcome_of(&signature_text(text), traced)
+            normalized_outcome_of(&signature_text(text), ValueTypeAnnotation::Written, traced)
         else {
             panic!("テストが渡す綴りは読み取れる: {text}");
         };
@@ -1278,8 +1367,11 @@ mod tests {
 
     /// その綴りを読み解けなかったか。
     fn unreadable(text: &str) -> bool {
-        normalized_outcome_of(&signature_text(text), &TracedTypeNames::default())
-            == TypeSignatureOutcome::UnreadableSignature
+        normalized_outcome_of(
+            &signature_text(text),
+            ValueTypeAnnotation::Written,
+            &TracedTypeNames::default(),
+        ) == TypeSignatureOutcome::UnreadableSignature
     }
 
     /// 型名 1 つ分を、宣言まで辿って開いた結果。
@@ -1299,6 +1391,7 @@ mod tests {
         // 綴りのまま比べると、別々のファイルの同じ綴りが単一化可能に出る（偽陽性）
         let outcome = normalized_outcome_of(
             &signature_text("const build: (x: number) => Result"),
+            ValueTypeAnnotation::Written,
             &TracedTypeNames::default(),
         );
 
@@ -1311,6 +1404,7 @@ mod tests {
         // 綴りのまま比べると、構造の違う 2 つの `localValue` が単一化可能に出る（偽陽性）
         let outcome = normalized_outcome_of(
             &signature_text("function currentValue(): typeof localValue"),
+            ValueTypeAnnotation::Written,
             &TracedTypeNames::default(),
         );
 
@@ -1321,6 +1415,7 @@ mod tests {
     fn test_normalized_outcome_of_a_signature_keeping_a_computed_key_is_unmeasurable() {
         let outcome = normalized_outcome_of(
             &signature_text("function shaped(): { [key]: string }"),
+            ValueTypeAnnotation::Written,
             &TracedTypeNames::default(),
         );
 
@@ -1332,6 +1427,7 @@ mod tests {
         // `this` が指すのは囲むクラスなので、綴りが一致しても同じ型とは限らない
         let outcome = normalized_outcome_of(
             &signature_text("function chained(): this"),
+            ValueTypeAnnotation::Written,
             &TracedTypeNames::default(),
         );
 
@@ -1339,10 +1435,149 @@ mod tests {
     }
 
     #[test]
+    fn test_normalized_outcome_of_a_signature_inferring_a_return_type_name_written_as_a_parameter_is_unmeasurable()
+     {
+        // #187 の形。引数に書かれた `Amount` は辿れているが、**戻り値の `Amount` は
+        // 別の出現**で、注釈を省いた以上ソースのどこにも無い。綴りで引くと
+        // 引数側の記録が乗り、別々のモジュールの `Amount` が単一化可能に出る（偽陽性）
+        let outcome = normalized_outcome_of(
+            &signature_text("function build(a: Amount): Amount"),
+            ValueTypeAnnotation::Omitted,
+            &tracing_all("Amount"),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::UntracedTypeName);
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_inferring_a_return_type_opened_from_a_parameter_alias_is_unmeasurable()
+     {
+        // 引数に書かれた `Amount` が開けるエイリアスだと、差し込みは**綴りで引く**ので
+        // 推論された戻り値の `Amount` にも右辺が入る。差し込んだ後で数えると
+        // 値の型に型名が残らず、エイリアス越しに偽陽性がそのまま通る
+        let outcome = normalized_outcome_of(
+            &signature_text("function build(a: Amount): Amount"),
+            ValueTypeAnnotation::Omitted,
+            &tracing_one("Amount", "{ shared: number }", "/repo/src/written.ts"),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::UntracedTypeName);
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_the_same_signature_with_a_written_return_type_is_normalized() {
+        // 対照は上のテスト。注釈の有無だけが違う。**注釈を書いてある関数まで
+        // 測れない側へ落とすと、この Issue が塞ぐはずの穴より広く効く**
+        let outcome = normalized_outcome_of(
+            &signature_text("function build(a: Amount): Amount"),
+            ValueTypeAnnotation::Written,
+            &tracing_all("Amount"),
+        );
+
+        assert!(matches!(outcome, TypeSignatureOutcome::Normalized(_)));
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_inferring_a_keyword_return_type_is_normalized() {
+        // 推論された戻り値がキーワードの型なら、どこで書かれても同じ型を指す。
+        // 注釈を省いたことだけを根拠に落とすと、**戻り値が `void` の関数が
+        // まとめて測れない側へ落ちる**
+        let outcome = normalized_outcome_of(
+            &signature_text("function build(a: Amount): void"),
+            ValueTypeAnnotation::Omitted,
+            &tracing_all("Amount"),
+        );
+
+        assert!(matches!(outcome, TypeSignatureOutcome::Normalized(_)));
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_inferring_its_own_type_variable_is_normalized() {
+        // 推論された戻り値が自分の型変数なら辿る相手が居ない。数えると、
+        // **注釈を省いたジェネリック関数がまとめて測れない側へ落ちる**
+        let outcome = normalized_outcome_of(
+            &signature_text("function build<T>(a: T): T"),
+            ValueTypeAnnotation::Omitted,
+            &TracedTypeNames::default(),
+        );
+
+        assert!(matches!(outcome, TypeSignatureOutcome::Normalized(_)));
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_inferring_a_type_variable_bound_outside_it_is_unmeasurable()
+     {
+        // そのシグネチャが宣言していない型変数は、辿る相手が**外に居る**。自分の型変数と
+        // 同じに扱って値の型から落とすと、注釈を省いた戻り値に出た `Outer` が
+        // 別のファイルの同じ綴りと重なる（偽陽性）。**辿った記録があっても倒す**ので、
+        // ここを落とすと `Normalized` になる
+        let outcome = normalized_outcome_of(
+            &signature_text("const build: (x: number) => Outer"),
+            ValueTypeAnnotation::Omitted,
+            &tracing_all("Outer"),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::UntracedTypeName);
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_getter_inferring_its_type_is_unmeasurable() {
+        // アクセサはメンバーとしての型がまるごと値の型。読む側は `get value(): T` の `T`
+        let outcome = normalized_outcome_of(
+            &signature_text("(getter) Holder.value: Amount"),
+            ValueTypeAnnotation::Omitted,
+            &tracing_all("Amount"),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::UntracedTypeName);
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_setter_inferring_its_type_is_unmeasurable() {
+        // 書く側の値の型は `set value(next: T)` の `T`。**戻り値を注釈できないので、
+        // 戻り値の注釈の有無で決めると setter がまとめて落ちる**
+        let outcome = normalized_outcome_of(
+            &signature_text("(setter) Holder.value: Amount"),
+            ValueTypeAnnotation::Omitted,
+            &tracing_all("Amount"),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::UntracedTypeName);
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_inferring_a_return_type_answers_the_unopened_name_first()
+     {
+        // どちらも「測れない」だが、開けなかった理由のほうが利用者の次の手
+        // （サーバを替える / ファイルを読めるようにする）に直結する
+        let traced = TracedTypeNames::new(
+            vec![declared("Amount", "/repo/src/written.ts", 1)],
+            vec![unopened(
+                "Amount",
+                UnopenedReason::UnreadableDeclaringDocument,
+            )],
+        );
+
+        let outcome = normalized_outcome_of(
+            &signature_text("function build(a: Amount): Amount"),
+            ValueTypeAnnotation::Omitted,
+            &traced,
+        );
+
+        assert_eq!(
+            outcome,
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::UnreadableDeclaringDocument
+            }
+        );
+    }
+
+    #[test]
     fn test_normalized_outcome_of_a_signature_keeping_a_module_specifier_is_unmeasurable() {
         // 指定子は importer の位置から解決するので、同じ綴りが別の依存先を指す
         let outcome = normalized_outcome_of(
             &signature_text("function imported(): import(\"./local\").Thing"),
+            ValueTypeAnnotation::Written,
             &TracedTypeNames::default(),
         );
 
@@ -1355,6 +1590,7 @@ mod tests {
         // 分解できた形の中にも綴りのまま持つ部分は残る。外側だけを見ると取りこぼす
         let outcome = normalized_outcome_of(
             &signature_text("function listed(): Array<typeof localValue>"),
+            ValueTypeAnnotation::Written,
             &tracing_all("Array"),
         );
 
@@ -1367,6 +1603,7 @@ mod tests {
         // どこで書かれていても同じ型を指すので落とさない
         let outcome = normalized_outcome_of(
             &signature_text("function shaped(): { id: string }"),
+            ValueTypeAnnotation::Written,
             &TracedTypeNames::default(),
         );
 
@@ -1382,6 +1619,7 @@ mod tests {
 
         let outcome = normalized_outcome_of(
             &signature_text("function priced(a: Amount): typeof localValue"),
+            ValueTypeAnnotation::Written,
             &traced,
         );
 
@@ -1400,6 +1638,7 @@ mod tests {
         // 逆に置くと、注釈が書かれている綴りへ「注釈を書くと辿れる」と答えることになる
         let outcome = normalized_outcome_of(
             &signature_text("function mixed(a: Untraced): typeof localValue"),
+            ValueTypeAnnotation::Written,
             &TracedTypeNames::default(),
         );
 
@@ -1412,6 +1651,7 @@ mod tests {
         // 数えると、ジェネリック関数がまとめて測れない側へ落ちる
         let outcome = normalized_outcome_of(
             &signature_text("function id<T>(x: T): T"),
+            ValueTypeAnnotation::Written,
             &TracedTypeNames::default(),
         );
 
@@ -1422,6 +1662,7 @@ mod tests {
     fn test_normalized_outcome_of_a_signature_written_with_keyword_types_alone_is_normalized() {
         let outcome = normalized_outcome_of(
             &signature_text("function len(a: string): number"),
+            ValueTypeAnnotation::Written,
             &TracedTypeNames::default(),
         );
 
@@ -1436,6 +1677,7 @@ mod tests {
 
         let outcome = normalized_outcome_of(
             &signature_text("function priced(a: Amount): Inferred"),
+            ValueTypeAnnotation::Written,
             &traced,
         );
 
@@ -1456,6 +1698,7 @@ mod tests {
         assert_eq!(
             normalized_outcome_of(
                 &signature_text("function halve(amount: Amount): Amount"),
+                ValueTypeAnnotation::Written,
                 &traced
             ),
             TypeSignatureOutcome::UnopenedTypeName {
@@ -1474,6 +1717,7 @@ mod tests {
         assert_eq!(
             normalized_outcome_of(
                 &signature_text("function halve(value: number): number"),
+                ValueTypeAnnotation::Written,
                 &traced
             ),
             TypeSignatureOutcome::Normalized(signature("function halve(value: number): number"))
@@ -1490,6 +1734,7 @@ mod tests {
         assert_eq!(
             normalized_outcome_of(
                 &signature_text("function halve(amount: Amount): number"),
+                ValueTypeAnnotation::Written,
                 &traced
             ),
             TypeSignatureOutcome::Normalized(signature("function halve(amount: number): number"))
@@ -1503,7 +1748,11 @@ mod tests {
             .with_unopened(vec![unopened("Amount", UnopenedReason::NoDeclarationSite)]);
 
         assert_eq!(
-            normalized_outcome_of(&signature_text("function Amount<T>(value: T): T"), &traced),
+            normalized_outcome_of(
+                &signature_text("function Amount<T>(value: T): T"),
+                ValueTypeAnnotation::Written,
+                &traced
+            ),
             TypeSignatureOutcome::Normalized(signature("function Amount<T>(value: T): T"))
         );
     }
@@ -1519,6 +1768,7 @@ mod tests {
         assert_eq!(
             normalized_outcome_of(
                 &signature_text("function halve(amount: Amount): Total"),
+                ValueTypeAnnotation::Written,
                 &traced
             ),
             TypeSignatureOutcome::UnopenedTypeName {
@@ -1538,7 +1788,11 @@ mod tests {
         )]);
 
         assert_eq!(
-            normalized_outcome_of(&signature_text("const halveAmount: Scaling"), &traced),
+            normalized_outcome_of(
+                &signature_text("const halveAmount: Scaling"),
+                ValueTypeAnnotation::Written,
+                &traced
+            ),
             TypeSignatureOutcome::UnopenedTypeName {
                 reason: UnopenedReason::TypeDefinitionNotProvided
             }
@@ -1555,6 +1809,7 @@ mod tests {
         assert_eq!(
             normalized_outcome_of(
                 &signature_text("function broken(x: { id string }): Amount"),
+                ValueTypeAnnotation::Written,
                 &traced
             ),
             TypeSignatureOutcome::UnreadableSignature
@@ -1568,6 +1823,7 @@ mod tests {
         assert_eq!(
             normalized_outcome_of(
                 &signature_text("(getter) Holder.value: string"),
+                ValueTypeAnnotation::Written,
                 &TracedTypeNames::default()
             ),
             TypeSignatureOutcome::Normalized(signature("(getter) Other.kept: string"))
@@ -1614,7 +1870,11 @@ mod tests {
             .with_unopened(vec![unopened("Amount", UnopenedReason::NoDeclarationSite)]);
 
         assert_eq!(
-            normalized_outcome_of(&signature_text("(getter) Holder.value: Amount"), &traced),
+            normalized_outcome_of(
+                &signature_text("(getter) Holder.value: Amount"),
+                ValueTypeAnnotation::Written,
+                &traced
+            ),
             TypeSignatureOutcome::UnopenedTypeName {
                 reason: UnopenedReason::NoDeclarationSite
             }
@@ -1627,6 +1887,7 @@ mod tests {
         assert_eq!(
             normalized_outcome_of(
                 &signature_text("(getter) Holder.value: Amount"),
+                ValueTypeAnnotation::Written,
                 &TracedTypeNames::default().with_resolved(resolving("Amount", "number"))
             ),
             TypeSignatureOutcome::Normalized(signature("(getter) Holder.value: number"))
@@ -1664,6 +1925,7 @@ mod tests {
         assert_eq!(
             normalized_outcome_of(
                 &signature_text("(property) Holder.handler: (a: string) => void"),
+                ValueTypeAnnotation::Written,
                 &TracedTypeNames::default()
             ),
             TypeSignatureOutcome::Normalized(signature("(a: string) => void"))
@@ -1687,6 +1949,7 @@ mod tests {
         assert_eq!(
             normalized_outcome_of(
                 &signature_text("function overloaded(a: string): string (+1 overload)"),
+                ValueTypeAnnotation::Written,
                 &TracedTypeNames::default()
             ),
             TypeSignatureOutcome::OverloadSetMiscounted {
@@ -1703,6 +1966,7 @@ mod tests {
         assert_eq!(
             normalized_outcome_of(
                 &signature_text("function overloaded(a: string): string (+2 overloads)"),
+                ValueTypeAnnotation::Written,
                 &TracedTypeNames::default()
             ),
             TypeSignatureOutcome::OverloadSetMiscounted {
@@ -1718,7 +1982,11 @@ mod tests {
         let parenthesized = "function load(a: string): (string | number)";
 
         assert_eq!(
-            normalized_outcome_of(&signature_text(parenthesized), &TracedTypeNames::default()),
+            normalized_outcome_of(
+                &signature_text(parenthesized),
+                ValueTypeAnnotation::Written,
+                &TracedTypeNames::default()
+            ),
             TypeSignatureOutcome::Normalized(overload_set(&[parenthesized]))
         );
     }
@@ -1730,6 +1998,7 @@ mod tests {
         assert_eq!(
             normalized_outcome_of(
                 &signature_text("function tally(a: string): void (+1 note)"),
+                ValueTypeAnnotation::Written,
                 &TracedTypeNames::default()
             ),
             TypeSignatureOutcome::UnreadableSignature

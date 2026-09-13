@@ -174,7 +174,7 @@ pub(super) fn constructed_class_references_of(node: Node<'_>, source: &str) -> V
 }
 
 /// そのコンストラクタが構築するクラスの宣言。コンストラクタでなければ `None`。
-fn constructed_class_of<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+pub(super) fn constructed_class_of<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
     let member = node.child_by_field_name(NAME_FIELD)?;
     if source.get(member.byte_range())? != CONSTRUCTOR_NAME {
         return None;

@@ -338,6 +338,29 @@ impl Callable {
         self.free_type_names_of(&mut Vec::new(), SpelledBinders::Skipped)
     }
 
+    /// **戻り値の位置**に残っている型名のうち、宣言を辿る相手になりうるもの。
+    /// 綴りのまま持っている部分を読めなければ `None`。
+    ///
+    /// 呼べる型の値の型は戻り値の型（`rules/naming.md` の `value type`）。
+    /// **注釈が省かれていれば、ここに出る型名はソースのどこにも書かれていない**ので、
+    /// 同じ綴りが引数の側に書かれていても**その出現を尋ねたことにはならない**
+    /// (`rules/architecture.md`「どこまでを「取れなかった」に数えるか」)。
+    ///
+    /// **自分の型変数はここでも外す。** `<T>(x: T) => T` の戻り値は辿る相手が居ないので、
+    /// 数えると**注釈を省いたジェネリック関数がまとめて測れない側へ落ちる**
+    /// （[`Callable::type_names`] が外しているのと同じ理由）。
+    pub(crate) fn value_type_names(&self) -> Option<BTreeSet<String>> {
+        let mut scopes = vec![
+            self.type_parameters
+                .iter()
+                .map(|declared| declared.name.clone())
+                .collect(),
+        ];
+
+        self.return_type
+            .free_type_names_of(&mut scopes, SpelledBinders::Skipped)
+    }
+
     /// `scopes` が束縛していない型名。
     ///
     /// 自分の型変数でスコープを 1 つ積んでから降りる（[`Callable::renamed`] と同じ形）。
@@ -1622,6 +1645,55 @@ mod tests {
             .expect("テストが渡す綴りは呼べる型として読み取れる");
 
         assert_eq!(read.names_only_types(), Some(true));
+    }
+
+    #[test]
+    fn test_the_value_type_names_of_a_callable_type_leave_out_the_parameter_type_names() {
+        // 戻り値の注釈を省いた関数では、**戻り値の位置に出た綴りだけ**が尋ねていない側。
+        // 引数の同じ綴りまで数えると、注釈を書いてある引数の型まで巻き添えになる
+        let read = Callable::from_spelling("(a: Amount, b: Rate) => Receipt")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(
+            read.value_type_names(),
+            Some(["Receipt"].into_iter().map(str::to_owned).collect())
+        );
+    }
+
+    #[test]
+    fn test_the_value_type_names_of_a_callable_type_hold_a_name_also_written_as_a_parameter() {
+        // #187 の形。引数に書かれた `Amount` と戻り値に推論された `Amount` は
+        // **別の出現**なので、引数側に記録があっても戻り値側は数える
+        let read = Callable::from_spelling("(a: Amount) => Amount")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(
+            read.value_type_names(),
+            Some(["Amount"].into_iter().map(str::to_owned).collect())
+        );
+    }
+
+    #[test]
+    fn test_the_value_type_names_of_a_callable_type_leave_out_the_type_variables_it_declares() {
+        // 束縛された型変数は辿る相手が居ない。数えると、**注釈を省いただけの
+        // ジェネリック関数がまとめて測れない側へ落ちる**
+        let read = Callable::from_spelling("<T>(x: T) => T")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(read.value_type_names(), Some(BTreeSet::new()));
+    }
+
+    #[test]
+    fn test_the_value_type_names_of_a_callable_type_keep_a_type_variable_bound_outside_it() {
+        // 対照は上のテスト。**そのシグネチャからは辿れない**ので、落とすと
+        // 別のファイルの同じ綴りと重なる（偽陽性）
+        let read = Callable::from_spelling("(x: number) => Outer")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(
+            read.value_type_names(),
+            Some(["Outer"].into_iter().map(str::to_owned).collect())
+        );
     }
 
     #[test]

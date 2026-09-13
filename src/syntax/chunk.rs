@@ -20,9 +20,11 @@ use crate::source_position::SourcePosition;
 use crate::syntax::import::{ImportSet, ImportsUnavailable};
 use crate::syntax::line_range::LineRange;
 use crate::syntax::token::TokenSequence;
-use crate::syntax::tree::{SyntaxTree, source_position_of, unwrapped_parent_of};
+use crate::syntax::tree::{
+    SyntaxTree, source_position_of, transparent_wrappers_of, unwrapped_parent_of,
+};
 use crate::syntax::type_reference::{
-    TypeReference, constructed_class_references_of, type_references_of,
+    TypeReference, constructed_class_of, constructed_class_references_of, type_references_of,
 };
 
 /// 比較の単位。関数・メソッド 1 つ分のソースと、それがどこにあったか。
@@ -38,11 +40,55 @@ pub struct Chunk {
     path: PathBuf,
     lines: LineRange,
     name_position: Option<SourcePosition>,
-    overload_name_positions: Vec<SourcePosition>,
+    value_type: ValueTypeAnnotation,
+    overload_declarations: Vec<OverloadDeclaration>,
     type_references: Vec<TypeReference>,
     source: String,
     tokens: Option<TokenSequence>,
     imports: Result<ImportSet, ImportsUnavailable>,
+}
+
+/// そのチャンクの宣言が、**値の型**に注釈を書いたか。
+///
+/// 値の型は、そのチャンクが受け渡しする値の型（`rules/naming.md` の `value type`）。
+/// 関数・getter では戻り値の型、setter では引数の型で、**チャンクの宣言が注釈を
+/// 省ける唯一の位置**になる。
+///
+/// **省かれていれば、hover の綴りに現れる型名は尋ねる位置を持たない。**
+/// TypeScript が推論した綴りなので、構文木のどこにもその名前が無い
+/// （`syntax::type_reference`）。**綴りが一致しただけのものを「重なる」と答えない**ため、
+/// `semantics` はその出現を「そもそも尋ねていない」に数える
+/// (`rules/architecture.md`「どこまでを「取れなかった」に数えるか」)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueTypeAnnotation {
+    /// ソースに書かれている。
+    Written,
+    /// 省かれている。
+    Omitted,
+}
+
+/// そのチャンクのオーバーロード宣言 1 つ分の、hover を向ける先。
+///
+/// **位置と注釈の有無を組で持つ。** hover は宣言 1 つずつに尋ねるので
+/// （`semantics::type_signature`）、注釈の有無も宣言ごとに答えが違う。
+/// 別々の並びで持つと、**ある宣言の位置に別の宣言の注釈の有無を合わせた**まま
+/// 尋ねられてしまう (`rules/coding.md`「不正な状態を型で表現できなくする」)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverloadDeclaration {
+    name_position: SourcePosition,
+    value_type: ValueTypeAnnotation,
+}
+
+impl OverloadDeclaration {
+    /// その宣言の名前が置かれている位置。hover を向ける先。
+    pub fn name_position(&self) -> SourcePosition {
+        self.name_position
+    }
+
+    /// その宣言が、値の型に注釈を書いたか。
+    pub fn value_type_annotation(&self) -> ValueTypeAnnotation {
+        self.value_type
+    }
 }
 
 impl Chunk {
@@ -104,7 +150,8 @@ impl Chunk {
             path: path.to_path_buf(),
             lines,
             name_position: name_position_of(node, source),
-            overload_name_positions: overload_name_positions_of(node, source),
+            value_type: value_type_annotation_of(node, source),
+            overload_declarations: overload_declarations_of(node, source),
             type_references: chunk_type_references_of(node, source),
             source: source_of_lines(source, lines),
             tokens: TokenSequence::from_node(node),
@@ -134,7 +181,17 @@ impl Chunk {
         self.name_position
     }
 
-    /// このチャンクのオーバーロード宣言の、名前が置かれている位置。ソースに書かれた順。
+    /// このチャンクの宣言が、**値の型**に注釈を書いたか。
+    ///
+    /// 値の型は関数・getter では戻り値の型、setter では引数の型
+    /// (`rules/naming.md` の `value type`)。省かれていれば hover はそこに**推論した型**を
+    /// 綴るので、その綴りに現れる型名を指して尋ねる位置が無い
+    /// (`rules/architecture.md`「どこまでを「取れなかった」に数えるか」)。
+    pub fn value_type_annotation(&self) -> ValueTypeAnnotation {
+        self.value_type
+    }
+
+    /// このチャンクのオーバーロード宣言。ソースに書かれた順。
     ///
     /// オーバーロードされていなければ空。**hover は宣言の位置を指すとその 1 本を返す**
     /// （typescript-language-server 6.0.0 で実測）ので、集合を揃えるのに要るのは
@@ -142,8 +199,8 @@ impl Chunk {
     ///
     /// **並びをそのまま持つ。** TypeScript のオーバーロード解決は書かれた順に
     /// 突き合わせるので、並べ替えると別の型になる。
-    pub fn overload_name_positions(&self) -> &[SourcePosition] {
-        &self.overload_name_positions
+    pub fn overload_declarations(&self) -> &[OverloadDeclaration] {
+        &self.overload_declarations
     }
 
     /// このチャンクのシグネチャに書かれた型名。1 つも書かれていなければ空。
@@ -323,6 +380,40 @@ const NAME_FIELD: &str = "name";
 /// クラスの静的なメンバーを表す修飾子の種別。
 const STATIC_MODIFIER: &str = "static";
 
+/// プロパティへ書く側のアクセサを表す修飾子の種別。
+const SETTER_MODIFIER: &str = "set";
+
+/// 戻り値の型注釈を載せるフィールド。
+const RETURN_TYPE_FIELD: &str = "return_type";
+
+/// 引数リストを載せるフィールド。
+const PARAMETERS_FIELD: &str = "parameters";
+
+/// 型注釈を載せるフィールド。
+const TYPE_FIELD: &str = "type";
+
+/// 引数リストが並べる、引数 1 つ分のノードの種別。
+///
+/// **コメントも引数リストの名前付きの子になる**（`set value(/* why */ next: T)`）ので、
+/// 名前付きの子をそのまま数えると**注釈を書いてある setter が「省かれている」側へ落ちる**。
+///
+/// **許可リストにする。** 一覧から漏れた種別は本数が合わなくなり、
+/// 「省かれている」へ倒れる（偽陰性）
+/// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+const PARAMETER_KINDS: [&str; 2] = ["required_parameter", "optional_parameter"];
+
+/// **書かれた型をその式の型として言い切る**包みの種別。
+///
+/// `x as T` と `<T>x` の 2 つで、どちらも hover が返す綴りは書かれた `T` になる。
+///
+/// **許可リストにする。** 値を通すだけの包み（`syntax::tree` の
+/// `TRANSPARENT_EXPRESSION_KINDS`）には**型を言い切らないもの**が混じっており、
+/// `satisfies` は書かれた型と照らし合わせるだけで**推論された型をそのまま残す**
+/// （`tsc 5.9.3` で実測: `((x: R) => makeA()) satisfies (x: R) => unknown` の型は
+/// `(x: R) => string`）。一覧から漏れた種別は「省かれている」へ倒れる（偽陰性）
+/// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+const TYPE_ASSERTION_KINDS: [&str; 2] = ["as_expression", "type_assertion"];
+
 /// 指定行を含むチャンクノードのうち、もっとも内側のもの。1 つも無ければ `None`。
 ///
 /// 内側かどうかはバイト範囲の短さで決める。入れ子になったノードは必ず外側の範囲に
@@ -374,15 +465,134 @@ fn name_node_of(node: Node<'_>) -> Option<Node<'_>> {
     assigned_name_of(parent)
 }
 
-/// そのチャンクのオーバーロード宣言の、名前が置かれている位置。ソースに書かれた順。
+/// そのチャンクの [`OverloadDeclaration`]（hover を向ける先と、**その宣言の**
+/// 値の型の注釈の有無）。ソースに書かれた順。
 ///
 /// `node` はチャンクのノード、`source` はそれを含むファイル全体のソース。
 /// オーバーロードされていなければ空。
-fn overload_name_positions_of(node: Node<'_>, source: &str) -> Vec<SourcePosition> {
-    overload_declarations_of(node, source)
+///
+/// **構文木のノードを返す [`overload_declaration_nodes_of`] と返すものが違う。**
+/// あちらは型名を集める側（[`signature_nodes_of`]）が使う。
+///
+/// **名前の位置を作れない宣言は落ちる。** hover を向ける先が無いので集合を揃えられず、
+/// 本数が合わなくなった時点で `semantics` が「測れない」と答える
+/// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+fn overload_declarations_of(node: Node<'_>, source: &str) -> Vec<OverloadDeclaration> {
+    overload_declaration_nodes_of(node, source)
         .into_iter()
-        .filter_map(|declaration| name_position_of(declaration, source))
+        .filter_map(|declaration| {
+            Some(OverloadDeclaration {
+                name_position: name_position_of(declaration, source)?,
+                value_type: value_type_annotation_of(declaration, source),
+            })
+        })
         .collect()
+}
+
+/// そのノードの宣言が、値の型に注釈を書いたか。
+///
+/// `node` はチャンクのノード（またはそのオーバーロード宣言）、`source` は
+/// それを含むファイル全体のソース。
+///
+/// **「書かれている」へ倒すのは、その位置の綴りがソースのどこかに書かれていると
+/// 言い切れるときだけ。** 言い切れない形はすべて「省かれている」に落ちるので、
+/// 漏れは偽陰性（測れる答えを 1 つ落とす）に倒れる
+/// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+fn value_type_annotation_of(node: Node<'_>, source: &str) -> ValueTypeAnnotation {
+    // 外側の型が綴り全体を決める形（`const handler: Handler = (x) => x`）。
+    // hover はその型を返すので、戻り値の位置にも推論された型名は現れない
+    if outer_type_decides_the_spelling(node) {
+        return ValueTypeAnnotation::Written;
+    }
+
+    // setter は戻り値を注釈できない。hover が綴るのは受け取る引数の型なので、
+    // そちらの注釈を見る（`rules/naming.md`「読める型と書ける型を混ぜない」）
+    if is_setter(node) {
+        return sole_parameter_annotation_of(node);
+    }
+
+    // コンストラクタも戻り値を注釈できないが、hover が綴るのは囲むクラスの名前で、
+    // それは**クラスの宣言に書かれている**（`constructed_class_references_of`）
+    if constructed_class_of(node, source).is_some() {
+        return ValueTypeAnnotation::Written;
+    }
+
+    if node.child_by_field_name(RETURN_TYPE_FIELD).is_some() {
+        return ValueTypeAnnotation::Written;
+    }
+
+    ValueTypeAnnotation::Omitted
+}
+
+/// そのチャンクの外側に書かれた型が、hover の綴り全体を決めるか。
+///
+/// **自分の名前を持つチャンクでは決めない。** hover はその名前を指すので、返るのは
+/// 関数自身の型になる（[`name_node_of`] の Why と同じ分かれ目）。
+///
+/// 決めるのは 2 つ。**型を言い切る包み**（[`TYPE_ASSERTION_KINDS`]）と、
+/// **代入先の型注釈**（`const handler: Handler = …`）。
+///
+/// **言い切る包みは 1 つでもあれば決まる。** `((x) => x) as A satisfies B` の型は `A` で、
+/// 外側に `satisfies` が重なっても言い切った型のほうが残る。
+///
+/// **見るのはこのチャンク自身が持つ注釈だけ。** 宣言と代入が離れている形
+/// （`let handler: Handler;` のあとで `handler = (x) => x`）では、hover が返すのは
+/// 宣言側の注釈だが、それを辿るには**どの束縛を指しているか**を決める必要がある。
+/// 変数の隠蔽・型名の隠蔽・引数の束縛をそれぞれ見分けることになり、
+/// **スコープ解決をここで作り直す**ことになる。倒れる向きは偽陰性（測れる答えを失う）。
+///
+/// **Why not（代入先を宣言まで辿る）**: 一度入れて外した。実コーパス
+/// （rxjs 7.8.1 の `src`、尋ねた 517 チャンク）で測ると**取り戻せた `Normalized` は 0 件**で、
+/// 代わりに隠蔽を見分け損ねた形が偽陽性へ倒れた。指す先を決めるのは `semantics` の担当で、
+/// `syntax` が持つのは**どこを指して尋ねればよいか**まで（`rules/architecture.md`）。
+fn outer_type_decides_the_spelling(node: Node<'_>) -> bool {
+    if node.child_by_field_name(NAME_FIELD).is_some() {
+        return false;
+    }
+
+    let asserted = transparent_wrappers_of(node)
+        .iter()
+        .any(|wrapper| TYPE_ASSERTION_KINDS.contains(&wrapper.kind()));
+    let assigned =
+        unwrapped_parent_of(node).and_then(|parent| parent.child_by_field_name(TYPE_FIELD));
+
+    asserted || assigned.is_some()
+}
+
+/// そのノードが、プロパティへ書く側のアクセサか。
+///
+/// **読み書きの向きは修飾子のトークンにしか現れず、フィールドには載らない**
+/// （静的かどうかを見る [`is_static_member`] と同じ形）。
+fn is_setter(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+
+    node.children(&mut cursor)
+        .any(|child| child.kind() == SETTER_MODIFIER)
+}
+
+/// 引数を 1 つだけ取るノードの、その引数の注釈の有無。
+///
+/// 引数がちょうど 1 つでなければ「省かれている」。setter の引数は 1 つと決まっているので、
+/// そうなっていない綴りは**読み違えている**ほうへ倒す
+/// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+fn sole_parameter_annotation_of(node: Node<'_>) -> ValueTypeAnnotation {
+    let Some(parameters) = node.child_by_field_name(PARAMETERS_FIELD) else {
+        return ValueTypeAnnotation::Omitted;
+    };
+
+    let mut cursor = parameters.walk();
+    let declared: Vec<Node<'_>> = parameters
+        .named_children(&mut cursor)
+        .filter(|child| PARAMETER_KINDS.contains(&child.kind()))
+        .collect();
+    let [sole] = declared.as_slice() else {
+        return ValueTypeAnnotation::Omitted;
+    };
+
+    match sole.child_by_field_name(TYPE_FIELD) {
+        Some(_) => ValueTypeAnnotation::Written,
+        None => ValueTypeAnnotation::Omitted,
+    }
 }
 
 /// そのチャンクのシグネチャで、宣言を辿る相手になる型名。
@@ -414,12 +624,12 @@ fn chunk_type_references_of(node: Node<'_>, source: &str) -> Vec<TypeReference> 
 /// 集合として比べる以上、宣言にだけ現れる型名も解決の対象になる。
 fn signature_nodes_of<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>> {
     let mut nodes = vec![node];
-    nodes.extend(overload_declarations_of(node, source));
+    nodes.extend(overload_declaration_nodes_of(node, source));
 
     nodes
 }
 
-/// そのチャンクのオーバーロード宣言。ソースに書かれた順。
+/// そのチャンクのオーバーロード宣言の**構文木のノード**。ソースに書かれた順。
 ///
 /// 集めるのは**同じスコープにある、同じ名前で同じ側（静的 / インスタンス）の宣言**。
 /// TypeScript は同じスコープの同じ側に同名の実装を 2 つ置けないので、そこまで揃えば
@@ -431,7 +641,7 @@ fn signature_nodes_of<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>
 ///
 /// **Why not（実装の直前に並ぶ分だけを採る）**: 宣言と実装の間にはコメントが入りうる。
 /// 隣接で切ると、コメントの有無で集合が変わる。
-fn overload_declarations_of<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>> {
+fn overload_declaration_nodes_of<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>> {
     let Some(name) = declared_name_of(node, source) else {
         return Vec::new();
     };
@@ -1276,10 +1486,174 @@ function broken() {
     /// そのチャンクのオーバーロード宣言の、名前の位置（行・列）。
     fn overload_positions_of_chunk(chunk: &Chunk) -> Vec<(usize, usize)> {
         chunk
-            .overload_name_positions()
+            .overload_declarations()
             .iter()
-            .map(|position| (position.line().get(), position.character()))
+            .map(|declaration| {
+                let position = declaration.name_position();
+                (position.line().get(), position.character())
+            })
             .collect()
+    }
+
+    /// そのチャンクの、値の型の注釈の有無。
+    fn value_type_of(source: &str, location: &str) -> ValueTypeAnnotation {
+        chunk_at(source, location)
+            .expect("切り出せる")
+            .value_type_annotation()
+    }
+
+    #[test]
+    fn test_a_function_annotating_its_return_type_writes_its_value_type() {
+        let annotated = "export function build(x: Amount): Receipt {\n  return x;\n}\n";
+
+        assert_eq!(
+            value_type_of(annotated, "a.ts:1"),
+            ValueTypeAnnotation::Written
+        );
+    }
+
+    #[test]
+    fn test_a_function_omitting_its_return_type_omits_its_value_type() {
+        // 対照は上のテスト。戻り値の注釈を外しただけの違い。hover はここに
+        // **推論した型名**を綴るので、その出現を指して尋ねる位置が無い
+        let inferred = "export function build(x: Amount) {\n  return x;\n}\n";
+
+        assert_eq!(
+            value_type_of(inferred, "a.ts:1"),
+            ValueTypeAnnotation::Omitted
+        );
+    }
+
+    #[test]
+    fn test_a_getter_omitting_its_return_type_omits_its_value_type() {
+        let inferred = "class Holder {\n  get value() {\n    return 1;\n  }\n}\n";
+
+        assert_eq!(
+            value_type_of(inferred, "a.ts:2"),
+            ValueTypeAnnotation::Omitted
+        );
+    }
+
+    #[test]
+    fn test_a_setter_annotating_its_parameter_writes_its_value_type() {
+        // setter は戻り値を注釈できない。hover が綴るのは受け取る引数の型なので、
+        // 戻り値の注釈が無いことを根拠に「省かれている」へ倒すと、
+        // **注釈を書いてある setter がまとめて測れない側へ落ちる**
+        let annotated = "class Holder {\n  set value(next: Amount) {\n    void next;\n  }\n}\n";
+
+        assert_eq!(
+            value_type_of(annotated, "a.ts:2"),
+            ValueTypeAnnotation::Written
+        );
+    }
+
+    #[test]
+    fn test_a_setter_with_a_comment_in_its_parameter_list_still_writes_its_value_type() {
+        // **コメントも引数リストの名前付きの子になる。** そのまま数えると本数が合わず、
+        // 注釈を書いてある setter が「省かれている」側へ落ちる
+        let commented =
+            "class Holder {\n  set value(/* why */ next: Amount) {\n    void next;\n  }\n}\n";
+
+        assert_eq!(
+            value_type_of(commented, "a.ts:2"),
+            ValueTypeAnnotation::Written
+        );
+    }
+
+    #[test]
+    fn test_a_setter_omitting_its_parameter_annotation_omits_its_value_type() {
+        // 対照は上のテスト。引数の注釈を外しただけの違い
+        let inferred = "class Holder {\n  set value(next) {\n    void next;\n  }\n}\n";
+
+        assert_eq!(
+            value_type_of(inferred, "a.ts:2"),
+            ValueTypeAnnotation::Omitted
+        );
+    }
+
+    #[test]
+    fn test_a_constructor_writes_its_value_type() {
+        // コンストラクタも戻り値を注釈できないが、hover が綴るのは囲むクラスの名前で、
+        // それは**クラスの宣言に書かれている**（`constructed_class_references_of`）
+        let constructor = "class Receipt {\n  constructor(x: Amount) {\n    void x;\n  }\n}\n";
+
+        assert_eq!(
+            value_type_of(constructor, "a.ts:2"),
+            ValueTypeAnnotation::Written
+        );
+    }
+
+    #[test]
+    fn test_an_arrow_function_assigned_to_an_annotated_name_writes_its_value_type() {
+        // hover が返すのは代入先に書かれた注釈そのもの（`chunk` の `name_node_of`）なので、
+        // 戻り値の位置にも推論された型名は現れない
+        let assigned = "const build: Builder = (x) => x;\n";
+
+        assert_eq!(
+            value_type_of(assigned, "a.ts:1"),
+            ValueTypeAnnotation::Written
+        );
+    }
+
+    #[test]
+    fn test_an_arrow_function_asserted_by_a_wrapper_writes_its_value_type() {
+        let asserted = "const build = ((x) => x) as Builder;\n";
+
+        assert_eq!(
+            value_type_of(asserted, "a.ts:1"),
+            ValueTypeAnnotation::Written
+        );
+    }
+
+    #[test]
+    fn test_an_arrow_function_only_checked_by_satisfies_omits_its_value_type() {
+        // 対照は 1 つ上のテスト。包みを `as` から `satisfies` に替えただけの違い。
+        // **`satisfies` は書かれた型と照らし合わせるだけで、推論された型をそのまま残す**
+        // （`tsc 5.9.3` で実測）ので、戻り値の位置には推論された型名が現れる
+        let checked = "const build = ((x: Amount) => x) satisfies (x: Amount) => unknown;\n";
+
+        assert_eq!(
+            value_type_of(checked, "a.ts:1"),
+            ValueTypeAnnotation::Omitted
+        );
+    }
+
+    #[test]
+    fn test_an_arrow_function_asserted_then_checked_by_satisfies_writes_its_value_type() {
+        // 言い切った型は外側に `satisfies` が重なっても残る（型は `Builder`）
+        let asserted = "const build = ((x) => x) as Builder satisfies unknown;\n";
+
+        assert_eq!(
+            value_type_of(asserted, "a.ts:1"),
+            ValueTypeAnnotation::Written
+        );
+    }
+
+    #[test]
+    fn test_an_arrow_function_assigned_to_a_bare_name_omits_its_value_type() {
+        // 対照は上の 2 つ。外側の注釈を外しただけの違い
+        let bare = "const build = (x: Amount) => x;\n";
+
+        assert_eq!(value_type_of(bare, "a.ts:1"), ValueTypeAnnotation::Omitted);
+    }
+
+    #[test]
+    fn test_overload_declarations_carry_their_own_value_type_annotations() {
+        // **注釈の有無は宣言ごとに違う。** 1 つにまとめると、書いた側の注釈で
+        // 省いた側を測れたことにする
+        let mixed = "export function read(a: string): string;\nexport function read(a: number);\nexport function read(a: unknown): unknown {\n  return a;\n}\n";
+        let chunk = chunk_at(mixed, "a.ts:3").expect("切り出せる");
+
+        let annotations: Vec<ValueTypeAnnotation> = chunk
+            .overload_declarations()
+            .iter()
+            .map(OverloadDeclaration::value_type_annotation)
+            .collect();
+
+        assert_eq!(
+            annotations,
+            vec![ValueTypeAnnotation::Written, ValueTypeAnnotation::Omitted]
+        );
     }
 
     const OVERLOADED_FUNCTION: &str = r#"export function overloaded(a: string): string;

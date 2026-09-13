@@ -110,7 +110,8 @@ fn type_signature_of(session: &mut Session, chunk: &Chunk) -> OverloadSet {
         session,
         &document,
         position,
-        chunk.overload_name_positions(),
+        chunk.value_type_annotation(),
+        chunk.overload_declarations(),
         &traced,
     );
     let Ok(TypeSignatureOutcome::Normalized(overloads)) = asked else {
@@ -767,6 +768,44 @@ fn test_compare_with_an_lsp_does_not_unify_two_interfaces_of_different_types_spe
     assert_eq!(
         measured.signals().type_signature_match(),
         TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_does_not_unify_an_inferred_return_type_spelled_like_a_written_parameter()
+ {
+    // どちらのファイルも、引数には**共有の** `Receipt` を注釈し、戻り値の注釈は省いて
+    // **自分の側の** `Receipt` を返す。hover はどちらも
+    // `function echoReceipt(received: Receipt): Receipt` と綴るので、**引数の `Receipt`
+    // （書かれている）と戻り値の `Receipt`（推論された）が同じ綴り**になる。
+    // 綴りで「尋ねたか」を引くと引数側の記録が乗り、単一化可能に出る（偽陽性）
+    let echoes_a_billing_receipt = fixture("references/src/billing/echoed.ts", 4);
+    let echoes_a_report_receipt = fixture("references/src/report/echoed.ts", 4);
+
+    let measured = measured_with_an_lsp(&echoes_a_billing_receipt, &echoes_a_report_receipt);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::UntracedTypeName
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_unifies_the_same_pair_once_the_return_type_is_annotated() {
+    // 対照は上のテスト。**本体は 1 行も違わず、戻り値の注釈だけを書き足してある**
+    // （`diff` が 1 行だけを出す）。注釈を書けば hover が綴る戻り値は共有の `Receipt` に
+    // なるので、同じ本体でも答えが変わる。これが落ちるなら、
+    // 「注釈を省いた出現だけを尋ねていない側へ倒す」が効きすぎている
+    let echoes_a_billing_receipt = fixture("references/src/billing/annotated.ts", 4);
+    let echoes_a_report_receipt = fixture("references/src/report/annotated.ts", 4);
+
+    let measured = measured_with_an_lsp(&echoes_a_billing_receipt, &echoes_a_report_receipt);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
     );
 }
 

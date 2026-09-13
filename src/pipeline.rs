@@ -605,7 +605,8 @@ fn resolved_type_signature_outcome_of(
         session,
         document,
         position,
-        chunk.overload_name_positions(),
+        chunk.value_type_annotation(),
+        chunk.overload_declarations(),
         &traced,
     )
 }
@@ -1848,6 +1849,7 @@ mod tests {
     use crate::semantics::resolved_type::TracedTypeNames;
     use crate::semantics::type_signature::normalized_outcome_of;
     use crate::similarity::Similarity;
+    use crate::syntax::chunk::ValueTypeAnnotation;
     use crate::test_support::{line, missing_server, overload_count, signature_text};
 
     fn measured(value: f64) -> Similarity {
@@ -1885,7 +1887,11 @@ mod tests {
 
     /// 正規化できた型シグネチャ。
     fn normalized(text: &str) -> TypeSignatureOutcome {
-        normalized_outcome_of(&signature_text(text), &TracedTypeNames::default())
+        normalized_outcome_of(
+            &signature_text(text),
+            ValueTypeAnnotation::Written,
+            &TracedTypeNames::default(),
+        )
     }
 
     /// 参照元を尋ねて、サーバが答えた形。
