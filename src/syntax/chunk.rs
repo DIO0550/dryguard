@@ -151,7 +151,7 @@ impl Chunk {
             lines,
             name_position: name_position_of(node, source),
             value_type: value_type_annotation_of(node, source),
-            overload_declarations: overload_declarations_at(node, source),
+            overload_declarations: overload_declarations_of(node, source),
             type_references: chunk_type_references_of(node, source),
             source: source_of_lines(source, lines),
             tokens: TokenSequence::from_node(node),
@@ -455,16 +455,20 @@ fn name_node_of(node: Node<'_>) -> Option<Node<'_>> {
     assigned_name_of(parent)
 }
 
-/// そのチャンクのオーバーロード宣言。ソースに書かれた順。
+/// そのチャンクの [`OverloadDeclaration`]（hover を向ける先と、**その宣言の**
+/// 値の型の注釈の有無）。ソースに書かれた順。
 ///
 /// `node` はチャンクのノード、`source` はそれを含むファイル全体のソース。
 /// オーバーロードされていなければ空。
 ///
+/// **構文木のノードを返す [`overload_declaration_nodes_of`] と返すものが違う。**
+/// あちらは型名を集める側（[`signature_nodes_of`]）が使う。
+///
 /// **名前の位置を作れない宣言は落ちる。** hover を向ける先が無いので集合を揃えられず、
 /// 本数が合わなくなった時点で `semantics` が「測れない」と答える
 /// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-fn overload_declarations_at(node: Node<'_>, source: &str) -> Vec<OverloadDeclaration> {
-    overload_declarations_of(node, source)
+fn overload_declarations_of(node: Node<'_>, source: &str) -> Vec<OverloadDeclaration> {
+    overload_declaration_nodes_of(node, source)
         .into_iter()
         .filter_map(|declaration| {
             Some(OverloadDeclaration {
@@ -596,12 +600,12 @@ fn chunk_type_references_of(node: Node<'_>, source: &str) -> Vec<TypeReference> 
 /// 集合として比べる以上、宣言にだけ現れる型名も解決の対象になる。
 fn signature_nodes_of<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>> {
     let mut nodes = vec![node];
-    nodes.extend(overload_declarations_of(node, source));
+    nodes.extend(overload_declaration_nodes_of(node, source));
 
     nodes
 }
 
-/// そのチャンクのオーバーロード宣言。ソースに書かれた順。
+/// そのチャンクのオーバーロード宣言の**構文木のノード**。ソースに書かれた順。
 ///
 /// 集めるのは**同じスコープにある、同じ名前で同じ側（静的 / インスタンス）の宣言**。
 /// TypeScript は同じスコープの同じ側に同名の実装を 2 つ置けないので、そこまで揃えば
@@ -613,7 +617,7 @@ fn signature_nodes_of<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>
 ///
 /// **Why not（実装の直前に並ぶ分だけを採る）**: 宣言と実装の間にはコメントが入りうる。
 /// 隣接で切ると、コメントの有無で集合が変わる。
-fn overload_declarations_of<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>> {
+fn overload_declaration_nodes_of<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>> {
     let Some(name) = declared_name_of(node, source) else {
         return Vec::new();
     };

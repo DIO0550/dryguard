@@ -168,9 +168,18 @@ pub enum TypeSignatureOutcome {
 /// その名前が持つ型シグネチャを揃えて、正規化した形にする。
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
-/// `Chunk::name_position` が指す識別子の位置、`overload_positions` は
-/// `Chunk::overload_name_positions` が指すオーバーロード宣言の名前の位置。
-/// `traced` は `semantics::resolved_type` が型名を宣言まで辿った結果。
+/// `Chunk::name_position` が指す識別子の位置、`value_type` は `Chunk::value_type_annotation`
+/// が答えるそのチャンクの値の型の注釈の有無、`overloads` は
+/// `Chunk::overload_declarations` が返すオーバーロード宣言（名前の位置と、**その宣言の**
+/// 値の型の注釈の有無）。`traced` は `semantics::resolved_type` が型名を宣言まで辿った結果。
+///
+/// **`value_type` が使われるのはオーバーロードされていないときだけ。** 宣言が並ぶときは
+/// hover を宣言 1 つずつに向けるので、注釈の有無も `overloads` が持つ側を見る。
+///
+/// **注釈が省かれていれば、値の型の位置に出た型名は辿った記録を綴りで引かない**
+/// （[`TypeSignatureOutcome::UntracedTypeName`] になる）。書かれていない出現が、
+/// 同じ綴りの書かれた出現の記録に乗るのを防ぐため
+/// (`rules/architecture.md`「どこまでを「取れなかった」に数えるか」)。
 ///
 /// **オーバーロードされていれば、宣言 1 つずつに尋ねる。** 実装の位置を指した hover は
 /// 1 本目しか返さず、残りは件数の要約になる（typescript-language-server 6.0.0 で実測）。
@@ -1493,6 +1502,22 @@ mod tests {
         );
 
         assert!(matches!(outcome, TypeSignatureOutcome::Normalized(_)));
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_inferring_a_type_variable_bound_outside_it_is_unmeasurable()
+     {
+        // そのシグネチャが宣言していない型変数は、辿る相手が**外に居る**。自分の型変数と
+        // 同じに扱って値の型から落とすと、注釈を省いた戻り値に出た `Outer` が
+        // 別のファイルの同じ綴りと重なる（偽陽性）。**辿った記録があっても倒す**ので、
+        // ここを落とすと `Normalized` になる
+        let outcome = normalized_outcome_of(
+            &signature_text("const build: (x: number) => Outer"),
+            ValueTypeAnnotation::Omitted,
+            &tracing_all("Outer"),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::UntracedTypeName);
     }
 
     #[test]
