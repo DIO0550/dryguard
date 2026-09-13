@@ -402,6 +402,12 @@ const TYPE_FIELD: &str = "type";
 /// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
 const PARAMETER_KINDS: [&str; 2] = ["required_parameter", "optional_parameter"];
 
+/// 変数の宣言を並べる文の種別。
+const DECLARATION_KINDS: [&str; 2] = ["lexical_declaration", "variable_declaration"];
+
+/// 宣言 1 つ分のノードの種別。
+const DECLARATOR_KIND: &str = "variable_declarator";
+
 /// **書かれた型をその式の型として言い切る**包みの種別。
 ///
 /// `x as T` と `<T>x` の 2 つで、どちらも hover が返す綴りは書かれた `T` になる。
@@ -501,7 +507,7 @@ fn overload_declarations_of(node: Node<'_>, source: &str) -> Vec<OverloadDeclara
 fn value_type_annotation_of(node: Node<'_>, source: &str) -> ValueTypeAnnotation {
     // 外側の型が綴り全体を決める形（`const handler: Handler = (x) => x`）。
     // hover はその型を返すので、戻り値の位置にも推論された型名は現れない
-    if outer_type_decides_the_spelling(node) {
+    if outer_type_decides_the_spelling(node, source) {
         return ValueTypeAnnotation::Written;
     }
 
@@ -529,12 +535,13 @@ fn value_type_annotation_of(node: Node<'_>, source: &str) -> ValueTypeAnnotation
 /// **自分の名前を持つチャンクでは決めない。** hover はその名前を指すので、返るのは
 /// 関数自身の型になる（[`name_node_of`] の Why と同じ分かれ目）。
 ///
-/// 決めるのは 2 つ。**型を言い切る包み**（[`TYPE_ASSERTION_KINDS`]）と、
-/// **代入先の型注釈**（`const handler: Handler = …`）。
+/// 決めるのは 3 つ。**型を言い切る包み**（[`TYPE_ASSERTION_KINDS`]）、
+/// **代入先の型注釈**（`const handler: Handler = …`）、それに
+/// **宣言と代入が離れている形の、宣言側の型注釈**（`let handler: Handler;` `handler = …`）。
 ///
 /// **言い切る包みは 1 つでもあれば決まる。** `((x) => x) as A satisfies B` の型は `A` で、
 /// 外側に `satisfies` が重なっても言い切った型のほうが残る。
-fn outer_type_decides_the_spelling(node: Node<'_>) -> bool {
+fn outer_type_decides_the_spelling(node: Node<'_>, source: &str) -> bool {
     if node.child_by_field_name(NAME_FIELD).is_some() {
         return false;
     }
@@ -545,7 +552,77 @@ fn outer_type_decides_the_spelling(node: Node<'_>) -> bool {
     let assigned =
         unwrapped_parent_of(node).and_then(|parent| parent.child_by_field_name(TYPE_FIELD));
 
-    asserted || assigned.is_some()
+    asserted || assigned.is_some() || assigned_target_is_annotated(node, source)
+}
+
+/// 代入先の名前が、**宣言のところで**型注釈を持っているか。
+///
+/// `node` はチャンクのノード、`source` はそれを含むファイル全体のソース。
+///
+/// 宣言と代入が離れていると（`let handler: Handler;` のあとで `handler = (x) => x`）、
+/// **代入の式には注釈が載らない**。代入の側だけを見ると「省かれている」に落ちるが、
+/// hover が返すのは宣言に書かれた注釈のほう。
+///
+/// **同じファイルの同じ綴りは同じ型を指す**ので、宣言側の注釈に現れる型名は、
+/// チャンクの注釈から集めた記録で引いてよい（`syntax::type_reference`）。
+/// 別のファイルの宣言が綴りを決める形（文脈から型付けされたオブジェクトのメンバー）とは
+/// ここが違う。
+///
+/// **見るのは左辺が素の識別子のときだけ。** `obj.handler = …` の綴りを決めるのは
+/// `obj` の型で、その宣言は別のファイルにありうる。辿れない形は「省かれている」へ
+/// 倒れる（偽陰性）(`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+fn assigned_target_is_annotated(node: Node<'_>, source: &str) -> bool {
+    let Some(parent) = unwrapped_parent_of(node) else {
+        return false;
+    };
+    if parent.kind() != ASSIGNMENT_KIND {
+        return false;
+    }
+
+    let Some(assigned) = parent.child_by_field_name("left") else {
+        return false;
+    };
+    if assigned.kind() != IDENTIFIER_KIND {
+        return false;
+    }
+    let Some(name) = source.get(assigned.byte_range()) else {
+        return false;
+    };
+
+    let mut scope = parent.parent();
+    while let Some(current) = scope {
+        if declares_annotated_name(current, name, source) {
+            return true;
+        }
+        scope = current.parent();
+    }
+
+    false
+}
+
+/// そのノードの直下に、その名前を**型注釈付きで**宣言している文があるか。
+///
+/// `scope` は探す範囲のノード、`name` は代入先の綴り、`source` はファイル全体のソース。
+///
+/// **直下だけを見る。** 文はスコープの直接の子に並ぶので、入れ子まで降りると
+/// 別のスコープの同名の宣言を拾う。**包みの中の宣言**（`export let handler: Handler;`）は
+/// ここでは見つからず、「省かれている」へ倒れる（偽陰性）。
+fn declares_annotated_name(scope: Node<'_>, name: &str, source: &str) -> bool {
+    let mut cursor = scope.walk();
+
+    scope.named_children(&mut cursor).any(|statement| {
+        if !DECLARATION_KINDS.contains(&statement.kind()) {
+            return false;
+        }
+
+        let mut declared = statement.walk();
+        statement.named_children(&mut declared).any(|declarator| {
+            let annotated = declarator.kind() == DECLARATOR_KIND
+                && declarator.child_by_field_name(TYPE_FIELD).is_some();
+
+            annotated && declared_name_of(declarator, source) == Some(name)
+        })
+    })
 }
 
 /// そのノードが、プロパティへ書く側のアクセサか。
@@ -1615,6 +1692,41 @@ function broken() {
         assert_eq!(
             value_type_of(asserted, "a.ts:1"),
             ValueTypeAnnotation::Written
+        );
+    }
+
+    #[test]
+    fn test_an_arrow_function_assigned_to_a_separately_annotated_name_writes_its_value_type() {
+        // 宣言と代入が離れていると**代入の式には注釈が載らない**が、hover が返すのは
+        // 宣言に書かれた注釈のほう。代入の側だけを見ると「省かれている」に落ちる
+        let declared = "let build: (x: Amount) => Amount;\nbuild = (x: Amount) => x;\n";
+
+        assert_eq!(
+            value_type_of(declared, "a.ts:2"),
+            ValueTypeAnnotation::Written
+        );
+    }
+
+    #[test]
+    fn test_an_arrow_function_assigned_to_a_separately_declared_bare_name_omits_its_value_type() {
+        // 対照は上のテスト。宣言から注釈を外しただけの違い
+        let declared = "let build;\nbuild = (x: Amount) => x;\n";
+
+        assert_eq!(
+            value_type_of(declared, "a.ts:2"),
+            ValueTypeAnnotation::Omitted
+        );
+    }
+
+    #[test]
+    fn test_an_arrow_function_assigned_to_a_property_omits_its_value_type() {
+        // 綴りを決めるのは `obj` の型で、その宣言は別のファイルにありうる。
+        // 辿れない形は「省かれている」へ倒す
+        let assigned = "const obj: Holder = { handler: null };\nobj.handler = (x: Amount) => x;\n";
+
+        assert_eq!(
+            value_type_of(assigned, "a.ts:2"),
+            ValueTypeAnnotation::Omitted
         );
     }
 
