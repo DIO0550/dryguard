@@ -300,6 +300,11 @@ impl Callable {
     /// 答えられる。**型名にならないのに指す先が書いた人の位置で決まる綴り**
     /// （`typeof localValue` / `{ [key]: string }` / `import("./local").T` / `this`）は、
     /// 分解しない側（[`TypeStructure::Spelled`]）にしか現れない。
+    ///
+    /// **同じシグネチャが束縛した値の名前も外を指す扱いになる。** `(x: string) => typeof x`
+    /// の `x` は引数なので指す先はこのシグネチャの中で決まるが、**引数の名前は読んだ時点で
+    /// 落ちている**（[`Parameter`]）ので、ここから束縛を引けない。倒れる向きは偽陰性
+    /// （測れる答えを 1 つ落とすだけ）なので直していない（Issue #192）。
     pub(crate) fn names_only_types(&self) -> Option<bool> {
         let mut names_only = true;
 
