@@ -269,6 +269,11 @@ impl Callable {
     /// **番号はシグネチャ全体で 1 つの通し番号。** 入れ子のスコープごとに `%0` から
     /// 振り直すと、`<T>(cb: <U>(u: U) => T) => void` と `<T>(cb: <U>(u: U) => U) => void` が
     /// どちらも「内側 `%0`・戻り値 `%0`」になり、**単一化できない 2 つを重ねてしまう**。
+    ///
+    /// **そのため、共用体の相手をまたぐと書かれた並びで番号が変わる。** 番号は出現順に
+    /// 振るので、`<V, A>(acc: V | A) => A` と `<V, A>(acc: A | V) => A` では `V` と `A` に
+    /// 別の番号が付き、並べ替えは付け替えの後なので**同じ型が別の構造のまま残る**（偽陰性）。
+    /// 並びに依存しない番号の振り方には相手の並べ替えを試す探索が要るので、ここでは行わない。
     pub(crate) fn normalized(self) -> Option<Self> {
         let mut scopes = TypeVariableScopes::new();
 
@@ -1478,6 +1483,28 @@ mod tests {
         assert!(same_structure(
             "<A>(x: A | Middle) => void",
             "<Z>(x: Z | Middle) => void"
+        ));
+    }
+
+    #[test]
+    fn test_a_union_whose_members_declare_type_variables_reads_as_a_different_structure_when_written_in_the_other_order()
+     {
+        // 既知の限界（#181）。番号は出現順に振るので、相手がそれぞれ型変数を宣言していると
+        // 書かれた順で別の番号が付く。並べ替えは付け替えの後なので同じ型のまま残らない
+        assert!(!same_structure(
+            "(cb: (<T>(x: T) => T) | (<U>(x: U) => U[])) => void",
+            "(cb: (<U>(x: U) => U[]) | (<T>(x: T) => T)) => void"
+        ));
+    }
+
+    #[test]
+    fn test_a_union_of_type_variables_bound_outside_reads_as_a_different_structure_when_written_in_the_other_order()
+     {
+        // 同じ限界（#181）が、相手が型変数を宣言していなくても出る形。実コーパス
+        // （rxjs 7.8.1 の `src`）で出たのはこちらだけなので、両方を固定する
+        assert!(!same_structure(
+            "<V, A>(acc: V | A) => A",
+            "<V, A>(acc: A | V) => A"
         ));
     }
 
