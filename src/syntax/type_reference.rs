@@ -112,29 +112,53 @@ pub(super) fn type_references_of(nodes: &[Node<'_>], source: &str) -> Vec<TypeRe
 
     for node in nodes {
         for annotated in annotation_scopes_of(*node) {
-            let declared = bound_type_names_of(&annotated, source);
-
-            for node in annotated {
-                for identifier in type_identifiers_of(node) {
-                    let Some(reference) = type_reference_of(identifier, source) else {
-                        continue;
-                    };
-                    if declared.contains(reference.name()) {
-                        continue;
-                    }
-                    if references
-                        .iter()
-                        .any(|kept| kept.name() == reference.name())
-                    {
-                        continue;
-                    }
-                    references.push(reference);
-                }
-            }
+            kept_references_of(&annotated, source, &mut references);
         }
     }
 
     references
+}
+
+/// 注釈のノード 1 つに書かれた型名。1 つも書かれていなければ空。
+///
+/// `annotated` は型注釈のノード、`source` はそれを含むファイル全体のソース。
+///
+/// **[`type_references_of`] とは範囲の切り方が違う。** あちらはチャンクのシグネチャから
+/// 範囲を組み立てるが、こちらは**渡されたノード 1 つだけ**を 1 つの範囲として読む。
+/// チャンクから辿れない場所に書かれた注釈（宣言と代入が離れている形の宣言側）を、
+/// 呼ぶ側が見つけて渡す（`syntax::chunk` の `assigned_target_annotation_of`）。
+pub(super) fn type_references_in(annotated: Node<'_>, source: &str) -> Vec<TypeReference> {
+    let mut references = Vec::new();
+    kept_references_of(&[annotated], source, &mut references);
+
+    references
+}
+
+/// その範囲に書かれた型名を、まだ無い綴りだけ `references` へ足す。
+///
+/// `annotated` は**1 つの束縛の範囲**に属する注釈のノード、`source` はファイル全体のソース。
+///
+/// **同じ綴りは 1 つにまとめる。** 尋ねる先は綴りごとに 1 箇所あればよい。
+fn kept_references_of(annotated: &[Node<'_>], source: &str, references: &mut Vec<TypeReference>) {
+    let declared = bound_type_names_of(annotated, source);
+
+    for node in annotated {
+        for identifier in type_identifiers_of(*node) {
+            let Some(reference) = type_reference_of(identifier, source) else {
+                continue;
+            };
+            if declared.contains(reference.name()) {
+                continue;
+            }
+            if references
+                .iter()
+                .any(|kept| kept.name() == reference.name())
+            {
+                continue;
+            }
+            references.push(reference);
+        }
+    }
 }
 
 /// hover がコンストラクタの綴りに載せる、囲むクラス側の型名。

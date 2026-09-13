@@ -24,7 +24,8 @@ use crate::syntax::tree::{
     SyntaxTree, source_position_of, transparent_wrappers_of, unwrapped_parent_of,
 };
 use crate::syntax::type_reference::{
-    TypeReference, constructed_class_of, constructed_class_references_of, type_references_of,
+    TypeReference, constructed_class_of, constructed_class_references_of, type_references_in,
+    type_references_of,
 };
 
 /// 比較の単位。関数・メソッド 1 つ分のソースと、それがどこにあったか。
@@ -552,10 +553,10 @@ fn outer_type_decides_the_spelling(node: Node<'_>, source: &str) -> bool {
     let assigned =
         unwrapped_parent_of(node).and_then(|parent| parent.child_by_field_name(TYPE_FIELD));
 
-    asserted || assigned.is_some() || assigned_target_is_annotated(node, source)
+    asserted || assigned.is_some() || assigned_target_annotation_of(node, source).is_some()
 }
 
-/// 代入先の名前が、**宣言のところで**型注釈を持っているか。
+/// 代入先の名前が、**宣言のところで**持っている型注釈。宣言が無い / 注釈が無ければ `None`。
 ///
 /// `node` はチャンクのノード、`source` はそれを含むファイル全体のソース。
 ///
@@ -571,57 +572,61 @@ fn outer_type_decides_the_spelling(node: Node<'_>, source: &str) -> bool {
 /// **見るのは左辺が素の識別子のときだけ。** `obj.handler = …` の綴りを決めるのは
 /// `obj` の型で、その宣言は別のファイルにありうる。辿れない形は「省かれている」へ
 /// 倒れる（偽陰性）(`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-fn assigned_target_is_annotated(node: Node<'_>, source: &str) -> bool {
-    let Some(parent) = unwrapped_parent_of(node) else {
-        return false;
-    };
+fn assigned_target_annotation_of<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let parent = unwrapped_parent_of(node)?;
     if parent.kind() != ASSIGNMENT_KIND {
-        return false;
+        return None;
     }
 
-    let Some(assigned) = parent.child_by_field_name("left") else {
-        return false;
-    };
+    let assigned = parent.child_by_field_name("left")?;
     if assigned.kind() != IDENTIFIER_KIND {
-        return false;
+        return None;
     }
-    let Some(name) = source.get(assigned.byte_range()) else {
-        return false;
-    };
+    let name = source.get(assigned.byte_range())?;
 
     let mut scope = parent.parent();
     while let Some(current) = scope {
-        if declares_annotated_name(current, name, source) {
-            return true;
+        if let Some(annotation) = annotation_declared_for(current, name, source) {
+            return Some(annotation);
         }
         scope = current.parent();
     }
 
-    false
+    None
 }
 
-/// そのノードの直下に、その名前を**型注釈付きで**宣言している文があるか。
+/// そのノードの直下で、その名前に書かれている型注釈。宣言が無い / 注釈が無ければ `None`。
 ///
 /// `scope` は探す範囲のノード、`name` は代入先の綴り、`source` はファイル全体のソース。
 ///
 /// **直下だけを見る。** 文はスコープの直接の子に並ぶので、入れ子まで降りると
 /// 別のスコープの同名の宣言を拾う。**包みの中の宣言**（`export let handler: Handler;`）は
 /// ここでは見つからず、「省かれている」へ倒れる（偽陰性）。
-fn declares_annotated_name(scope: Node<'_>, name: &str, source: &str) -> bool {
+fn annotation_declared_for<'tree>(
+    scope: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
     let mut cursor = scope.walk();
 
-    scope.named_children(&mut cursor).any(|statement| {
+    scope.named_children(&mut cursor).find_map(|statement| {
         if !DECLARATION_KINDS.contains(&statement.kind()) {
-            return false;
+            return None;
         }
 
         let mut declared = statement.walk();
-        statement.named_children(&mut declared).any(|declarator| {
-            let annotated = declarator.kind() == DECLARATOR_KIND
-                && declarator.child_by_field_name(TYPE_FIELD).is_some();
+        statement
+            .named_children(&mut declared)
+            .find_map(|declarator| {
+                if declarator.kind() != DECLARATOR_KIND {
+                    return None;
+                }
+                if declared_name_of(declarator, source) != Some(name) {
+                    return None;
+                }
 
-            annotated && declared_name_of(declarator, source) == Some(name)
-        })
+                declarator.child_by_field_name(TYPE_FIELD)
+            })
     })
 }
 
@@ -671,14 +676,20 @@ fn sole_parameter_annotation_of(node: Node<'_>) -> ValueTypeAnnotation {
 fn chunk_type_references_of(node: Node<'_>, source: &str) -> Vec<TypeReference> {
     let mut references = type_references_of(&signature_nodes_of(node, source), source);
 
-    for constructed in constructed_class_references_of(node, source) {
-        if references
-            .iter()
-            .any(|kept| kept.name() == constructed.name())
-        {
+    // 宣言と代入が離れていると、綴りを決める注釈はチャンクから辿れない場所にある。
+    // 集めないと、そこにだけ現れる型名が「尋ねていない」に当たって測れなくなる
+    let declared = assigned_target_annotation_of(node, source)
+        .map(|annotation| type_references_in(annotation, source))
+        .unwrap_or_default();
+
+    for written in declared
+        .into_iter()
+        .chain(constructed_class_references_of(node, source))
+    {
+        if references.iter().any(|kept| kept.name() == written.name()) {
             continue;
         }
-        references.push(constructed);
+        references.push(written);
     }
 
     references
@@ -1873,6 +1884,17 @@ export function overloaded(a: unknown): unknown {
             .iter()
             .map(TypeReference::name)
             .collect()
+    }
+
+    #[test]
+    fn test_chunk_type_references_cover_the_separately_declared_target_annotation() {
+        // 宣言と代入が離れていると、綴りを決める注釈はチャンクから辿れない場所にある。
+        // 集めないと、そこにだけ現れる型名が「尋ねていない」に当たって測れなくなる
+        let declared = "let build: (x: string) => Receipt;\nbuild = (x) => make(x);\n";
+
+        let chunk = chunk_at(declared, "a.ts:2").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Receipt"]);
     }
 
     #[test]
