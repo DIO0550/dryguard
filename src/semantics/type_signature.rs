@@ -150,6 +150,18 @@ pub enum TypeSignatureOutcome {
     /// 綴りを持たせると `Copy` が外れ、判定の側が文字列を持ち回ることになる。
     /// 直す先は綴りによらず同じ（**その型に注釈を書く**）ので、名前は答えを変えない。
     UntracedTypeName,
+    /// **比較に残る綴りに、指す先が書かれた場所で決まる綴りが現れた。**
+    ///
+    /// 値の名前（`typeof localValue`）・オブジェクト型の計算されたキー
+    /// （`{ [key]: string }`）・モジュールの指定子（`import("./local").T`）・`this` 型は
+    /// **型名のノードにならない**ので、`syntax::type_reference` が集めず `semantics` も
+    /// 辿らない。綴りのまま比べると、**別々のファイルの構造の違う `localValue` が
+    /// 単一化可能に出る**（偽陽性）。
+    ///
+    /// **[`TypeSignatureOutcome::UntracedTypeName`] と混ぜない。** あちらは型名なので
+    /// 尋ねる位置を作れる（注釈を書けば辿れる）が、こちらは**型名にするところから要る**
+    /// （`rules/naming.md`「`site-dependent spelling` を `untraced type name` と混ぜない」）。
+    SiteDependentSpelling,
 }
 
 /// その名前が持つ型シグネチャを揃えて、正規化した形にする。
@@ -304,6 +316,13 @@ fn single_outcome_of(spelling: &str, traced: &TracedTypeNames) -> TypeSignatureO
 
     if let Some(reason) = unopened {
         return TypeSignatureOutcome::UnopenedTypeName { reason };
+    }
+
+    // **「尋ねていない」より先に見る。** どちらも対象のコードに注釈を書く話だが、
+    // こちらは**型に名前を付ける一手が余分に要る**。手数の多いほうを先に出さないと、
+    // 注釈を書いた利用者が同じ「測れない」で戻ってくる
+    if !normalized.names_only_types {
+        return TypeSignatureOutcome::SiteDependentSpelling;
     }
 
     // **開けなかった型名を先に見る。** どちらも「測れない」だが、開けなかった理由のほうが
@@ -596,6 +615,15 @@ impl ChunkType {
             Self::Read(member_type) | Self::Written(member_type) => member_type.type_names(),
         }
     }
+
+    /// 比較に残る綴りが、型の名前だけで書かれているか。
+    /// 綴りのまま持っている部分を読めなければ `None`。
+    fn names_only_types(&self) -> Option<bool> {
+        match self {
+            Self::Callable(callable) => callable.names_only_types(),
+            Self::Read(member_type) | Self::Written(member_type) => member_type.names_only_types(),
+        }
+    }
 }
 
 /// 単一化の可否を比べられる形に直した型シグネチャ 1 本。
@@ -637,6 +665,12 @@ struct NormalizedSignature {
     /// 「尋ねたか」を見ると**辿る相手が居ない名前を「尋ねていない」と答える**
     /// （`syntax::type_structure` の `SpelledBinders`）。
     traceable_type_names: BTreeSet<String>,
+    /// 比較に残る綴りが、型の名前だけで書かれているか。
+    ///
+    /// **型名を数える 2 つでは掬えない。** `typeof localValue` の `localValue` は
+    /// 型名のノードにならないので、どちらの集合にも入らないまま綴りで比べられる
+    /// （`syntax::type_structure::Callable::names_only_types`）。
+    names_only_types: bool,
 }
 
 impl NormalizedSignature {
@@ -667,6 +701,7 @@ impl NormalizedSignature {
         // 綴りのまま持っている部分から型名を拾えなくなる
         let remaining_type_names = remaining_type_names_of(&read)?;
         let traceable_type_names = traceable_type_names_of(&read)?;
+        let names_only_types = read.names_only_types()?;
 
         let signature = TypeSignature {
             chunk_type: read.normalized()?,
@@ -677,6 +712,7 @@ impl NormalizedSignature {
             signature,
             remaining_type_names,
             traceable_type_names,
+            names_only_types,
         })
     }
 }
@@ -1270,6 +1306,107 @@ mod tests {
     }
 
     #[test]
+    fn test_normalized_outcome_of_a_signature_keeping_a_value_name_is_unmeasurable() {
+        // `typeof localValue` は型名のノードにならないので、辿る位置を作れない。
+        // 綴りのまま比べると、構造の違う 2 つの `localValue` が単一化可能に出る（偽陽性）
+        let outcome = normalized_outcome_of(
+            &signature_text("function currentValue(): typeof localValue"),
+            &TracedTypeNames::default(),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::SiteDependentSpelling);
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_keeping_a_computed_key_is_unmeasurable() {
+        let outcome = normalized_outcome_of(
+            &signature_text("function shaped(): { [key]: string }"),
+            &TracedTypeNames::default(),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::SiteDependentSpelling);
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_keeping_a_this_type_is_unmeasurable() {
+        // `this` が指すのは囲むクラスなので、綴りが一致しても同じ型とは限らない
+        let outcome = normalized_outcome_of(
+            &signature_text("function chained(): this"),
+            &TracedTypeNames::default(),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::SiteDependentSpelling);
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_keeping_a_module_specifier_is_unmeasurable() {
+        // 指定子は importer の位置から解決するので、同じ綴りが別の依存先を指す
+        let outcome = normalized_outcome_of(
+            &signature_text("function imported(): import(\"./local\").Thing"),
+            &TracedTypeNames::default(),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::SiteDependentSpelling);
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_burying_a_value_name_in_a_type_argument_is_unmeasurable()
+     {
+        // 分解できた形の中にも綴りのまま持つ部分は残る。外側だけを見ると取りこぼす
+        let outcome = normalized_outcome_of(
+            &signature_text("function listed(): Array<typeof localValue>"),
+            &tracing_all("Array"),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::SiteDependentSpelling);
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_keeping_an_object_type_of_names_is_normalized() {
+        // 対照。綴りのまま持つ部分があっても、型の名前だけで書かれていれば
+        // どこで書かれていても同じ型を指すので落とさない
+        let outcome = normalized_outcome_of(
+            &signature_text("function shaped(): { id: string }"),
+            &TracedTypeNames::default(),
+        );
+
+        assert!(matches!(outcome, TypeSignatureOutcome::Normalized(_)));
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_answers_the_unopened_name_before_the_site_dependent_spelling()
+     {
+        // どちらも「測れない」だが、開けなかった理由のほうが利用者の次の手に直結する
+        let traced = TracedTypeNames::default()
+            .with_unopened(vec![unopened("Amount", UnopenedReason::NoDeclarationSite)]);
+
+        let outcome = normalized_outcome_of(
+            &signature_text("function priced(a: Amount): typeof localValue"),
+            &traced,
+        );
+
+        assert_eq!(
+            outcome,
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::NoDeclarationSite,
+            }
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_answers_the_site_dependent_spelling_before_the_untraced_name()
+     {
+        // 綴りが型名でできていて初めて「その型名を辿れたか」に意味が出る。
+        // 逆に置くと、注釈が書かれている綴りへ「注釈を書くと辿れる」と答えることになる
+        let outcome = normalized_outcome_of(
+            &signature_text("function mixed(a: Untraced): typeof localValue"),
+            &TracedTypeNames::default(),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::SiteDependentSpelling);
+    }
+
+    #[test]
     fn test_normalized_outcome_of_a_signature_using_only_its_own_type_variables_is_normalized() {
         // 型変数は辿る相手が居ないので、記録が無いのは当たり前。これを「尋ねていない」に
         // 数えると、ジェネリック関数がまとめて測れない側へ落ちる
@@ -1578,11 +1715,11 @@ mod tests {
     #[test]
     fn test_normalized_outcome_of_a_spelling_ending_in_a_parenthesis_is_still_read() {
         // 対照は上の 2 つ。末尾が閉じ括弧というだけで剥がすと、この綴りの戻り値の型が消える
-        let importing = "function load(a: string): typeof import(\"./m\")";
+        let parenthesized = "function load(a: string): (string | number)";
 
         assert_eq!(
-            normalized_outcome_of(&signature_text(importing), &TracedTypeNames::default()),
-            TypeSignatureOutcome::Normalized(overload_set(&[importing]))
+            normalized_outcome_of(&signature_text(parenthesized), &TracedTypeNames::default()),
+            TypeSignatureOutcome::Normalized(overload_set(&[parenthesized]))
         );
     }
 
@@ -2217,20 +2354,6 @@ mod tests {
     }
 
     #[test]
-    fn test_a_value_named_like_a_resolved_type_is_not_substituted() {
-        // `typeof ID` の `ID` は値の名前。TypeScript は型と値で名前空間が別なので、
-        // 同じ綴りが両方にありうる。差し替えると `typeof string` という綴りになる
-        let aliased = signature_with(
-            "function pick(x: ID, y: typeof ID): void",
-            &resolving("ID", "string"),
-        );
-
-        assert!(
-            aliased.is_unifiable_with(&signature("function other(a: string, b: typeof ID): void"))
-        );
-    }
-
-    #[test]
     fn test_an_opened_alias_whose_body_starts_with_a_type_operator_is_wrapped() {
         // `type Keys = keyof string` を `Keys[]` の位置へそのまま差し込むと
         // `keyof string[]` になり、TypeScript は `keyof (string[])` と読む
@@ -2365,19 +2488,6 @@ mod tests {
 
         assert!(constrained.is_unifiable_with(&signature(
             "function other<A>(y: A extends Promise<infer U extends number> ? U : never): void"
-        )));
-    }
-
-    #[test]
-    fn test_a_qualified_value_name_after_typeof_is_not_opened() {
-        // `.` を挟んだ先も値の名前。TypeScript は型と値で名前空間が別
-        let queried = signature_with(
-            "function pick(x: ns.ID, y: typeof ns.ID): void",
-            &resolving("ns.ID", "string"),
-        );
-
-        assert!(queried.is_unifiable_with(&signature(
-            "function other(a: string, b: typeof ns.ID): void"
         )));
     }
 
@@ -2741,15 +2851,6 @@ mod tests {
         assert!(!unifiable(
             "function pick<T>(value: { T: T }): void",
             "function other<U>(entry: { U: U }): void"
-        ));
-    }
-
-    #[test]
-    fn test_a_value_named_like_a_type_variable_is_not_renamed_after_typeof() {
-        // `typeof T` の `T` は値の名前。付け替えると、綴りをそのまま持つ側と重ならなくなる
-        assert!(unifiable(
-            "function pick<T>(x: T, y: typeof T): void",
-            "function other<U>(a: U, b: typeof T): void"
         ));
     }
 

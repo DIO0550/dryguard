@@ -251,6 +251,11 @@ fn type_signature_text_of(signal: TypeSignatureMatch) -> Option<String> {
         TypeSignatureMatch::UntracedTypeName => {
             "測れない (比較に残る型名がソースに書かれていない: 型注釈を書くと辿れる)"
         }
+        // **直す先が 1 つ手前にある。** 綴りが型名になっていないので、注釈を書く前に
+        // その型へ名前を付けるところから要る
+        TypeSignatureMatch::SiteDependentSpelling => {
+            "測れない (比較に残る綴りが書かれた場所で決まる: 型に名前を付けて注釈を書く)"
+        }
         // 本数は測れなかった相手そのものなので、綴りに埋め込む。**「オーバーロードが
         // 揃わない」だけでは、利用者はどれだけ足りないのかを見られない**
         TypeSignatureMatch::OverloadSetMiscounted { counted, found } => {

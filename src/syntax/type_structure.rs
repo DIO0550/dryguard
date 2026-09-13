@@ -21,7 +21,9 @@ use std::ops::Range;
 use tree_sitter::Node;
 
 use crate::syntax::tree::{Grammar, SyntaxTree};
-use crate::syntax::type_spelling::{Wrapped, substitutable_type_name_spans_of, type_name_spans_of};
+use crate::syntax::type_spelling::{
+    Wrapped, names_only_types, substitutable_type_name_spans_of, type_name_spans_of,
+};
 
 /// 付け替えた型変数の綴りの前置き。
 ///
@@ -290,6 +292,33 @@ impl Callable {
         self.free_type_names_of(&mut Vec::new(), SpelledBinders::Counted)
     }
 
+    /// 綴りのまま持っている部分が、すべて型の名前だけで書かれているか。
+    /// 綴りのまま持っている部分を読めなければ `None`。
+    ///
+    /// **分解できた部分は見ない。** 型が書かれる場所だけを歩いて組み立てた形なので、
+    /// そこに残る綴りは型名（[`TypeStructure::Named`]）で、辿れたかどうかは型名として
+    /// 答えられる。**型名にならないのに指す先が書いた人の位置で決まる綴り**
+    /// （`typeof localValue` / `{ [key]: string }` / `import("./local").T` / `this`）は、
+    /// 分解しない側（[`TypeStructure::Spelled`]）にしか現れない。
+    pub(crate) fn names_only_types(&self) -> Option<bool> {
+        let mut names_only = true;
+
+        for declared in &self.type_parameters {
+            for annotated in [&declared.constraint, &declared.default]
+                .into_iter()
+                .flatten()
+            {
+                names_only &= annotated.names_only_types()?;
+            }
+        }
+        for parameter in &self.parameters {
+            names_only &= parameter.annotated_type.names_only_types()?;
+        }
+        names_only &= self.return_type.names_only_types()?;
+
+        Some(names_only)
+    }
+
     /// 綴りに残っている型名のうち、**宣言を辿る相手になりうるもの**。
     /// 綴りのまま持っている部分を読めなければ `None`。
     ///
@@ -474,6 +503,26 @@ impl TypeStructure {
         self.free_type_names_of(&mut Vec::new(), SpelledBinders::Counted)
     }
 
+    /// 綴りのまま持っている部分が、すべて型の名前だけで書かれているか
+    /// （[`Callable::names_only_types`]）。
+    pub(crate) fn names_only_types(&self) -> Option<bool> {
+        match self {
+            Self::Callable(callable) => callable.names_only_types(),
+            Self::Union(members) | Self::Intersection(members) => {
+                all_names_only_types(members.iter())
+            }
+            Self::Tuple(elements) => {
+                all_names_only_types(elements.iter().map(|element| &element.element))
+            }
+            Self::Array(element) => element.names_only_types(),
+            Self::Named { arguments, .. } => all_names_only_types(arguments.iter()),
+            Self::Predicate { narrowed, .. } => {
+                all_names_only_types(narrowed.iter().map(Box::as_ref))
+            }
+            Self::Spelled(spelling) => names_only_types(spelling),
+        }
+    }
+
     /// 綴りに残っている型名のうち、**宣言を辿る相手になりうるもの**
     /// （[`Callable::traceable_type_names`]）。
     pub(crate) fn traceable_type_names(&self) -> Option<BTreeSet<String>> {
@@ -627,6 +676,19 @@ impl TypeStructure {
 }
 
 /// 並べた型を、それぞれ付け替えた形。
+/// どれも型の名前だけで書かれているか。**1 つでも読めなければ `None`。**
+///
+/// 1 つも無ければ `true`（型名でない綴りが残っていない）。
+fn all_names_only_types<'a>(structures: impl Iterator<Item = &'a TypeStructure>) -> Option<bool> {
+    let mut names_only = true;
+
+    for structure in structures {
+        names_only &= structure.names_only_types()?;
+    }
+
+    Some(names_only)
+}
+
 fn renamed_members(
     members: Vec<TypeStructure>,
     scopes: &mut TypeVariableScopes,
@@ -1476,6 +1538,45 @@ mod tests {
             "<T>(x: { T: string; value: T }) => void",
             "<U>(x: { U: string; value: U }) => void"
         ));
+    }
+
+    #[test]
+    fn test_a_value_name_after_typeof_matching_a_type_variable_is_not_renamed() {
+        // `typeof T` の `T` は値の名前。TypeScript は型と値で名前空間が別なので、
+        // 付け替えがそこまで届くと、この 2 つが重なる（偽陽性）
+        assert!(!same_structure(
+            "<T>(x: T, y: typeof T) => void",
+            "<U>(x: U, y: typeof U) => void"
+        ));
+    }
+
+    #[test]
+    fn test_a_callable_type_keeping_a_value_name_does_not_name_only_types() {
+        // `typeof localValue` はどのファイルで書かれたかで指す先が変わるのに、
+        // 型名のノードにならないので辿る位置を作れない
+        let read = Callable::from_spelling("() => typeof localValue")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(read.names_only_types(), Some(false));
+    }
+
+    #[test]
+    fn test_a_callable_type_burying_a_value_name_in_a_type_argument_does_not_name_only_types() {
+        // 分解できた形の中にも綴りのまま持つ部分は残る。外側だけを見ると取りこぼす
+        let read = Callable::from_spelling("() => Array<typeof localValue>")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(read.names_only_types(), Some(false));
+    }
+
+    #[test]
+    fn test_a_callable_type_written_with_names_alone_names_only_types() {
+        // 対照。綴りのまま持つ部分があっても、型の名前だけで書かれていれば
+        // どこで書かれていても同じ型を指す
+        let read = Callable::from_spelling("(a: { id: string }) => Local")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(read.names_only_types(), Some(true));
     }
 
     #[test]

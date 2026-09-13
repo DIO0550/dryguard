@@ -801,6 +801,10 @@ fn type_signature_match_of(
         | (_, TypeSignatureOutcome::UnopenedTypeName { reason }) => {
             TypeSignatureMatch::UnopenedTypeName { reason: *reason }
         }
+        (TypeSignatureOutcome::SiteDependentSpelling, _)
+        | (_, TypeSignatureOutcome::SiteDependentSpelling) => {
+            TypeSignatureMatch::SiteDependentSpelling
+        }
         (TypeSignatureOutcome::UntracedTypeName, _)
         | (_, TypeSignatureOutcome::UntracedTypeName) => TypeSignatureMatch::UntracedTypeName,
     }

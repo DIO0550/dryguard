@@ -202,6 +202,16 @@ pub enum TypeSignatureMatch {
     /// **その型に注釈を書く**）(`rules/naming.md`「`untraced type name` と
     /// `unopened` を混ぜない」)。
     UntracedTypeName,
+    /// **比較に残る綴りに、指す先が書かれた場所で決まる綴りが現れた。**
+    ///
+    /// `typeof localValue` / `{ [key]: string }` / `import("./local").T` / `this` は
+    /// 型名のノードにならないので辿る位置を作れない。綴りのまま比べると、**別々の
+    /// ファイルの構造の違う値が単一化可能に出る**（偽陽性）。
+    ///
+    /// **`UntracedTypeName` と混ぜない。** あちらは型名なので注釈を書けば辿れるが、
+    /// こちらは**型名にするところから要る**（`rules/naming.md`
+    /// 「`site-dependent spelling` を `untraced type name` と混ぜない」）。
+    SiteDependentSpelling,
 }
 
 /// 呼び出し元ドメインの重なりのシグナル（Stage 2）。

@@ -790,6 +790,25 @@ fn test_compare_with_an_lsp_does_not_unify_two_inferred_return_types_spelled_ali
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_does_not_unify_two_local_values_spelled_alike_after_typeof() {
+    // どちらのファイルも自分だけの `localValue` を持っていて、中身は別物
+    // （`{ invoiceId: string }` と `{ rowCount: number }`）。**hover はどちらも
+    // `typeof localValue` と返す**が、`localValue` は値の名前で型名のノードにならないので
+    // 尋ねる位置を作れない（`syntax::type_reference`）。綴りのまま比べると
+    // 単一化可能に出る（偽陽性）
+    let holds_a_billing_shape = fixture("references/src/billing/localShape.ts", 3);
+    let holds_a_report_shape = fixture("references/src/report/localShape.ts", 3);
+
+    let measured = measured_with_an_lsp(&holds_a_billing_shape, &holds_a_report_shape);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::SiteDependentSpelling
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_an_lsp_unifies_two_generic_functions_of_the_same_shape() {
     // 対照は上のテスト。**型変数にも辿った記録は無いが、辿る相手が居ない。**
     // これを「尋ねていない」に数えると、戻り値を注釈したジェネリック関数まで
