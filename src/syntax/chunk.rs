@@ -24,8 +24,7 @@ use crate::syntax::tree::{
     SyntaxTree, source_position_of, transparent_wrappers_of, unwrapped_parent_of,
 };
 use crate::syntax::type_reference::{
-    TypeReference, constructed_class_of, constructed_class_references_of, type_references_in,
-    type_references_of,
+    TypeReference, constructed_class_of, constructed_class_references_of, type_references_of,
 };
 
 /// 比較の単位。関数・メソッド 1 つ分のソースと、それがどこにあったか。
@@ -403,12 +402,6 @@ const TYPE_FIELD: &str = "type";
 /// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
 const PARAMETER_KINDS: [&str; 2] = ["required_parameter", "optional_parameter"];
 
-/// 変数の宣言を並べる文の種別。
-const DECLARATION_KINDS: [&str; 2] = ["lexical_declaration", "variable_declaration"];
-
-/// 宣言 1 つ分のノードの種別。
-const DECLARATOR_KIND: &str = "variable_declarator";
-
 /// **書かれた型をその式の型として言い切る**包みの種別。
 ///
 /// `x as T` と `<T>x` の 2 つで、どちらも hover が返す綴りは書かれた `T` になる。
@@ -508,7 +501,7 @@ fn overload_declarations_of(node: Node<'_>, source: &str) -> Vec<OverloadDeclara
 fn value_type_annotation_of(node: Node<'_>, source: &str) -> ValueTypeAnnotation {
     // 外側の型が綴り全体を決める形（`const handler: Handler = (x) => x`）。
     // hover はその型を返すので、戻り値の位置にも推論された型名は現れない
-    if outer_type_decides_the_spelling(node, source) {
+    if outer_type_decides_the_spelling(node) {
         return ValueTypeAnnotation::Written;
     }
 
@@ -536,13 +529,23 @@ fn value_type_annotation_of(node: Node<'_>, source: &str) -> ValueTypeAnnotation
 /// **自分の名前を持つチャンクでは決めない。** hover はその名前を指すので、返るのは
 /// 関数自身の型になる（[`name_node_of`] の Why と同じ分かれ目）。
 ///
-/// 決めるのは 3 つ。**型を言い切る包み**（[`TYPE_ASSERTION_KINDS`]）、
-/// **代入先の型注釈**（`const handler: Handler = …`）、それに
-/// **宣言と代入が離れている形の、宣言側の型注釈**（`let handler: Handler;` `handler = …`）。
+/// 決めるのは 2 つ。**型を言い切る包み**（[`TYPE_ASSERTION_KINDS`]）と、
+/// **代入先の型注釈**（`const handler: Handler = …`）。
 ///
 /// **言い切る包みは 1 つでもあれば決まる。** `((x) => x) as A satisfies B` の型は `A` で、
 /// 外側に `satisfies` が重なっても言い切った型のほうが残る。
-fn outer_type_decides_the_spelling(node: Node<'_>, source: &str) -> bool {
+///
+/// **見るのはこのチャンク自身が持つ注釈だけ。** 宣言と代入が離れている形
+/// （`let handler: Handler;` のあとで `handler = (x) => x`）では、hover が返すのは
+/// 宣言側の注釈だが、それを辿るには**どの束縛を指しているか**を決める必要がある。
+/// 変数の隠蔽・型名の隠蔽・引数の束縛をそれぞれ見分けることになり、
+/// **スコープ解決をここで作り直す**ことになる。倒れる向きは偽陰性（測れる答えを失う）。
+///
+/// **Why not（代入先を宣言まで辿る）**: 一度入れて外した。実コーパス
+/// （rxjs 7.8.1 の `src`、尋ねた 517 チャンク）で測ると**取り戻せた `Normalized` は 0 件**で、
+/// 代わりに隠蔽を見分け損ねた形が偽陽性へ倒れた。指す先を決めるのは `semantics` の担当で、
+/// `syntax` が持つのは**どこを指して尋ねればよいか**まで（`rules/architecture.md`）。
+fn outer_type_decides_the_spelling(node: Node<'_>) -> bool {
     if node.child_by_field_name(NAME_FIELD).is_some() {
         return false;
     }
@@ -553,100 +556,7 @@ fn outer_type_decides_the_spelling(node: Node<'_>, source: &str) -> bool {
     let assigned =
         unwrapped_parent_of(node).and_then(|parent| parent.child_by_field_name(TYPE_FIELD));
 
-    asserted || assigned.is_some() || assigned_target_annotation_of(node, source).is_some()
-}
-
-/// 代入先の名前が、**宣言のところで**持っている型注釈。宣言が無い / 注釈が無ければ `None`。
-///
-/// `node` はチャンクのノード、`source` はそれを含むファイル全体のソース。
-///
-/// 宣言と代入が離れていると（`let handler: Handler;` のあとで `handler = (x) => x`）、
-/// **代入の式には注釈が載らない**。代入の側だけを見ると「省かれている」に落ちるが、
-/// hover が返すのは宣言に書かれた注釈のほう。
-///
-/// **同じファイルの同じ綴りは同じ型を指す**ので、宣言側の注釈に現れる型名は、
-/// チャンクの注釈から集めた記録で引いてよい（`syntax::type_reference`）。
-/// 別のファイルの宣言が綴りを決める形（文脈から型付けされたオブジェクトのメンバー）とは
-/// ここが違う。
-///
-/// **見るのは左辺が素の識別子のときだけ。** `obj.handler = …` の綴りを決めるのは
-/// `obj` の型で、その宣言は別のファイルにありうる。辿れない形は「省かれている」へ
-/// 倒れる（偽陰性）(`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
-fn assigned_target_annotation_of<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
-    let parent = unwrapped_parent_of(node)?;
-    if parent.kind() != ASSIGNMENT_KIND {
-        return None;
-    }
-
-    let assigned = parent.child_by_field_name("left")?;
-    if assigned.kind() != IDENTIFIER_KIND {
-        return None;
-    }
-    let name = source.get(assigned.byte_range())?;
-
-    // **いちばん内側の束縛で止める。** 隠している宣言を飛び越えると、
-    // 外側の別の変数の注釈を、この代入の綴りを決めたものとして読むことになる
-    let mut scope = parent.parent();
-    while let Some(current) = scope {
-        match binding_declared_in(current, name, source) {
-            DeclaredBinding::Absent => scope = current.parent(),
-            DeclaredBinding::Unannotated => return None,
-            DeclaredBinding::Annotated(annotation) => return Some(annotation),
-        }
-    }
-
-    None
-}
-
-/// スコープ 1 つ分を見た、その名前の束縛。
-///
-/// **「宣言が無い」と「宣言はあるが注釈が無い」を同じ値で表さない。** 1 つにまとめると、
-/// 隠している宣言を飛び越えて**外側の別の変数の注釈**を拾う
-/// (`rules/coding.md`「不正な状態を型で表現できなくする」)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeclaredBinding<'tree> {
-    /// その名前を宣言していない。外側のスコープを続けて見る。
-    Absent,
-    /// その名前を宣言しているが、型注釈が無い。**外側は見ない。**
-    Unannotated,
-    /// 型注釈付きで宣言している。
-    Annotated(Node<'tree>),
-}
-
-/// そのノードの直下で、その名前がどう宣言されているか。
-///
-/// `scope` は探す範囲のノード、`name` は代入先の綴り、`source` はファイル全体のソース。
-///
-/// **直下だけを見る。** 文はスコープの直接の子に並ぶので、入れ子まで降りると
-/// 別のスコープの同名の宣言を拾う。**包みの中の宣言**（`export let handler: Handler;`）は
-/// ここでは見つからず、「省かれている」へ倒れる（偽陰性）。
-fn binding_declared_in<'tree>(
-    scope: Node<'tree>,
-    name: &str,
-    source: &str,
-) -> DeclaredBinding<'tree> {
-    let mut cursor = scope.walk();
-
-    let declarator = scope.named_children(&mut cursor).find_map(|statement| {
-        if !DECLARATION_KINDS.contains(&statement.kind()) {
-            return None;
-        }
-
-        let mut declared = statement.walk();
-        statement.named_children(&mut declared).find(|declarator| {
-            declarator.kind() == DECLARATOR_KIND
-                && declared_name_of(*declarator, source) == Some(name)
-        })
-    });
-
-    let Some(declarator) = declarator else {
-        return DeclaredBinding::Absent;
-    };
-
-    match declarator.child_by_field_name(TYPE_FIELD) {
-        Some(annotation) => DeclaredBinding::Annotated(annotation),
-        None => DeclaredBinding::Unannotated,
-    }
+    asserted || assigned.is_some()
 }
 
 /// そのノードが、プロパティへ書く側のアクセサか。
@@ -695,20 +605,14 @@ fn sole_parameter_annotation_of(node: Node<'_>) -> ValueTypeAnnotation {
 fn chunk_type_references_of(node: Node<'_>, source: &str) -> Vec<TypeReference> {
     let mut references = type_references_of(&signature_nodes_of(node, source), source);
 
-    // 宣言と代入が離れていると、綴りを決める注釈はチャンクから辿れない場所にある。
-    // 集めないと、そこにだけ現れる型名が「尋ねていない」に当たって測れなくなる
-    let declared = assigned_target_annotation_of(node, source)
-        .map(|annotation| type_references_in(annotation, source))
-        .unwrap_or_default();
-
-    for written in declared
-        .into_iter()
-        .chain(constructed_class_references_of(node, source))
-    {
-        if references.iter().any(|kept| kept.name() == written.name()) {
+    for constructed in constructed_class_references_of(node, source) {
+        if references
+            .iter()
+            .any(|kept| kept.name() == constructed.name())
+        {
             continue;
         }
-        references.push(written);
+        references.push(constructed);
     }
 
     references
@@ -1726,64 +1630,6 @@ function broken() {
     }
 
     #[test]
-    fn test_an_arrow_function_assigned_to_a_separately_annotated_name_writes_its_value_type() {
-        // 宣言と代入が離れていると**代入の式には注釈が載らない**が、hover が返すのは
-        // 宣言に書かれた注釈のほう。代入の側だけを見ると「省かれている」に落ちる
-        let declared = "let build: (x: Amount) => Amount;\nbuild = (x: Amount) => x;\n";
-
-        assert_eq!(
-            value_type_of(declared, "a.ts:2"),
-            ValueTypeAnnotation::Written
-        );
-    }
-
-    #[test]
-    fn test_an_arrow_function_assigned_to_a_separately_declared_bare_name_omits_its_value_type() {
-        // 対照は上のテスト。宣言から注釈を外しただけの違い
-        let declared = "let build;\nbuild = (x: Amount) => x;\n";
-
-        assert_eq!(
-            value_type_of(declared, "a.ts:2"),
-            ValueTypeAnnotation::Omitted
-        );
-    }
-
-    #[test]
-    fn test_an_arrow_function_assigned_to_a_shadowing_bare_name_omits_its_value_type() {
-        // 内側の宣言が外側の同名を**隠している**。飛び越えて外側の注釈を拾うと、
-        // 別の変数の注釈をこの代入の綴りを決めたものとして読むことになる
-        let shadowed = "let build: Builder = (x) => x;\nexport function setup() {\n  let build = (x: Amount) => x;\n  build = (x: Amount) => x;\n  return build;\n}\n";
-
-        assert_eq!(
-            value_type_of(shadowed, "a.ts:4"),
-            ValueTypeAnnotation::Omitted
-        );
-    }
-
-    #[test]
-    fn test_an_arrow_function_assigned_to_a_shadowing_annotated_name_writes_its_value_type() {
-        // 対照は上のテスト。内側の宣言に注釈を足しただけの違い
-        let shadowed = "let build: Builder = (x) => x;\nexport function setup() {\n  let build: (x: Amount) => Amount = (x) => x;\n  build = (x: Amount) => x;\n  return build;\n}\n";
-
-        assert_eq!(
-            value_type_of(shadowed, "a.ts:4"),
-            ValueTypeAnnotation::Written
-        );
-    }
-
-    #[test]
-    fn test_an_arrow_function_assigned_to_a_property_omits_its_value_type() {
-        // 綴りを決めるのは `obj` の型で、その宣言は別のファイルにありうる。
-        // 辿れない形は「省かれている」へ倒す
-        let assigned = "const obj: Holder = { handler: null };\nobj.handler = (x: Amount) => x;\n";
-
-        assert_eq!(
-            value_type_of(assigned, "a.ts:2"),
-            ValueTypeAnnotation::Omitted
-        );
-    }
-
-    #[test]
     fn test_an_arrow_function_assigned_to_a_bare_name_omits_its_value_type() {
         // 対照は上の 2 つ。外側の注釈を外しただけの違い
         let bare = "const build = (x: Amount) => x;\n";
@@ -1926,17 +1772,6 @@ export function overloaded(a: unknown): unknown {
             .iter()
             .map(TypeReference::name)
             .collect()
-    }
-
-    #[test]
-    fn test_chunk_type_references_cover_the_separately_declared_target_annotation() {
-        // 宣言と代入が離れていると、綴りを決める注釈はチャンクから辿れない場所にある。
-        // 集めないと、そこにだけ現れる型名が「尋ねていない」に当たって測れなくなる
-        let declared = "let build: (x: string) => Receipt;\nbuild = (x) => make(x);\n";
-
-        let chunk = chunk_at(declared, "a.ts:2").expect("切り出せる");
-
-        assert_eq!(type_names_of(&chunk), vec!["Receipt"]);
     }
 
     #[test]
