@@ -8,6 +8,7 @@ use std::num::NonZeroUsize;
 
 use crate::semantics::caller_domain::CallerDomains;
 use crate::semantics::resolved_type::UnopenedReason;
+use crate::semantics::type_signature::UntracedReason;
 use crate::similarity::Similarity;
 use crate::syntax::import::ImportsUnavailable;
 use crate::syntax::module_distance::ModuleDistance;
@@ -193,22 +194,25 @@ pub enum TypeSignatureMatch {
     },
     /// **比較に残る綴りに現れる**型名を、そもそも尋ねていない。
     ///
-    /// 戻り値の注釈を省いた関数では、hover の綴りに構文木のどこにも無い型名が現れ、
-    /// `typeDefinition` を向ける位置を作れない。綴りのまま比べると、**別々のファイルが
-    /// 同じ綴りで宣言した構造の違う型が単一化可能に出る**（偽陽性）。
+    /// `typeDefinition` を向ける位置を作れなかった型名は綴りのまま残る。綴りのまま
+    /// 比べると、**別々のファイルが同じ綴りで宣言した構造の違う型が単一化可能に出る**
+    /// （偽陽性）。
     ///
     /// **`UnopenedTypeName` と混ぜない。** あちらは尋ねた結果辿れなかったもので、
     /// 利用者が次にすることが違う（あちらはサーバやファイルの側、こちらは
-    /// **その型に注釈を書く**）(`rules/naming.md`「`untraced type name` と
+    /// **対象のコードか dryguard の側**）(`rules/naming.md`「`untraced type name` と
     /// `unopened` を混ぜない」)。
-    UntracedTypeName,
+    UntracedTypeName {
+        /// 尋ねていない理由。
+        reason: UntracedReason,
+    },
     /// **比較に残る綴りに、指す先が書かれた場所で決まる綴りが現れた。**
     ///
     /// `typeof localValue` / `{ [key]: string }` / `import("./local").T` / `this` は
     /// 型名のノードにならないので辿る位置を作れない。綴りのまま比べると、**別々の
     /// ファイルの構造の違う値が単一化可能に出る**（偽陽性）。
     ///
-    /// **`UntracedTypeName` と混ぜない。** あちらは型名なので注釈を書けば辿れるが、
+    /// **`UntracedTypeName` と混ぜない。** あちらは型名なので尋ねる位置を作れるが、
     /// こちらは**型名にするところから要る**（`rules/naming.md`
     /// 「`site-dependent spelling` を `untraced type name` と混ぜない」）。
     SiteDependentSpelling,

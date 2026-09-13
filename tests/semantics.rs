@@ -25,7 +25,7 @@ use dryguard::report::text_of;
 use dryguard::semantics::caller_domain::CallerDomains;
 use dryguard::semantics::resolved_type::traced_type_names_of;
 use dryguard::semantics::type_signature::{
-    OverloadSet, TypeSignatureOutcome, type_signature_outcome_of,
+    OverloadSet, TypeSignatureOutcome, UntracedReason, type_signature_outcome_of,
 };
 use dryguard::syntax::chunk::Chunk;
 
@@ -90,7 +90,7 @@ fn session_over(paths: &[PathBuf]) -> Session {
 /// **辿るところまでは省けない。** 書かれた型名を尋ねずに渡すと、比較に残る綴りの型名が
 /// 「そもそも尋ねていない」に当たり、正規化まで進まずに `UntracedTypeName` になる
 /// （`rules/architecture.md`「どこまでを「取れなかった」に数えるか」）。**本番でも
-/// 書かれた型名は必ず尋ねる**ので、尋ねていない状態を渡すほうが実態から離れている。
+/// `syntax` が集めた型名は必ず尋ねる**ので、尋ねていない状態を渡すほうが実態から離れている。
 fn type_signature_of(session: &mut Session, chunk: &Chunk) -> OverloadSet {
     let document = document(chunk.path());
     if session.open_document(&document).is_err() {
@@ -787,7 +787,9 @@ fn test_compare_with_an_lsp_does_not_unify_an_inferred_return_type_spelled_like_
 
     assert_eq!(
         measured.signals().type_signature_match(),
-        TypeSignatureMatch::UntracedTypeName
+        TypeSignatureMatch::UntracedTypeName {
+            reason: UntracedReason::OmittedValueTypeAnnotation
+        }
     );
 }
 
@@ -823,7 +825,31 @@ fn test_compare_with_an_lsp_does_not_unify_two_inferred_return_types_spelled_ali
 
     assert_eq!(
         measured.signals().type_signature_match(),
-        TypeSignatureMatch::UntracedTypeName
+        TypeSignatureMatch::UntracedTypeName {
+            reason: UntracedReason::OmittedValueTypeAnnotation
+        }
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_does_not_blame_a_missing_annotation_for_a_contextually_typed_parameter()
+{
+    // どちらのファイルも、名前付き関数式の引数の型を**代入先の注釈から**受け取る。
+    // hover は `(local function) inner(figure: Shape): void` を返し、`Shape` は
+    // **ソースに書かれている**のに `syntax::type_reference` が集める場所の一覧から漏れる。
+    // 「注釈を書くと辿れる」と出すと、**注釈を書いてある利用者に嘘の案内**になる
+    let traces_a_billing_shape = fixture("references/src/billing/contextual.ts", 4);
+    let traces_a_report_shape = fixture("references/src/report/contextual.ts", 4);
+
+    let measured = measured_with_an_lsp(&traces_a_billing_shape, &traces_a_report_shape);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::UntracedTypeName {
+            reason: UntracedReason::NoTracedRecord
+        },
+        "集め損ねかもしれない側の理由になる"
     );
 }
 
