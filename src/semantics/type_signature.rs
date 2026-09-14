@@ -134,10 +134,9 @@ pub enum TypeSignatureOutcome {
     },
     /// **比較に残る綴りに現れる**型名を、そもそも尋ねていない。
     ///
-    /// 戻り値の注釈を省いた関数では、hover の綴りに推論された型名が現れるのに
-    /// **構文木のどこにもその名前が無く**、`typeDefinition` を向ける位置を作れない
-    /// （`syntax::type_reference`）。綴りのまま比べると、**別々のファイルが同じ綴りで
-    /// 宣言した構造の違う型が単一化可能に出る**（偽陽性）。
+    /// `typeDefinition` は**ソースの 1 点を指して**尋ねる問い合わせなので、
+    /// 尋ねる位置を作れなかった型名は綴りのまま残る。綴りのまま比べると、
+    /// **別々のファイルが同じ綴りで宣言した構造の違う型が単一化可能に出る**（偽陽性）。
     ///
     /// **[`TypeSignatureOutcome::UnopenedTypeName`] と混ぜない。** あちらは
     /// 尋ねた結果辿れなかったもので、**利用者が次にすることが違う**
@@ -149,8 +148,11 @@ pub enum TypeSignatureOutcome {
     /// **Why not（どの型名だったかを持つ）**: このバリアントは
     /// `classification::signal::TypeSignatureMatch` まで運ばれ、あちらは `Copy`。
     /// 綴りを持たせると `Copy` が外れ、判定の側が文字列を持ち回ることになる。
-    /// 直す先は綴りによらず同じ（**その型に注釈を書く**）ので、名前は答えを変えない。
-    UntracedTypeName,
+    /// [`UntracedReason`] は値を持たないので `Copy` のまま運べる。
+    UntracedTypeName {
+        /// 尋ねていない理由。
+        reason: UntracedReason,
+    },
     /// **比較に残る綴りに、指す先が書かれた場所で決まる綴りが現れた。**
     ///
     /// 値の名前（`typeof localValue`）・オブジェクト型の計算されたキー
@@ -159,10 +161,44 @@ pub enum TypeSignatureOutcome {
     /// 辿らない。綴りのまま比べると、**別々のファイルの構造の違う `localValue` が
     /// 単一化可能に出る**（偽陽性）。
     ///
-    /// **[`TypeSignatureOutcome::UntracedTypeName`] と混ぜない。** あちらは型名なので
-    /// 尋ねる位置を作れる（注釈を書けば辿れる）が、こちらは**型名にするところから要る**
+    /// **[`TypeSignatureOutcome::UntracedTypeName`] と混ぜない。** あちらは**型名ではある**ので
+    /// 注釈を書けば尋ねる位置ができうるが、こちらは**型名にするところから要る**
     /// （`rules/naming.md`「`site-dependent spelling` を `untraced type name` と混ぜない」）。
+    ///
+    /// **あちらが必ず注釈で直るとは限らない。** [`UntracedReason::NoTracedRecord`] は
+    /// **注釈が書かれているのに集め損ねた**形を含む。それでも「型名かどうか」の線は動かない。
     SiteDependentSpelling,
+}
+
+/// 比較に残る綴りの型名を尋ねていない理由。
+///
+/// **言い切れることが違うので分ける。** 片方は注釈が無いことを構文木から確かめてあり、
+/// もう片方は**確かめられていない**。1 語で呼ぶと、確かめてある原因まで
+/// 「区別できない」という文で覆うことになる
+/// (`rules/coding.md`「エラー型は原因ごとにバリアントを分ける」)。
+///
+/// **[`UnopenedReason`] と混ぜない。** あちらはサーバやファイルの側の理由で、
+/// こちらは**対象のコードか dryguard の側**の話
+/// (`rules/naming.md`「`untraced type name` と `unopened` を混ぜない」)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UntracedReason {
+    /// そのチャンクが値の型の注釈を省いていて、値の型の位置に型名が残る。
+    ///
+    /// **注釈が無いことは確かめてある**（`syntax::chunk` の `ValueTypeAnnotation`）。
+    /// 書かれていない出現なので、同じ綴りの書かれた出現の記録を綴りで引かない
+    /// (`rules/architecture.md`「どこまでを「取れなかった」に数えるか」)。
+    OmittedValueTypeAnnotation,
+    /// 比較に残る綴りの型名に、辿った記録が 1 つも無い。
+    ///
+    /// **ソースに書かれていないのか、`syntax::type_reference` が集め損ねたのかを
+    /// 区別できない。** 集める場所の一覧は TypeScript の文法が持つ形の数だけ増え続けるので、
+    /// 「書かれていない」と言い切ると**注釈を書いてある利用者へ嘘の案内を出す**
+    /// （名前付き関数式が代入先の注釈から引数の型を受け取る形が実例）。
+    ///
+    /// **倒れる向きは偽陰性のまま。** 集め損ねても綴りのまま比べに行かないので、
+    /// 変わるのは出方だけ（`rules/coding.md`「列挙で判定を組むときは、
+    /// 漏れの倒れる向きを選ぶ」）。
+    NoTracedRecord,
 }
 
 /// その名前が持つ型シグネチャを揃えて、正規化した形にする。
@@ -323,7 +359,9 @@ fn single_outcome_of(
         return unreadable_outcome_of(spelling, traced);
     };
 
-    // 名前順で先に来るものを出す。尋ねた順に任せると、同じ綴りが巡ごとに違う理由を出す。
+    // **「尋ねていない」より先に見る。** どちらも「測れない」だが、開けなかった理由のほうが
+    // 利用者の次の手（サーバを替える / ファイルを読めるようにする）に直結する。
+    // 名前順で先に来るものを出す。尋ねた順に任せると、同じ綴りが巡ごとに違う理由を出す
     let unopened = normalized
         .remaining_type_names
         .iter()
@@ -333,9 +371,11 @@ fn single_outcome_of(
         return TypeSignatureOutcome::UnopenedTypeName { reason };
     }
 
-    // **「尋ねていない」より先に見る。** どちらも対象のコードに注釈を書く話だが、
-    // こちらは**型に名前を付ける一手が余分に要る**。手数の多いほうを先に出さないと、
-    // 注釈を書いた利用者が同じ「測れない」で戻ってくる
+    // **「尋ねていない」より先に見る。** こちらは**型に名前を付けるところから要る**ので、
+    // 注釈を書けば位置ができうる側より手数が多い。手数の多いほうを先に出さないと、
+    // 注釈を書いた利用者が同じ「測れない」で戻ってくる。
+    // **「尋ねていない」側が必ず注釈で直るわけではない**（`UntracedReason::NoTracedRecord`）が、
+    // 型名ですらないこちらは**どう書いても位置ができない**ので、並びは変わらない
     if !normalized.names_only_types {
         return TypeSignatureOutcome::SiteDependentSpelling;
     }
@@ -350,16 +390,26 @@ fn single_outcome_of(
         .is_none_or(|names| !names.is_empty());
     let inferred_value_type = value_type == ValueTypeAnnotation::Omitted && value_type_holds_a_name;
 
-    // **開けなかった型名を先に見る。** どちらも「測れない」だが、開けなかった理由のほうが
-    // 利用者の次の手（サーバを替える / ファイルを読めるようにする）に直結する
-    let untraced = inferred_value_type
-        || normalized
-            .traceable_type_names
-            .iter()
-            .any(|name| !is_traced(name, traced));
+    // **確かめてある理由を先に出す。** ここは注釈が無いことを構文木から確かめてあるので、
+    // 直す先を言い切ってよい。両方に当たるときに下の枝を先に出すと、
+    // **確かめてある原因を「区別できない」という文で覆う**ことになる
+    if inferred_value_type {
+        return TypeSignatureOutcome::UntracedTypeName {
+            reason: UntracedReason::OmittedValueTypeAnnotation,
+        };
+    }
 
-    if untraced {
-        return TypeSignatureOutcome::UntracedTypeName;
+    // **記録が無いことしか言えない。** 書かれていないのか `syntax::type_reference` が
+    // 集め損ねたのかはここからは分からないので、理由を分けて出方に残す
+    let no_traced_record = normalized
+        .traceable_type_names
+        .iter()
+        .any(|name| !is_traced(name, traced));
+
+    if no_traced_record {
+        return TypeSignatureOutcome::UntracedTypeName {
+            reason: UntracedReason::NoTracedRecord,
+        };
     }
 
     TypeSignatureOutcome::Normalized(OverloadSet::of_one(normalized.signature))
@@ -369,7 +419,12 @@ fn single_outcome_of(
 ///
 /// 宣言の場所が取れた・開いた綴りが取れた・開けなかった、の**どれかに入っていれば
 /// 尋ねている**。どれにも無ければ `syntax` がその名前を集めておらず、**そもそも
-/// 尋ねていない**（`syntax::type_reference` は**ソースに書かれた型名しか集められない**）。
+/// 尋ねていない**。
+///
+/// **集めなかった理由までは言えない。** ソースに書かれていないのか
+/// （`syntax::type_reference` は書かれた型名しか集められない）、書かれているのに
+/// 集める場所の一覧から漏れたのかは、ここからは区別が付かない
+/// （[`UntracedReason::NoTracedRecord`]）。
 ///
 /// **束縛された型変数はここへ来ない。** `syntax::type_structure` が型名から外すので、
 /// 比較に残る綴りの型名に現れない。
@@ -1300,9 +1355,9 @@ mod tests {
 
     /// テストが渡す綴りは読み取れる前提で組み立てる。**書かれた型名はすべて辿れた前提。**
     ///
-    /// **本番では、ソースに書かれた型名は必ず尋ねる**（`pipeline` が
+    /// **本番では、`syntax` が集めた型名は必ず尋ねる**（`pipeline` が
     /// `Chunk::type_references` を渡す）。辿った記録がまったく無い型名が比較に残るのは
-    /// **ソースに書かれていない型名のときだけ**なので、そちらは
+    /// **書かれていないか、集める場所の一覧から漏れたとき**なので、そちらは
     /// [`TypeSignatureOutcome::UntracedTypeName`] の側のテストで見る。
     fn signature(text: &str) -> OverloadSet {
         signature_tracing(text, &tracing_all(text))
@@ -1395,7 +1450,12 @@ mod tests {
             &TracedTypeNames::default(),
         );
 
-        assert_eq!(outcome, TypeSignatureOutcome::UntracedTypeName);
+        assert_eq!(
+            outcome,
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord
+            }
+        );
     }
 
     #[test]
@@ -1446,7 +1506,12 @@ mod tests {
             &tracing_all("Amount"),
         );
 
-        assert_eq!(outcome, TypeSignatureOutcome::UntracedTypeName);
+        assert_eq!(
+            outcome,
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation
+            }
+        );
     }
 
     #[test]
@@ -1461,7 +1526,32 @@ mod tests {
             &tracing_one("Amount", "{ shared: number }", "/repo/src/written.ts"),
         );
 
-        assert_eq!(outcome, TypeSignatureOutcome::UntracedTypeName);
+        assert_eq!(
+            outcome,
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation
+            }
+        );
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_omitting_its_value_type_answers_that_before_a_missing_record()
+     {
+        // 2 つの枝に同時に当たる形（値の型の注釈が省かれていて、引数の `Missing` にも
+        // 記録が無い）。**確かめてある理由のほうを出す。** 記録が無いほうを先に出すと、
+        // 注釈が無いと確かめてあるのに「区別できない」という文で覆うことになる
+        let outcome = normalized_outcome_of(
+            &signature_text("function build(a: Missing): Amount"),
+            ValueTypeAnnotation::Omitted,
+            &TracedTypeNames::default(),
+        );
+
+        assert_eq!(
+            outcome,
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation
+            }
+        );
     }
 
     #[test]
@@ -1517,7 +1607,12 @@ mod tests {
             &tracing_all("Outer"),
         );
 
-        assert_eq!(outcome, TypeSignatureOutcome::UntracedTypeName);
+        assert_eq!(
+            outcome,
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation
+            }
+        );
     }
 
     #[test]
@@ -1529,7 +1624,12 @@ mod tests {
             &tracing_all("Amount"),
         );
 
-        assert_eq!(outcome, TypeSignatureOutcome::UntracedTypeName);
+        assert_eq!(
+            outcome,
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation
+            }
+        );
     }
 
     #[test]
@@ -1542,7 +1642,12 @@ mod tests {
             &tracing_all("Amount"),
         );
 
-        assert_eq!(outcome, TypeSignatureOutcome::UntracedTypeName);
+        assert_eq!(
+            outcome,
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation
+            }
+        );
     }
 
     #[test]

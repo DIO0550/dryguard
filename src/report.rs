@@ -18,6 +18,7 @@ use crate::location::Location;
 use crate::pipeline::{Scan, SkippedFile};
 use crate::semantics::caller_domain::CallerDomains;
 use crate::semantics::resolved_type::UnopenedReason;
+use crate::semantics::type_signature::UntracedReason;
 use crate::syntax::import::ImportsUnavailable;
 use crate::syntax::module_distance::ModuleDistance;
 use crate::threshold::Threshold;
@@ -246,11 +247,7 @@ fn type_signature_text_of(signal: TypeSignatureMatch) -> Option<String> {
         TypeSignatureMatch::UnreadableSignature => "測れない (返った綴りを読み解けない)",
         TypeSignatureMatch::HoverNotProvided => "測れない (サーバが hover を提供していない)",
         TypeSignatureMatch::UnopenedTypeName { reason } => unopened_text_of(reason),
-        // **直す先を出す。** 開けなかったのとは違い、サーバの側でできることは無く、
-        // 対象のコードに注釈を書くと尋ねる位置ができる
-        TypeSignatureMatch::UntracedTypeName => {
-            "測れない (比較に残る型名がソースに書かれていない: 型注釈を書くと辿れる)"
-        }
+        TypeSignatureMatch::UntracedTypeName { reason } => untraced_text_of(reason),
         // **ここだけ直す先を出さない。** 形ごとに直し方が違い、`this` 型は
         // **囲むクラスの外へ出せない**（型エイリアスに移せず、クラス名に置き換えると
         // 部分型での振る舞いが変わる）。1 つの文にまとめると、直せない相手へ
@@ -268,6 +265,28 @@ fn type_signature_text_of(signal: TypeSignatureMatch) -> Option<String> {
     };
 
     Some(text.to_owned())
+}
+
+/// 比較に残る型名を尋ねていない理由。
+///
+/// **言い切る側と言い切らない側を分ける。** 注釈が省かれているのは構文木から
+/// 確かめてあるので直す先を出せるが、記録が無いことしか言えないほうは
+/// **dryguard が集め損ねただけかもしれない**
+/// （`semantics::type_signature::UntracedReason`）。
+fn untraced_text_of(reason: UntracedReason) -> &'static str {
+    match reason {
+        // **直す先を出す。** 開けなかったのとは違い、サーバの側でできることは無く、
+        // 対象のコードに注釈を書くと尋ねる位置ができる
+        UntracedReason::OmittedValueTypeAnnotation => {
+            "測れない (値の型の注釈が省かれている: 注釈を書くと辿れる)"
+        }
+        // **直す先を言い切らない。** 型名を集める場所の一覧は TypeScript の文法が持つ
+        // 形の数だけ増え続けるので、「書かれていない」と出すと**注釈を書いてある
+        // 利用者へ嘘の案内を出す**ことになる
+        UntracedReason::NoTracedRecord => {
+            "測れない (比較に残る型名を尋ねていない: ソースに書かれていないか、dryguard が集め損ねている)"
+        }
+    }
 }
 
 /// 比較に残る型名を開けなかった理由。
@@ -885,6 +904,48 @@ mod tests {
                 "型シグネチャ: 測れない (比較に残る型名を開けない: typeDefinition の応答を読めない) → どちらでもない"
             ),
             "読めなかったことが理由として出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_an_omitted_value_type_annotation_points_at_the_annotation_to_write() {
+        // 注釈が省かれているのは構文木から確かめてあるので、**直す先を言い切ってよい**
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (値の型の注釈が省かれている: 注釈を書くと辿れる) → どちらでもない"
+            ),
+            "注釈を書けば辿れることまで出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_no_traced_record_does_not_claim_the_annotation_is_missing() {
+        // 対照は 1 つ上のテスト。どちらも「尋ねていない」だが、**こちらは注釈が
+        // 書かれているのに集め損ねただけかもしれない**。書かれていないと言い切ると、
+        // 注釈を書いてある利用者に嘘の案内を出す
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (比較に残る型名を尋ねていない: ソースに書かれていないか、dryguard が集め損ねている) → どちらでもない"
+            ),
+            "dryguard 側の穴かもしれないことが読める: {text}"
         );
     }
 

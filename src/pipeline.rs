@@ -28,7 +28,9 @@ use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outco
 use crate::semantics::resolved_type::{
     TypeDeclaration, UnopenedReason, UnopenedTypeName, opened_type_names_of, traced_type_names_of,
 };
-use crate::semantics::type_signature::{TypeSignatureOutcome, type_signature_outcome_of};
+use crate::semantics::type_signature::{
+    TypeSignatureOutcome, UntracedReason, type_signature_outcome_of,
+};
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks};
 use crate::syntax::import::ImportsUnavailable;
@@ -808,8 +810,28 @@ fn type_signature_match_of(
         | (_, TypeSignatureOutcome::UnopenedTypeName { reason }) => {
             TypeSignatureMatch::UnopenedTypeName { reason: *reason }
         }
-        (TypeSignatureOutcome::UntracedTypeName, _)
-        | (_, TypeSignatureOutcome::UntracedTypeName) => TypeSignatureMatch::UntracedTypeName,
+        // **確かめてある理由を先に出す。** 注釈が省かれているのは構文木から確かめてあるので、
+        // 記録が無いだけのほうで覆うと、確かめてある原因に「区別できない」という文が出る。
+        // **理由をパターンで先に掴む。** 受け取った順に任せると、下の or パターンが
+        // 左側を掴むので、`compare` の引数を入れ替えただけで案内が変わる
+        (
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation,
+            },
+            _,
+        )
+        | (
+            _,
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation,
+            },
+        ) => TypeSignatureMatch::UntracedTypeName {
+            reason: UntracedReason::OmittedValueTypeAnnotation,
+        },
+        (TypeSignatureOutcome::UntracedTypeName { reason }, _)
+        | (_, TypeSignatureOutcome::UntracedTypeName { reason }) => {
+            TypeSignatureMatch::UntracedTypeName { reason: *reason }
+        }
     }
 }
 
@@ -2171,6 +2193,61 @@ mod tests {
         );
 
         assert_eq!(matched, TypeSignatureMatch::SiteDependentSpelling);
+    }
+
+    #[test]
+    fn test_type_signature_match_of_two_untraced_reasons_does_not_depend_on_the_pair_order() {
+        // 両側が別の理由で「尋ねていない」に倒れた形。受け取った順で決めると、
+        // **`compare` の引数を入れ替えただけで案内が変わる**。確かめてある側
+        // （注釈が無いと構文木から分かっている）を、確かめられていない側で覆わない
+        let omitted_first = type_signature_match_of(
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation,
+            },
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord,
+            },
+        );
+        let no_record_first = type_signature_match_of(
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord,
+            },
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation,
+            },
+        );
+
+        assert_eq!(
+            omitted_first,
+            TypeSignatureMatch::UntracedTypeName {
+                reason: UntracedReason::OmittedValueTypeAnnotation
+            }
+        );
+        assert_eq!(
+            no_record_first, omitted_first,
+            "引数の順を入れ替えても同じ理由が出る"
+        );
+    }
+
+    #[test]
+    fn test_type_signature_match_of_two_unconfirmed_untraced_reasons_keeps_the_unconfirmed_one() {
+        // 対照は 1 つ上のテスト。**確かめてある側が無ければ、言い切らないほうが残る。**
+        // ここで確かめてある側を出すと、注釈が書かれているチャンクに嘘の案内が出る
+        let matched = type_signature_match_of(
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord,
+            },
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord,
+            },
+        );
+
+        assert_eq!(
+            matched,
+            TypeSignatureMatch::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord
+            }
+        );
     }
 
     #[test]
