@@ -111,8 +111,9 @@ const ABSTRACT_MODIFIER: &str = "abstract";
 
 /// 型 1 つ分の綴りを構文木から読んだ形。
 ///
-/// **綴りの上の違いのうち、型の違いでないものは持たない。** 引数名・タプルのラベル・
-/// 型述語の主語の綴り・括弧は、読んだ時点で落ちている。
+/// **綴りの上の違いのうち、型の違いでないものは持たない。** タプルのラベル・
+/// 型述語の主語の綴り・括弧は読んだ時点で落ち、引数名は付け替えで落ちる
+/// （[`Callable::bound_value_names`]）。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum TypeStructure {
     /// 呼べる型（関数型・構築型）。
@@ -154,6 +155,16 @@ pub(crate) struct Callable {
     kind: SignatureKind,
     /// 型変数。付け替え後は番号順の並び。
     type_parameters: Vec<TypeParameter>,
+    /// このシグネチャの引数が束縛した値の名前。**付け替えの後は空**。
+    ///
+    /// **引数 1 つずつではなくシグネチャ単位で持つ。** 使うのは
+    /// 「その名前が束縛されているか」だけで、どの引数が束縛したかは答えを変えない
+    /// （[`Callable::names_only_types`]）。
+    ///
+    /// **比較に残る形には持ち込まない。** 引数の名前は型を変えないので、
+    /// 残すと**名前が違うだけの 2 つが別の構造になる**。落とす場所は
+    /// 型変数の名前を付け替えるのと同じ [`Callable::renamed`]。
+    bound_value_names: BTreeSet<String>,
     /// 引数。名前を落とし、渡し方と型だけが残る。
     parameters: Vec<Parameter>,
     return_type: Box<TypeStructure>,
@@ -306,25 +317,40 @@ impl Callable {
     /// （`typeof localValue` / `{ [key]: string }` / `import("./local").T` / `this`）は、
     /// 分解しない側（[`TypeStructure::Spelled`]）にしか現れない。
     ///
-    /// **同じシグネチャが束縛した値の名前も外を指す扱いになる。** `(x: string) => typeof x`
-    /// の `x` は引数なので指す先はこのシグネチャの中で決まるが、**引数の名前は読んだ時点で
-    /// 落ちている**（[`Parameter`]）ので、ここから束縛を引けない。倒れる向きは偽陰性
-    /// （測れる答えを 1 つ落とすだけ）なので直していない（Issue #192）。
+    /// **同じシグネチャが束縛した値の名前は外を指さない。** `(x: string) => typeof x`
+    /// の `x` は引数なので、指す先は**どこに書かれていてもこのシグネチャの中で決まる**
+    /// （束縛された型変数を「尋ねていない」に数えないのと同じ線。
+    /// `rules/architecture.md`「どこまでを「取れなかった」に数えるか」）。
+    /// 束縛は [`Callable::bound_value_names`] が運ぶ。
     pub(crate) fn names_only_types(&self) -> Option<bool> {
+        self.names_only_types_of(&BTreeSet::new())
+    }
+
+    /// `bound` と自分の引数が束縛した値の名前を外して見た、
+    /// [`Callable::names_only_types`]。
+    ///
+    /// **束縛を足すのは自分の中へ降りるあいだだけ。** 兄弟へ漏らすと、
+    /// `((x: string) => void) & typeof x` の末尾の `x`（外の値を指す）まで
+    /// 束縛された名前に見える（偽陽性）。**引数が見える範囲も、引数の型と戻り値だけ。**
+    fn names_only_types_of(&self, bound: &BTreeSet<String>) -> Option<bool> {
         let mut names_only = true;
 
+        // **制約と既定の型からは引数が見えない。** 型変数は引数より先に宣言されるので、
+        // ここまで束縛を届かせると**外の値を指す `typeof x` を束縛された名前と読む**（偽陽性）
         for declared in &self.type_parameters {
             for annotated in [&declared.constraint, &declared.default]
                 .into_iter()
                 .flatten()
             {
-                names_only &= annotated.names_only_types()?;
+                names_only &= annotated.names_only_types_of(bound)?;
             }
         }
+
+        let bound = bound | &self.bound_value_names;
         for parameter in &self.parameters {
-            names_only &= parameter.annotated_type.names_only_types()?;
+            names_only &= parameter.annotated_type.names_only_types_of(&bound)?;
         }
-        names_only &= self.return_type.names_only_types()?;
+        names_only &= self.return_type.names_only_types_of(&bound)?;
 
         Some(names_only)
     }
@@ -431,6 +457,8 @@ impl Callable {
                 .into_iter()
                 .map(|(_, parameter)| parameter)
                 .collect(),
+            // 引数の名前は型を変えないので、比較に残る形には持ち込まない
+            bound_value_names: BTreeSet::new(),
             parameters,
             return_type,
         })
@@ -445,6 +473,7 @@ impl Callable {
                 .into_iter()
                 .map(TypeParameter::sorted)
                 .collect(),
+            bound_value_names: self.bound_value_names,
             parameters: self.parameters.into_iter().map(Parameter::sorted).collect(),
             return_type: Box::new(self.return_type.sorted()),
         }
@@ -539,20 +568,26 @@ impl TypeStructure {
     /// 綴りのまま持っている部分が、すべて型の名前だけで書かれているか
     /// （[`Callable::names_only_types`]）。
     pub(crate) fn names_only_types(&self) -> Option<bool> {
+        self.names_only_types_of(&BTreeSet::new())
+    }
+
+    /// `bound` が束縛している値の名前を外して見た、
+    /// [`TypeStructure::names_only_types`]。
+    fn names_only_types_of(&self, bound: &BTreeSet<String>) -> Option<bool> {
         match self {
-            Self::Callable(callable) => callable.names_only_types(),
+            Self::Callable(callable) => callable.names_only_types_of(bound),
             Self::Union(members) | Self::Intersection(members) => {
-                all_names_only_types(members.iter())
+                all_names_only_types(members.iter(), bound)
             }
             Self::Tuple(elements) => {
-                all_names_only_types(elements.iter().map(|element| &element.element))
+                all_names_only_types(elements.iter().map(|element| &element.element), bound)
             }
-            Self::Array(element) => element.names_only_types(),
-            Self::Named { arguments, .. } => all_names_only_types(arguments.iter()),
+            Self::Array(element) => element.names_only_types_of(bound),
+            Self::Named { arguments, .. } => all_names_only_types(arguments.iter(), bound),
             Self::Predicate { narrowed, .. } => {
-                all_names_only_types(narrowed.iter().map(Box::as_ref))
+                all_names_only_types(narrowed.iter().map(Box::as_ref), bound)
             }
-            Self::Spelled(spelling) => names_only_types(spelling),
+            Self::Spelled(spelling) => names_only_types(spelling, bound),
         }
     }
 
@@ -712,11 +747,14 @@ impl TypeStructure {
 /// どれも型の名前だけで書かれているか。**1 つでも読めなければ `None`。**
 ///
 /// 1 つも無ければ `true`（型名でない綴りが残っていない）。
-fn all_names_only_types<'a>(structures: impl Iterator<Item = &'a TypeStructure>) -> Option<bool> {
+fn all_names_only_types<'a>(
+    structures: impl Iterator<Item = &'a TypeStructure>,
+    bound: &BTreeSet<String>,
+) -> Option<bool> {
     let mut names_only = true;
 
     for structure in structures {
-        names_only &= structure.names_only_types()?;
+        names_only &= structure.names_only_types_of(bound)?;
     }
 
     Some(names_only)
@@ -1056,6 +1094,7 @@ fn callable_structure(node: Node<'_>, text: &str) -> Option<TypeStructure> {
     Some(TypeStructure::Callable(Callable {
         kind,
         type_parameters,
+        bound_value_names: written.names.iter().cloned().collect(),
         parameters: written.parameters,
         return_type: Box::new(return_type),
     }))
@@ -1064,7 +1103,8 @@ fn callable_structure(node: Node<'_>, text: &str) -> Option<TypeStructure> {
 /// 引数リストから読んだ、渡し方と型の並び。
 ///
 /// **書かれた名前も一緒に持つ。** 型述語の主語がどの引数を指しているかを決めるのに要る
-/// （[`returned_structure`]）。名前そのものは [`Parameter`] に残らない。
+/// （[`returned_structure`]）のと、`typeof x` の `x` がこのシグネチャの引数かを決めるのに
+/// 要る（[`Callable::bound_value_names`]）。名前そのものは [`Parameter`] に残らない。
 #[derive(Default)]
 struct ParameterList {
     names: Vec<String>,
@@ -1632,6 +1672,46 @@ mod tests {
     fn test_a_callable_type_burying_a_value_name_in_a_type_argument_does_not_name_only_types() {
         // 分解できた形の中にも綴りのまま持つ部分は残る。外側だけを見ると取りこぼす
         let read = Callable::from_spelling("() => Array<typeof localValue>")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(read.names_only_types(), Some(false));
+    }
+
+    #[test]
+    fn test_a_callable_type_querying_its_own_parameter_names_only_types() {
+        // 対照は 2 つ上のテスト。同じ `typeof` の後ろでも、**このシグネチャの引数**を
+        // 指す名前はどのファイルに書かれても同じ引数を指す
+        let read = Callable::from_spelling("(x: string) => typeof x")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(read.names_only_types(), Some(true));
+    }
+
+    #[test]
+    fn test_a_nested_callable_type_querying_an_enclosing_parameter_names_only_types() {
+        // 束縛は内側へ届く。届かないと、入れ子の呼べる型に入った時点で測れなくなる
+        let read = Callable::from_spelling("(x: string) => () => typeof x")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(read.names_only_types(), Some(true));
+    }
+
+    #[test]
+    fn test_a_callable_type_querying_a_value_in_a_type_parameter_constraint_does_not_name_only_types()
+     {
+        // 対照は 1 つ上のテスト。型変数は引数より先に宣言されるので、制約に書かれた
+        // `typeof x` は**外の値**を指す
+        let read = Callable::from_spelling("<T extends typeof x>(x: string) => T")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(read.names_only_types(), Some(false));
+    }
+
+    #[test]
+    fn test_a_callable_type_querying_a_value_a_nested_signature_binds_does_not_name_only_types() {
+        // 対照は 1 つ上のテスト。束縛は**内側へだけ**届く。兄弟へ漏らすと、
+        // 外の値を指す `typeof x` が束縛された名前に見える（偽陽性）
+        let read = Callable::from_spelling("(f: (x: string) => void) => typeof x")
             .expect("テストが渡す綴りは呼べる型として読み取れる");
 
         assert_eq!(read.names_only_types(), Some(false));

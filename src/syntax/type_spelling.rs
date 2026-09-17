@@ -201,20 +201,39 @@ enum BoundNames {
 /// **見分けるのは「外を指す形」ではなく「中に留まる名前」。** 外を指す形は文法が
 /// 増えるたびに増えるが、型名でない名前が許される場所は閉じている
 /// （[`LOCAL_NAME_KINDS`]）。
-pub(crate) fn names_only_types(spelling: &str) -> Option<bool> {
+///
+/// `bound_value_names` は、**この綴りを囲むシグネチャが束縛した値の名前**。
+/// `(x: string) => typeof x` の `x` は引数なので、指す先はそのシグネチャの中で決まり、
+/// **どこに書かれていても同じ型を指す**。綴り 1 つの中には囲む側の引数が現れないので、
+/// 呼び出し側が渡す（`syntax::type_structure` の `Callable::names_only_types`）。
+///
+/// **空の集合を渡すと、束縛を一切見ない。** 綴りを別の場所へ差し込んでよいかを見る側は、
+/// **差し込み先の束縛が分からない**のでそちらを渡す
+/// （`semantics::type_signature` の `is_site_independent`）。
+pub(crate) fn names_only_types(
+    spelling: &str,
+    bound_value_names: &BTreeSet<String>,
+) -> Option<bool> {
     let wrapped = Wrapped::from_spelling(spelling)?;
     let tree = SyntaxTree::from_source(wrapped.text(), Grammar::TypeScript).ok()?;
 
     let reaches_outside = tree
         .named_descendants()
         .into_iter()
-        .any(names_outside_the_type_namespace);
+        .any(|node| names_outside_the_type_namespace(node, wrapped.text(), bound_value_names));
 
     Some(!reaches_outside)
 }
 
 /// そのノードが、型の名前空間の外を指しているか。
-fn names_outside_the_type_namespace(node: Node<'_>) -> bool {
+///
+/// `wrapped` は包んだ文（ノードの範囲はそこを指す）、`bound_value_names` は
+/// 囲むシグネチャが束縛した値の名前。
+fn names_outside_the_type_namespace(
+    node: Node<'_>,
+    wrapped: &str,
+    bound_value_names: &BTreeSet<String>,
+) -> bool {
     if matches!(node.kind(), THIS_TYPE_KIND | IMPORT_KIND) {
         return true;
     }
@@ -225,8 +244,11 @@ fn names_outside_the_type_namespace(node: Node<'_>) -> bool {
     let names_locally = node
         .parent()
         .is_some_and(|parent| LOCAL_NAME_KINDS.contains(&parent.kind()));
+    let names_a_bound_value = wrapped
+        .get(node.byte_range())
+        .is_some_and(|name| bound_value_names.contains(name));
 
-    !names_locally
+    !names_locally && !names_a_bound_value
 }
 
 /// 綴りを包んで構文木にできた文と、そのとき使った前置きの長さ。
@@ -810,57 +832,104 @@ mod tests {
 
     #[test]
     fn test_a_spelling_written_with_type_names_alone_names_only_types() {
-        assert_eq!(names_only_types("Local<string> | \"on\""), Some(true));
+        assert_eq!(
+            names_only_types("Local<string> | \"on\"", &BTreeSet::new()),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_a_spelling_naming_a_parameter_names_only_types() {
         // 引数の名前・タプルの要素の名前・インデックスシグネチャの引数の名前・
         // 型述語の主語は、その綴りの中でだけ意味を持つ
-        assert_eq!(names_only_types("(a: string) => void"), Some(true));
-        assert_eq!(names_only_types("[first: string]"), Some(true));
-        assert_eq!(names_only_types("{ [index: number]: string }"), Some(true));
-        assert_eq!(names_only_types("(a: unknown) => a is Local"), Some(true));
+        assert_eq!(
+            names_only_types("(a: string) => void", &BTreeSet::new()),
+            Some(true)
+        );
+        assert_eq!(
+            names_only_types("[first: string]", &BTreeSet::new()),
+            Some(true)
+        );
+        assert_eq!(
+            names_only_types("{ [index: number]: string }", &BTreeSet::new()),
+            Some(true)
+        );
+        assert_eq!(
+            names_only_types("(a: unknown) => a is Local", &BTreeSet::new()),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_a_spelling_querying_a_value_does_not_name_only_types() {
         // 対照は上のテスト。同じ `identifier` でも、`typeof` の後ろは外の値を指す
-        assert_eq!(names_only_types("typeof localValue"), Some(false));
+        assert_eq!(
+            names_only_types("typeof localValue", &BTreeSet::new()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_a_spelling_querying_a_bound_value_names_only_types() {
+        // 対照は 1 つ上のテスト。同じ `typeof` の後ろでも、囲むシグネチャが束縛した
+        // 名前なら指す先はその中で決まる（`(x: string) => typeof x` の `x`）
+        let bound = BTreeSet::from(["x".to_owned()]);
+
+        assert_eq!(names_only_types("typeof x", &bound), Some(true));
+    }
+
+    #[test]
+    fn test_a_spelling_querying_another_value_does_not_name_only_types_when_a_name_is_bound() {
+        // 対照は 1 つ上のテスト。束縛が在っても、別の名前は外を指したまま
+        let bound = BTreeSet::from(["x".to_owned()]);
+
+        assert_eq!(names_only_types("typeof localValue", &bound), Some(false));
     }
 
     #[test]
     fn test_a_spelling_with_a_computed_key_does_not_name_only_types() {
         // 計算されたキーは `unique symbol` の値を指す。別々のモジュールが同じ綴りの
         // `key` を宣言していると、同じ綴りが別の型を指す
-        assert_eq!(names_only_types("{ [key]: string }"), Some(false));
+        assert_eq!(
+            names_only_types("{ [key]: string }", &BTreeSet::new()),
+            Some(false)
+        );
     }
 
     #[test]
     fn test_a_spelling_naming_the_enclosing_class_does_not_name_only_types() {
         // `this` 型は囲むクラスを指すので、どこに書かれたかで意味が変わる
-        assert_eq!(names_only_types("this"), Some(false));
+        assert_eq!(names_only_types("this", &BTreeSet::new()), Some(false));
     }
 
     #[test]
     fn test_a_spelling_querying_an_imported_module_does_not_name_only_types() {
-        assert_eq!(names_only_types("typeof import(\"./local\")"), Some(false));
+        assert_eq!(
+            names_only_types("typeof import(\"./local\")", &BTreeSet::new()),
+            Some(false)
+        );
     }
 
     #[test]
     fn test_a_spelling_naming_a_type_in_an_imported_module_does_not_name_only_types() {
         // `typeof` を伴わない書き方でも指定子は指定子
-        assert_eq!(names_only_types("import(\"./local\").Thing"), Some(false));
+        assert_eq!(
+            names_only_types("import(\"./local\").Thing", &BTreeSet::new()),
+            Some(false)
+        );
     }
 
     #[test]
     fn test_a_string_literal_type_names_only_types() {
         // 対照は上の 2 つ。引用符があることではなく、外を指すことを見ている
-        assert_eq!(names_only_types("\"on\" | \"off\""), Some(true));
+        assert_eq!(
+            names_only_types("\"on\" | \"off\"", &BTreeSet::new()),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_a_spelling_that_does_not_read_as_a_type_cannot_be_asked_what_it_names() {
-        assert_eq!(names_only_types("=> )("), None);
+        assert_eq!(names_only_types("=> )(", &BTreeSet::new()), None);
     }
 }
