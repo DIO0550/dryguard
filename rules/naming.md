@@ -99,6 +99,7 @@ if structurally_similar && domains_differ { ... }
 | `value type` | チャンクが受け渡しする値の型。関数・getter では戻り値の型、setter では引数の型。**チャンクの宣言が注釈を省ける唯一の位置**で、省くと TypeScript が推論する |
 | `value type annotation` | その `value type` にソースが注釈を書いたか。省かれていれば hover はそこに推論した型を綴るので、**その出現は尋ねていない** |
 | `site-dependent spelling` | **型名にならないのに、指す先が書かれた場所で決まる**綴り（`typeof localValue` / `{ [key]: string }` / `import("./local").T` / `this`）。型名のノードにならないので、尋ねる位置そのものを作れない |
+| `bound value name` | そのシグネチャの引数が束縛した値の名前。`typeof x` の `x` がこれなら、指す先は**書かれた場所ではなくシグネチャ**が決める。**比較に残る形には持ち込まない**（引数の名前は型を変えない） |
 | `type structure` | `type spelling` を構文木から読んだ形。**書かれ方の違い**（括弧・引数名・タプルのラベル・共用体の並び）を落としてある |
 | `callable` | 呼べる型（関数型・構築型）1 つ分の `type structure`。型変数・引数・戻り値を持つ |
 | `spelled type` | `type structure` のうち、**分解せず綴りのまま持つ**もの。比較も綴りで行う |
@@ -252,9 +253,17 @@ JSON が壊れているのは違う話）。1 語で呼ぶと、どちらの層�
 クラス名に置き換えると部分型での振る舞いが変わる）。`--explain` が理由だけを出して
 直し先を出さないのはこのため（`report::type_signature_text_of`）。
 
-**引数を指す `typeof x` は、定義の後半に当たらない。** 指す先がそのシグネチャの中で決まるので
-「書かれた場所で決まる」ではないが、引数の名前は構造として読んだ時点で落ちているため
-今は見分けられず、偽陰性側へ倒れている（Issue #192）。
+**引数を指す `typeof x` は、`site-dependent spelling` に数えない。** 指す先がそのシグネチャの
+中で決まるので、定義の後半（「書かれた場所で決まる」）に当たらない。**束縛された型変数を
+`untraced type name` に数えないのと同じ線**（`rules/architecture.md`
+「どこまでを「取れなかった」に数えるか」）。束縛を運ぶのは `syntax::type_structure` の
+`Callable::bound_value_names` で、**内側へだけ届く** — 兄弟へ漏らすと、
+`((x: string) => void) & typeof x` の末尾（外の値を指す）まで束縛された名前に見える（偽陽性）。
+
+**それでも引数名が違うだけの 2 つは重ならない。** `(x: string) => typeof x` と
+`(y: string) => typeof y` は `spelled type` として綴りのまま残るので、綴りで比べる限り別物。
+倒れる向きは偽陰性で、閉じるには綴りのまま持つ部分の中の値の名前も付け替えることになる
+（Issue #192 がスコープ外と決めた）。
 
 **`site-dependent spelling` を `spelled type` と混ぜない。** どちらも分解せず綴りのまま持つが、
 `spelled type` は**綴りで比べれば答えが出る**（同じ綴りなら重なる）のに対し、こちらは
