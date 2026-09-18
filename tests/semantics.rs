@@ -833,6 +833,30 @@ fn test_compare_with_an_lsp_does_not_unify_two_inferred_return_types_spelled_ali
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_does_not_unify_two_accessors_before_the_project_is_loaded() {
+    // **どちらのチャンクも型注釈を 1 つも持たない**（getter は引数を取れず、戻り値の注釈を
+    // 省くと注釈が残らない）。書かれた型名が 0 件だと `typeDefinition` の往復が 1 度も
+    // 起きないので、**hover がそのドキュメントへの最初の要求**になる。
+    //
+    // 読み込みの前に尋ねると、サーバは推論された型に `any` を綴って返す。`any` は型として
+    // 読める綴りなので、**中身の違う `Receipt` と `Shipment` が単一化可能に出る**（偽陽性）。
+    // 落ち着いてから尋ね直せば綴りは自分の側の型名になり、注釈を省いた出現として
+    // 測れない側へ倒れる
+    let holds_a_receipt = fixture("inferred-accessors/holder.ts", 4);
+    let keeps_a_shipment = fixture("inferred-accessors/keeper.ts", 4);
+
+    let measured = measured_with_an_lsp(&holds_a_receipt, &keeps_a_shipment);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::UntracedTypeName {
+            reason: UntracedReason::OmittedValueTypeAnnotation
+        }
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_an_lsp_does_not_blame_a_missing_annotation_for_a_contextually_typed_parameter()
 {
     // どちらのファイルも、名前付き関数式の引数の型を**代入先の注釈から**受け取る。
