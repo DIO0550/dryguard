@@ -31,6 +31,13 @@ use crate::syntax::type_spelling::{
 /// もう一度付け替えてしまうこともない。
 const PLACEHOLDER_PREFIX: char = '%';
 
+/// 正規化のときに試す、共用体の相手の並べ替えの組み合わせの上限。
+///
+/// **5! = 120。** 並べ替えの要る相手が 5 つ並ぶ共用体 1 つ分にあたる。
+/// 実コーパスで出た形（Issue #181 の測定。`V | A`）は相手 2 つ = 2 通りなので、
+/// 実際に効く形からは離してある。
+const MAX_UNION_ORDERINGS: usize = 120;
+
 /// 関数型を表すノードの種別（`(a: string) => void`）。
 const FUNCTION_TYPE_KIND: &str = "function_type";
 
@@ -271,7 +278,7 @@ impl Callable {
         }
     }
 
-    /// 型変数を出現順に付け替え、共用体の並びを固定した形。
+    /// 型変数を付け替え、共用体の並びを固定した形。
     /// 綴りのまま持っている部分を読めなければ `None`。
     ///
     /// **付け替えてから並べ替える。** 逆にすると、付け替え前の名前で整列することになり、
@@ -281,11 +288,24 @@ impl Callable {
     /// 振り直すと、`<T>(cb: <U>(u: U) => T) => void` と `<T>(cb: <U>(u: U) => U) => void` が
     /// どちらも「内側 `%0`・戻り値 `%0`」になり、**単一化できない 2 つを重ねてしまう**。
     ///
-    /// **そのため、共用体の相手をまたぐと書かれた並びで番号が変わる。** 番号は出現順に
-    /// 振るので、`<V, A>(acc: V | A) => A` と `<V, A>(acc: A | V) => A` では `V` と `A` に
-    /// 別の番号が付き、並べ替えは付け替えの後なので**同じ型が別の構造のまま残る**（偽陰性）。
-    /// 並びに依存しない番号の振り方には相手の並べ替えを試す探索が要るので、ここでは行わない。
+    /// **そのため番号は共用体の書かれた並びで変わる。** 通し番号は出現順に振るので、
+    /// `<V, A>(acc: V | A) => A` と `<V, A>(acc: A | V) => A` では `V` と `A` に別の番号が付く。
+    /// 並べ替えは付け替えの後なので、書かれた並びのままでは**同じ型が別の構造として残る**。
+    /// **共用体の相手の並べ替えを試して最小を採る**ことで、ここを閉じる
+    /// （[`searched_normal_form`]。組み合わせが上限を超えたときの倒れ方もそちら）。
     pub(crate) fn normalized(self) -> Option<Self> {
+        searched_normal_form(
+            self,
+            |callable: Self, orderings: &mut UnionOrderings<'_>| {
+                callable.reordered(orderings, &mut Vec::new())
+            },
+            Self::normal_form,
+        )
+    }
+
+    /// 書かれた並びのまま、型変数を付け替えて可換な並びを固定した形。
+    /// 綴りのまま持っている部分を読めなければ `None`。
+    fn normal_form(self) -> Option<Self> {
         let mut scopes = TypeVariableScopes::new();
 
         Some(self.renamed(&mut scopes)?.sorted())
@@ -478,6 +498,60 @@ impl Callable {
             return_type: Box::new(self.return_type.sorted()),
         }
     }
+
+    /// 共用体の相手を、配られた並べ替えのとおりに並べ直した形
+    /// （[`TypeStructure::reordered`]）。
+    fn reordered(
+        self,
+        orderings: &mut UnionOrderings<'_>,
+        scopes: &mut Vec<BTreeSet<String>>,
+    ) -> Self {
+        scopes.push(
+            self.type_parameters
+                .iter()
+                .map(|declared| declared.name.clone())
+                .collect(),
+        );
+
+        let type_parameters = self
+            .type_parameters
+            .into_iter()
+            .map(|declared| declared.reordered(orderings, scopes))
+            .collect();
+        let parameters = self
+            .parameters
+            .into_iter()
+            .map(|parameter| parameter.reordered(orderings, scopes))
+            .collect();
+        let return_type = Box::new(self.return_type.reordered(orderings, scopes));
+
+        scopes.pop();
+
+        Self {
+            kind: self.kind,
+            type_parameters,
+            bound_value_names: self.bound_value_names,
+            parameters,
+            return_type,
+        }
+    }
+
+    /// 共用体の相手として並べ替えると、付け替えの番号が変わりうるか
+    /// （[`TypeStructure::allocates_placeholders`]）。
+    ///
+    /// **型変数を宣言していれば必ず変わる。** 引数にも戻り値にも現れない型変数にも
+    /// [`TypeVariableScopes::assigned_remaining`] が番号を付けるので、
+    /// 宣言が 1 つでもあれば番号を割り当てる。
+    fn allocates_placeholders(&self, scopes: &[BTreeSet<String>]) -> bool {
+        if !self.type_parameters.is_empty() {
+            return true;
+        }
+
+        self.parameters
+            .iter()
+            .any(|parameter| parameter.annotated_type.allocates_placeholders(scopes))
+            || self.return_type.allocates_placeholders(scopes)
+    }
 }
 
 impl TypeParameter {
@@ -506,6 +580,28 @@ impl TypeParameter {
             default: self.default.map(TypeStructure::sorted),
         }
     }
+
+    /// 共用体の相手を、配られた並べ替えのとおりに並べ直した形
+    /// （[`TypeStructure::reordered`]）。
+    fn reordered(
+        self,
+        orderings: &mut UnionOrderings<'_>,
+        scopes: &mut Vec<BTreeSet<String>>,
+    ) -> Self {
+        let constraint = self
+            .constraint
+            .map(|constraint| constraint.reordered(orderings, scopes));
+        let default = self
+            .default
+            .map(|default| default.reordered(orderings, scopes));
+
+        Self {
+            modifiers: self.modifiers,
+            name: self.name,
+            constraint,
+            default,
+        }
+    }
 }
 
 impl Parameter {
@@ -522,6 +618,19 @@ impl Parameter {
         Self {
             kind: self.kind,
             annotated_type: self.annotated_type.sorted(),
+        }
+    }
+
+    /// 共用体の相手を、配られた並べ替えのとおりに並べ直した形
+    /// （[`TypeStructure::reordered`]）。
+    fn reordered(
+        self,
+        orderings: &mut UnionOrderings<'_>,
+        scopes: &mut Vec<BTreeSet<String>>,
+    ) -> Self {
+        Self {
+            kind: self.kind,
+            annotated_type: self.annotated_type.reordered(orderings, scopes),
         }
     }
 }
@@ -545,14 +654,29 @@ impl TypeStructure {
         structured(spanning_node(&tree, wrapped.span())?, wrapped.text())
     }
 
-    /// 型変数を出現順に付け替え、共用体の並びを固定した形。
+    /// 型変数を付け替え、共用体の並びを固定した形。
     /// 綴りのまま持っている部分を読めなければ `None`。
     ///
     /// **外側に型変数の宣言を置かない。** 型 1 つ分の綴りの中で宣言されるのは、
     /// 入れ子の呼べる型が自分で宣言した型変数だけ（[`Callable::renamed`] がその都度
     /// スコープを開く）。ここで宣言されていない名前は、**どこかで宣言された型名**なので
     /// 付け替えない。
+    ///
+    /// **共用体の相手の並べ替えを試して最小を採る**のは呼べる型と同じ
+    /// （[`searched_normal_form`]）。
     pub(crate) fn normalized(self) -> Option<Self> {
+        searched_normal_form(
+            self,
+            |structure: Self, orderings: &mut UnionOrderings<'_>| {
+                structure.reordered(orderings, &mut Vec::new())
+            },
+            Self::normal_form,
+        )
+    }
+
+    /// 書かれた並びのまま、型変数を付け替えて可換な並びを固定した形。
+    /// 綴りのまま持っている部分を読めなければ `None`。
+    fn normal_form(self) -> Option<Self> {
         let mut scopes = TypeVariableScopes::new();
 
         Some(self.renamed(&mut scopes)?.sorted())
@@ -740,6 +864,306 @@ impl TypeStructure {
             },
             Self::Spelled(spelling) => Self::Spelled(spelling),
         }
+    }
+
+    /// 共用体の相手を、配られた並べ替えのとおりに並べ直した形。
+    ///
+    /// **並べ替えるのは共用体だけ。** 交差型の並びは型の一部なので、
+    /// 並べ替えると**単一化できない 2 つを重ねてしまう**（[`TypeStructure::sorted`]）。
+    ///
+    /// **相手を辿ってから並べ替える。** 並べ替えた順で辿ると、外側の共用体の並びで
+    /// **入れ子の共用体に配られる並べ替えが別の共用体を指す**（巡ごとに対応がずれる）。
+    fn reordered(
+        self,
+        orderings: &mut UnionOrderings<'_>,
+        scopes: &mut Vec<BTreeSet<String>>,
+    ) -> Self {
+        match self {
+            Self::Callable(callable) => Self::Callable(callable.reordered(orderings, scopes)),
+            Self::Union(members) => {
+                let ordering = orderings.ordering_of(&members, scopes);
+                let reordered: Vec<Self> = members
+                    .into_iter()
+                    .map(|member| member.reordered(orderings, scopes))
+                    .collect();
+
+                Self::Union(reordered_by(reordered, &ordering))
+            }
+            Self::Intersection(members) => Self::Intersection(
+                members
+                    .into_iter()
+                    .map(|member| member.reordered(orderings, scopes))
+                    .collect(),
+            ),
+            Self::Tuple(elements) => Self::Tuple(
+                elements
+                    .into_iter()
+                    .map(|element| TupleElement {
+                        kind: element.kind,
+                        element: element.element.reordered(orderings, scopes),
+                    })
+                    .collect(),
+            ),
+            Self::Array(element) => Self::Array(Box::new(element.reordered(orderings, scopes))),
+            Self::Named { name, arguments } => Self::Named {
+                name,
+                arguments: arguments
+                    .into_iter()
+                    .map(|argument| argument.reordered(orderings, scopes))
+                    .collect(),
+            },
+            Self::Predicate {
+                subject,
+                asserted,
+                narrowed,
+            } => Self::Predicate {
+                subject,
+                asserted,
+                narrowed: narrowed.map(|narrowed| Box::new(narrowed.reordered(orderings, scopes))),
+            },
+            Self::Spelled(spelling) => Self::Spelled(spelling),
+        }
+    }
+
+    /// 共用体の相手として並べ替えると、付け替えの番号が変わりうるか。
+    ///
+    /// 番号を 1 つも割り当てない相手は、共用体のどこに置いても正規化した形を変えない。
+    ///
+    /// **広めに数える。** 数え漏らすと同じ型が別の構造のまま残る（偽陰性）が、
+    /// 多く数えても答えは変わらず、組み合わせの数が増えるだけ
+    /// (`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」)。
+    fn allocates_placeholders(&self, scopes: &[BTreeSet<String>]) -> bool {
+        match self {
+            Self::Callable(callable) => callable.allocates_placeholders(scopes),
+            Self::Union(members) | Self::Intersection(members) => members
+                .iter()
+                .any(|member| member.allocates_placeholders(scopes)),
+            Self::Tuple(elements) => elements
+                .iter()
+                .any(|element| element.element.allocates_placeholders(scopes)),
+            Self::Array(element) => element.allocates_placeholders(scopes),
+            Self::Named { name, arguments } => {
+                is_bound_in(scopes, name)
+                    || arguments
+                        .iter()
+                        .any(|argument| argument.allocates_placeholders(scopes))
+            }
+            Self::Predicate { narrowed, .. } => narrowed
+                .as_ref()
+                .is_some_and(|narrowed| narrowed.allocates_placeholders(scopes)),
+            Self::Spelled(spelling) => spelled_allocates_placeholders(spelling, scopes),
+        }
+    }
+}
+
+/// 共用体の相手の並べ替えを試して、正規化した形の最小を採る。
+/// 正規化できなければ `None`。
+///
+/// `reordered` は、配られた並べ替えのとおりに共用体の相手を並べ直す。
+/// `normal_form` は、書かれた並びのまま正規化する。
+///
+/// **最小はシグネチャ全体で採る。** 共用体 1 つの中だけで採ると、
+/// `<V, A>(acc: V | A) => A` のように**差が共用体の外（戻り値）に出る**形が閉じない
+/// （並べ替えた後の相手の並びは、どちらの順で辿っても同じになる）。
+///
+/// **組み合わせが [`MAX_UNION_ORDERINGS`] を超えたら、書かれた並びのまま返す。**
+/// 材料は揃っていて探索の予算を使い切っただけなので、「取れなかった」には数えない
+/// (`rules/architecture.md`「どこまでを「取れなかった」に数えるか」)。倒れる向きは
+/// **上限を入れる前と同じ偽陰性**で、書かれた並びの正規形は偽陽性を生まない。
+///
+/// **Why not（上限を超えたら「測れない」にする）**: 今日答えを出せているシグネチャが
+/// 答えを失う。上限を超えるかは構造から決まるので、**同じ型の 2 つは必ず揃って超えるか
+/// 超えないか**になり、片方だけ探索されて食い違うことも起きない。
+fn searched_normal_form<T, R, N>(structure: T, reordered: R, normal_form: N) -> Option<T>
+where
+    T: Clone + Ord,
+    R: Fn(T, &mut UnionOrderings<'_>) -> T,
+    N: Fn(T) -> Option<T>,
+{
+    // 1 巡目は書かれた順のまま。ここで並べ替えの要る相手の位置が揃う
+    let mut written = UnionOrderings::written();
+    let in_written_order = reordered(structure.clone(), &mut written);
+
+    let Some(plans) = order_plans_of(&written.permutable) else {
+        return normal_form(in_written_order);
+    };
+
+    let mut smallest = normal_form(in_written_order)?;
+    for plan in plans {
+        let candidate = normal_form(reordered(
+            structure.clone(),
+            &mut UnionOrderings::planned(&plan),
+        ))?;
+        smallest = smallest.min(candidate);
+    }
+
+    Some(smallest)
+}
+
+/// 共用体ごとに 1 つずつ並べ替えを選んだ、すべての組み合わせ。
+/// 組み合わせが [`MAX_UNION_ORDERINGS`] を超えれば `None`。
+///
+/// `permutable` は共用体ごとの、並べ替えの要る相手の位置（訪れた順）。
+fn order_plans_of(permutable: &[Vec<usize>]) -> Option<Vec<Vec<Vec<usize>>>> {
+    // **先に数える。** 上限を超える共用体の順列を作り始めると、数える前に組み合わせが
+    // 爆発する（相手が 20 なら 20! 通りを並べることになる）
+    let mut combinations: usize = 1;
+    for positions in permutable {
+        combinations = combinations.checked_mul(factorial_of(positions.len())?)?;
+        if combinations > MAX_UNION_ORDERINGS {
+            return None;
+        }
+    }
+
+    let mut plans: Vec<Vec<Vec<usize>>> = vec![Vec::new()];
+    for positions in permutable {
+        let orderings = permutations_of(positions);
+        let mut extended = Vec::with_capacity(plans.len() * orderings.len());
+        for plan in &plans {
+            for ordering in &orderings {
+                let mut next = plan.clone();
+                next.push(ordering.clone());
+                extended.push(next);
+            }
+        }
+        plans = extended;
+    }
+
+    Some(plans)
+}
+
+/// `n` の階乗。`usize` に収まらなければ `None`。
+fn factorial_of(n: usize) -> Option<usize> {
+    (1..=n).try_fold(1usize, |product, factor| product.checked_mul(factor))
+}
+
+/// `items` の並べ替えをすべて。**`items` 自身の並びを含む。**
+fn permutations_of(items: &[usize]) -> Vec<Vec<usize>> {
+    let Some((first, rest)) = items.split_first() else {
+        return vec![Vec::new()];
+    };
+
+    let mut permutations = Vec::new();
+    for permutation in permutations_of(rest) {
+        for position in 0..=permutation.len() {
+            let mut extended = permutation.clone();
+            extended.insert(position, *first);
+            permutations.push(extended);
+        }
+    }
+
+    permutations
+}
+
+/// 並べ替えの要る相手の位置（昇順）。
+///
+/// **番号を 1 つも割り当てない相手は数えない。** 数えると、**答えの変わらない
+/// 並べ替えに上限を食われて**、同じシグネチャに並んだ型変数の共用体が探索から落ちる。
+fn permutable_positions_of(members: &[TypeStructure], scopes: &[BTreeSet<String>]) -> Vec<usize> {
+    members
+        .iter()
+        .enumerate()
+        .filter(|(_, member)| member.allocates_placeholders(scopes))
+        .map(|(position, _)| position)
+        .collect()
+}
+
+/// 並べ替えの要る相手を `permuted` の順に置いた、相手全体を辿る順。
+///
+/// 並べ替えの要らない相手は書かれた位置に残る。
+fn ordering_of_permuted(members: usize, permuted: &[usize]) -> Vec<usize> {
+    let mut slots: Vec<usize> = permuted.to_vec();
+    slots.sort_unstable();
+
+    let mut ordering: Vec<usize> = (0..members).collect();
+    for (slot, position) in slots.into_iter().zip(permuted) {
+        if let Some(entry) = ordering.get_mut(slot) {
+            *entry = *position;
+        }
+    }
+
+    ordering
+}
+
+/// `ordering` の順に並べ直した相手。
+///
+/// `ordering` は位置の置換なので、**取り出されずに残る相手は無い。**
+fn reordered_by(members: Vec<TypeStructure>, ordering: &[usize]) -> Vec<TypeStructure> {
+    let mut taken: Vec<Option<TypeStructure>> = members.into_iter().map(Some).collect();
+
+    ordering
+        .iter()
+        .filter_map(|position| taken.get_mut(*position).and_then(Option::take))
+        .collect()
+}
+
+/// 綴りのまま持っている部分に、`scopes` が束縛した型変数が現れるか。
+///
+/// **型として読めなければ、現れるものとして数える。** 読めない綴りでは付け替え自体が
+/// 失敗するので、多く数えても答えは変わらない。
+fn spelled_allocates_placeholders(spelling: &str, scopes: &[BTreeSet<String>]) -> bool {
+    let Some(spans) = substitutable_type_name_spans_of(spelling) else {
+        return true;
+    };
+
+    spans.into_iter().any(|span| {
+        spelling
+            .get(span)
+            .is_some_and(|name| is_bound_in(scopes, name))
+    })
+}
+
+/// 共用体ごとに、相手をどの順に並べるか。**訪れた順に 1 つずつ配る。**
+///
+/// 1 巡目は書かれた順のまま配り、**並べ替えの要る相手の位置**を記録する。
+/// 2 巡目からは記録した位置の並べ替えを配る。**どちらも元の構造を書かれた順に辿る**ので、
+/// 訪れた順の番号は巡をまたいでも同じ共用体を指す。
+struct UnionOrderings<'planned> {
+    /// 配る並べ替え。訪れた共用体の番号で引く。**空なら書かれた順。**
+    planned: &'planned [Vec<usize>],
+    /// 次に配る共用体の番号。
+    next: usize,
+    /// 書かれた順に配ったあいだに記録した、並べ替えの要る相手の位置。
+    permutable: Vec<Vec<usize>>,
+}
+
+impl<'planned> UnionOrderings<'planned> {
+    /// 書かれた順のまま配る。
+    fn written() -> Self {
+        Self {
+            planned: &[],
+            next: 0,
+            permutable: Vec::new(),
+        }
+    }
+
+    /// 記録した並べ替えのとおりに配る。
+    fn planned(planned: &'planned [Vec<usize>]) -> Self {
+        Self {
+            planned,
+            next: 0,
+            permutable: Vec::new(),
+        }
+    }
+
+    /// その共用体の相手を並べる順。**配る並べ替えが無ければ書かれた順。**
+    fn ordering_of(
+        &mut self,
+        members: &[TypeStructure],
+        scopes: &[BTreeSet<String>],
+    ) -> Vec<usize> {
+        let ordering = match self.planned.get(self.next) {
+            Some(permuted) => ordering_of_permuted(members.len(), permuted),
+            None => {
+                self.permutable
+                    .push(permutable_positions_of(members, scopes));
+
+                (0..members.len()).collect()
+            }
+        };
+        self.next += 1;
+
+        ordering
     }
 }
 
@@ -1551,37 +1975,87 @@ mod tests {
 
     #[test]
     fn test_a_union_of_one_type_variable_written_in_the_other_order_reads_as_the_same_structure() {
-        // 下の 2 本が固定する限界の対照。番号の付き方が並びで変わらなければ落ちるので、
-        // 「型変数が絡むと並びが残る」ではない（`rules/naming.md` の `type structure`）
-        assert!(
-            same_structure("<T>(x: T | string) => void", "<T>(x: string | T) => void"),
-            "型変数が 1 つだけの共用体でも、書かれた並びが構造に残るようになった"
-        );
+        assert!(same_structure(
+            "<T>(x: T | string) => void",
+            "<T>(x: string | T) => void"
+        ));
     }
 
     #[test]
-    fn test_a_union_of_members_declaring_type_variables_written_in_the_other_order_reads_as_a_different_structure()
+    fn test_a_union_of_members_declaring_type_variables_written_in_the_other_order_reads_as_the_same_structure()
      {
-        // 既知の限界（#195）。番号は出現順に振るので、相手がそれぞれ型変数を宣言していると
-        // 書かれた順で別の番号が付く。並べ替えは付け替えの後なので同じ型のまま残らない
+        // 相手がそれぞれ型変数を宣言している形。並べ替えを試さないと、書かれた順で
+        // 別の番号が付いたまま残る
+        assert!(same_structure(
+            "(cb: (<T>(x: T) => T) | (<U>(x: U) => U[])) => void",
+            "(cb: (<U>(x: U) => U[]) | (<T>(x: T) => T)) => void"
+        ));
+    }
+
+    #[test]
+    fn test_a_union_of_type_variables_bound_outside_written_in_the_other_order_reads_as_the_same_structure()
+     {
+        // 実コーパス（rxjs 7.8.1 の `src`）で出たのはこちら。**差が共用体の外（戻り値）に
+        // 出る**ので、共用体 1 つの中だけで最小を採る形では閉じない
+        assert!(same_structure(
+            "<V, A>(acc: V | A) => A",
+            "<V, A>(acc: A | V) => A"
+        ));
+    }
+
+    #[test]
+    fn test_a_union_inside_a_reordered_member_is_reordered_with_its_own_orderings() {
+        // 外側の共用体を並べ替えても、入れ子の共用体には自分の並べ替えが配られる。
+        // 並べ替えた順で辿ると、ここで配る相手がずれる
+        assert!(same_structure(
+            "<A, B, C>(x: ((p: A | B) => void) | C) => [C, A, B]",
+            "<A, B, C>(x: C | ((p: B | A) => void)) => [C, A, B]"
+        ));
+    }
+
+    #[test]
+    fn test_a_union_at_the_ordering_limit_written_in_the_other_order_reads_as_the_same_structure() {
+        // 並べ替えの要る相手が 5 つ = 120 通りで、上限ちょうど
+        assert!(same_structure(
+            "<A, B, C, D, E>(x: A | B | C | D | E) => A",
+            "<A, B, C, D, E>(x: E | D | C | B | A) => A"
+        ));
+    }
+
+    #[test]
+    fn test_a_union_over_the_ordering_limit_written_in_the_other_order_reads_as_a_different_structure()
+     {
+        // 相手が 6 つ = 720 通りで上限を超える。書かれた並びのまま返すので、
+        // 倒れる向きは偽陰性のまま（`searched_normal_form`）
         assert!(
             !same_structure(
-                "(cb: (<T>(x: T) => T) | (<U>(x: U) => U[])) => void",
-                "(cb: (<U>(x: U) => U[]) | (<T>(x: T) => T)) => void"
+                "<A, B, C, D, E, F>(x: A | B | C | D | E | F) => A",
+                "<A, B, C, D, E, F>(x: F | E | D | C | B | A) => A"
             ),
-            "共用体の相手が宣言した型変数の番号が、書かれた並びに依存しなくなった（#195 が入ったなら、このテストは限界が消えた合図）"
+            "上限を超えた共用体まで並べ替えを試すようになった"
         );
     }
 
     #[test]
-    fn test_a_union_of_type_variables_bound_outside_written_in_the_other_order_reads_as_a_different_structure()
+    fn test_a_union_of_keyword_types_does_not_spend_the_ordering_limit() {
+        // 番号を割り当てない相手は数えないので、6 つ並んでいても上限を食わない。
+        // 数えると、同じシグネチャに並んだ型変数の共用体が探索から落ちる
+        assert!(same_structure(
+            "<V, A>(acc: V | A, tag: string | number | boolean | symbol | bigint | object) => A",
+            "<V, A>(acc: A | V, tag: object | bigint | symbol | boolean | number | string) => A"
+        ));
+    }
+
+    #[test]
+    fn test_an_intersection_of_type_variables_written_in_the_other_order_reads_as_a_different_structure()
      {
-        // 同じ限界（#195）が、相手が型変数を宣言していなくても出る形。実コーパス
-        // （rxjs 7.8.1 の `src`）で出たのはこちらだけなので、両方を固定する
-        assert!(
-            !same_structure("<V, A>(acc: V | A) => A", "<V, A>(acc: A | V) => A"),
-            "外側で束縛された型変数の番号が、共用体の書かれた並びに依存しなくなった（#195 が入ったなら、このテストは限界が消えた合図）"
-        );
+        // 共用体の並べ替えを足しても、交差型の並びは落とさない
+        // （`rules/naming.md`「`overload set` の並びを落とさない」）。
+        // 対照は上の共用体のテストで、そちらは同じ構造になる
+        assert!(!same_structure(
+            "<A, B>(x: A & B) => A",
+            "<A, B>(x: B & A) => A"
+        ));
     }
 
     #[test]
