@@ -1,0 +1,61 @@
+name: PR body
+
+# 強制力の序列で層 1（AGENTS.md「強制力の序列」）。
+#
+# Why（層 2 ではない）: push の時点では PR がまだ無く、本文も存在しない。
+# git hooks からは原理的に検査できない（Issue #153 の案 B）。
+#
+# Why（`edited` を含める）: 再発した形は「push した後に本文を直す」順序で、
+# push の時点の本文は必ず古い（harness/records/pr-185.md 指摘 3 /
+# pr-191.md 指摘 6 がどちらも「push の前ではなく後に気づいた」と書いている）。
+# `edited` を含めておくと、本文を直した時点で検査が走り直す。
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  diff-size:
+    name: 差分規模の宣言
+    runs-on: ubuntu-latest
+    steps:
+      # アクションは commit hash で固定する（AGENTS.md「CI で使うアクション」）。
+      # 更新するときは hash とコメントの版を両方直す。
+      #
+      # 既定では refs/pull/N/merge（マージ結果）が checkout されるので、
+      # PR の先端そのものを指定する。基点との差分を取るので履歴も全部要る。
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      # 基点の枝そのものを取る。`base.sha` はイベントの時点で止まっていることがあり、
+      # GitHub の「Files changed」が使う共通の祖先とずれうる。
+      - name: 基点の枝を取る
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: git fetch --no-tags --quiet origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+
+      # 検査そのもののテスト。検査が壊れていても黙って緑になる状態を作らない
+      # （rules/testing.md「通ったのか検査されなかったのかが区別できない状態」）。
+      - name: 検査のテスト
+        run: bash harness/ci/pr-body-diff-test.sh
+
+      # 本文は環境変数で渡す。`run:` へ直接展開すると、本文に書かれた文字列が
+      # シェルとして解釈されうる。
+      - name: PR 本文を取り出す
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: printf '%s' "$PR_BODY" > "${RUNNER_TEMP}/pr-body.md"
+
+      - name: 差分規模の宣言と実際の差分を突き合わせる
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash harness/ci/pr-body-diff.sh "${RUNNER_TEMP}/pr-body.md" "origin/${BASE_REF}" "$HEAD_SHA"
