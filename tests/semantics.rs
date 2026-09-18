@@ -874,6 +874,23 @@ fn test_compare_with_an_lsp_does_not_unify_two_local_values_spelled_alike_after_
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_unifies_two_functions_querying_their_own_parameter() {
+    // 対照は上のテスト。**hover はどちらも `typeof x` と返す**が、`x` は
+    // **そのシグネチャ自身の引数**なので、どのファイルに書かれていても同じ引数を指す。
+    // 「書かれた場所で決まる」に数えると、測れる答えを落とす（偽陰性。Issue #192）
+    let keeps_a_billing_parameter = fixture("references/src/billing/paramValue.ts", 1);
+    let keeps_a_report_parameter = fixture("references/src/report/paramValue.ts", 1);
+
+    let measured = measured_with_an_lsp(&keeps_a_billing_parameter, &keeps_a_report_parameter);
+
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_with_an_lsp_unifies_two_generic_functions_of_the_same_shape() {
     // 対照は上のテスト。**型変数にも辿った記録は無いが、辿る相手が居ない。**
     // これを「尋ねていない」に数えると、戻り値を注釈したジェネリック関数まで

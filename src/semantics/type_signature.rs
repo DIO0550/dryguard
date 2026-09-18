@@ -1074,9 +1074,14 @@ fn annotation_of(text: &str) -> Option<(&str, &str)> {
 /// **Why not（残った名前もその宣言まで辿る）**: 辿るには宣言のあるファイルを
 /// 構文木にするところから始まり、綴りではなく位置で差し込む形になる（Issue #133）。
 fn is_site_independent(spelling: &str) -> bool {
-    let (Some(names), Some(names_only_types)) =
-        (declared_type_names_of(spelling), names_only_types(spelling))
-    else {
+    // **束縛された値の名前を渡さない。** 見ているのは差し込む側の綴りで、
+    // **差し込み先が何を束縛しているかはここでは分からない**。`typeof x` を含む綴りを
+    // 通すと、`x` の束縛が無い位置（引数の型）へ差し込んで壊れる。**同じ一覧を、
+    // 安全な倒れ方が違う 2 箇所で使い回さない**（`rules/coding.md`）
+    let (Some(names), Some(names_only_types)) = (
+        declared_type_names_of(spelling),
+        names_only_types(spelling, &BTreeSet::new()),
+    ) else {
         return false;
     };
     let holds_a_declared_name = !names.is_empty();
@@ -1469,6 +1474,19 @@ mod tests {
         );
 
         assert_eq!(outcome, TypeSignatureOutcome::SiteDependentSpelling);
+    }
+
+    #[test]
+    fn test_normalized_outcome_of_a_signature_querying_its_own_parameter_is_normalized() {
+        // 対照は 1 つ上のテスト。同じ `typeof` の後ろでも、**このシグネチャの引数**を
+        // 指す名前は、どのファイルに書かれていても同じ引数を指すので落とさない
+        let outcome = normalized_outcome_of(
+            &signature_text("function same(x: string): typeof x"),
+            ValueTypeAnnotation::Written,
+            &TracedTypeNames::default(),
+        );
+
+        assert!(matches!(outcome, TypeSignatureOutcome::Normalized(_)));
     }
 
     #[test]
@@ -2170,6 +2188,25 @@ mod tests {
 
     fn unifiable(one: &str, other: &str) -> bool {
         signature(one).is_unifiable_with(&signature(other))
+    }
+
+    #[test]
+    fn test_signatures_querying_their_own_parameter_are_unifiable() {
+        // `typeof x` の `x` は引数なので、指す先は書かれた場所ではなくシグネチャが決める
+        assert!(unifiable(
+            "function same(x: string): typeof x",
+            "function alsoSame(x: string): typeof x"
+        ));
+    }
+
+    #[test]
+    fn test_signatures_querying_their_own_parameter_of_a_different_type_are_not_unifiable() {
+        // 対照は 1 つ上のテスト。`typeof x` の綴りが同じでも、束縛した引数の型が違えば
+        // 指す先の型が違う
+        assert!(!unifiable(
+            "function same(x: string): typeof x",
+            "function other(x: number): typeof x"
+        ));
     }
 
     #[test]
