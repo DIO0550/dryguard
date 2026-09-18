@@ -11,10 +11,17 @@
 # ローカルで確かめるとき:
 #   bash harness/ci/pr-body-diff.sh /tmp/body.md origin/main HEAD
 #
-# 本文に置く宣言は次の 1 行（ちょうど 1 行）。
+# 本文に置く宣言は次の形の行。行の頭から `差分規模:` で始める（箇条書きの `- ` と
+# 太字の `**` は付いていてもよい）。
 #
 #   差分規模: 3 ファイル / +61 -0
 #
+# Why（行の頭に限る）: 本文が書式そのものを説明することがある。表のセルに書いた例まで
+# 宣言として数えると、書式を説明した PR が自分の例で落ちる（この検査を入れた PR #209 が
+# 実際にそうなった）。
+#
+# Why（1 行に限らない）: 同じ宣言を 2 度書くのは害が無い。数が食い違う 2 行は、
+# どちらかが実際と合わないので下の突き合わせが落とす。
 # Why（`差分規模` という綴り）: harness/records/TEMPLATE.md が記録に要求している
 # 綴りと同じものを使う。新しい語彙を足さずに済む（rules/naming.md
 # 「語を増やすときは、既にある語で言えないかを先に確かめる」）。
@@ -34,12 +41,14 @@ if [ ! -f "$body_file" ]; then
   exit 2
 fi
 
-# 数の並びだけを拾う。前後の装飾（`**`・表のセル・箇条書き）は見ない。
+# 数の並び。書式の雛形（`<ファイル数> ファイル / ...`）はここに当たらない。
 declaration_pattern='[0-9]+[[:space:]]*ファイル[[:space:]]*/[[:space:]]*\+[0-9]+[[:space:]]*-[0-9]+'
 
-# 宣言の行は「`差分規模` と数の並びの両方を持つ行」。片方だけの行は拾わない
-# （本文が `差分規模` を地の文で書くことも、別の PR の数を引くこともあるため）。
-declarations="$(grep -E "差分規模" "$body_file" | grep -E "$declaration_pattern" || true)"
+# 行の頭。箇条書きの印と太字は許す。
+prefix_pattern='^[[:space:]]*([-*+][[:space:]]+)?(\*\*)?差分規模(\*\*)?[：:]'
+
+# 宣言の行は「行の頭が `差分規模:` で、数の並びも持つ行」。片方だけの行は拾わない。
+declarations="$(grep -E "$prefix_pattern" "$body_file" | grep -E "$declaration_pattern" || true)"
 declaration_count="$(printf '%s' "$declarations" | grep -c . || true)"
 
 if [ "$declaration_count" -eq 0 ]; then
@@ -52,6 +61,9 @@ PR 本文に差分規模の宣言がありません。
 
     git diff --numstat origin/main...HEAD
 
+行の頭から始まっていないと宣言として読みません（表のセルの中に書いた例を
+宣言と取り違えないため）。箇条書きの `- ` と太字の `**` は付いていてもかまいません。
+
 Why: 本文の数がレビュー対応の push で古くなる形が、層 4（AGENTS.md）へ介入した後も
 再発している。出し直せる数は層 1 で突き合わせる（AGENTS.md「ツールで落とせるものは
 規約の文に留めない」）。
@@ -59,13 +71,15 @@ EOF
   exit 1
 fi
 
-if [ "$declaration_count" -gt 1 ]; then
-  echo "差分規模の宣言が ${declaration_count} 行あります。どれを突き合わせるかが決まらないので、1 行にしてください。" >&2
+numbers="$(printf '%s\n' "$declarations" | grep -oE "$declaration_pattern" | sort -u)"
+distinct_count="$(printf '%s' "$numbers" | grep -c . || true)"
+
+if [ "$distinct_count" -gt 1 ]; then
+  echo "差分規模の宣言が ${declaration_count} 行あり、数が揃っていません。同じ数に揃えてください。" >&2
   printf '%s\n' "$declarations" >&2
   exit 1
 fi
 
-numbers="$(printf '%s' "$declarations" | grep -oE "$declaration_pattern")"
 declared_files="$(printf '%s' "$numbers" | sed -E 's/^([0-9]+).*/\1/')"
 declared_additions="$(printf '%s' "$numbers" | sed -E 's/.*\+([0-9]+)[[:space:]]*-[0-9]+$/\1/')"
 declared_deletions="$(printf '%s' "$numbers" | sed -E 's/.*-([0-9]+)$/\1/')"
