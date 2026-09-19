@@ -2138,13 +2138,30 @@ export function scale(a: unknown, rate?: unknown): unknown {
     #[test]
     fn test_chunk_type_references_of_a_named_chunk_leave_out_the_annotation_it_is_assigned_to() {
         // 対照は上のテスト。自分の名前を持つので hover は関数自身の型を返し、
-        // 代入先の注釈は綴りに現れない
+        // 注釈を書いてあるこの形では `Formatter` が綴りに現れない。注釈を省いた位置には
+        // 代入先から推論された型名が出るが、それでも集めない理由は
+        // `type_reference::outer_annotated_nodes_of` の Why not
         let named =
             "const named: Formatter = function inner(value: Text): Text {\n  return value;\n};\n";
 
         let chunk = chunk_at(named, "a.ts:1").expect("切り出せる");
 
         assert_eq!(type_names_of(&chunk), vec!["Text"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_of_a_named_chunk_leave_out_a_type_only_the_assignment_writes() {
+        // 対照は同じ綴りの中の `Output`（このチャンク自身が書いた戻り値の注釈）。
+        // `Input` は代入先の注釈にしか無く、hover の綴りには**注釈を省いた引数の位置**に
+        // だけ現れる。その位置の出現は綴りで引かないので、集めても答えは動かない
+        // （`type_reference::outer_annotated_nodes_of` の Why not。Issue #202）
+        let inferred_parameter = "const named: (x: Input) => Output = function inner(x): Output {\n\
+                                  \x20 return build(x);\n\
+                                  };\n";
+
+        let chunk = chunk_at(inferred_parameter, "a.ts:1").expect("切り出せる");
+
+        assert_eq!(type_names_of(&chunk), vec!["Output"]);
     }
 
     #[test]
