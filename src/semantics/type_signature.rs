@@ -116,6 +116,12 @@ pub enum TypeSignatureOutcome {
     NoTypeThere,
     /// hover の応答を `lsp` が読めなかった。
     UnreadableHover,
+    /// 尋ねるたびにサーバが作業を始めるので、hover の答えが落ち着かなかった。
+    ///
+    /// **途中の綴りを答えにしない。** 読み込み前の hover は推論された型に `any` を綴るので、
+    /// そのまま正規化すると比較まで進み、**中身の違う 2 つが単一化可能に出る**（偽陽性）
+    /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+    ServerStillWorking,
     /// 綴りは返ったが、[`normalized_outcome_of`] が読み解けなかった。
     UnreadableSignature,
     /// サーバが hover を提供していない。
@@ -318,6 +324,7 @@ fn asked_signature_text_of(
         HoverOutcome::Answered(signature_text) => Ok(signature_text),
         HoverOutcome::NoAnswer => Err(TypeSignatureOutcome::NoTypeThere),
         HoverOutcome::Unreadable => Err(TypeSignatureOutcome::UnreadableHover),
+        HoverOutcome::ServerStillWorking => Err(TypeSignatureOutcome::ServerStillWorking),
         HoverOutcome::NotSupported => Err(TypeSignatureOutcome::HoverNotProvided),
     };
 

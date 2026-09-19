@@ -537,6 +537,9 @@ fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
 /// `tests/semantics.rs` の `test_caller_domains_asked_after_a_type_signature_are_still_complete`）。
 /// 型名の解決も hover と同じ側に置くので、references は最後のまま。
 ///
+/// **hover の側の落ち着きは、この順序が担っているのではない。** hover 自身が
+/// 落ち着くまで尋ね直す（`lsp::Connection::hover`）ので、並べ替えても綴りは変わらない。
+///
 /// **1 つが落ちても残りを尋ねる。** 途中で降りると、取れていたシグナルまで
 /// 「測れない」に化ける（[`AskedSemantics`]）。
 fn asked_semantics_of(
@@ -789,6 +792,11 @@ fn type_signature_match_of(
         | (_, TypeSignatureOutcome::SiteDependentSpelling) => {
             TypeSignatureMatch::SiteDependentSpelling
         }
+        // **落ち着かなかったほうを、往復と読み取りの理由より先に出す。** 残りの理由は
+        // どれも**サーバが落ち着いた上での答え**（型が無い・読めない・提供していない）なので、
+        // 後ろに置くと「待てば変わる」側の案内が、待っても変わらない側の文に覆われる
+        (TypeSignatureOutcome::ServerStillWorking, _)
+        | (_, TypeSignatureOutcome::ServerStillWorking) => TypeSignatureMatch::ServerStillWorking,
         (TypeSignatureOutcome::NoTypeThere, _) | (_, TypeSignatureOutcome::NoTypeThere) => {
             TypeSignatureMatch::NoTypeThere
         }
@@ -1499,6 +1507,9 @@ fn asked_paths_of(chunks: &[ScannedChunk], asked: &BTreeSet<usize>) -> Vec<PathB
 /// （`tests/semantics.rs` の `test_caller_domains_asked_after_a_type_signature_are_still_complete`）、
 /// 1 チャンクずつ交互に送ると読み込み中に計算された答えを受け取る。
 ///
+/// **hover の側の落ち着きは、この順序が担っているのではない。** hover 自身が
+/// 落ち着くまで尋ね直す（`lsp::Connection::hover`）ので、並べ替えても綴りは変わらない。
+///
 /// **1 つが落ちても残りを尋ねる。** 途中で降りると、取れていたシグナルまで
 /// 「測れない」に化ける（[`AskedSemantics`]）。
 fn asked_scan_semantics_of(
@@ -2190,6 +2201,32 @@ mod tests {
             &TypeSignatureOutcome::UnopenedTypeName {
                 reason: UnopenedReason::NoDeclarationSite,
             },
+        );
+
+        assert_eq!(matched, TypeSignatureMatch::SiteDependentSpelling);
+    }
+
+    #[test]
+    fn test_type_signature_match_of_an_unsettled_hover_outranks_a_reason_from_a_settled_answer() {
+        // 対照は 1 つ上のテスト（形の理由が往復の理由を上回る側）。残りの往復の理由は
+        // どれも**サーバが落ち着いた上での答え**なので、落ち着かなかった側を後ろに置くと
+        // 「待てば変わる」案内が、待っても変わらない側の文に覆われる
+        let matched = type_signature_match_of(
+            &TypeSignatureOutcome::NoTypeThere,
+            &TypeSignatureOutcome::ServerStillWorking,
+        );
+
+        assert_eq!(matched, TypeSignatureMatch::ServerStillWorking);
+    }
+
+    #[test]
+    fn test_type_signature_match_of_an_unsettled_hover_does_not_outrank_a_site_dependent_spelling()
+    {
+        // 対照は 1 つ上のテスト。落ち着きを待っても綴りが場所に依存することは変わらないので、
+        // **環境を直しても変わらない理由**のほうを先に出す
+        let matched = type_signature_match_of(
+            &TypeSignatureOutcome::ServerStillWorking,
+            &TypeSignatureOutcome::SiteDependentSpelling,
         );
 
         assert_eq!(matched, TypeSignatureMatch::SiteDependentSpelling);

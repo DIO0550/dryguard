@@ -244,6 +244,9 @@ fn type_signature_text_of(signal: TypeSignatureMatch) -> Option<String> {
         TypeSignatureMatch::NoName => "測れない (チャンクが名前を持たない)",
         TypeSignatureMatch::NoTypeThere => "測れない (サーバがその位置に型を持たない)",
         TypeSignatureMatch::UnreadableHover => "測れない (hover の応答を読めない)",
+        TypeSignatureMatch::ServerStillWorking => {
+            "測れない (サーバが作業中で hover の答えが落ち着かない)"
+        }
         TypeSignatureMatch::UnreadableSignature => "測れない (返った綴りを読み解けない)",
         TypeSignatureMatch::HoverNotProvided => "測れない (サーバが hover を提供していない)",
         TypeSignatureMatch::UnopenedTypeName { reason } => unopened_text_of(reason),
@@ -315,6 +318,9 @@ fn unopened_text_of(reason: UnopenedReason) -> &'static str {
         }
         UnopenedReason::HoverNotProvided => {
             "測れない (比較に残る型名を開けない: サーバが hover を提供していない)"
+        }
+        UnopenedReason::ServerStillWorking => {
+            "測れない (比較に残る型名を開けない: サーバが作業中で宣言の位置の hover の答えが落ち着かない)"
         }
         UnopenedReason::UnopenableAlias => {
             "測れない (比較に残る型名を開けない: エイリアスの右辺を差し込める形にできない)"
@@ -883,6 +889,48 @@ mod tests {
                 "型シグネチャ: 測れない (比較に残る型名を開けない: サーバが typeDefinition を提供していない) → どちらでもない"
             ),
             "開けなかったことが理由として出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_an_unsettled_hover_says_so_instead_of_calling_the_pair_unifiable() {
+        // 対照は 1 つ上のテスト（開けなかった型名）。**待てば変わる**側なので、
+        // 直す先が違う。読み込み前の hover は推論された型に `any` を綴り、`any` どうしは
+        // 重なるので、黙って採ると単一化可能に出る（偽陽性）
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::ServerStillWorking,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (サーバが作業中で hover の答えが落ち着かない) → どちらでもない"
+            ),
+            "落ち着かなかったことが理由として出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_an_unsettled_declaration_hover_says_which_hover_did_not_settle() {
+        // 対照は 1 つ上のテスト。**落ち着かなかった hover が別**（チャンクの位置ではなく
+        // 宣言の位置）で、開く先の綴りが取れていない。1 語で出すと、どちらの往復を
+        // 待てばよいのかが読めない
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::UnopenedTypeName {
+                reason: UnopenedReason::ServerStillWorking,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (比較に残る型名を開けない: サーバが作業中で宣言の位置の hover の答えが落ち着かない) → どちらでもない"
+            ),
+            "宣言の位置の hover が落ち着かなかったことが出る: {text}"
         );
     }
 

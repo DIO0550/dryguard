@@ -112,6 +112,12 @@ pub enum UnopenedReason {
     NoSpellingAtDeclaration,
     /// 宣言の位置の hover の応答を `lsp` が読めなかった。
     UnreadableDeclarationHover,
+    /// 尋ねるたびにサーバが作業を始めるので、宣言の位置の hover が落ち着かなかった。
+    ///
+    /// **途中の綴りを右辺として差し込まない。** 読み込み前の hover は推論された型に
+    /// `any` を綴るので、差し込むと**開けていない型名を開けたことにする**
+    /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+    ServerStillWorking,
     /// サーバが hover を提供していない。
     HoverNotProvided,
     /// 宣言は型エイリアスだが、右辺を差し込める形にできなかった。
@@ -291,6 +297,13 @@ pub fn opened_type_names_of(
                 unopened.push(UnopenedTypeName::new(
                     name,
                     UnopenedReason::UnreadableDeclarationHover,
+                ));
+                continue;
+            }
+            HoverOutcome::ServerStillWorking => {
+                unopened.push(UnopenedTypeName::new(
+                    name,
+                    UnopenedReason::ServerStillWorking,
                 ));
                 continue;
             }

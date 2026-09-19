@@ -43,12 +43,13 @@ use crate::source_position::SourcePosition;
 /// `initialize` でサーバに名乗る名前。
 const CLIENT_NAME: &str = "dryguard";
 
-/// references を尋ねる回数の上限。
+/// 落ち着いた答えを求めて尋ね直す回数の上限。
 ///
 /// 1 回目は読み込みの途中に当たりうる。2 回目はその読み込みが終わってからになる。
 /// **3 回目でも作業に触れているなら、尋ねるたびに始まっている**ので、待っても
-/// 答えは落ち着かない（`ReferencesOutcome::ServerStillWorking`）。
-const REFERENCES_ATTEMPTS: usize = 3;
+/// 答えは落ち着かない（`ReferencesOutcome::ServerStillWorking` /
+/// `HoverOutcome::ServerStillWorking`）。
+const SETTLED_ATTEMPTS: usize = 3;
 
 /// LSP サーバとの往復。
 ///
@@ -263,6 +264,11 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     /// 開かせてあるかの断りは呼び出し側が置く。**断る理由が呼び出し側で違う**ので、
     /// ここにまとめると片方に合わない断りが入る。
     ///
+    /// 答えを採るのは**サーバの作業が動いていないとき**だけ。読み込みの前に尋ねると、
+    /// サーバは推論された型に `any` を綴って返す（typescript-language-server 6.0.0 で実測）。
+    /// `any` は型として読める綴りなので、そのまま採ると**中身の違う 2 つが
+    /// 「単一化可能」に出る**（偽陽性）。
+    ///
     /// # Errors
     ///
     /// パラメータを JSON にできないとき、送受信が失敗したとき、
@@ -282,6 +288,19 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         let params = serde_json::to_value(params)
             .map_err(not_serializable_error_of(HoverRequest::METHOD))?;
 
+        self.settled_outcome_of(
+            params,
+            Self::ask_hover_once,
+            HoverOutcome::ServerStillWorking,
+        )
+    }
+
+    /// hover を 1 往復だけ尋ねる。
+    ///
+    /// # Errors
+    ///
+    /// 送受信が失敗したとき、応答を hover の結果として読めないとき。
+    fn ask_hover_once(&mut self, params: Value) -> Result<HoverOutcome, ConnectionError> {
         let result = self.request(HoverRequest::METHOD, Some(params))?;
         // 答えが無いときサーバは null を返す。`Option` で受けて、応答が読めなかった
         // 場合と分ける。
@@ -397,14 +416,11 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         let params =
             serde_json::to_value(params).map_err(not_serializable_error_of(References::METHOD))?;
 
-        let settled = self.settled_references_of(params);
-
-        // 用意されただけの作業を覚えておくのは、**この問い合わせの間だけ**。持ち越すと、
-        // 始まらないまま捨てられた token 1 つで、以降の問い合わせがすべて
-        // `ServerStillWorking` になる。
-        self.prepared_progress.clear();
-
-        settled
+        self.settled_outcome_of(
+            params,
+            Self::ask_references_once,
+            ReferencesOutcome::ServerStillWorking,
+        )
     }
 
     /// そのファイルを、サーバがどのプロジェクトの一員として扱っているかを尋ねる。
@@ -451,17 +467,48 @@ impl<R: BufRead, W: Write> Connection<R, W> {
 
     /// サーバの作業に触れていない答えが返るまで、上限まで尋ね直す。
     ///
+    /// `ask_once` はその問い合わせを 1 往復だけ送るもの、`still_working` は上限まで
+    /// 落ち着かなかったときの答え。**問い合わせの種類で分けない。** 読み込み中の答えが
+    /// 実際と違うのは references も hover も同じで、分けて持つと**同じ「落ち着き」の判定が
+    /// 2 つ別々に育つ**（片方だけが直る形になる）。
+    ///
     /// # Errors
     ///
-    /// 送受信が失敗したとき、応答を references の結果として読めないとき。
-    fn settled_references_of(
+    /// 送受信が失敗したとき、応答をその問い合わせの結果として読めないとき。
+    fn settled_outcome_of<T>(
         &mut self,
         params: Value,
-    ) -> Result<ReferencesOutcome, ConnectionError> {
+        ask_once: fn(&mut Self, Value) -> Result<T, ConnectionError>,
+        still_working: T,
+    ) -> Result<T, ConnectionError> {
+        let settled = self.outcome_untouched_by_work_of(params, ask_once, still_working);
+
+        // 用意されただけの作業を覚えておくのは、**この問い合わせの間だけ**。持ち越すと、
+        // 始まらないまま捨てられた token 1 つで、以降の問い合わせがすべて
+        // 落ち着かなかったことになる。
+        self.prepared_progress.clear();
+
+        settled
+    }
+
+    /// 作業に触れていない答えを、上限まで尋ね直して探す。
+    ///
+    /// 上限まで落ち着かなければ `still_working` を返す。覚えている作業を忘れるのは
+    /// 呼び出し元（[`Self::settled_outcome_of`]）の担当。
+    ///
+    /// # Errors
+    ///
+    /// 送受信が失敗したとき、応答をその問い合わせの結果として読めないとき。
+    fn outcome_untouched_by_work_of<T>(
+        &mut self,
+        params: Value,
+        ask_once: fn(&mut Self, Value) -> Result<T, ConnectionError>,
+        still_working: T,
+    ) -> Result<T, ConnectionError> {
         // 読み込み中に返ってきた答えは、**サーバがまだ見ていないファイルの分が抜けている**
-        // （呼び出し元は呼び出し先を import する側なので、開かせたファイルからは辿れない）。
+        // （references なら呼び出し元が欠け、hover なら推論された型が `any` になる）。
         // 作業が終わってから尋ね直し、**作業に触れていない答えだけを採る**。
-        let mut attempts_left = REFERENCES_ATTEMPTS;
+        let mut attempts_left = SETTLED_ATTEMPTS;
 
         while attempts_left > 0 {
             // **尋ねる前に、動いている作業を待ち切る。** 動いている最中に送ると、
@@ -470,7 +517,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             self.wait_for_running_progress()?;
 
             let noticed_before = self.noticed_progress_count;
-            let answered = self.ask_references_once(params.clone())?;
+            let answered = ask_once(self, params.clone())?;
 
             // 「今動いているか」だけでは足りない。**尋ねている間に始まって終わった作業**が
             // あると、読み込み前に計算された答えを受け取りながら、手元では何も動いて
@@ -488,7 +535,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             attempts_left -= 1;
         }
 
-        Ok(ReferencesOutcome::ServerStillWorking)
+        Ok(still_working)
     }
 
     /// references を 1 往復だけ尋ねる。
@@ -1215,18 +1262,18 @@ mod tests {
     }
 
     /// hover の応答 1 通分の payload。
-    fn hover_response(signature: &str) -> String {
+    fn hover_response(id: u64, signature: &str) -> String {
         let contents = json!({
             "kind": "markdown",
             "value": format!("\n```typescript\n{signature}\n```\n"),
         });
 
-        json!({"jsonrpc": "2.0", "id": 1, "result": {"contents": contents}}).to_string()
+        json!({"jsonrpc": "2.0", "id": id, "result": {"contents": contents}}).to_string()
     }
 
     #[test]
     fn test_hover_returns_the_signature_the_server_answered() {
-        let server_output = frames_of(&[&hover_response("function decl(a: string): number")]);
+        let server_output = frames_of(&[&hover_response(1, "function decl(a: string): number")]);
         let mut connection = connection_over(&server_output);
         let document = document_of("tests/fixtures/billing/discount.ts", "export const a = 1;");
         connection.open_document(&document).expect("送れる");
@@ -1244,7 +1291,7 @@ mod tests {
     #[test]
     fn test_hover_names_the_document_and_the_position_it_asks_about() {
         // 行は 0 始まりに直して送る。1 始まりのまま送ると 1 行下を見ることになる
-        let server_output = frames_of(&[&hover_response("function decl(a: string): number")]);
+        let server_output = frames_of(&[&hover_response(1, "function decl(a: string): number")]);
         let mut connection = connection_over(&server_output);
         let document = document_of("tests/fixtures/billing/discount.ts", "export const a = 1;");
         connection.open_document(&document).expect("送れる");
@@ -1281,6 +1328,83 @@ mod tests {
             .expect("応答を受け取れる");
 
         assert_eq!(signature, HoverOutcome::NoAnswer);
+    }
+
+    #[test]
+    fn test_hover_answered_while_the_server_is_still_working_asks_again_when_it_finished() {
+        // 読み込みの前でもサーバは答えるが、**推論された型には `any` が綴られる**
+        // （typescript-language-server 6.0.0 で実測）。`any` は型として読める綴りなので、
+        // 1 通目をそのまま返すと比較まで進み、中身の違う 2 つが単一化可能に出る
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            &progress_begin_notification("loading"),
+            &hover_response(1, "(getter) Holder.value: any"),
+            &progress_end_notification("loading"),
+            &hover_response(2, "(getter) Holder.value: Result"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .hover(&document, position_after(5, "  get "))
+            .expect("応答を受け取れる");
+
+        assert_eq!(
+            outcome,
+            HoverOutcome::Answered(signature_text("(getter) Holder.value: Result")),
+            "読み込みが終わってから尋ね直した綴りを返す"
+        );
+    }
+
+    #[test]
+    fn test_hover_that_never_settles_does_not_return_a_partial_spelling() {
+        // 対照は上のテスト。最後の答えも綴りを持っているが、**その答えを返している間も
+        // 作業が動いている**。読み込み前の綴りを最終的なシグナルとして返すと、
+        // `any` どうしが重なって偽陽性になる
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading-first"),
+            &progress_begin_notification("loading-first"),
+            &hover_response(1, "(getter) Holder.value: any"),
+            &progress_end_notification("loading-first"),
+            &progress_create_request(10, "loading-next"),
+            &progress_begin_notification("loading-next"),
+            &hover_response(2, "(getter) Holder.value: any"),
+            &progress_end_notification("loading-next"),
+            &progress_create_request(11, "loading-more"),
+            &progress_begin_notification("loading-more"),
+            &hover_response(3, "(getter) Holder.value: any"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .hover(&document, position_after(5, "  get "))
+            .expect("応答を受け取れる");
+
+        assert_eq!(
+            outcome,
+            HoverOutcome::ServerStillWorking,
+            "落ち着かなかったことを名前で返す"
+        );
+    }
+
+    #[test]
+    fn test_hover_answered_without_any_work_asks_once() {
+        // 落ち着いているときに往復が増えると、チャンクごと・型名ごとに尋ねる hover で
+        // 積み上がる。**尋ね直すのは作業に触れたときだけ**
+        let server_output = frames_of(&[&hover_response(1, "(getter) Holder.value: Result")]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        connection
+            .hover(&document, position_after(5, "  get "))
+            .expect("応答を受け取れる");
+
+        let asked = sent_payloads(&connection.writer)
+            .iter()
+            .filter(|payload| payload["method"] == json!("textDocument/hover"))
+            .count();
+        assert_eq!(asked, 1, "作業が動いていなければ 1 往復で済ませる");
     }
 
     #[test]
@@ -1334,6 +1458,11 @@ mod tests {
         format!(
             r#"{{"jsonrpc":"2.0","id":{id},"result":[{{"uri":"{uri}","range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":1}}}}}}]}}"#
         )
+    }
+
+    /// 宣言の場所が無いという応答。
+    fn no_type_definition_response(id: u64) -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#)
     }
 
     /// 参照元が 1 件も無いという応答。
@@ -1498,12 +1627,15 @@ mod tests {
 
     #[test]
     fn test_references_answered_while_work_prepared_earlier_ran_asks_again() {
-        // token を用意するのは前の問い合わせ（hover）の最中で、**始まりと終わりだけが
+        // token を用意するのは前の問い合わせ（typeDefinition）の最中で、**始まりと終わりだけが
         // 参照元を尋ねている間に届く**。用意した時点しか数えていないと、この並びで
         // 「何も起きなかった」ように見え、読み込み中の答えをそのまま採る
+        //
+        // **前の問い合わせに typeDefinition を置く。** hover は落ち着くまで尋ね直すので、
+        // 用意されただけの作業が残っているうちは答えを返さない
         let server_output = frames_of(&[
             &progress_create_request(9, "loading"),
-            &hover_response("function applyDiscount(invoice: Invoice): number"),
+            &no_type_definition_response(1),
             &progress_begin_notification("loading"),
             &progress_end_notification("loading"),
             &no_references_response(2),
@@ -1512,8 +1644,8 @@ mod tests {
         let mut connection = connection_over(&server_output);
         let document = opened_document(&mut connection);
         connection
-            .hover(&document, position_after(5, "export function "))
-            .expect("hover に答えが返る");
+            .type_definition(&document, position_after(5, "export function "))
+            .expect("typeDefinition に答えが返る");
 
         let outcome = connection
             .references(&document, position_after(5, "export function "))
@@ -1527,12 +1659,15 @@ mod tests {
 
     #[test]
     fn test_references_with_prepared_work_that_has_not_begun_does_not_settle() {
-        // token を用意する要求は前の問い合わせ（hover）の最中に届き、**始まりの通知が
+        // token を用意する要求は前の問い合わせ（typeDefinition）の最中に届き、**始まりの通知が
         // どの答えよりも後ろ**に並ぶ。用意されただけの作業を 1 度で忘れると、2 通目を
         // 「何も起きていない」と読んで、始まる前に計算された答えを採る
+        //
+        // **前の問い合わせに typeDefinition を置く。** hover は落ち着くまで尋ね直すので、
+        // 用意されただけの作業が残っているうちは答えを返さない
         let server_output = frames_of(&[
             &progress_create_request(9, "prepared"),
-            &hover_response("function applyDiscount(invoice: Invoice): number"),
+            &no_type_definition_response(1),
             &no_references_response(2),
             &no_references_response(3),
             &no_references_response(4),
@@ -1540,8 +1675,8 @@ mod tests {
         let mut connection = connection_over(&server_output);
         let document = opened_document(&mut connection);
         connection
-            .hover(&document, position_after(5, "export function "))
-            .expect("hover に答えが返る");
+            .type_definition(&document, position_after(5, "export function "))
+            .expect("typeDefinition に答えが返る");
 
         let outcome = connection
             .references(&document, position_after(5, "export function "))

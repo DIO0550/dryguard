@@ -168,6 +168,12 @@ pub enum TypeSignatureMatch {
     NoTypeThere,
     /// hover の応答を `lsp` が読めなかった。
     UnreadableHover,
+    /// 尋ねるたびにサーバが作業を始めるので、hover の答えが落ち着かなかった。
+    ///
+    /// **途中の綴りを比較に使わない。** 読み込み前の hover は推論された型に `any` を綴り、
+    /// `any` どうしは重なるので、**中身の違う 2 つが `Unifiable` に出る**（偽陽性）
+    /// （`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」）。
+    ServerStillWorking,
     /// 綴りは返ったが、`semantics` が型シグネチャへ直せなかった。
     UnreadableSignature,
     /// サーバが数えたオーバーロードの本数と、揃えられた本数が食い違う。
