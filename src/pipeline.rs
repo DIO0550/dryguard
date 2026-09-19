@@ -610,7 +610,7 @@ fn resolved_type_signature_outcome_of(
         session,
         document,
         position,
-        chunk.value_type_annotation(),
+        chunk.annotated_positions(),
         chunk.overload_declarations(),
         &traced,
     )
@@ -824,17 +824,34 @@ fn type_signature_match_of(
         // 左側を掴むので、`compare` の引数を入れ替えただけで案内が変わる
         (
             TypeSignatureOutcome::UntracedTypeName {
-                reason: UntracedReason::OmittedValueTypeAnnotation,
+                reason: UntracedReason::OmittedTypeAnnotation,
             },
             _,
         )
         | (
             _,
             TypeSignatureOutcome::UntracedTypeName {
-                reason: UntracedReason::OmittedValueTypeAnnotation,
+                reason: UntracedReason::OmittedTypeAnnotation,
             },
         ) => TypeSignatureMatch::UntracedTypeName {
-            reason: UntracedReason::OmittedValueTypeAnnotation,
+            reason: UntracedReason::OmittedTypeAnnotation,
+        },
+        // **記録が無いほうを、揃わなかったほうより先に出す。** 並びは 1 本の綴りを読む側
+        // （`semantics::type_signature` の `single_outcome_of`）と揃える。2 箇所で違う順に
+        // すると、同じ 2 つの理由が「1 本の中で重なったか」で違う案内になる
+        (
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord,
+            },
+            _,
+        )
+        | (
+            _,
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord,
+            },
+        ) => TypeSignatureMatch::UntracedTypeName {
+            reason: UntracedReason::NoTracedRecord,
         },
         (TypeSignatureOutcome::UntracedTypeName { reason }, _)
         | (_, TypeSignatureOutcome::UntracedTypeName { reason }) => {
@@ -1882,7 +1899,7 @@ mod tests {
     use crate::semantics::resolved_type::TracedTypeNames;
     use crate::semantics::type_signature::normalized_outcome_of;
     use crate::similarity::Similarity;
-    use crate::syntax::chunk::ValueTypeAnnotation;
+    use crate::syntax::chunk::AnnotatedPositions;
     use crate::test_support::{line, missing_server, overload_count, signature_text};
 
     fn measured(value: f64) -> Similarity {
@@ -1922,7 +1939,7 @@ mod tests {
     fn normalized(text: &str) -> TypeSignatureOutcome {
         normalized_outcome_of(
             &signature_text(text),
-            ValueTypeAnnotation::Written,
+            &AnnotatedPositions::AllWritten,
             &TracedTypeNames::default(),
         )
     }
@@ -2239,7 +2256,7 @@ mod tests {
         // （注釈が無いと構文木から分かっている）を、確かめられていない側で覆わない
         let omitted_first = type_signature_match_of(
             &TypeSignatureOutcome::UntracedTypeName {
-                reason: UntracedReason::OmittedValueTypeAnnotation,
+                reason: UntracedReason::OmittedTypeAnnotation,
             },
             &TypeSignatureOutcome::UntracedTypeName {
                 reason: UntracedReason::NoTracedRecord,
@@ -2250,14 +2267,14 @@ mod tests {
                 reason: UntracedReason::NoTracedRecord,
             },
             &TypeSignatureOutcome::UntracedTypeName {
-                reason: UntracedReason::OmittedValueTypeAnnotation,
+                reason: UntracedReason::OmittedTypeAnnotation,
             },
         );
 
         assert_eq!(
             omitted_first,
             TypeSignatureMatch::UntracedTypeName {
-                reason: UntracedReason::OmittedValueTypeAnnotation
+                reason: UntracedReason::OmittedTypeAnnotation
             }
         );
         assert_eq!(
@@ -2284,6 +2301,73 @@ mod tests {
             TypeSignatureMatch::UntracedTypeName {
                 reason: UntracedReason::NoTracedRecord
             }
+        );
+    }
+
+    #[test]
+    fn test_type_signature_match_of_unaligned_parameters_and_no_traced_record_keeps_no_traced_record()
+     {
+        // **1 本の綴りを読む側と同じ並びにする**（`single_outcome_of`）。2 箇所で違う順に
+        // すると、同じ 2 つの理由が「1 本の中で重なったか」で違う案内になる
+        let unaligned_first = type_signature_match_of(
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::UnalignedParameters,
+            },
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord,
+            },
+        );
+        let no_record_first = type_signature_match_of(
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord,
+            },
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::UnalignedParameters,
+            },
+        );
+
+        assert_eq!(
+            unaligned_first,
+            TypeSignatureMatch::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord
+            }
+        );
+        assert_eq!(
+            no_record_first, unaligned_first,
+            "引数の順を入れ替えても同じ理由が出る"
+        );
+    }
+
+    #[test]
+    fn test_type_signature_match_of_an_omitted_annotation_and_unaligned_parameters_keeps_the_omitted_one()
+     {
+        // 対照は 1 つ上のテスト。**確かめてある側があれば、そちらが残る**
+        let omitted_first = type_signature_match_of(
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedTypeAnnotation,
+            },
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::UnalignedParameters,
+            },
+        );
+        let unaligned_first = type_signature_match_of(
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::UnalignedParameters,
+            },
+            &TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::OmittedTypeAnnotation,
+            },
+        );
+
+        assert_eq!(
+            omitted_first,
+            TypeSignatureMatch::UntracedTypeName {
+                reason: UntracedReason::OmittedTypeAnnotation
+            }
+        );
+        assert_eq!(
+            unaligned_first, omitted_first,
+            "引数の順を入れ替えても同じ理由が出る"
         );
     }
 

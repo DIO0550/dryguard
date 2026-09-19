@@ -110,7 +110,7 @@ fn type_signature_of(session: &mut Session, chunk: &Chunk) -> OverloadSet {
         session,
         &document,
         position,
-        chunk.value_type_annotation(),
+        chunk.annotated_positions(),
         chunk.overload_declarations(),
         &traced,
     );
@@ -788,7 +788,7 @@ fn test_compare_with_an_lsp_does_not_unify_an_inferred_return_type_spelled_like_
     assert_eq!(
         measured.signals().type_signature_match(),
         TypeSignatureMatch::UntracedTypeName {
-            reason: UntracedReason::OmittedValueTypeAnnotation
+            reason: UntracedReason::OmittedTypeAnnotation
         }
     );
 }
@@ -826,7 +826,7 @@ fn test_compare_with_an_lsp_does_not_unify_two_inferred_return_types_spelled_ali
     assert_eq!(
         measured.signals().type_signature_match(),
         TypeSignatureMatch::UntracedTypeName {
-            reason: UntracedReason::OmittedValueTypeAnnotation
+            reason: UntracedReason::OmittedTypeAnnotation
         }
     );
 }
@@ -850,7 +850,7 @@ fn test_compare_with_an_lsp_does_not_unify_two_accessors_before_the_project_is_l
     assert_eq!(
         measured.signals().type_signature_match(),
         TypeSignatureMatch::UntracedTypeName {
-            reason: UntracedReason::OmittedValueTypeAnnotation
+            reason: UntracedReason::OmittedTypeAnnotation
         }
     );
 }
