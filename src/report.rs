@@ -280,8 +280,13 @@ fn untraced_text_of(reason: UntracedReason) -> &'static str {
     match reason {
         // **直す先を出す。** 開けなかったのとは違い、サーバの側でできることは無く、
         // 対象のコードに注釈を書くと尋ねる位置ができる
-        UntracedReason::OmittedValueTypeAnnotation => {
-            "測れない (値の型の注釈が省かれている: 注釈を書くと辿れる)"
+        UntracedReason::OmittedTypeAnnotation => {
+            "測れない (型注釈が省かれている: 注釈を書くと辿れる)"
+        }
+        // **直す先を言い切らない。** 引数の数が揃わないと**どの引数が省いたのかを
+        // 言えない**ので、注釈はもう書かれているかもしれない
+        UntracedReason::UnalignedParameters => {
+            "測れない (引数の数が綴りと揃わない: どの引数の型名を尋ねていないかを言えない)"
         }
         // **直す先を言い切らない。** 型名を集める場所の一覧は TypeScript の文法が持つ
         // 形の数だけ増え続けるので、「書かれていない」と出すと**注釈を書いてある
@@ -956,11 +961,11 @@ mod tests {
     }
 
     #[test]
-    fn test_text_of_with_an_omitted_value_type_annotation_points_at_the_annotation_to_write() {
+    fn test_text_of_with_an_omitted_type_annotation_points_at_the_annotation_to_write() {
         // 注釈が省かれているのは構文木から確かめてあるので、**直す先を言い切ってよい**
         let text = text_of_accidental_duplication_with_semantics(
             TypeSignatureMatch::UntracedTypeName {
-                reason: UntracedReason::OmittedValueTypeAnnotation,
+                reason: UntracedReason::OmittedTypeAnnotation,
             },
             CallerDomainOverlap::Unavailable {
                 reason: SemanticsUnavailable::NotAsked,
@@ -969,9 +974,31 @@ mod tests {
 
         assert!(
             text.contains(
-                "型シグネチャ: 測れない (値の型の注釈が省かれている: 注釈を書くと辿れる) → どちらでもない"
+                "型シグネチャ: 測れない (型注釈が省かれている: 注釈を書くと辿れる) → どちらでもない"
             ),
             "注釈を書けば辿れることまで出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_unaligned_parameters_does_not_claim_the_annotation_is_missing() {
+        // 対照は 1 つ上のテスト。どちらも「尋ねていない」だが、**引数の数が揃わないと
+        // どの引数が省いたのかを言えない**。注釈を書けと出すと、もう書いてある
+        // 利用者に嘘の案内を出す
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::UntracedTypeName {
+                reason: UntracedReason::UnalignedParameters,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (引数の数が綴りと揃わない: どの引数の型名を尋ねていないかを言えない) → どちらでもない"
+            ),
+            "注釈を書けとは出ない: {text}"
         );
     }
 

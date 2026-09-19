@@ -392,10 +392,40 @@ impl Callable {
     /// 同じ綴りが引数の側に書かれていても**その出現を尋ねたことにはならない**
     /// (`rules/architecture.md`「どこまでを「取れなかった」に数えるか」)。
     ///
-    /// **自分の型変数はここでも外す。** `<T>(x: T) => T` の戻り値は辿る相手が居ないので、
+    /// **自分の型変数は外す**（[`Callable::free_type_names_under_own_scope`]）。
+    pub(crate) fn value_type_names(&self) -> Option<BTreeSet<String>> {
+        self.free_type_names_under_own_scope(&self.return_type)
+    }
+
+    /// **引数の位置**ごとに残っている型名のうち、宣言を辿る相手になりうるもの。
+    /// 綴りに並んだ順。綴りのまま持っている部分を読めなければ `None`。
+    ///
+    /// **既定値つきの引数は注釈を省ける**ので、戻り値と同じく
+    /// **ソースのどこにも書かれていない型名**がここに出る
+    /// （`function echo(received = buildLocal()): Receipt` の hover は
+    /// `function echo(received?: Receipt): Receipt`）。綴りで記録を引くと、
+    /// **書かれた戻り値の記録が推論された引数に乗る**（偽陽性）。
+    ///
+    /// **並びを落とさない。** ソースの引数リストも綴りの引数リストも順序を持つので、
+    /// **添字が、どの出現が書かれていないかを言い当てる鍵になる**
+    /// （戻り値・型引数にはこの鍵が無い）。
+    pub(crate) fn parameter_type_names(&self) -> Option<Vec<BTreeSet<String>>> {
+        self.parameters
+            .iter()
+            .map(|parameter| self.free_type_names_under_own_scope(&parameter.annotated_type))
+            .collect()
+    }
+
+    /// 自分の型変数だけを束縛として積んで見た、その綴りに残る辿れる型名。
+    /// 綴りのまま持っている部分を読めなければ `None`。
+    ///
+    /// **自分の型変数はここでも外す。** `<T>(x: T) => T` の `T` は辿る相手が居ないので、
     /// 数えると**注釈を省いたジェネリック関数がまとめて測れない側へ落ちる**
     /// （[`Callable::type_names`] が外しているのと同じ理由）。
-    pub(crate) fn value_type_names(&self) -> Option<BTreeSet<String>> {
+    fn free_type_names_under_own_scope(
+        &self,
+        annotated: &TypeStructure,
+    ) -> Option<BTreeSet<String>> {
         let mut scopes = vec![
             self.type_parameters
                 .iter()
@@ -403,8 +433,7 @@ impl Callable {
                 .collect(),
         ];
 
-        self.return_type
-            .free_type_names_of(&mut scopes, SpelledBinders::Skipped)
+        annotated.free_type_names_of(&mut scopes, SpelledBinders::Skipped)
     }
 
     /// `scopes` が束縛していない型名。
@@ -2225,6 +2254,33 @@ mod tests {
             read.value_type_names(),
             Some(["Amount"].into_iter().map(str::to_owned).collect())
         );
+    }
+
+    #[test]
+    fn test_the_parameter_type_names_of_a_callable_type_stay_in_the_written_order() {
+        // 添字がソースの引数リストと突き合わせる鍵なので、**位置ごとに分けて持つ**。
+        // 1 つの集合へ畳むと、注釈を書いてある引数の型名まで巻き添えになる
+        let read = Callable::from_spelling("(a: Amount, b: number, c: Receipt) => void")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(
+            read.parameter_type_names(),
+            Some(vec![
+                ["Amount"].into_iter().map(str::to_owned).collect(),
+                ["number"].into_iter().map(str::to_owned).collect(),
+                ["Receipt"].into_iter().map(str::to_owned).collect(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_the_parameter_type_names_of_a_callable_type_leave_out_the_type_variables_it_declares() {
+        // 束縛された型変数は辿る相手が居ない。数えると、**引数の注釈を省いただけの
+        // ジェネリック関数がまとめて測れない側へ落ちる**
+        let read = Callable::from_spelling("<T>(x: T) => void")
+            .expect("テストが渡す綴りは呼べる型として読み取れる");
+
+        assert_eq!(read.parameter_type_names(), Some(vec![BTreeSet::new()]));
     }
 
     #[test]
