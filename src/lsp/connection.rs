@@ -13,18 +13,21 @@ use lsp_types::notification::{
     DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized, Notification as _, Progress,
 };
 use lsp_types::request::{
-    ExecuteCommand, GotoTypeDefinition, GotoTypeDefinitionParams, GotoTypeDefinitionResponse,
-    HoverRequest, Initialize, References, Request as _, Shutdown, WorkDoneProgressCreate,
+    CallHierarchyOutgoingCalls, CallHierarchyPrepare, ExecuteCommand, GotoTypeDefinition,
+    GotoTypeDefinitionParams, GotoTypeDefinitionResponse, HoverRequest, Initialize, References,
+    Request as _, Shutdown, WorkDoneProgressCreate,
 };
 use lsp_types::{
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover, HoverParams, InitializeResult,
-    Location, PartialResultParams, ProgressParams, ProgressParamsValue, ProgressToken,
-    ReferenceContext, ReferenceParams, ServerCapabilities, TextDocumentIdentifier,
-    TextDocumentPositionParams, Uri, WorkDoneProgress, WorkDoneProgressCreateParams,
-    WorkDoneProgressParams,
+    CallHierarchyItem, CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
+    CallHierarchyPrepareParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover,
+    HoverParams, InitializeResult, Location, PartialResultParams, ProgressParams,
+    ProgressParamsValue, ProgressToken, ReferenceContext, ReferenceParams, ServerCapabilities,
+    TextDocumentIdentifier, TextDocumentPositionParams, Uri, WorkDoneProgress,
+    WorkDoneProgressCreateParams, WorkDoneProgressParams,
 };
 use serde_json::{Value, json};
 
+use super::call_hierarchy::{self, CallHierarchyStart, CalleesOutcome};
 use super::document::SourceDocument;
 use super::framing::{self, FramingError};
 use super::hover::{self, HoverOutcome};
@@ -48,7 +51,7 @@ const CLIENT_NAME: &str = "dryguard";
 /// 1 回目は読み込みの途中に当たりうる。2 回目はその読み込みが終わってからになる。
 /// **3 回目でも作業に触れているなら、尋ねるたびに始まっている**ので、待っても
 /// 答えは落ち着かない（`ReferencesOutcome::ServerStillWorking` /
-/// `HoverOutcome::ServerStillWorking`）。
+/// `HoverOutcome::ServerStillWorking` / `CalleesOutcome::ServerStillWorking`）。
 const SETTLED_ATTEMPTS: usize = 3;
 
 /// LSP サーバとの往復。
@@ -116,16 +119,26 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         let params = json!({
             "processId": std::process::id(),
             "clientInfo": { "name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION") },
-            // 宣言するのは進捗を受け取ることだけ。宣言した機能に応じてサーバはこちらへ
+            // 宣言するのは下の 2 つだけ。宣言した機能に応じてサーバはこちらへ
             // 要求を投げてくるので、支えていない機能の要求を呼び込まない。ただし
             // `window/showMessageRequest` のように宣言に依らず届く要求はあり、
             // それは `answer` が断る。
             //
-            // Why（進捗だけは宣言する）: **サーバは読み込みの途中でも要求に答える。**
+            // Why（進捗を宣言する）: **サーバは読み込みの途中でも要求に答える。**
             // typescript-language-server はプロジェクトを読み終える前の
             // `textDocument/references` に空の答えを返すので、宣言しないと
             // 「呼び出し元が無い」と「まだ読んでいない」を区別できない。
-            "capabilities": { "window": { "workDoneProgress": true } },
+            //
+            // Why（callHierarchy を宣言する）: このサーバは**こちらが宣言したときだけ**
+            // `callHierarchyProvider` を広告する（hover / references は宣言に依らず広告する）。
+            // 宣言しないと、呼び出し先に答えられるサーバを `NotSupported` と読む。
+            //
+            // Why（`dynamicRegistration` を偽にする）: 真にすると、サーバは登録のために
+            // `client/registerCapability` を投げてくる。支えていない要求を呼び込まない。
+            "capabilities": {
+                "window": { "workDoneProgress": true },
+                "textDocument": { "callHierarchy": { "dynamicRegistration": false } },
+            },
             "rootUri": root.uri().as_str(),
         });
 
@@ -423,6 +436,55 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         )
     }
 
+    /// 開かせたファイルの、指定位置にある名前が呼んでいる相手を尋ねる。
+    ///
+    /// `position` は `Chunk::name_position` が指す識別子の位置。返るのは呼び出し先の
+    /// ファイルで、読めなかったのか 1 件も無かったのかは [`CalleesOutcome`] が分けて持つ。
+    ///
+    /// **1 往復では済まない。** `textDocument/prepareCallHierarchy` で起点を取り、
+    /// それを `callHierarchy/outgoingCalls` へ渡す。2 つ合わせて 1 回の問い合わせとして
+    /// 落ち着きを見る（[`Self::ask_callees_once`]）。
+    ///
+    /// 答えを採るのは**サーバの作業が動いていないとき**だけ。動いている間の答えは
+    /// まだ見ていないファイルの分が抜けており、それを最終的なシグナルとして扱うと、
+    /// 依存先の広がりが実際より狭く出る。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、パラメータを JSON にできないとき、
+    /// 送受信が失敗したとき、応答を callHierarchy の結果として読めないとき。
+    pub fn callees(
+        &mut self,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<CalleesOutcome, ConnectionError> {
+        // 開かせていないドキュメントへ送ると、サーバは中身を知らないまま起点を返さない。
+        // 「起点が無い」と「開かせ忘れ」が同じ答えになるので、送る前に断る。
+        if !self.open_documents.contains(document.uri()) {
+            return Err(ConnectionError::DocumentNotOpen {
+                uri: document.uri().clone(),
+            });
+        }
+
+        let params = CallHierarchyPrepareParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: document.uri().clone(),
+                },
+                position: position.to_lsp_position(),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+        let params = serde_json::to_value(params)
+            .map_err(not_serializable_error_of(CallHierarchyPrepare::METHOD))?;
+
+        self.settled_outcome_of(
+            params,
+            Self::ask_callees_once,
+            CalleesOutcome::ServerStillWorking,
+        )
+    }
+
     /// そのファイルを、サーバがどのプロジェクトの一員として扱っているかを尋ねる。
     ///
     /// 先に [`Connection::open_document`] で開かせておく。開かせる前は、サーバが
@@ -556,6 +618,56 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         Ok(match answered.as_deref() {
             Some(locations) => references::outcome_of(locations),
             None => ReferencesOutcome::NoAnswer,
+        })
+    }
+
+    /// 呼び出し先を 1 回だけ尋ねる（prepare → outgoingCalls の 2 往復で 1 回）。
+    ///
+    /// `params` は `prepareCallHierarchy` のもの。**起点は毎回取り直す。**
+    /// 尋ね直すのはサーバが作業していたときで、作業の前に取った起点は
+    /// そのとき見えていた宣言を指しているため（[`Self::outcome_untouched_by_work_of`]）。
+    ///
+    /// # Errors
+    ///
+    /// パラメータを JSON にできないとき、送受信が失敗したとき、
+    /// 応答を callHierarchy の結果として読めないとき。
+    fn ask_callees_once(&mut self, params: Value) -> Result<CalleesOutcome, ConnectionError> {
+        let result = self.request(CallHierarchyPrepare::METHOD, Some(params))?;
+        // 起点が無いときサーバは null を返す。空配列と同じ扱いにしてよい
+        // （どちらも「その位置に起点が無い」で、[`call_hierarchy::start_of`] が畳む）。
+        let prepared: Option<Vec<CallHierarchyItem>> =
+            serde_json::from_value(result).map_err(|cause| ConnectionError::MalformedResult {
+                method: CallHierarchyPrepare::METHOD.to_owned(),
+                cause,
+            })?;
+        let prepared = prepared.unwrap_or_default();
+
+        let item = match call_hierarchy::start_of(&prepared) {
+            CallHierarchyStart::Item(item) => item,
+            CallHierarchyStart::Undecidable(outcome) => return Ok(outcome),
+        };
+
+        let params = CallHierarchyOutgoingCallsParams {
+            item: item.clone(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let params = serde_json::to_value(params).map_err(not_serializable_error_of(
+            CallHierarchyOutgoingCalls::METHOD,
+        ))?;
+
+        let result = self.request(CallHierarchyOutgoingCalls::METHOD, Some(params))?;
+        // 呼び出し先が無いときサーバは null を返す。`Option` で受けて、応答が読めなかった
+        // 場合と分ける。
+        let answered: Option<Vec<CallHierarchyOutgoingCall>> = serde_json::from_value(result)
+            .map_err(|cause| ConnectionError::MalformedResult {
+                method: CallHierarchyOutgoingCalls::METHOD.to_owned(),
+                cause,
+            })?;
+
+        Ok(match answered.as_deref() {
+            Some(calls) => call_hierarchy::outcome_of(calls),
+            None => CalleesOutcome::NoCallees,
         })
     }
 
@@ -1139,6 +1251,23 @@ mod tests {
 
         let sent = sent_payloads(&connection.writer);
         assert_eq!(sent[0]["params"]["rootUri"], json!(root.uri().as_str()));
+    }
+
+    #[test]
+    fn test_handshake_declares_call_hierarchy_as_a_client_capability() {
+        // 宣言しないと typescript-language-server は callHierarchyProvider を広告せず、
+        // 呼び出し先に答えられるサーバを `NotSupported` と読むことになる
+        let server_output =
+            frames_of(&[r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#]);
+        let mut connection = connection_over(&server_output);
+
+        connection.handshake(&workspace_root()).expect("握手できる");
+
+        let sent = sent_payloads(&connection.writer);
+        assert_eq!(
+            sent[0]["params"]["capabilities"]["textDocument"]["callHierarchy"],
+            json!({ "dynamicRegistration": false })
+        );
     }
 
     #[test]
