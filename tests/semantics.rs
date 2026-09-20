@@ -394,9 +394,10 @@ fn callee_domain_overlap(location_a: &Location, location_b: &Location) -> f64 {
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
-fn test_two_functions_calling_into_the_same_domain_share_their_callee_domains() {
-    // **置かれているディレクトリは utils と report で分かれている**が、どちらも
-    // `utils/pad` を呼んでいる。呼び出し元ドメインの側と同じ主張の裏返しで、
+fn test_two_functions_calling_into_the_same_domains_share_their_callee_domains() {
+    // **置かれているディレクトリは utils と report で分かれている**が、呼び出し先の
+    // ドメインは両方とも同じ 2 つ（`utils/pad` の utils と、`Date` のメソッドが
+    // 宣言されている TypeScript の lib）。呼び出し元ドメインの側と同じ主張の裏返しで、
     // 置き場所ではなく実際に何へ依存しているかを見る
     let formats_a_date = fixture("references/src/utils/formatDate.ts", 3);
     let helps_with_dates = fixture("references/src/report/dateHelper.ts", 3);
@@ -409,14 +410,21 @@ fn test_two_functions_calling_into_the_same_domain_share_their_callee_domains() 
 
 #[test]
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
-fn test_a_function_calling_into_two_domains_only_partly_overlaps_one_calling_into_one() {
-    // 対照は上のテスト。`monthlyLabel` は `utils/formatDate` と `report/dateHelper` の
-    // **2 ドメインへ下りて**おり、`formatDate` は `utils/pad` の 1 ドメインだけ。
-    // ドメインを 1 つに畳んでいれば、ここも 1.0 になってしまう
+fn test_two_functions_sharing_one_of_their_two_callee_domains_partly_overlap() {
+    // 対照は上のテスト。`monthlyLabel` が下りるのは utils（`formatDate`）と
+    // report（`dateHelper`）で、`formatDate` が下りるのは utils（`pad`）と
+    // TypeScript の lib（`Date.getMonth`）。**共通は utils の 1 つだけ**で、
+    // 合わせて 3 ドメインなので 1/3。ドメインを 1 つに畳んでいれば 1.0 になる
+    //
+    // **TypeScript の lib が 1 ドメインとして数えられていることを、この値が固定する。**
+    // 落とすかどうかは #220 が決めるので、決まった回にこのテストが落ちて更新を促す
     let labels_a_month = fixture("references/src/report/monthly.ts", 4);
     let formats_a_date = fixture("references/src/utils/formatDate.ts", 3);
 
-    assert_eq!(callee_domain_overlap(&labels_a_month, &formats_a_date), 0.5);
+    assert_eq!(
+        callee_domain_overlap(&labels_a_month, &formats_a_date),
+        1.0 / 3.0
+    );
 }
 
 #[test]
