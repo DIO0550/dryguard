@@ -119,16 +119,26 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         let params = json!({
             "processId": std::process::id(),
             "clientInfo": { "name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION") },
-            // 宣言するのは進捗を受け取ることだけ。宣言した機能に応じてサーバはこちらへ
+            // 宣言するのは下の 2 つだけ。宣言した機能に応じてサーバはこちらへ
             // 要求を投げてくるので、支えていない機能の要求を呼び込まない。ただし
             // `window/showMessageRequest` のように宣言に依らず届く要求はあり、
             // それは `answer` が断る。
             //
-            // Why（進捗だけは宣言する）: **サーバは読み込みの途中でも要求に答える。**
+            // Why（進捗を宣言する）: **サーバは読み込みの途中でも要求に答える。**
             // typescript-language-server はプロジェクトを読み終える前の
             // `textDocument/references` に空の答えを返すので、宣言しないと
             // 「呼び出し元が無い」と「まだ読んでいない」を区別できない。
-            "capabilities": { "window": { "workDoneProgress": true } },
+            //
+            // Why（callHierarchy を宣言する）: このサーバは**こちらが宣言したときだけ**
+            // `callHierarchyProvider` を広告する（hover / references は宣言に依らず広告する）。
+            // 宣言しないと、呼び出し先に答えられるサーバを `NotSupported` と読む。
+            //
+            // Why（`dynamicRegistration` を偽にする）: 真にすると、サーバは登録のために
+            // `client/registerCapability` を投げてくる。支えていない要求を呼び込まない。
+            "capabilities": {
+                "window": { "workDoneProgress": true },
+                "textDocument": { "callHierarchy": { "dynamicRegistration": false } },
+            },
             "rootUri": root.uri().as_str(),
         });
 
@@ -1241,6 +1251,23 @@ mod tests {
 
         let sent = sent_payloads(&connection.writer);
         assert_eq!(sent[0]["params"]["rootUri"], json!(root.uri().as_str()));
+    }
+
+    #[test]
+    fn test_handshake_declares_call_hierarchy_as_a_client_capability() {
+        // 宣言しないと typescript-language-server は callHierarchyProvider を広告せず、
+        // 呼び出し先に答えられるサーバを `NotSupported` と読むことになる
+        let server_output =
+            frames_of(&[r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#]);
+        let mut connection = connection_over(&server_output);
+
+        connection.handshake(&workspace_root()).expect("握手できる");
+
+        let sent = sent_payloads(&connection.writer);
+        assert_eq!(
+            sent[0]["params"]["capabilities"]["textDocument"]["callHierarchy"],
+            json!({ "dynamicRegistration": false })
+        );
     }
 
     #[test]
