@@ -106,7 +106,7 @@ pub(super) fn start_of(items: &[CallHierarchyItem]) -> CallHierarchyStart<'_> {
 /// **呼び出し箇所の数（`from_ranges`）は数えない。** 応答は**呼ばれている相手 1 つにつき
 /// 1 件**で、同じ相手を 2 回呼んでいれば範囲が 2 つ載る。同じ相手を 2 回呼ぶことは
 /// 「その相手に依存している」という 1 つの事実で、2 倍の証拠ではない
-/// （`semantics::caller_domain::CallerDomains::jaccard` が件数で重み付けしないのと同じ考え）。
+/// （`semantics::domain::DomainCounts::jaccard` が件数で重み付けしないのと同じ考え）。
 ///
 /// ドメインの導出（どのディレクトリに属するか）は `semantics` が行う。ここは応答の形を
 /// 読むところまで。

@@ -6,6 +6,7 @@
 //!
 //! | モジュール | 持つもの |
 //! |---|---|
+//! | `domain` | ファイルが属するドメインと、ドメインごとの件数。向きを持たない |
 //! | `resolved_type` | シグネチャに書かれた型名を、それが指す型の綴りへ解決する |
 //! | `type_signature` | hover に尋ね、呼べる型シグネチャを揃えて比べられる形へ直す |
 //! | `caller_domain` | references に尋ね、参照元がどのドメインに属するかを数える |
@@ -13,9 +14,8 @@
 //! **サーバを起こす・握手する・ドキュメントを開かせるのはここではない。**
 //! 借りた `lsp::Session` に尋ねるだけで、その手順は `pipeline` が持つ
 //! （`rules/architecture.md`「`lsp` はオーケストレーションを持たない」）。
-//!
-//! 呼び出し先（callHierarchy）の収集はこの後の Phase で足す。
 
 pub mod caller_domain;
+pub mod domain;
 pub mod resolved_type;
 pub mod type_signature;
