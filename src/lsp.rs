@@ -14,6 +14,7 @@
 //! | `hover` | hover の応答から型の綴りを取り出す |
 //! | `type_definition` | typeDefinition の応答から型の宣言の場所を取り出す |
 //! | `references` | references の応答から参照元のファイルを取り出す |
+//! | `call_hierarchy` | callHierarchy の応答から呼び出し先のファイルを取り出す |
 //! | `project_membership` | projectInfo の応答を読み、設定されたプロジェクトか見分ける |
 //! | ここ | サーバの起動・パイプの配線・終了 |
 //!
@@ -22,6 +23,7 @@
 //! 区切りや payload の組み立て方は、いつ変えても外に影響しない位置に置く
 //! (rules/architecture.md「モジュールの公開 API」)。
 
+pub(crate) mod call_hierarchy;
 pub(crate) mod connection;
 pub(crate) mod document;
 pub(crate) mod framing;
@@ -39,7 +41,8 @@ use std::io::{self, BufReader};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
 use lsp_types::{
-    HoverProviderCapability, OneOf, ServerCapabilities, TypeDefinitionProviderCapability,
+    CallHierarchyServerCapability, HoverProviderCapability, OneOf, ServerCapabilities,
+    TypeDefinitionProviderCapability,
 };
 
 use crate::source_position::SourcePosition;
@@ -47,8 +50,9 @@ use connection::Connection;
 
 // 開かせるドキュメントとワークスペースの根は、呼ぶ側が組み立てて渡す。
 pub use document::{DocumentError, SourceDocument};
-// hover / references の結果は「取れた / 取れなかった理由」を分けて持つので、
+// hover / references / callHierarchy の結果は「取れた / 取れなかった理由」を分けて持つので、
 // 外から読める形で出す。
+pub use call_hierarchy::CalleesOutcome;
 pub use hover::{HoverOutcome, SignatureText};
 pub use references::ReferencesOutcome;
 // 型の宣言の場所は、開かせる相手を決める材料として `pipeline` が読む。
@@ -368,6 +372,35 @@ impl Session {
         provides_references(&self.capabilities)
     }
 
+    /// 開かせたファイルの、指定位置にある名前が呼んでいる相手を尋ねる。
+    ///
+    /// `position` は `Chunk::name_position` が指す識別子の位置。呼び出し先が返ったのか、
+    /// 起点が無かったのか、読めなかったのかは [`CalleesOutcome`] が分けて持つ。
+    ///
+    /// **callHierarchy を提供していないサーバには送らない**（[`CalleesOutcome::NotSupported`]）。
+    /// hover と同じ理由で、送ると**シグナルが取れないだけの話が往復の失敗になる**。
+    ///
+    /// 先に [`Session::open_document`] で開かせておく。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、往復が失敗したとき、
+    /// 応答を callHierarchy の結果として読めないとき。
+    pub fn callees(
+        &mut self,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<CalleesOutcome, ClientError> {
+        if !provides_call_hierarchy(&self.capabilities) {
+            return Ok(CalleesOutcome::NotSupported);
+        }
+
+        self.client
+            .connection
+            .callees(document, position)
+            .map_err(ClientError::Conversation)
+    }
+
     /// そのファイルを、サーバがどのプロジェクトの一員として扱っているかを尋ねる。
     ///
     /// hover と同じく、**サーバができると宣言していなければ送らない**。
@@ -483,6 +516,19 @@ fn provides_references(capabilities: &ServerCapabilities) -> bool {
     matches!(
         capabilities.references_provider,
         Some(OneOf::Left(true) | OneOf::Right(_))
+    )
+}
+
+/// そのサーバが callHierarchy に答えるか。
+///
+/// hover と同じく**有無ではなく中身を見る**。無効を表す `Simple(false)` も
+/// 「宣言はある」ので、`is_some()` で見ると callHierarchy を切ったサーバへ送ってしまう。
+fn provides_call_hierarchy(capabilities: &ServerCapabilities) -> bool {
+    matches!(
+        capabilities.call_hierarchy_provider,
+        Some(
+            CallHierarchyServerCapability::Simple(true) | CallHierarchyServerCapability::Options(_)
+        )
     )
 }
 
@@ -658,6 +704,15 @@ mod tests {
     /// 誰にも呼ばれていない関数を持つ fixture。
     const AN_UNCALLED_FILE: &str = "tests/fixtures/references/src/report/monthly.ts";
 
+    /// 2 つのモジュールを呼んでいる関数を持つ fixture。
+    ///
+    /// **[`AN_UNCALLED_FILE`] と同じファイル。** 呼び出し元が 1 件も無い関数が
+    /// 呼び出し先を 2 件持つので、**向きが逆であること**が 1 つの入力から出る。
+    const A_CALLING_FILE: &str = AN_UNCALLED_FILE;
+
+    /// 何も呼んでいない関数を持つ fixture。
+    const A_FILE_CALLING_NOTHING: &str = "tests/fixtures/references/src/report/paramValue.ts";
+
     /// 2 つの fixture から決まる、サーバに見せる根。
     ///
     /// **テスト側で広げない。** `WorkspaceRoot::enclosing` は綴りだけで根を決める
@@ -690,6 +745,23 @@ mod tests {
 
         let outcome = session
             .references(&document, position)
+            .expect("問い合わせられる");
+
+        session.shutdown().expect("終了できる");
+        outcome
+    }
+
+    /// 開かせたファイルの、その位置にある名前が呼んでいる相手をサーバに尋ねる。
+    fn callees_at(relative_path: &str, position: SourcePosition) -> CalleesOutcome {
+        let client = Client::start(&ServerCommand::typescript()).expect("サーバを起動できる");
+        let mut session = client
+            .handshake(&references_fixture_root())
+            .expect("握手できる");
+        let document = document_of(relative_path);
+        session.open_document(&document).expect("開かせられる");
+
+        let outcome = session
+            .callees(&document, position)
             .expect("問い合わせられる");
 
         session.shutdown().expect("終了できる");
@@ -812,6 +884,43 @@ mod tests {
         let capabilities = capabilities_declaring_references(None);
 
         assert!(!provides_references(&capabilities));
+    }
+
+    /// そのサーバができることとして callHierarchy だけを宣言した capabilities。
+    fn capabilities_declaring_call_hierarchy(
+        call_hierarchy_provider: Option<CallHierarchyServerCapability>,
+    ) -> ServerCapabilities {
+        ServerCapabilities {
+            call_hierarchy_provider,
+            ..ServerCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn test_provides_call_hierarchy_with_a_server_that_declares_it_is_true() {
+        let capabilities = capabilities_declaring_call_hierarchy(Some(
+            CallHierarchyServerCapability::Simple(true),
+        ));
+
+        assert!(provides_call_hierarchy(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_call_hierarchy_with_a_server_that_turned_it_off_is_false() {
+        // 対照は上のテスト。**宣言はあるが無効**という形で、`is_some()` で見ていると
+        // callHierarchy を切ったサーバへ要求を送ってしまう
+        let capabilities = capabilities_declaring_call_hierarchy(Some(
+            CallHierarchyServerCapability::Simple(false),
+        ));
+
+        assert!(!provides_call_hierarchy(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_call_hierarchy_with_a_server_that_does_not_declare_it_is_false() {
+        let capabilities = capabilities_declaring_call_hierarchy(None);
+
+        assert!(!provides_call_hierarchy(&capabilities));
     }
 
     /// そのサーバが実行できるコマンドとして、渡した綴りだけを宣言した capabilities。
@@ -1035,6 +1144,45 @@ mod tests {
         assert!(
             matches!(outcome, ReferencesOutcome::NoAnswer),
             "呼び出し元の無いチャンクでは参照元が返らない: {outcome:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+    fn test_session_callees_at_a_function_name_answers_the_files_it_calls() {
+        // fixture の 4 行目 `export function monthlyLabel`。呼んでいるのは
+        // `../utils/formatDate` と `./dateHelper` の 2 つで、**別のディレクトリへ跨る**
+        let outcome = callees_at(
+            A_CALLING_FILE,
+            SourcePosition::from_preceding_text(line(4), "export function "),
+        );
+
+        let CalleesOutcome::Answered(paths) = outcome else {
+            panic!("呼び出し先のあるチャンクには呼び出し先が返る: {outcome:?}");
+        };
+        let names: BTreeSet<String> = paths
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from(["dateHelper.ts".to_owned(), "formatDate.ts".to_owned()])
+        );
+    }
+
+    #[test]
+    #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+    fn test_session_callees_at_a_function_calling_nothing_has_no_callees() {
+        // 対照は上のテスト。同じ木の中で、何も呼んでいない関数を指す。
+        // 起点そのものを呼び出し先に数えていれば、ここでも 1 件返ってしまう
+        let outcome = callees_at(
+            A_FILE_CALLING_NOTHING,
+            SourcePosition::from_preceding_text(line(1), "export function "),
+        );
+
+        assert!(
+            matches!(outcome, CalleesOutcome::NoCallees),
+            "何も呼んでいないチャンクでは呼び出し先が返らない: {outcome:?}"
         );
     }
 }
