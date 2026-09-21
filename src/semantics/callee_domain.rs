@@ -236,13 +236,16 @@ mod tests {
 
     #[test]
     fn test_callee_domains_calling_into_one_shared_domain_overlap_completely() {
-        // 対照は上のテスト。呼び出し先のファイル数は同じで、属するドメインだけが揃っている
-        let monthly =
+        // 対照は上のテスト。呼び出し先のファイル数は同じで、属するドメインだけが揃っている。
+        // 上は集合が持つドメインで名付けているが、ここは両方 utils なので、
+        // 見分けが付く呼び出し先のほうで名付ける
+        let calls_format_date =
             CalleeDomains::from_callee_paths(&[PathBuf::from("/repo/src/utils/formatDate.ts")])
                 .expect("テストが渡す呼び出し先は 1 件以上");
-        let daily = CalleeDomains::from_callee_paths(&[PathBuf::from("/repo/src/utils/pad.ts")])
-            .expect("テストが渡す呼び出し先は 1 件以上");
+        let calls_pad =
+            CalleeDomains::from_callee_paths(&[PathBuf::from("/repo/src/utils/pad.ts")])
+                .expect("テストが渡す呼び出し先は 1 件以上");
 
-        assert_eq!(monthly.jaccard(&daily).value(), 1.0);
+        assert_eq!(calls_format_date.jaccard(&calls_pad).value(), 1.0);
     }
 }
