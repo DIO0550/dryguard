@@ -5,6 +5,54 @@
 //!
 //! I/O も LSP の呼び出しも持たない。意味情報はシグナルとして受け取るので、
 //! LSP が使えない環境でも判定できる（`rules/architecture.md`「依存方向のルール」）。
+//!
+//! # シグナル → ラベル
+//!
+//! **決定木はこのモジュールにしか無い**（`rules/architecture.md`「判定は 1 箇所にだけ
+//! 置く」）。シグナルはまず 1 つずつ傾き（[`reason::Lean`]）になり、その傾きだけから
+//! ラベルが決まる。**判定も `--explain` の根拠も、同じ 1 組の傾きを読む**（`Leans`）。
+//!
+//! | シグナル | 共通化する側へ傾く | 共通化しない側へ傾く |
+//! |---|---|---|
+//! | 構造類似度 | 閾値に届いた | （傾けない。下の表の 1 行目） |
+//! | 依存先の重なり | [`SHARED_IMPORTS_THRESHOLD`] に届いた | 届かなかった |
+//! | ディレクトリの隔たり | [`SEPARATE_DIRECTORY_STEPS`] 段未満 | 段以上 |
+//! | 型シグネチャ | 単一化可能 | 単一化不能 |
+//! | 呼び出し元ドメインの重なり | [`SHARED_CALLER_DOMAINS_THRESHOLD`] に届いた | 届かなかった |
+//!
+//! 傾きからラベルまでは 2 段。まず**ドメインが同じか**を、置き場所（依存先の重なり →
+//! ディレクトリの隔たり）で決めてから**呼び出し元の観測を重ねて**出す
+//! （`placement_domain_match_of` → `domain_match_of`）。次にそれと型シグネチャの傾きで
+//! ラベルを決める（`verdict_of`）。
+//!
+//! | 構造が似ている | ドメイン | 型シグネチャ | ラベル |
+//! |---|---|---|---|
+//! | いいえ | — | — | `REVIEW` |
+//! | はい | 別 | — | `DO-NOT-EXTRACT` |
+//! | はい | どちらとも言えない | — | `REVIEW` |
+//! | はい | 同じ | 単一化不能 | `REVIEW` |
+//! | はい | 同じ | 単一化可能 | `EXTRACT-CANDIDATE` |
+//! | はい | 同じ | 傾かない | 置き場所だけで同じドメインなら `EXTRACT-CANDIDATE`、でなければ `REVIEW` |
+//!
+//! # 取れなかったシグナルの扱い
+//!
+//! **どちらへも傾けない。** 取れなかったシグナルは [`reason::Lean::Neither`] になり、
+//! ラベルは残りのシグナルだけで決まる。**これは「取れなかったシグナルを既定値で埋めない」
+//! （`rules/architecture.md`）に反しない** — 埋めないのは**シグナルの値**のほうで、
+//! 値は取れなかった理由を持ったままここへ届く。どのシグナルでも同じ扱いにするため、
+//! 傾きを出す関数はどれも「取れなかった」バリアントを `_` の受け皿ではなく
+//! **並べて書く**（バリアントを足したときにコンパイルで止まる）。
+//!
+//! **欠けた数を数えて判定を弱めることはしない。** 弱める規則を足すと、`--explain` が
+//! 出す根拠を全部足しても判定を再現できなくなり、`rules/architecture.md`「判定は
+//! 1 箇所にだけ置く」が守りたい**根拠と判定の一致**が壊れる。断定
+//! （`EXTRACT-CANDIDATE` / `DO-NOT-EXTRACT`）には傾いた根拠が要るので、**傾けないまま
+//! 扱っても欠けが増えれば `REVIEW` へ寄る** — 弱めた結果ではなく、証拠が揃わない結果。
+//!
+//! **例外が 1 つある。** 型シグネチャが取れていないとき、呼び出し元の観測だけで
+//! ドメインを「どちらとも言えない」から「同じ」へ上げたペアは候補に出さない
+//! （`stage1_shared_domain_verdict_of`）。これは中立ではなく弱める側の規則で、
+//! **hover だけが落ちた環境で判定が緩む側へ動く**のを防ぐために置いてある。
 
 pub mod reason;
 pub mod signal;
@@ -15,6 +63,7 @@ use crate::classification::signal::{
     CallerDomainOverlap, ImportOverlap, Signals, StructuralSimilarity, TypeSignatureMatch,
 };
 use crate::classification::verdict::Verdict;
+use crate::similarity::Similarity;
 use crate::syntax::module_distance::ModuleDistance;
 use crate::threshold::Threshold;
 
@@ -92,18 +141,54 @@ pub fn classification_of(
         signals.structural_similarity(),
         structural_similarity_threshold,
     );
-    let placement = placement_domain_match_of(signals);
-    let domain_match = domain_match_of(placement, signals);
-    let type_signature_lean = type_signature_lean_of(signals.type_signature_match());
+    let leans = Leans::of(signals, structural_similarity_threshold);
+    let placement = placement_domain_match_of(&leans);
+    let domain_match = domain_match_of(placement, &leans);
 
     Classification {
         verdict: verdict_of(
             structurally_similar,
-            type_signature_lean,
+            leans.type_signature,
             placement,
             domain_match,
         ),
-        reasons: reasons_of(signals, structural_similarity_threshold),
+        reasons: reasons_of(signals, &leans),
+    }
+}
+
+/// シグナル 1 つずつが判定を傾けた向き。
+///
+/// **判定も根拠もこれだけを読む。** シグナルから傾きを出すのは 1 ペアにつき 1 度きりで、
+/// `verdict_of` 側と [`reasons_of`] 側は同じ値を受け取る。経路ごとに出し直す形にすると、
+/// 片方にだけ条件を足したときに **`--explain` が出す根拠と実際の判定が食い違う**
+/// (`rules/architecture.md`「判定は 1 箇所にだけ置く」)。食い違いが「起きない」ではなく
+/// **書けない**ようにしてある。
+///
+/// 構造類似度が閾値に届いたかは [`is_structurally_similar`] が別に答える。
+/// 傾きから読み取れそうに見えるが、閾値未満を `Neither` にしているのは
+/// [`structural_similarity_lean_of`] の判断で、**候補かどうかとは別の話**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Leans {
+    structural_similarity: Lean,
+    import_overlap: Lean,
+    module_distance: Lean,
+    type_signature: Lean,
+    caller_domain: Lean,
+}
+
+impl Leans {
+    /// シグナル一式から、傾きを 1 つずつ出す。
+    fn of(signals: &Signals, structural_similarity_threshold: Threshold) -> Self {
+        Self {
+            structural_similarity: structural_similarity_lean_of(
+                signals.structural_similarity(),
+                structural_similarity_threshold,
+            ),
+            import_overlap: import_overlap_lean_of(signals.import_overlap()),
+            module_distance: module_distance_lean_of(signals.module_distance()),
+            type_signature: type_signature_lean_of(signals.type_signature_match()),
+            caller_domain: caller_domain_lean_of(signals.caller_domain_overlap()),
+        }
     }
 }
 
@@ -200,8 +285,8 @@ enum DomainMatch {
 /// - 観測が取れなければ、置き場所の判定のまま（LSP が無い環境が通る道）
 /// - 観測と置き場所が食い違えば `Undecidable`。**潰さずに人へ回す**
 /// - 食い違わなければ観測の側に寄せる
-fn domain_match_of(placement: DomainMatch, signals: &Signals) -> DomainMatch {
-    match caller_domain_lean_of(signals.caller_domain_overlap()) {
+fn domain_match_of(placement: DomainMatch, leans: &Leans) -> DomainMatch {
+    match leans.caller_domain {
         Lean::Neither => placement,
         Lean::TowardExtract => match placement {
             DomainMatch::Same | DomainMatch::Undecidable => DomainMatch::Same,
@@ -226,11 +311,11 @@ fn domain_match_of(placement: DomainMatch, signals: &Signals) -> DomainMatch {
 ///
 /// 逆に**別のドメインと言うには隔たりも要る**。ディレクトリはドメイン境界の代理指標
 /// でしかないので、同じディレクトリにあるものを依存先の違いだけで別ドメインと呼ばない。
-fn placement_domain_match_of(signals: &Signals) -> DomainMatch {
-    match import_overlap_lean_of(signals.import_overlap()) {
+fn placement_domain_match_of(leans: &Leans) -> DomainMatch {
+    match leans.import_overlap {
         Lean::TowardExtract => DomainMatch::Same,
         Lean::Neither => DomainMatch::Undecidable,
-        Lean::TowardDoNotExtract => match module_distance_lean_of(signals.module_distance()) {
+        Lean::TowardDoNotExtract => match leans.module_distance {
             Lean::TowardDoNotExtract => DomainMatch::Separate,
             Lean::TowardExtract => DomainMatch::Undecidable,
             Lean::Neither => DomainMatch::Undecidable,
@@ -251,30 +336,30 @@ pub fn is_structurally_similar(signal: StructuralSimilarity, threshold: Threshol
 }
 
 /// シグナル 1 つずつを、値と傾きの組にする。
-fn reasons_of(signals: &Signals, structural_similarity_threshold: Threshold) -> Vec<Reason> {
+///
+/// **傾きはここで出し直さない。** 判定が読んだ [`Leans`] をそのまま組にする
+/// (`rules/architecture.md`「判定は 1 箇所にだけ置く」)。
+fn reasons_of(signals: &Signals, leans: &Leans) -> Vec<Reason> {
     vec![
         Reason::StructuralSimilarity {
             signal: signals.structural_similarity(),
-            lean: structural_similarity_lean_of(
-                signals.structural_similarity(),
-                structural_similarity_threshold,
-            ),
+            lean: leans.structural_similarity,
         },
         Reason::ImportOverlap {
             signal: signals.import_overlap(),
-            lean: import_overlap_lean_of(signals.import_overlap()),
+            lean: leans.import_overlap,
         },
         Reason::ModuleDistance {
             signal: signals.module_distance(),
-            lean: module_distance_lean_of(signals.module_distance()),
+            lean: leans.module_distance,
         },
         Reason::TypeSignatureMatch {
             signal: signals.type_signature_match(),
-            lean: type_signature_lean_of(signals.type_signature_match()),
+            lean: leans.type_signature,
         },
         Reason::CallerDomainOverlap {
             signal: signals.caller_domain_overlap().clone(),
-            lean: caller_domain_lean_of(signals.caller_domain_overlap()),
+            lean: leans.caller_domain,
         },
     ]
 }
@@ -299,18 +384,24 @@ fn type_signature_lean_of(signal: TypeSignatureMatch) -> Lean {
 }
 
 /// 呼び出し元ドメインの重なりが傾けた向き。尋ねていない / 測れなければ傾けない。
+///
+/// **取れなかったバリアントを `_` で受けない。** 受けると、あとで足した「測れた」側の
+/// バリアントが黙って `Neither` へ落ちる（module doc「取れなかったシグナルの扱い」）。
 fn caller_domain_lean_of(signal: &CallerDomainOverlap) -> Lean {
-    let CallerDomainOverlap::Measured(measured) = signal else {
-        return Lean::Neither;
+    let measured = match signal {
+        CallerDomainOverlap::Measured(measured) => Some(measured.overlap()),
+        CallerDomainOverlap::Unavailable { .. }
+        | CallerDomainOverlap::NoName
+        | CallerDomainOverlap::ProjectUnrooted { .. }
+        | CallerDomainOverlap::OutsideProject { .. }
+        | CallerDomainOverlap::ProjectMembershipNotProvided
+        | CallerDomainOverlap::NoReferences
+        | CallerDomainOverlap::UnreadableReferences
+        | CallerDomainOverlap::ServerStillWorking
+        | CallerDomainOverlap::ReferencesNotProvided => None,
     };
 
-    if measured
-        .overlap()
-        .is_at_least(SHARED_CALLER_DOMAINS_THRESHOLD)
-    {
-        return Lean::TowardExtract;
-    }
-    Lean::TowardDoNotExtract
+    overlap_lean_of(measured, SHARED_CALLER_DOMAINS_THRESHOLD)
 }
 
 /// 構造類似度が傾けた向き。
@@ -327,11 +418,29 @@ fn structural_similarity_lean_of(signal: StructuralSimilarity, threshold: Thresh
 
 /// 依存先の重なりが傾けた向き。測れなければどちらへも傾けない。
 fn import_overlap_lean_of(signal: ImportOverlap) -> Lean {
-    let ImportOverlap::Measured(overlap) = signal else {
+    let measured = match signal {
+        ImportOverlap::Measured(overlap) => Some(overlap),
+        ImportOverlap::Unavailable(_) => None,
+    };
+
+    overlap_lean_of(measured, SHARED_IMPORTS_THRESHOLD)
+}
+
+/// 集合の重なりが傾けた向き。**測れていなければ傾けない**
+/// （module doc「取れなかったシグナルの扱い」）。
+///
+/// `overlap` はそのシグナルが測れた重なり、`shared_threshold` は共有していると見なす下限。
+///
+/// **閾値を引数で受ける。** 重なりを測っている集合はシグナルごとに違うので、
+/// 1 つの定数へ畳むと片方を調整したときにもう片方まで黙って動く
+/// （[`SHARED_IMPORTS_THRESHOLD`] の Why not と同じ理由）。畳んでいるのは
+/// **閾値との比べ方と、測れなかったときの倒れ方**だけ。
+fn overlap_lean_of(overlap: Option<Similarity>, shared_threshold: Threshold) -> Lean {
+    let Some(overlap) = overlap else {
         return Lean::Neither;
     };
 
-    if overlap.is_at_least(SHARED_IMPORTS_THRESHOLD) {
+    if overlap.is_at_least(shared_threshold) {
         return Lean::TowardExtract;
     }
     Lean::TowardDoNotExtract
@@ -352,6 +461,7 @@ fn module_distance_lean_of(distance: ModuleDistance) -> Lean {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
     use std::path::Path;
 
     use std::path::PathBuf;
@@ -363,6 +473,8 @@ mod tests {
     };
     use crate::classification::verdict::Verdict;
     use crate::semantics::caller_domain::CallerDomains;
+    use crate::semantics::resolved_type::UnopenedReason;
+    use crate::semantics::type_signature::UntracedReason;
     use crate::similarity::Similarity;
     use crate::syntax::import::ImportsUnavailable;
     use crate::syntax::module_distance::ModuleDistance;
@@ -1064,5 +1176,144 @@ mod tests {
             "測れなかったシグナルはどちらへも傾けない: {:?}",
             classification.reasons()
         );
+    }
+
+    /// Stage 2 へ届かなかった理由の全バリアント。
+    ///
+    /// **1 つずつ並べる。** 理由が増えたときに、増えた理由が断定側へ傾いていないかを
+    /// 確かめ直す先をここに置く（module doc「取れなかったシグナルの扱い」）。
+    const SEMANTICS_UNAVAILABLE_REASONS: [SemanticsUnavailable; 5] = [
+        SemanticsUnavailable::NotAsked,
+        SemanticsUnavailable::NotACandidate,
+        SemanticsUnavailable::DocumentUnopenable,
+        SemanticsUnavailable::WorkspaceRootUndecidable,
+        SemanticsUnavailable::LspUnusable,
+    ];
+
+    /// 単一化の可否を答えていない型シグネチャのシグナルを全部並べる。
+    fn unmeasured_type_signature_matches() -> Vec<TypeSignatureMatch> {
+        let mut signals: Vec<TypeSignatureMatch> = SEMANTICS_UNAVAILABLE_REASONS
+            .into_iter()
+            .map(|reason| TypeSignatureMatch::Unavailable { reason })
+            .collect();
+
+        signals.extend([
+            TypeSignatureMatch::NoName,
+            TypeSignatureMatch::NoTypeThere,
+            TypeSignatureMatch::UnreadableHover,
+            TypeSignatureMatch::ServerStillWorking,
+            TypeSignatureMatch::UnreadableSignature,
+            TypeSignatureMatch::HoverNotProvided,
+            TypeSignatureMatch::SiteDependentSpelling,
+            TypeSignatureMatch::OverloadSetMiscounted {
+                counted: NonZeroUsize::MIN,
+                found: 0,
+            },
+        ]);
+        signals.extend(
+            [
+                UnopenedReason::TypeDefinitionNotProvided,
+                UnopenedReason::NoDeclarationSite,
+                UnopenedReason::UnreadableTypeDefinition,
+                UnopenedReason::UnreadableDeclaringDocument,
+                UnopenedReason::NoSpellingAtDeclaration,
+                UnopenedReason::UnreadableDeclarationHover,
+                UnopenedReason::ServerStillWorking,
+                UnopenedReason::HoverNotProvided,
+                UnopenedReason::UnopenableAlias,
+            ]
+            .into_iter()
+            .map(|reason| TypeSignatureMatch::UnopenedTypeName { reason }),
+        );
+        signals.extend(
+            [
+                UntracedReason::OmittedTypeAnnotation,
+                UntracedReason::UnalignedParameters,
+                UntracedReason::NoTracedRecord,
+            ]
+            .into_iter()
+            .map(|reason| TypeSignatureMatch::UntracedTypeName { reason }),
+        );
+
+        signals
+    }
+
+    /// 重なりを答えていない呼び出し元ドメインのシグナルを全部並べる。
+    fn unmeasured_caller_domain_overlaps() -> Vec<CallerDomainOverlap> {
+        let markers = vec!["tsconfig.json".to_owned()];
+        let mut signals: Vec<CallerDomainOverlap> = SEMANTICS_UNAVAILABLE_REASONS
+            .into_iter()
+            .map(|reason| CallerDomainOverlap::Unavailable { reason })
+            .collect();
+
+        signals.extend([
+            CallerDomainOverlap::NoName,
+            CallerDomainOverlap::ProjectUnrooted {
+                markers: markers.clone(),
+            },
+            CallerDomainOverlap::OutsideProject { markers },
+            CallerDomainOverlap::ProjectMembershipNotProvided,
+            CallerDomainOverlap::NoReferences,
+            CallerDomainOverlap::UnreadableReferences,
+            CallerDomainOverlap::ServerStillWorking,
+            CallerDomainOverlap::ReferencesNotProvided,
+        ]);
+
+        signals
+    }
+
+    #[test]
+    fn test_classification_of_every_unmeasured_type_signature_leans_that_reason_neither_way() {
+        // 残りのシグナルは共通化する側へ揃える。傾いてしまった 1 件が
+        // EXTRACT-CANDIDATE を出す側へ効く並びなので、緩む向きで確かめられる
+        for signal in unmeasured_type_signature_matches() {
+            let signals = Signals::new(
+                StructuralSimilarity::Measured(measured(0.9)),
+                ImportOverlap::Measured(measured(1.0)),
+                same_directory(),
+            )
+            .with_semantics(signal, callers_in_the_same_domain());
+
+            let classification =
+                classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+            assert!(
+                leans(
+                    &classification,
+                    &Reason::TypeSignatureMatch {
+                        signal,
+                        lean: Lean::Neither,
+                    }
+                ),
+                "単一化の可否を答えていない型シグネチャが傾いた: {signal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classification_of_every_unmeasured_caller_domain_overlap_leans_that_reason_neither_way()
+    {
+        for signal in unmeasured_caller_domain_overlaps() {
+            let signals = Signals::new(
+                StructuralSimilarity::Measured(measured(0.9)),
+                ImportOverlap::Measured(measured(1.0)),
+                same_directory(),
+            )
+            .with_semantics(TypeSignatureMatch::Unifiable, signal.clone());
+
+            let classification =
+                classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+
+            assert!(
+                leans(
+                    &classification,
+                    &Reason::CallerDomainOverlap {
+                        signal: signal.clone(),
+                        lean: Lean::Neither,
+                    }
+                ),
+                "重なりを答えていない呼び出し元ドメインが傾いた: {signal:?}"
+            );
+        }
     }
 }
