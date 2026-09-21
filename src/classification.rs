@@ -178,7 +178,7 @@ fn stage1_shared_domain_verdict_of(placement: DomainMatch) -> Verdict {
 ///
 /// **ドメインそのものではなく、一致しているかどうか**を持つ
 /// （`rules/naming.md`「名前と実体を一致させる」）。ドメインを表す値は
-/// `semantics::caller_domain::Domain` にある。
+/// `semantics::domain::Domain` にある。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DomainMatch {
     /// 同じドメイン。

@@ -2,8 +2,9 @@
 //!
 //! ステージをつないだ結果はここで見る（rules/testing.md「ステージをまたぐテストと
 //! 単体のテストを分ける」）。名前の位置は `syntax::chunk`、応答の読み取りは
-//! `lsp::hover` / `lsp::references`、正規化と比較は `semantics::type_signature` /
-//! `semantics::caller_domain` のモジュール内テストにある。
+//! `lsp::hover` / `lsp::references` / `lsp::call_hierarchy`、正規化と比較は
+//! `semantics::type_signature` / `semantics::caller_domain` /
+//! `semantics::callee_domain` のモジュール内テストにある。
 //!
 //! **どのテストも実サーバを要するので `#[ignore]` を付ける。** サーバの入っていない
 //! 開発機で黙って通さないため（rules/testing.md「LSP を要するテストは、飛ばしたことが
@@ -18,10 +19,12 @@ use dryguard::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classifi
 use dryguard::codebase::source_of;
 use dryguard::location::Location;
 use dryguard::lsp::{
-    Client, ReferencesOutcome, ServerCommand, Session, SourceDocument, WorkspaceRoot,
+    CalleesOutcome, Client, ReferencesOutcome, ServerCommand, Session, SourceDocument,
+    WorkspaceRoot,
 };
 use dryguard::pipeline::{MeasuredPair, chunk_pair_of, measured_pair_of};
 use dryguard::report::text_of;
+use dryguard::semantics::callee_domain::CalleeDomains;
 use dryguard::semantics::caller_domain::CallerDomains;
 use dryguard::semantics::resolved_type::traced_type_names_of;
 use dryguard::semantics::type_signature::{
@@ -333,6 +336,94 @@ fn test_two_functions_called_from_the_same_domain_share_their_caller_domains() {
     assert_eq!(
         caller_domain_overlap(&formats_a_date, &helps_with_dates),
         1.0
+    );
+}
+
+/// そのチャンクが呼んでいる相手のファイル。サーバに尋ねて取り出す。
+fn callee_paths_of(session: &mut Session, chunk: &Chunk) -> Vec<PathBuf> {
+    let document = document(chunk.path());
+    if session.open_document(&document).is_err() {
+        panic!("ファイルを開かせられる: {}", chunk.path().display());
+    }
+
+    let Some(position) = chunk.name_position() else {
+        panic!(
+            "テストが指すチャンクは名前を持つ: {}",
+            chunk.path().display()
+        );
+    };
+    let outcome = session.callees(&document, position);
+    let Ok(CalleesOutcome::Answered(callee_paths)) = outcome else {
+        panic!(
+            "名前の位置には呼び出し先が返る: {} ({outcome:?})",
+            chunk.path().display()
+        );
+    };
+    callee_paths
+}
+
+/// そのチャンクの呼び出し先が属するドメイン。サーバに尋ねて数える。
+fn callee_domains_of(session: &mut Session, chunk: &Chunk) -> CalleeDomains {
+    let callee_paths = callee_paths_of(session, chunk);
+
+    let Some(callee_domains) = CalleeDomains::from_callee_paths(&callee_paths) else {
+        panic!("返った呼び出し先は 1 件以上ある: {callee_paths:?}");
+    };
+    callee_domains
+}
+
+/// 2 箇所のチャンクの呼び出し先ドメインがどれだけ重なるか、実サーバに尋ねて測る。
+fn callee_domain_overlap(location_a: &Location, location_b: &Location) -> f64 {
+    let Ok(pair) = chunk_pair_of(location_a, location_b) else {
+        panic!("テストが渡す位置はどちらも関数の中を指している");
+    };
+
+    let mut session = session_over(&[
+        location_a.path().to_path_buf(),
+        location_b.path().to_path_buf(),
+    ]);
+    let domains_a = callee_domains_of(&mut session, pair.chunk_a());
+    let domains_b = callee_domains_of(&mut session, pair.chunk_b());
+    let overlap = domains_a.jaccard(&domains_b).value();
+
+    if session.shutdown().is_err() {
+        panic!("サーバを終わらせられる");
+    }
+    overlap
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_two_functions_calling_into_the_same_domains_share_their_callee_domains() {
+    // **置かれているディレクトリは utils と report で分かれている**が、呼び出し先の
+    // ドメインは両方とも同じ 2 つ（`utils/pad` の utils と、`Date` のメソッドが
+    // 宣言されている TypeScript の lib）。呼び出し元ドメインの側と同じ主張の裏返しで、
+    // 置き場所ではなく実際に何へ依存しているかを見る
+    let formats_a_date = fixture("references/src/utils/formatDate.ts", 3);
+    let helps_with_dates = fixture("references/src/report/dateHelper.ts", 3);
+
+    assert_eq!(
+        callee_domain_overlap(&formats_a_date, &helps_with_dates),
+        1.0
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_two_functions_sharing_one_of_their_two_callee_domains_partly_overlap() {
+    // 対照は上のテスト。`monthlyLabel` が下りるのは utils（`formatDate`）と
+    // report（`dateHelper`）で、`formatDate` が下りるのは utils（`pad`）と
+    // TypeScript の lib（`Date.getMonth`）。**共通は utils の 1 つだけ**で、
+    // 合わせて 3 ドメインなので 1/3。ドメインを 1 つに畳んでいれば 1.0 になる
+    //
+    // **TypeScript の lib が 1 ドメインとして数えられていることを、この値が固定する。**
+    // 落とすかどうかは #220 が決めるので、決まった回にこのテストが落ちて更新を促す
+    let labels_a_month = fixture("references/src/report/monthly.ts", 4);
+    let formats_a_date = fixture("references/src/utils/formatDate.ts", 3);
+
+    assert_eq!(
+        callee_domain_overlap(&labels_a_month, &formats_a_date),
+        1.0 / 3.0
     );
 }
 
