@@ -72,6 +72,10 @@ cargo run -- scan [path]             # コードベース全体をスキャン (
   --fail-on do-not-extract           # 非推奨ペアがあれば exit 1
 ```
 
+`--explain` を付けると、根拠の行に 2 つが加わる。**LSP へ尋ねなかったシグナル**（理由付き）と、
+**各シグナルに当てた閾値**。**既定でも判定に効いた根拠は出る**ので、`--explain` は
+結論に理由を足すのではなく、**閾値との突き合わせまで見せる**ためのもの。
+
 `scan` が見るのは `.ts` と `.tsx` で、`node_modules` / `dist` / `build` / `target` / `.git` は
 降りない。**読むときの grammar は拡張子で選ぶ**（JSX は TypeScript の grammar では読めず、
 型アサーション `<T>value` は TSX の grammar では JSX に見えるので、片方で兼ねられない）。
