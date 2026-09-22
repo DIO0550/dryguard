@@ -766,6 +766,25 @@ mod tests {
     }
 
     #[test]
+    fn test_explained_text_of_reports_the_given_threshold_apart_from_the_hardcoded_one() {
+        // 既定と違う `--threshold` を渡す。既定と同じ値では、構造類似度の閾値を
+        // すべてのシグナルへ流用する実装でも通ってしまう
+        // （`rules/testing.md`「既定値と違う答えになる入力を選ぶ」）
+        let text = explained_text_of_separate_directories(
+            StructuralSimilarity::Measured(measured(0.94)),
+            ImportOverlap::Measured(measured(0.0)),
+            Threshold::from_literal(0.8),
+            Explanation::AllSignals,
+        );
+
+        assert!(
+            text.contains("構造類似度: 0.94 (閾値 0.8)")
+                && text.contains("依存先の重なり 0.00 (閾値 0.5)"),
+            "動かせる閾値と定数の閾値がシグナルごとに別々に出る: {text}"
+        );
+    }
+
+    #[test]
     fn test_explained_text_of_reports_the_steps_it_compared_against_not_the_measured_ones() {
         let text = explained_text_of_nested_directories();
 
