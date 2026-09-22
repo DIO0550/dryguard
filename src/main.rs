@@ -1,7 +1,8 @@
 //! `dryguard` のエントリポイント。
 //!
-//! 引数を解釈して、判定ラベル・位置・シグナルごとの根拠・提案を text で表示する
+//! 引数を解釈して、判定ラベル・位置・シグナルごとの根拠・提案を表示する
 //! （`docs/dryguard-plan.md`「CLI仕様 (案)」の出力イメージ）。
+//! `--format` が人の読む text とエージェントの読む JSON を切り替える。
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -9,11 +10,11 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use dryguard::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
-use dryguard::cli::{Cli, Command, CommonOptions};
+use dryguard::cli::{Cli, Command, CommonOptions, OutputFormat};
 use dryguard::location::Location;
 use dryguard::lsp::ServerCommand;
 use dryguard::pipeline::{chunk_pair_of, measured_pair_of, scan_of};
-use dryguard::report::{Explanation, scan_text_of, text_of};
+use dryguard::report::{Explanation, json_of, scan_json_of, scan_text_of, text_of};
 use dryguard::threshold::Threshold;
 
 fn main() -> ExitCode {
@@ -64,16 +65,13 @@ fn report_compare(
     }
 
     let classification = classification_of(measured.signals(), threshold);
+    let explanation = explanation_of(options);
 
-    println!(
-        "{}",
-        text_of(
-            location_a,
-            location_b,
-            &classification,
-            explanation_of(options)
-        )
-    );
+    let report = match options.format {
+        OutputFormat::Text => text_of(location_a, location_b, &classification, explanation),
+        OutputFormat::Json => json_of(location_a, location_b, &classification, explanation),
+    };
+    println!("{report}");
 
     ExitCode::SUCCESS
 }
@@ -102,7 +100,13 @@ fn report_scan(root: &Path, options: &CommonOptions) -> ExitCode {
         eprintln!("LSP への問い合わせが最後まで通りませんでした: {error}");
     }
 
-    println!("{}", scan_text_of(&scan, explanation_of(options)));
+    let explanation = explanation_of(options);
+
+    let report = match options.format {
+        OutputFormat::Text => scan_text_of(&scan, explanation),
+        OutputFormat::Json => scan_json_of(&scan, explanation),
+    };
+    println!("{report}");
 
     ExitCode::SUCCESS
 }

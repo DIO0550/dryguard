@@ -93,12 +93,15 @@ pub enum LanguageOption {
 
 /// `--format` が取る値。
 ///
-/// `json` は Phase 3 で足す。判定ルールが整理される前に出力形式を固めると、
-/// シグナルの構造が変わるたびに読む側が壊れる。
+/// **JSON スキーマはまだ安定していない。** 形を固めるのは Phase 5 で、
+/// それまではシグナルの構造が変わると読む側も追従することになる
+/// （`docs/dryguard-plan.md`「Phase 5: エージェント連携」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     /// 人が読む形式
     Text,
+    /// エージェントが読む形式
+    Json,
 }
 
 /// `--fail-on` が取る値。
@@ -170,6 +173,16 @@ mod tests {
         assert_eq!(cli.options.threshold, None);
         assert!(!cli.options.explain);
         assert_eq!(cli.options.fail_on, None);
+    }
+
+    #[test]
+    fn test_compare_with_format_json_overrides_the_default() {
+        // 既定は Text なので、既定と違う値を選ばないと指定が効いたか分からない
+        let cli = parse(&[
+            "dryguard", "compare", "a.ts:10", "b.ts:20", "--format", "json",
+        ]);
+
+        assert_eq!(cli.options.format, OutputFormat::Json);
     }
 
     #[test]
