@@ -141,7 +141,8 @@ pub fn classification_of(
         signals.structural_similarity(),
         structural_similarity_threshold,
     );
-    let leans = Leans::of(signals, structural_similarity_threshold);
+    let thresholds = AppliedThresholds::of(structural_similarity_threshold);
+    let leans = Leans::of(signals, thresholds);
     let placement = placement_domain_match_of(&leans);
     let domain_match = domain_match_of(placement, &leans);
 
@@ -152,7 +153,33 @@ pub fn classification_of(
             placement,
             domain_match,
         ),
-        reasons: reasons_of(signals, &leans),
+        reasons: reasons_of(signals, &leans, thresholds),
+    }
+}
+
+/// シグナル 1 つずつに当てる閾値。
+///
+/// **傾きを出す側と根拠に載せる側が、同じ 1 つの値を読む。** 定数を 2 箇所から読むと、
+/// 片方だけ差し替えたときに `--explain` が**当てていない閾値**を出す
+/// (`rules/architecture.md`「判定は 1 箇所にだけ置く」)。定数をここに束ねてあるので、
+/// どのシグナルにどれを当てるかを決めているのは [`AppliedThresholds::of`] だけ。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AppliedThresholds {
+    structural_similarity: Threshold,
+    shared_imports: Threshold,
+    separate_directory_steps: usize,
+    shared_caller_domains: Threshold,
+}
+
+impl AppliedThresholds {
+    /// 外から動くのは構造類似度の閾値だけ（`--threshold`）。残りは定数。
+    fn of(structural_similarity: Threshold) -> Self {
+        Self {
+            structural_similarity,
+            shared_imports: SHARED_IMPORTS_THRESHOLD,
+            separate_directory_steps: SEPARATE_DIRECTORY_STEPS,
+            shared_caller_domains: SHARED_CALLER_DOMAINS_THRESHOLD,
+        }
     }
 }
 
@@ -178,16 +205,25 @@ struct Leans {
 
 impl Leans {
     /// シグナル一式から、傾きを 1 つずつ出す。
-    fn of(signals: &Signals, structural_similarity_threshold: Threshold) -> Self {
+    fn of(signals: &Signals, thresholds: AppliedThresholds) -> Self {
         Self {
             structural_similarity: structural_similarity_lean_of(
                 signals.structural_similarity(),
-                structural_similarity_threshold,
+                thresholds.structural_similarity,
             ),
-            import_overlap: import_overlap_lean_of(signals.import_overlap()),
-            module_distance: module_distance_lean_of(signals.module_distance()),
+            import_overlap: import_overlap_lean_of(
+                signals.import_overlap(),
+                thresholds.shared_imports,
+            ),
+            module_distance: module_distance_lean_of(
+                signals.module_distance(),
+                thresholds.separate_directory_steps,
+            ),
             type_signature: type_signature_lean_of(signals.type_signature_match()),
-            caller_domain: caller_domain_lean_of(signals.caller_domain_overlap()),
+            caller_domain: caller_domain_lean_of(
+                signals.caller_domain_overlap(),
+                thresholds.shared_caller_domains,
+            ),
         }
     }
 }
@@ -335,22 +371,26 @@ pub fn is_structurally_similar(signal: StructuralSimilarity, threshold: Threshol
     }
 }
 
-/// シグナル 1 つずつを、値と傾きの組にする。
+/// シグナル 1 つずつを、値と当てた閾値と傾きの組にする。
 ///
-/// **傾きはここで出し直さない。** 判定が読んだ [`Leans`] をそのまま組にする
+/// **傾きも閾値もここで出し直さない。** 判定が読んだ [`Leans`] と
+/// [`AppliedThresholds`] をそのまま組にする
 /// (`rules/architecture.md`「判定は 1 箇所にだけ置く」)。
-fn reasons_of(signals: &Signals, leans: &Leans) -> Vec<Reason> {
+fn reasons_of(signals: &Signals, leans: &Leans, thresholds: AppliedThresholds) -> Vec<Reason> {
     vec![
         Reason::StructuralSimilarity {
             signal: signals.structural_similarity(),
+            threshold: thresholds.structural_similarity,
             lean: leans.structural_similarity,
         },
         Reason::ImportOverlap {
             signal: signals.import_overlap(),
+            threshold: thresholds.shared_imports,
             lean: leans.import_overlap,
         },
         Reason::ModuleDistance {
             signal: signals.module_distance(),
+            separate_directory_steps: thresholds.separate_directory_steps,
             lean: leans.module_distance,
         },
         Reason::TypeSignatureMatch {
@@ -359,6 +399,7 @@ fn reasons_of(signals: &Signals, leans: &Leans) -> Vec<Reason> {
         },
         Reason::CallerDomainOverlap {
             signal: signals.caller_domain_overlap().clone(),
+            threshold: thresholds.shared_caller_domains,
             lean: leans.caller_domain,
         },
     ]
@@ -385,9 +426,12 @@ fn type_signature_lean_of(signal: TypeSignatureMatch) -> Lean {
 
 /// 呼び出し元ドメインの重なりが傾けた向き。尋ねていない / 測れなければ傾けない。
 ///
+/// `shared_threshold` は呼び出し元を共有していると見なす下限
+/// （[`AppliedThresholds::shared_caller_domains`]）。
+///
 /// **取れなかったバリアントを `_` で受けない。** 受けると、あとで足した「測れた」側の
 /// バリアントが黙って `Neither` へ落ちる（module doc「取れなかったシグナルの扱い」）。
-fn caller_domain_lean_of(signal: &CallerDomainOverlap) -> Lean {
+fn caller_domain_lean_of(signal: &CallerDomainOverlap, shared_threshold: Threshold) -> Lean {
     let measured = match signal {
         CallerDomainOverlap::Measured(measured) => Some(measured.overlap()),
         CallerDomainOverlap::Unavailable { .. }
@@ -401,7 +445,7 @@ fn caller_domain_lean_of(signal: &CallerDomainOverlap) -> Lean {
         | CallerDomainOverlap::ReferencesNotProvided => None,
     };
 
-    overlap_lean_of(measured, SHARED_CALLER_DOMAINS_THRESHOLD)
+    overlap_lean_of(measured, shared_threshold)
 }
 
 /// 構造類似度が傾けた向き。
@@ -417,13 +461,16 @@ fn structural_similarity_lean_of(signal: StructuralSimilarity, threshold: Thresh
 }
 
 /// 依存先の重なりが傾けた向き。測れなければどちらへも傾けない。
-fn import_overlap_lean_of(signal: ImportOverlap) -> Lean {
+///
+/// `shared_threshold` は依存先を共有していると見なす下限
+/// （[`AppliedThresholds::shared_imports`]）。
+fn import_overlap_lean_of(signal: ImportOverlap, shared_threshold: Threshold) -> Lean {
     let measured = match signal {
         ImportOverlap::Measured(overlap) => Some(overlap),
         ImportOverlap::Unavailable(_) => None,
     };
 
-    overlap_lean_of(measured, SHARED_IMPORTS_THRESHOLD)
+    overlap_lean_of(measured, shared_threshold)
 }
 
 /// 集合の重なりが傾けた向き。**測れていなければ傾けない**
@@ -448,9 +495,12 @@ fn overlap_lean_of(overlap: Option<Similarity>, shared_threshold: Threshold) -> 
 
 /// ディレクトリの隔たりが傾けた向き。
 ///
+/// `separate_directory_steps` は別のディレクトリへ下りていると見なす段数
+/// （[`AppliedThresholds::separate_directory_steps`]）。
+///
 /// 段数は必ず取れるので `Neither` にはならない。
-fn module_distance_lean_of(distance: ModuleDistance) -> Lean {
-    let in_separate_directories = distance.steps() >= SEPARATE_DIRECTORY_STEPS;
+fn module_distance_lean_of(distance: ModuleDistance, separate_directory_steps: usize) -> Lean {
+    let in_separate_directories = distance.steps() >= separate_directory_steps;
 
     if in_separate_directories {
         return Lean::TowardDoNotExtract;
@@ -955,6 +1005,7 @@ mod tests {
                     signal: CallerDomainOverlap::Unavailable {
                         reason: SemanticsUnavailable::NotAsked
                     },
+                    threshold: SHARED_CALLER_DOMAINS_THRESHOLD,
                     lean: Lean::Neither,
                 }
             ),
@@ -980,6 +1031,7 @@ mod tests {
                 &classification,
                 &Reason::CallerDomainOverlap {
                     signal: callers_in_separate_domains(),
+                    threshold: SHARED_CALLER_DOMAINS_THRESHOLD,
                     lean: Lean::TowardDoNotExtract,
                 }
             ),
@@ -1005,6 +1057,7 @@ mod tests {
                 &classification,
                 &Reason::CallerDomainOverlap {
                     signal: callers_in_the_same_domain(),
+                    threshold: SHARED_CALLER_DOMAINS_THRESHOLD,
                     lean: Lean::TowardExtract,
                 }
             ),
@@ -1052,6 +1105,7 @@ mod tests {
                 &classification,
                 &Reason::ImportOverlap {
                     signal: ImportOverlap::Measured(measured(0.0)),
+                    threshold: SHARED_IMPORTS_THRESHOLD,
                     lean: Lean::TowardDoNotExtract,
                 }
             ),
@@ -1075,6 +1129,7 @@ mod tests {
                 &classification,
                 &Reason::ImportOverlap {
                     signal: ImportOverlap::Measured(measured(1.0)),
+                    threshold: SHARED_IMPORTS_THRESHOLD,
                     lean: Lean::TowardExtract,
                 }
             ),
@@ -1100,6 +1155,7 @@ mod tests {
                 &classification,
                 &Reason::StructuralSimilarity {
                     signal: StructuralSimilarity::Measured(measured(0.2)),
+                    threshold: DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
                     lean: Lean::Neither,
                 }
             ),
@@ -1123,6 +1179,7 @@ mod tests {
                 &classification,
                 &Reason::ModuleDistance {
                     signal: separate_directories(),
+                    separate_directory_steps: SEPARATE_DIRECTORY_STEPS,
                     lean: Lean::TowardDoNotExtract,
                 }
             ),
@@ -1147,6 +1204,7 @@ mod tests {
                 &classification,
                 &Reason::ModuleDistance {
                     signal: same_directory(),
+                    separate_directory_steps: SEPARATE_DIRECTORY_STEPS,
                     lean: Lean::TowardExtract,
                 }
             ),
@@ -1170,6 +1228,7 @@ mod tests {
                 &classification,
                 &Reason::ImportOverlap {
                     signal: ImportOverlap::Unavailable(ImportsUnavailable::NoDeclarations),
+                    threshold: SHARED_IMPORTS_THRESHOLD,
                     lean: Lean::Neither,
                 }
             ),
@@ -1309,6 +1368,7 @@ mod tests {
                     &classification,
                     &Reason::CallerDomainOverlap {
                         signal: signal.clone(),
+                        threshold: SHARED_CALLER_DOMAINS_THRESHOLD,
                         lean: Lean::Neither,
                     }
                 ),

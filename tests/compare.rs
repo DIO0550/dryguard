@@ -23,7 +23,7 @@ use dryguard::location::Location;
 use dryguard::pipeline::{
     ChunkPairError, MeasuredPair, chunk_pair_of, measured_pair_of, signals_of,
 };
-use dryguard::report::text_of;
+use dryguard::report::{Explanation, text_of};
 use dryguard::similarity::Similarity;
 
 mod common;
@@ -279,7 +279,7 @@ fn test_compare_of_similar_functions_in_separate_domains_reports_the_verdict_and
         &location_a,
         &location_b,
         &classification,
-        DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+        Explanation::AskedSignals,
     );
 
     let first_line = text.lines().next().unwrap_or_default();
@@ -486,7 +486,7 @@ fn test_compare_without_an_lsp_server_reports_the_stage2_signals_as_unmeasured_i
         &location_a,
         &location_b,
         &classification,
-        DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+        Explanation::AskedSignals,
     );
 
     assert!(

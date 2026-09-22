@@ -19,7 +19,7 @@ use dryguard::classification::DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
 use dryguard::classification::verdict::Verdict;
 use dryguard::lsp::ServerCommand;
 use dryguard::pipeline::{CandidatePair, Scan, scan_of};
-use dryguard::report::scan_text_of;
+use dryguard::report::{Explanation, scan_text_of};
 
 mod common;
 
@@ -167,7 +167,7 @@ fn test_scan_of_the_corpus_reads_every_typescript_file_under_the_root() {
 fn test_scan_text_of_the_corpus_lists_the_pairs_and_ends_with_what_it_walked() {
     let scan = scan_of_corpus();
 
-    let text = scan_text_of(&scan, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+    let text = scan_text_of(&scan, Explanation::AskedSignals);
 
     let first_line = text.lines().next().unwrap_or_default();
     assert!(
@@ -198,7 +198,7 @@ fn test_scan_without_an_lsp_server_reports_why_the_stage2_signals_are_missing() 
     // 同じ出方をすると、読者が両者を区別できない**
     let scan = scan_of_corpus();
 
-    let text = scan_text_of(&scan, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+    let text = scan_text_of(&scan, Explanation::AskedSignals);
 
     assert!(
         scan.semantics_error().is_some(),
@@ -342,7 +342,7 @@ fn pair_text_of(scan: &Scan, one: &str, other: &str) -> Option<String> {
         pair.location_b()
     );
 
-    scan_text_of(scan, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD)
+    scan_text_of(scan, Explanation::AskedSignals)
         .split("\n\n")
         .find(|block| block.starts_with(&heading))
         .map(ToOwned::to_owned)

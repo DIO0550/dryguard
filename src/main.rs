@@ -13,7 +13,7 @@ use dryguard::cli::{Cli, Command, CommonOptions};
 use dryguard::location::Location;
 use dryguard::lsp::ServerCommand;
 use dryguard::pipeline::{chunk_pair_of, measured_pair_of, scan_of};
-use dryguard::report::{scan_text_of, text_of};
+use dryguard::report::{Explanation, scan_text_of, text_of};
 use dryguard::threshold::Threshold;
 
 fn main() -> ExitCode {
@@ -67,7 +67,12 @@ fn report_compare(
 
     println!(
         "{}",
-        text_of(location_a, location_b, &classification, threshold)
+        text_of(
+            location_a,
+            location_b,
+            &classification,
+            explanation_of(options)
+        )
     );
 
     ExitCode::SUCCESS
@@ -97,9 +102,17 @@ fn report_scan(root: &Path, options: &CommonOptions) -> ExitCode {
         eprintln!("LSP への問い合わせが最後まで通りませんでした: {error}");
     }
 
-    println!("{}", scan_text_of(&scan, threshold));
+    println!("{}", scan_text_of(&scan, explanation_of(options)));
 
     ExitCode::SUCCESS
+}
+
+/// 根拠をどこまで出すか。`--explain` があれば、尋ねなかったシグナルと当てた閾値まで。
+fn explanation_of(options: &CommonOptions) -> Explanation {
+    if options.explain {
+        return Explanation::AllSignals;
+    }
+    Explanation::AskedSignals
 }
 
 /// 判定に使う閾値。`--threshold` が無ければ既定値。
