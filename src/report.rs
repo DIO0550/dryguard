@@ -7,6 +7,10 @@
 //! 判定はしない。ラベルと根拠を受け取って並べるだけで、シグナルからラベルを決めるのは
 //! `classification` にしか無い（`rules/architecture.md`「判定は 1 箇所にだけ置く」）。
 
+mod json;
+
+pub use json::{json_of, scan_json_of};
+
 use crate::classification::Classification;
 use crate::classification::reason::{Lean, Reason};
 use crate::classification::signal::{
