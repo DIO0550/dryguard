@@ -66,6 +66,7 @@ if structurally_similar && domains_differ { ... }
 | `verdict` | 判定の結果（`EXTRACT-CANDIDATE` / `DO-NOT-EXTRACT` / `REVIEW`） |
 | `reason` | 判定を傾けた根拠 1 件。シグナルの値と、**それに当てた閾値**と、それが傾けた向きの組 |
 | `lean` | シグナルが判定を傾けた向き（共通化する側 / しない側 / どちらでもない） |
+| `signal status` | シグナルの値が**測れた / 測れない / 尋ねていない**のどれか。`--format json` がこの語で出し、text は文に組み立てる |
 | `explanation` | 根拠をどこまで出すか。`--explain` が切り替える。**尋ねなかったシグナル**と**当てた閾値**を出すかどうかで分かれる |
 | `domain` | ドメイン。ディレクトリ構造からの推定と `dryguard.toml` の宣言で決まる |
 | `domain counts` | ドメインごとのファイルの件数。**向きを持たない** — `caller domain` と `callee domain` が中身として持つ |
@@ -126,6 +127,11 @@ if structurally_similar && domains_differ { ... }
 `reason` を出力側が組み立てた結果で、`reason` そのものではない。文にしてから持つと、
 **判定に効いた値と向きが文字列に埋もれて後段が読めない**（`--explain` が
 シグナルごとの効き方を出せなくなる）。
+
+**`signal status` に判定の答えを混ぜない。** 「測れた」と「重なった」は別の問いで、
+`unifiable` を `signal status` に並べると**測れたかどうかを確かめるのにシグナルごとの
+語彙が要る**（`--format json` の `status` に `unifiable` を並べない理由。
+`report::json` の `type_signature_value_of`）。
 
 **`explanation` を `reason` と混ぜない。** `reason` は判定を傾けた根拠 1 件そのもので、
 `explanation` は**その根拠をどこまで出すか**。1 語で呼ぶと、判定が持つものと出力の指定が
