@@ -7,6 +7,10 @@
 //! 判定はしない。ラベルと根拠を受け取って並べるだけで、シグナルからラベルを決めるのは
 //! `classification` にしか無い（`rules/architecture.md`「判定は 1 箇所にだけ置く」）。
 
+mod json;
+
+pub use json::{json_of, scan_json_of};
+
 use crate::classification::Classification;
 use crate::classification::reason::{Lean, Reason};
 use crate::classification::signal::{
@@ -594,17 +598,11 @@ mod tests {
 
     use crate::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
     use crate::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
-    use crate::location::Location;
-    use crate::pipeline::{Scan, scan_of};
     use crate::similarity::Similarity;
     use crate::syntax::import::ImportsUnavailable;
     use crate::syntax::module_distance::ModuleDistance;
-    use crate::test_support::{line, missing_server, overload_count};
+    use crate::test_support::{location, overload_count, scan_of_fixture};
     use crate::threshold::Threshold;
-
-    fn location(path: &str, number: usize) -> Location {
-        Location::new(PathBuf::from(path), line(number))
-    }
 
     fn measured(value: f64) -> Similarity {
         Similarity::new(value).expect("テストが渡す値は 0.0-1.0")
@@ -963,24 +961,6 @@ mod tests {
             text.contains("  提案: 共通化してよい。1 つにまとめる先を検討する。"),
             "候補側の提案が出る: {text}"
         );
-    }
-
-    /// `tests/fixtures/` 配下のディレクトリを走査した結果。
-    ///
-    /// カレントディレクトリではなくマニフェストの位置から組み立てる
-    /// （テストの実行位置に依存させない）。
-    ///
-    /// **起動できないサーバを渡す。** 実サーバを要する形にすると、サーバの入っていない
-    /// 開発機で出力が変わる（`rules/testing.md`「LSP を要するテストは、飛ばしたことが
-    /// 分かる形にする」）。
-    fn scan_of_fixture(relative_path: &str, threshold: Threshold) -> Scan {
-        let root = PathBuf::from(format!(
-            "{}/tests/fixtures/{relative_path}",
-            env!("CARGO_MANIFEST_DIR")
-        ));
-
-        scan_of(&root, threshold, &missing_server())
-            .expect("フィクスチャのディレクトリは走査できる")
     }
 
     /// 候補ペアが 1 組だけ出るフィクスチャの text。

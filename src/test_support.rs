@@ -10,8 +10,11 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use crate::line_number::LineNumber;
+use crate::location::Location;
 use crate::lsp::{DeclarationSite, ServerCommand, SignatureText};
+use crate::pipeline::{Scan, scan_of};
 use crate::source_position::SourcePosition;
+use crate::threshold::Threshold;
 
 /// このリポジトリの中のパス。
 ///
@@ -72,4 +75,34 @@ pub(crate) fn declaration_site(path: &str, number: usize) -> DeclarationSite {
     let position = SourcePosition::from_preceding_text(line(number), "");
 
     DeclarationSite::new(Path::new(path), position).expect("テストが渡すパスは絶対パス")
+}
+
+/// ファイルと行で表した位置。
+///
+/// 実在するファイルを指さなくてよい（綴りを出すだけのテストが使う）。
+///
+/// # Panics
+///
+/// `number` が 0 のとき。[`line`] と同じ理由。
+pub(crate) fn location(path: &str, number: usize) -> Location {
+    Location::new(PathBuf::from(path), line(number))
+}
+
+/// `tests/fixtures/` 配下のディレクトリを走査した結果。
+///
+/// カレントディレクトリではなくクレートの位置から組み立てるので、どこから
+/// `cargo test` を呼んでも同じ場所を指す。
+///
+/// **起動できないサーバを渡す。** 実サーバを要する形にすると、サーバの入っていない
+/// 開発機で出力が変わる（`rules/testing.md`「LSP を要するテストは、飛ばしたことが
+/// 分かる形にする」）。
+///
+/// # Panics
+///
+/// 走査を始められないとき。フィクスチャのディレクトリは実在するので、
+/// テストが渡すパスの書き間違い。
+pub(crate) fn scan_of_fixture(relative_path: &str, threshold: Threshold) -> Scan {
+    let root = repository_path(&format!("tests/fixtures/{relative_path}"));
+
+    scan_of(&root, threshold, &missing_server()).expect("フィクスチャのディレクトリは走査できる")
 }
