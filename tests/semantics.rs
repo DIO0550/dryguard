@@ -23,7 +23,7 @@ use dryguard::lsp::{
     WorkspaceRoot,
 };
 use dryguard::pipeline::{MeasuredPair, chunk_pair_of, measured_pair_of};
-use dryguard::report::text_of;
+use dryguard::report::{Explanation, text_of};
 use dryguard::semantics::callee_domain::CalleeDomains;
 use dryguard::semantics::caller_domain::CallerDomains;
 use dryguard::semantics::resolved_type::traced_type_names_of;
@@ -1190,7 +1190,7 @@ fn test_compare_with_an_lsp_reports_the_stage2_signals_it_measured() {
         &discounts_an_invoice,
         &reorders_stock,
         &classification,
-        DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+        Explanation::AskedSignals,
     );
 
     assert!(

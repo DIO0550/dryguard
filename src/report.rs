@@ -1,7 +1,7 @@
 //! 判定と根拠を、人が読む text にする層。
 //!
-//! **文を組み立てるのはここだけ。** `reason` は「シグナルの値と、それが傾けた向き」の
-//! 組であって文ではない（`rules/naming.md`「このツールの語彙を固定する」）。
+//! **文を組み立てるのはここだけ。** `reason` は「シグナルの値と、それに当てた閾値と、
+//! それが傾けた向き」の組であって文ではない（`rules/naming.md`「このツールの語彙を固定する」）。
 //! 判定側が文を持つと、判定に効いた値と向きが文字列に埋もれて後段が読めなくなる。
 //!
 //! 判定はしない。ラベルと根拠を受け取って並べるだけで、シグナルからラベルを決めるのは
@@ -31,10 +31,31 @@ const INDENT: &str = "  ";
 /// 見出し（`  理由: `）と同じ表示幅にして、根拠が縦に揃うようにしている。
 const REASON_CONTINUATION_INDENT: &str = "        ";
 
+/// 根拠をどこまで出すか。`--explain` が切り替える。
+///
+/// **既定でも判定に効いた根拠は出す。** `--explain` が増やすのは、**尋ねなかったシグナル**と
+/// **各シグナルに当てた閾値**の 2 つだけ。既定を結論だけに削ると、Phase 0 から
+/// 読めていた根拠が減り、「判断に理由が付く」というこのツールの価値が既定で消える
+/// （`docs/dryguard-plan.md`「差別化ポイント」）。
+///
+/// **Why not（`bool` で受ける）**: 呼び出し側が `text_of(.., true)` になり、
+/// 何が true なのかが読めない（`rules/coding.md`「値の語彙を型で閉じる」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Explanation {
+    /// 尋ねたシグナルの値と傾きだけを出す（既定の出力）。
+    AskedSignals,
+    /// 尋ねなかったシグナルと、当てた閾値まで出す（`--explain`）。
+    AllSignals,
+}
+
 /// 判定と根拠を、計画の出力イメージの形にする。
 ///
-/// `structural_similarity_threshold` は判定に使った閾値で、構造類似度の行に併記する。
-/// 併記しないと、`--threshold` の指定がどこに効いたのかが出力から読めない。
+/// `explanation` は根拠をどこまで出すか（`--explain` が [`Explanation::AllSignals`]）。
+///
+/// **閾値は根拠が運んでくる。** 判定が当てた値をそのまま出すので、
+/// ここが定数を読みに行くことはない（`classification::reason::Reason`）。
+/// 構造類似度の行だけは既定でも閾値を併記する。併記しないと、`--threshold` の指定が
+/// どこに効いたのかが出力から読めない。
 ///
 /// 末尾に改行は付けない（呼ぶ側が `println!` で出す）。
 ///
@@ -42,12 +63,12 @@ const REASON_CONTINUATION_INDENT: &str = "        ";
 /// 尋ねていないものを空欄やダミーで埋めずに行ごと出さない
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
 /// **尋ねて取れなかったときは理由まで出す**（環境が悪いのか材料が無いのかで、
-/// 読者が次にすることが違う）。
+/// 読者が次にすることが違う）。`--explain` は**尋ねなかったことも理由付きで**出す。
 pub fn text_of(
     location_a: &Location,
     location_b: &Location,
     classification: &Classification,
-    structural_similarity_threshold: Threshold,
+    explanation: Explanation,
 ) -> String {
     let mut lines = vec![format!(
         "[{}] {location_a} <-> {location_b}",
@@ -57,32 +78,50 @@ pub fn text_of(
 
     for reason in classification.reasons() {
         match reason {
-            Reason::StructuralSimilarity { signal, lean } => lines.push(format!(
+            Reason::StructuralSimilarity {
+                signal,
+                threshold,
+                lean,
+            } => lines.push(format!(
                 "{INDENT}構造類似度: {} → {}",
-                structural_similarity_text_of(*signal, structural_similarity_threshold),
+                structural_similarity_text_of(*signal, *threshold),
                 lean_text_of(*lean)
             )),
-            Reason::ImportOverlap { signal, lean } => reason_texts.push(format!(
+            Reason::ImportOverlap {
+                signal,
+                threshold,
+                lean,
+            } => reason_texts.push(format!(
                 "{} → {}",
-                import_overlap_text_of(*signal),
+                import_overlap_text_of(*signal, *threshold, explanation),
                 lean_text_of(*lean)
             )),
-            Reason::ModuleDistance { signal, lean } => reason_texts.push(format!(
+            Reason::ModuleDistance {
+                signal,
+                separate_directory_steps,
+                lean,
+            } => reason_texts.push(format!(
                 "{} → {}",
-                module_distance_text_of(*signal),
+                module_distance_text_of(*signal, *separate_directory_steps, explanation),
                 lean_text_of(*lean)
             )),
             Reason::TypeSignatureMatch { signal, lean } => {
-                lines.extend(type_signature_text_of(*signal).map(|signal_text| {
-                    format!(
-                        "{INDENT}型シグネチャ: {signal_text} → {}",
-                        lean_text_of(*lean)
-                    )
-                }));
+                lines.extend(
+                    type_signature_text_of(*signal, explanation).map(|signal_text| {
+                        format!(
+                            "{INDENT}型シグネチャ: {signal_text} → {}",
+                            lean_text_of(*lean)
+                        )
+                    }),
+                );
             }
-            Reason::CallerDomainOverlap { signal, lean } => {
+            Reason::CallerDomainOverlap {
+                signal,
+                threshold,
+                lean,
+            } => {
                 reason_texts.extend(
-                    caller_domain_overlap_text_of(signal)
+                    caller_domain_overlap_text_of(signal, *threshold, explanation)
                         .map(|signal_text| format!("{signal_text} → {}", lean_text_of(*lean))),
                 );
             }
@@ -100,8 +139,7 @@ pub fn text_of(
 
 /// 走査の結果を、候補ペアごとの text と走査した量にする。
 ///
-/// `structural_similarity_threshold` は候補を絞るのと判定に使った閾値で、
-/// ペアごとの行に併記する。
+/// `explanation` は根拠をどこまで出すか（`--explain` が [`Explanation::AllSignals`]）。
 ///
 /// 候補ペアは [`text_of`] と同じ形で並べる。**`compare` と `scan` で同じペアの
 /// 見え方が変わると、片方で見た結果をもう片方で確かめられない。**
@@ -110,7 +148,7 @@ pub fn text_of(
 /// 空の見出しを残すと、読む側は「何かを飛ばした」と読む。
 ///
 /// 末尾に改行は付けない（呼ぶ側が `println!` で出す）。
-pub fn scan_text_of(scan: &Scan, structural_similarity_threshold: Threshold) -> String {
+pub fn scan_text_of(scan: &Scan, explanation: Explanation) -> String {
     let mut blocks: Vec<String> = scan
         .candidate_pairs()
         .iter()
@@ -119,7 +157,7 @@ pub fn scan_text_of(scan: &Scan, structural_similarity_threshold: Threshold) -> 
                 pair.location_a(),
                 pair.location_b(),
                 pair.classification(),
-                structural_similarity_threshold,
+                explanation,
             )
         })
         .collect();
@@ -193,12 +231,22 @@ fn structural_similarity_text_of(signal: StructuralSimilarity, threshold: Thresh
 
 /// 依存モジュールの重なりの値。測れていなければ、その理由。
 ///
+/// 当てた閾値は `--explain` のときだけ併記する。**測れたときにしか併記しない**のは
+/// [`structural_similarity_text_of`] と同じ理由。
+///
 /// **理由を「宣言が無い」と言い切らない。** 読み取れる形は文法が持つ書き方より狭く
 /// (``require(`./${name}`)`` など)、宣言があるのに 1 件も集まらないことがある。
 /// 言い切ると、読む側は「このファイルは何にも依存していない」と受け取る。
-fn import_overlap_text_of(signal: ImportOverlap) -> String {
+fn import_overlap_text_of(
+    signal: ImportOverlap,
+    threshold: Threshold,
+    explanation: Explanation,
+) -> String {
     match signal {
-        ImportOverlap::Measured(overlap) => format!("依存先の重なり {overlap}"),
+        ImportOverlap::Measured(overlap) => format!(
+            "依存先の重なり {overlap}{}",
+            applied_threshold_text_of(threshold, explanation)
+        ),
         ImportOverlap::Unavailable(cause) => {
             format!(
                 "依存先の重なりを測れない ({})",
@@ -226,8 +274,42 @@ fn imports_unavailable_text_of(cause: ImportsUnavailable) -> String {
 }
 
 /// モジュール距離の値。段数は必ず取れるので、測れなかった形にはならない。
-fn module_distance_text_of(distance: ModuleDistance) -> String {
-    format!("モジュール距離 {} 段", distance.steps())
+///
+/// `separate_directory_steps` は別のディレクトリと見なした段数で、`--explain` の
+/// ときだけ併記する。
+fn module_distance_text_of(
+    distance: ModuleDistance,
+    separate_directory_steps: usize,
+    explanation: Explanation,
+) -> String {
+    format!(
+        "モジュール距離 {} 段{}",
+        distance.steps(),
+        applied_steps_text_of(separate_directory_steps, explanation)
+    )
+}
+
+/// `--explain` のときだけ付ける、そのシグナルに当てた閾値。
+///
+/// 既定で付けないのは、**ハードコードの閾値は出力を読む側が動かせない**から。
+/// 動かせる `--threshold` だけは既定でも構造類似度の行に出る
+/// （閾値の設定ファイル外出しは Issue #35）。
+fn applied_threshold_text_of(threshold: Threshold, explanation: Explanation) -> String {
+    match explanation {
+        Explanation::AskedSignals => String::new(),
+        Explanation::AllSignals => format!(" (閾値 {threshold})"),
+    }
+}
+
+/// `--explain` のときだけ付ける、別のディレクトリと見なした段数。
+///
+/// [`applied_threshold_text_of`] と分けるのは、**段数は 0.0-1.0 の閾値ではない**ため
+/// （単位を付けないと、同じ `(閾値 2)` が重なりの値として読める）。
+fn applied_steps_text_of(separate_directory_steps: usize, explanation: Explanation) -> String {
+    match explanation {
+        Explanation::AskedSignals => String::new(),
+        Explanation::AllSignals => format!(" (閾値 {separate_directory_steps} 段)"),
+    }
 }
 
 /// 型シグネチャの単一化の可否。測れていなければ、その理由。
@@ -236,11 +318,13 @@ fn module_distance_text_of(distance: ModuleDistance) -> String {
 /// 埋めると、読む側は測った結果としてそれを読む
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
 /// **測れなかったのとは別**なので、そちらは理由まで出す。
-fn type_signature_text_of(signal: TypeSignatureMatch) -> Option<String> {
+fn type_signature_text_of(signal: TypeSignatureMatch, explanation: Explanation) -> Option<String> {
     let text = match signal {
         TypeSignatureMatch::Unifiable => "単一化可能",
         TypeSignatureMatch::NotUnifiable => "単一化不能",
-        TypeSignatureMatch::Unavailable { reason } => semantics_unavailable_text_of(reason)?,
+        TypeSignatureMatch::Unavailable { reason } => {
+            semantics_unavailable_text_of(reason, explanation)?
+        }
         TypeSignatureMatch::NoName => "測れない (チャンクが名前を持たない)",
         TypeSignatureMatch::NoTypeThere => "測れない (サーバがその位置に型を持たない)",
         TypeSignatureMatch::UnreadableHover => "測れない (hover の応答を読めない)",
@@ -336,13 +420,21 @@ fn unopened_text_of(reason: UnopenedReason) -> &'static str {
 /// 呼び出し元ドメインの重なりの値と分布。測れていなければ、その理由。
 ///
 /// 尋ねていないときに `None` を返すのは [`type_signature_text_of`] と同じ理由。
-fn caller_domain_overlap_text_of(signal: &CallerDomainOverlap) -> Option<String> {
+fn caller_domain_overlap_text_of(
+    signal: &CallerDomainOverlap,
+    threshold: Threshold,
+    explanation: Explanation,
+) -> Option<String> {
     let unmeasured = match signal {
         CallerDomainOverlap::Measured(measured) => {
-            return Some(measured_caller_domains_text_of(measured));
+            return Some(measured_caller_domains_text_of(
+                measured,
+                threshold,
+                explanation,
+            ));
         }
         CallerDomainOverlap::Unavailable { reason } => {
-            let unavailable = semantics_unavailable_text_of(*reason)?;
+            let unavailable = semantics_unavailable_text_of(*reason, explanation)?;
 
             return Some(format!("呼び出し元ドメインの重なりを{unavailable}"));
         }
@@ -415,15 +507,24 @@ fn outside_project_text_of(markers: &[String]) -> String {
 
 /// Stage 2 へ届かなかったことを表す文。
 ///
-/// **尋ねていないだけなら `None`** を返し、行ごと出さない。空欄やダミーで埋めると、
+/// **尋ねていないだけなら既定では `None`** を返し、行ごと出さない。空欄やダミーで埋めると、
 /// 読む側は測った結果としてそれを読む
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+/// `--explain` は**尋ねなかったことも 1 つのシグナルの状態として**出す
+/// （そこだけ行が消えると、読む側は「シグナルを全表示」の一覧から何が抜けたのかを
+/// 数え直すことになる）。
 ///
 /// 頭を「測れない」「尋ねていない」に揃えてあるのは、呼び出し元ドメイン側が
 /// `…の重なりを` の後ろに続けて使うため。
-fn semantics_unavailable_text_of(reason: SemanticsUnavailable) -> Option<&'static str> {
+fn semantics_unavailable_text_of(
+    reason: SemanticsUnavailable,
+    explanation: Explanation,
+) -> Option<&'static str> {
     match reason {
-        SemanticsUnavailable::NotAsked => None,
+        SemanticsUnavailable::NotAsked => match explanation {
+            Explanation::AskedSignals => None,
+            Explanation::AllSignals => Some("尋ねていない (Stage 1 のシグナルだけで組み立てた)"),
+        },
         SemanticsUnavailable::NotACandidate => {
             Some("尋ねていない (構造が似ておらず候補ペアではない)")
         }
@@ -435,11 +536,16 @@ fn semantics_unavailable_text_of(reason: SemanticsUnavailable) -> Option<&'stati
     }
 }
 
-/// 測れた重なりと、両側のドメインごとの件数。
-fn measured_caller_domains_text_of(measured: &MeasuredCallerDomains) -> String {
+/// 測れた重なりと、両側のドメインごとの件数。当てた閾値は `--explain` のときだけ。
+fn measured_caller_domains_text_of(
+    measured: &MeasuredCallerDomains,
+    threshold: Threshold,
+    explanation: Explanation,
+) -> String {
     format!(
-        "呼び出し元ドメインの重なり {} ({} <-> {})",
+        "呼び出し元ドメインの重なり {}{} ({} <-> {})",
         measured.overlap(),
+        applied_threshold_text_of(threshold, explanation),
         references_per_domain_text_of(measured.callers_a()),
         references_per_domain_text_of(measured.callers_b())
     )
@@ -512,14 +618,28 @@ mod tests {
         )
     }
 
-    /// 別のディレクトリにある 2 箇所を、渡した閾値で判定した text。
+    /// 別のディレクトリにある 2 箇所を、渡した閾値で判定した既定の text。
     ///
-    /// 距離を固定して、構造の似かたと依存先の重なりだけを動かす。判定に渡す閾値と
-    /// 表示に渡す閾値を揃えているのは、`compare` が同じ値を両方へ渡すため。
+    /// 距離を固定して、構造の似かたと依存先の重なりだけを動かす。
     fn text_of_separate_directories(
         structural_similarity: StructuralSimilarity,
         import_overlap: ImportOverlap,
         threshold: Threshold,
+    ) -> String {
+        explained_text_of_separate_directories(
+            structural_similarity,
+            import_overlap,
+            threshold,
+            Explanation::AskedSignals,
+        )
+    }
+
+    /// 同じ組を、根拠をどこまで出すかまで指定して判定した text。
+    fn explained_text_of_separate_directories(
+        structural_similarity: StructuralSimilarity,
+        import_overlap: ImportOverlap,
+        threshold: Threshold,
+        explanation: Explanation,
     ) -> String {
         let signals = Signals::new(
             structural_similarity,
@@ -531,7 +651,46 @@ mod tests {
             &location("src/billing/discount.ts", 42),
             &location("src/inventory/reorder.ts", 18),
             &classification_of(&signals, threshold),
-            threshold,
+            explanation,
+        )
+    }
+
+    /// [`text_of_accidental_duplication`] と同じ組を `--explain` 付きで出した text。
+    fn explained_text_of_accidental_duplication() -> String {
+        explained_text_of_separate_directories(
+            StructuralSimilarity::Measured(measured(0.94)),
+            ImportOverlap::Measured(measured(0.0)),
+            DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+            Explanation::AllSignals,
+        )
+    }
+
+    /// 片方がもう片方のディレクトリの下にある 2 ファイルの隔たり（1 段）。
+    fn nested_directories() -> ModuleDistance {
+        ModuleDistance::between(
+            Path::new("src/billing/tax/rate.ts"),
+            Path::new("src/billing/invoice.ts"),
+        )
+    }
+
+    /// 隔たりが閾値に届かない組を `--explain` 付きで出した text。
+    ///
+    /// 測った段数（1）と当てた段数（2）が違う入力を選ぶ。同じ値の入力では、
+    /// 閾値の代わりに測った段数をもう一度出す実装でも通ってしまう
+    /// （`rules/testing.md`「既定値と違う答えになる入力を選ぶ」）。
+    fn explained_text_of_nested_directories() -> String {
+        let threshold = DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
+        let signals = Signals::new(
+            StructuralSimilarity::Measured(measured(0.94)),
+            ImportOverlap::Measured(measured(0.0)),
+            nested_directories(),
+        );
+
+        text_of(
+            &location("src/billing/tax/rate.ts", 42),
+            &location("src/billing/invoice.ts", 18),
+            &classification_of(&signals, threshold),
+            Explanation::AllSignals,
         )
     }
 
@@ -577,6 +736,77 @@ mod tests {
         assert!(
             text.contains("(閾値 0.8)"),
             "指定された閾値がそのまま出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_without_explain_omits_the_thresholds_of_the_hardcoded_signals() {
+        // 対照は同じ出力の構造類似度の行。`--threshold` で動かせる閾値だけは既定でも出る
+        let text = text_of_accidental_duplication();
+
+        assert!(
+            text.contains("依存先の重なり 0.00 → 共通化しない側")
+                && text.contains("モジュール距離 2 段 → 共通化しない側"),
+            "既定では値と傾きだけが並ぶ: {text}"
+        );
+        assert!(
+            text.contains("構造類似度: 0.94 (閾値 0.5)"),
+            "`--threshold` が動かす閾値は既定でも出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_explained_text_of_reports_the_threshold_each_signal_was_compared_against() {
+        let text = explained_text_of_accidental_duplication();
+
+        assert!(
+            text.contains("依存先の重なり 0.00 (閾値 0.5) → 共通化しない側"),
+            "当てた閾値が値の隣に出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_explained_text_of_reports_the_steps_it_compared_against_not_the_measured_ones() {
+        let text = explained_text_of_nested_directories();
+
+        assert!(
+            text.contains("モジュール距離 1 段 (閾値 2 段) → 共通化する側"),
+            "測った段数と当てた段数が別々に出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_without_explain_omits_the_signals_that_were_not_asked() {
+        // 対照は同じ出力に並ぶ Stage 1 の行。尋ねたシグナルが 1 つも無い入力で
+        // 確かめると、実装が何をしても通る
+        let text = text_of_accidental_duplication();
+
+        assert!(
+            !text.contains("型シグネチャ") && !text.contains("呼び出し元ドメイン"),
+            "尋ねていないシグナルは行ごと出さない: {text}"
+        );
+        assert!(
+            text.contains("構造類似度: 0.94") && text.contains("依存先の重なり 0.00"),
+            "尋ねたシグナルはそのまま出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_explained_text_of_reports_the_signals_that_were_not_asked() {
+        let text = explained_text_of_accidental_duplication();
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 尋ねていない (Stage 1 のシグナルだけで組み立てた) → どちらでもない"
+            ),
+            "尋ねなかったことも 1 つのシグナルの状態として出る: {text}"
+        );
+        assert!(
+            text.contains(
+                "呼び出し元ドメインの重なりを尋ねていない \
+                 (Stage 1 のシグナルだけで組み立てた) → どちらでもない"
+            ),
+            "尋ねなかった Stage 2 のシグナルは 2 つとも出る: {text}"
         );
     }
 
@@ -738,7 +968,10 @@ mod tests {
     fn scan_text_of_fixture() -> String {
         let threshold = DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
 
-        scan_text_of(&scan_of_fixture("scan", threshold), threshold)
+        scan_text_of(
+            &scan_of_fixture("scan", threshold),
+            Explanation::AskedSignals,
+        )
     }
 
     #[test]
@@ -763,7 +996,7 @@ mod tests {
         let threshold = Threshold::from_literal(0.0);
         let scan = scan_of_fixture("scan", threshold);
 
-        let text = scan_text_of(&scan, threshold);
+        let text = scan_text_of(&scan, Explanation::AskedSignals);
 
         let verdict_lines = text.lines().filter(|line| line.starts_with('[')).count();
         assert_eq!(verdict_lines, 14, "比べた 14 ペアが並ぶ: {text}");
@@ -786,7 +1019,10 @@ mod tests {
     fn test_scan_text_of_reports_a_file_it_could_not_read() {
         let threshold = DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
 
-        let text = scan_text_of(&scan_of_fixture("scan-skipped", threshold), threshold);
+        let text = scan_text_of(
+            &scan_of_fixture("scan-skipped", threshold),
+            Explanation::AskedSignals,
+        );
 
         assert!(
             text.contains("読めなかったファイル:"),
@@ -802,7 +1038,10 @@ mod tests {
     fn test_scan_text_of_reports_a_function_it_could_not_chunk() {
         let threshold = DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
 
-        let text = scan_text_of(&scan_of_fixture("scan-skipped", threshold), threshold);
+        let text = scan_text_of(
+            &scan_of_fixture("scan-skipped", threshold),
+            Explanation::AskedSignals,
+        );
 
         assert!(
             text.contains("構文エラーで切り出せなかった関数:"),
@@ -845,6 +1084,19 @@ mod tests {
         type_signature_match: TypeSignatureMatch,
         caller_domain_overlap: CallerDomainOverlap,
     ) -> String {
+        explained_text_of_accidental_duplication_with_semantics(
+            type_signature_match,
+            caller_domain_overlap,
+            Explanation::AskedSignals,
+        )
+    }
+
+    /// 同じ組を、根拠をどこまで出すかまで指定して判定した text。
+    fn explained_text_of_accidental_duplication_with_semantics(
+        type_signature_match: TypeSignatureMatch,
+        caller_domain_overlap: CallerDomainOverlap,
+        explanation: Explanation,
+    ) -> String {
         let threshold = DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.94)),
@@ -857,7 +1109,7 @@ mod tests {
             &location("src/billing/discount.ts", 42),
             &location("src/inventory/reorder.ts", 18),
             &classification_of(&signals, threshold),
-            threshold,
+            explanation,
         )
     }
 
@@ -1274,6 +1526,26 @@ mod tests {
                  (/repo/src/billing 1件 <-> /repo/src/inventory 1件) → 共通化しない側"
             ),
             "重なりの値と、両側の分布と、傾きが 1 行で読める: {text}"
+        );
+    }
+
+    #[test]
+    fn test_explained_text_of_reports_the_threshold_beside_the_caller_domain_overlap() {
+        // 対照は上のテスト。既定では同じ行に閾値が入らない
+        let text = explained_text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            callers_in_separate_domains(),
+            Explanation::AllSignals,
+        );
+
+        assert!(
+            text.contains(
+                "呼び出し元ドメインの重なり 0.00 (閾値 0.5) \
+                 (/repo/src/billing 1件 <-> /repo/src/inventory 1件) → 共通化しない側"
+            ),
+            "当てた閾値が重なりの値と分布のあいだに出る: {text}"
         );
     }
 
