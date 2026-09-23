@@ -68,6 +68,7 @@ if structurally_similar && domains_differ { ... }
 | `lean` | シグナルが判定を傾けた向き（共通化する側 / しない側 / どちらでもない） |
 | `signal status` | シグナルの値が**測れた / 測れない / 尋ねていない**のどれか。`--format json` がこの語で出し、text は文に組み立てる |
 | `explanation` | 根拠をどこまで出すか。`--explain` が切り替える。**尋ねなかったシグナル**と**当てた閾値**を出すかどうかで分かれる |
+| `configured threshold` | 外から動かせる閾値。`--threshold` と `dryguard.toml` が決める 3 つ（構造類似度・依存先の重なり・呼び出し元ドメインの重なり）。**既定値は持たず**、指定が無いキーに何を当てるかは `classification` が決める |
 | `domain` | ドメイン。ディレクトリ構造からの推定と `dryguard.toml` の宣言で決まる |
 | `domain counts` | ドメインごとのファイルの件数。**向きを持たない** — `caller domain` と `callee domain` が中身として持つ |
 | `import` | 依存の宣言。ソースに書かれた `import` / `export ... from` / `require` そのもの |
@@ -122,6 +123,17 @@ if structurally_similar && domains_differ { ... }
 
 `snippet` / `fragment` / `candidate`（chunk の意味で）/ `label`（verdict の意味で）は使わない。
 **`candidate` が指すのはペアであって chunk ではない。**
+
+**`configured threshold` を、判定に当てる閾値の全部と混ぜない。** 当てる閾値には
+ディレクトリの段数（`SEPARATE_DIRECTORY_STEPS`）も入るが、**そちらは外から動かせない**。
+1 語で呼ぶと、設定ファイルから段数を動かせるように読める。両者を合わせるのは
+`classification` の `AppliedThresholds::of` だけ（`rules/architecture.md`「判定は
+1 箇所にだけ置く」）。
+
+**`configured threshold` に「書かれていたか」を持たせない。** `dryguard.toml` に
+書かれていたかどうかは設定を読む側（`config`）の中だけの話で、**読み終えた時点で
+当てる値が決まっている**。`Option` のまま判定へ渡すと、既定値を当てる場所が
+`classification` の外にも作れてしまう。
 
 **`reason` は文ではなく構造。** 「依存先ドメイン不一致」のような人が読む文は
 `reason` を出力側が組み立てた結果で、`reason` そのものではない。文にしてから持つと、
