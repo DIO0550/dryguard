@@ -4,7 +4,7 @@
 //! （`docs/dryguard-plan.md`「CLI仕様 (案)」の出力イメージ）。
 //! `--format` が人の読む text とエージェントの読む JSON を切り替える。
 //!
-//! 判定に当てる閾値は `--threshold` > 既定値の順に決まる
+//! 判定に当てる閾値は `--threshold` > `dryguard.toml` > 既定値の順に決まる
 //! （[`configured_thresholds_of`]）。
 
 use std::path::Path;
@@ -14,6 +14,7 @@ use clap::Parser;
 
 use dryguard::classification::{ConfiguredThresholds, classification_of};
 use dryguard::cli::{Cli, Command, CommonOptions, OutputFormat};
+use dryguard::config::{ConfigError, thresholds_of};
 use dryguard::location::Location;
 use dryguard::lsp::ServerCommand;
 use dryguard::pipeline::{chunk_pair_of, measured_pair_of, scan_of};
@@ -22,7 +23,15 @@ use dryguard::report::{Explanation, json_of, scan_json_of, scan_text_of, text_of
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let thresholds = configured_thresholds_of(&cli.options);
+    // **判定を始める前に落とす。** 設定を読めないまま既定値で走らせると、
+    // 置いた設定が効いていないことを出力から確かめられない
+    let thresholds = match configured_thresholds_of(&cli.options) {
+        Ok(thresholds) => thresholds,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     match &cli.command {
         Command::Compare {
@@ -32,6 +41,13 @@ fn main() -> ExitCode {
         Command::Scan { path } => report_scan(path, &cli.options, thresholds),
     }
 }
+
+/// 設定ファイルを探すディレクトリ。
+///
+/// **カレントディレクトリの 1 つだけを見る。** 上へ遡って探すと、立っている場所しだいで
+/// **リポジトリの外の設定が黙って効く**。`scan <path>` でも `<path>` 側を見ないのは、
+/// `compare` には根が無く、サブコマンドによって置き場所が変わることになるため。
+const CONFIG_DIRECTORY: &str = ".";
 
 /// `compare` の 2 箇所を判定して、理由付きで表示する。
 ///
@@ -121,15 +137,20 @@ fn explanation_of(options: &CommonOptions) -> Explanation {
     Explanation::AskedSignals
 }
 
-/// 判定に当てる閾値。**`--threshold` > 既定値**。
+/// 判定に当てる閾値。**`--threshold` > `dryguard.toml` > 既定値**。
 ///
-/// 優先順位を条件で書かずに**重ねる順番**で表す。既定値から始めて `--threshold` を
-/// 重ねるので、後から重ねたほうが残る。
-fn configured_thresholds_of(options: &CommonOptions) -> ConfiguredThresholds {
-    let thresholds = ConfiguredThresholds::default();
+/// 優先順位を条件で書かずに**重ねる順番**で表す。既定値から始めて、設定ファイルに
+/// 書かれていたキーを重ね、最後に `--threshold` を重ねるので、後から重ねたほうが残る。
+///
+/// # Errors
+///
+/// `dryguard.toml` が在るのに読めない / 書式が違うとき。**無いことは失敗ではない**
+/// （設定を置かずに使える）。
+fn configured_thresholds_of(options: &CommonOptions) -> Result<ConfiguredThresholds, ConfigError> {
+    let thresholds = thresholds_of(Path::new(CONFIG_DIRECTORY))?;
 
     let Some(threshold) = options.threshold else {
-        return thresholds;
+        return Ok(thresholds);
     };
-    thresholds.with_structural_similarity(threshold)
+    Ok(thresholds.with_structural_similarity(threshold))
 }
