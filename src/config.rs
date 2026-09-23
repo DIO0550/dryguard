@@ -537,6 +537,24 @@ mod tests {
     }
 
     #[test]
+    fn test_settings_file_that_is_present_but_unreadable_is_not_treated_as_absent() {
+        // 対照は 1 つ上のテスト（無ければ既定値）。同じ入力では、読めない場合も
+        // 既定値へ落とす実装が通ってしまう
+        //
+        // フィクスチャは dryguard.toml という名前のディレクトリ。chmod で権限を
+        // 外す形にしないのは、**CI が root で走ると読めてしまう**ため
+        let directory =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/config/unreadable");
+
+        let error = thresholds_of(&directory).expect_err("読めないものを既定値へ落とさない");
+
+        assert!(
+            matches!(error, ConfigError::Unreadable { .. }),
+            "無いことと読めないことを分ける: {error}"
+        );
+    }
+
+    #[test]
     fn test_settings_file_on_disk_that_is_malformed_names_the_file_and_the_line() {
         let directory =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/config/unknown-key");
