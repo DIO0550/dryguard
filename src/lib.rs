@@ -10,8 +10,8 @@
 //! | `classification` | 分類（シグナルの統合と判定・理由の組み立て） | Stage 3 |
 //!
 //! 現在は Phase 2 の途中。CLI の受け口（`compare` と `scan`）、`codebase` の対象ファイル
-//! 収集、`syntax` のチャンク化・構造類似度・import 収集、`classification` の
-//! ハードコードした閾値による 3 ラベルの判定、`report` の理由付き出力までがある。
+//! 収集、`syntax` のチャンク化・構造類似度・import 収集、`classification` の 3 ラベルの判定、
+//! `report` の理由付き出力までがある。判定に当てる閾値は `--threshold` > 既定値の順に決まる。
 //! 出力は `--format` が人の読む text とエージェントの読む JSON を切り替える
 //! （**どちらにも同じ根拠が出る**。JSON のスキーマ安定化は Phase 5）。
 //!

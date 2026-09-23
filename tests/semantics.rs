@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use dryguard::classification::signal::{CallerDomainOverlap, TypeSignatureMatch};
 use dryguard::classification::verdict::Verdict;
-use dryguard::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
+use dryguard::classification::{ConfiguredThresholds, classification_of};
 use dryguard::codebase::source_of;
 use dryguard::location::Location;
 use dryguard::lsp::{
@@ -486,7 +486,7 @@ fn measured_with_an_lsp(location_a: &Location, location_b: &Location) -> Measure
 
     let measured = measured_pair_of(
         &pair,
-        DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+        ConfiguredThresholds::default(),
         &ServerCommand::typescript(),
     );
     if let Some(error) = measured.semantics_error() {
@@ -1158,8 +1158,7 @@ fn test_compare_with_an_lsp_keeps_the_accidental_duplication_a_do_not_extract() 
 
     let measured = measured_with_an_lsp(&discounts_an_invoice, &reorders_stock);
 
-    let classification =
-        classification_of(measured.signals(), DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+    let classification = classification_of(measured.signals(), ConfiguredThresholds::default());
     assert_eq!(classification.verdict(), Verdict::DoNotExtract);
 }
 
@@ -1171,8 +1170,7 @@ fn test_compare_with_an_lsp_keeps_the_shared_utility_pair_an_extract_candidate()
 
     let measured = measured_with_an_lsp(&formats_a_date, &helps_with_dates);
 
-    let classification =
-        classification_of(measured.signals(), DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+    let classification = classification_of(measured.signals(), ConfiguredThresholds::default());
     assert_eq!(classification.verdict(), Verdict::ExtractCandidate);
 }
 
@@ -1183,8 +1181,7 @@ fn test_compare_with_an_lsp_reports_the_stage2_signals_it_measured() {
     // （`tests/compare.rs`）。**判定に使われたシグナルの違いが出力から読める**のがこの Issue の完了条件
     let (discounts_an_invoice, reorders_stock) = accidental_duplication_pair();
     let measured = measured_with_an_lsp(&discounts_an_invoice, &reorders_stock);
-    let classification =
-        classification_of(measured.signals(), DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+    let classification = classification_of(measured.signals(), ConfiguredThresholds::default());
 
     let text = text_of(
         &discounts_an_invoice,

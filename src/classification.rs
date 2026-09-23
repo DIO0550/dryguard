@@ -15,10 +15,13 @@
 //! | シグナル | 共通化する側へ傾く | 共通化しない側へ傾く |
 //! |---|---|---|
 //! | 構造類似度 | 閾値に届いた | （傾けない。下の表の 1 行目） |
-//! | 依存先の重なり | [`SHARED_IMPORTS_THRESHOLD`] に届いた | 届かなかった |
+//! | 依存先の重なり | 閾値に届いた | 届かなかった |
 //! | ディレクトリの隔たり | [`SEPARATE_DIRECTORY_STEPS`] 段未満 | 段以上 |
 //! | 型シグネチャ | 単一化可能 | 単一化不能 |
-//! | 呼び出し元ドメインの重なり | [`SHARED_CALLER_DOMAINS_THRESHOLD`] に届いた | 届かなかった |
+//! | 呼び出し元ドメインの重なり | 閾値に届いた | 届かなかった |
+//!
+//! 当てる閾値のうち 3 つは外から動く（[`ConfiguredThresholds`]）。段数だけは定数で、
+//! **どのシグナルにどれを当てるかを決めているのは [`AppliedThresholds::of`] だけ。**
 //!
 //! 傾きからラベルまでは 2 段。まず**ドメインが同じか**を、置き場所（依存先の重なり →
 //! ディレクトリの隔たり）で決めてから**呼び出し元の観測を重ねて**出す
@@ -67,7 +70,7 @@ use crate::similarity::Similarity;
 use crate::syntax::module_distance::ModuleDistance;
 use crate::threshold::Threshold;
 
-/// 構造が似ていると見なす類似度の下限。`--threshold` が無いときに使う。
+/// 構造が似ていると見なす類似度の下限。指定が無いときに使う。
 ///
 /// **この値は構造類似度の測り方とセットでしか意味を持たない。** 測り方を変えたら、
 /// ここも測り直して決める（`tests/corpus/` の全ペアで旧実装と突き合わせる）。
@@ -80,29 +83,96 @@ use crate::threshold::Threshold;
 /// 1.00 付近に潰れており、0.85 はその分布に対して選んだ値だった。並びを見る測り方では
 /// 同じ 0.85 が 4 倍近く厳しくなり、Phase 0 で検出できていた真陽性が消える。
 ///
-/// Phase 3 まで設定ファイルへ出さない。**先回りで外に出すと、まだ意味の分かっていない
-/// つまみが増える**（`docs/dryguard-plan.md`「Phase 3: Stage 3 を厚くする」）。
+/// `--threshold` と `dryguard.toml` の `structural_similarity` が上書きする
+/// （[`ConfiguredThresholds`]）。
 pub const DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD: Threshold = Threshold::from_literal(0.50);
 
-/// 依存先を共有していると見なす重なりの下限。
+/// 依存先を共有していると見なす重なりの下限。指定が無いときに使う。
 ///
 /// 半分以上が共通なら、同じ道具立ての上に書かれていると見る。
-const SHARED_IMPORTS_THRESHOLD: Threshold = Threshold::from_literal(0.5);
+/// `dryguard.toml` の `shared_imports` が上書きする（[`ConfiguredThresholds`]）。
+const DEFAULT_SHARED_IMPORTS_THRESHOLD: Threshold = Threshold::from_literal(0.5);
 
-/// 呼び出し元を共有していると見なす重なりの下限。
+/// 呼び出し元を共有していると見なす重なりの下限。指定が無いときに使う。
 ///
 /// 半分以上のドメインが共通なら、同じ機能から使われていると見る。
+/// `dryguard.toml` の `shared_caller_domains` が上書きする（[`ConfiguredThresholds`]）。
 ///
-/// **Why not（[`SHARED_IMPORTS_THRESHOLD`] を使い回す）**: 測っている集合が違う
+/// **Why not（[`DEFAULT_SHARED_IMPORTS_THRESHOLD`] を使い回す）**: 測っている集合が違う
 /// （依存先モジュールと呼び出し元ドメイン）。片方を調整したときに、もう片方まで
-/// 黙って動くのを避ける。
-const SHARED_CALLER_DOMAINS_THRESHOLD: Threshold = Threshold::from_literal(0.5);
+/// 黙って動くのを避ける。**設定のキーを 2 つに分けてあるのも同じ理由。**
+const DEFAULT_SHARED_CALLER_DOMAINS_THRESHOLD: Threshold = Threshold::from_literal(0.5);
 
 /// 別のディレクトリへ下りていると見なす段数。
 ///
 /// 1 段は片方がもう片方のディレクトリの下にある形なので、同じドメインの下位と見る。
 /// 2 段になって初めて、双方が共通の親から別のディレクトリへ下りている。
 const SEPARATE_DIRECTORY_STEPS: usize = 2;
+
+/// 外から動かせる閾値。`--threshold` と `dryguard.toml` が決める。
+///
+/// **指定が無ければ既定値**で、その既定値を持つのはこのモジュール
+/// (`rules/architecture.md`「判定は 1 箇所にだけ置く」)。設定を読む側（`crate::config`）は
+/// **書かれていたキーを重ねるだけ**で、書かれていないキーに何を当てるかを知らない。
+///
+/// **[`SEPARATE_DIRECTORY_STEPS`] はここに持たない。** 段数は 0.0-1.0 の閾値ではなく
+/// （`--threshold <0-1>` の単位と違う）、外から動かしたくなった記録も無い。持たせないことで
+/// **設定から段数を動かす呼び出しが書けない**
+/// (`rules/coding.md`「不正な状態を型で表現できなくする」)。
+///
+/// **Why not（3 つを位置引数で受ける）**: どれも同じ [`Threshold`] 型なので、
+/// 並びを取り違えても型では落ちない
+/// (`rules/coding.md`「スコアと閾値を素の `f64` で混ぜない」と同じ形)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConfiguredThresholds {
+    structural_similarity: Threshold,
+    shared_imports: Threshold,
+    shared_caller_domains: Threshold,
+}
+
+impl ConfiguredThresholds {
+    /// 構造が似ていると見なす類似度の下限。
+    ///
+    /// 候補ペアの枝刈り（`pipeline`）が判定と同じ値を読むために要る。
+    pub fn structural_similarity(self) -> Threshold {
+        self.structural_similarity
+    }
+
+    /// 構造類似度の閾値を差し替える。
+    pub fn with_structural_similarity(self, threshold: Threshold) -> Self {
+        Self {
+            structural_similarity: threshold,
+            ..self
+        }
+    }
+
+    /// 依存先の重なりの閾値を差し替える。
+    pub fn with_shared_imports(self, threshold: Threshold) -> Self {
+        Self {
+            shared_imports: threshold,
+            ..self
+        }
+    }
+
+    /// 呼び出し元ドメインの重なりの閾値を差し替える。
+    pub fn with_shared_caller_domains(self, threshold: Threshold) -> Self {
+        Self {
+            shared_caller_domains: threshold,
+            ..self
+        }
+    }
+}
+
+impl Default for ConfiguredThresholds {
+    /// どこからも指定されなかったときに当てる値。
+    fn default() -> Self {
+        Self {
+            structural_similarity: DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
+            shared_imports: DEFAULT_SHARED_IMPORTS_THRESHOLD,
+            shared_caller_domains: DEFAULT_SHARED_CALLER_DOMAINS_THRESHOLD,
+        }
+    }
+}
 
 /// 判定と、その根拠。
 ///
@@ -128,20 +198,17 @@ impl Classification {
 
 /// シグナルを統合して判定する。
 ///
-/// `structural_similarity_threshold` は構造が似ていると見なす下限で、
-/// `--threshold` が指定されなければ [`DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD`]。
+/// `thresholds` は外から動かせる閾値。どこからも指定されなければ
+/// [`ConfiguredThresholds::default`]。
 ///
 /// **シグナルからラベルへの決定木はここにしか無い**
 /// (`rules/architecture.md`「判定は 1 箇所にだけ置く」)。
-pub fn classification_of(
-    signals: &Signals,
-    structural_similarity_threshold: Threshold,
-) -> Classification {
+pub fn classification_of(signals: &Signals, configured: ConfiguredThresholds) -> Classification {
     let structurally_similar = is_structurally_similar(
         signals.structural_similarity(),
-        structural_similarity_threshold,
+        configured.structural_similarity,
     );
-    let thresholds = AppliedThresholds::of(structural_similarity_threshold);
+    let thresholds = AppliedThresholds::of(configured);
     let leans = Leans::of(signals, thresholds);
     let placement = placement_domain_match_of(&leans);
     let domain_match = domain_match_of(placement, &leans);
@@ -172,13 +239,13 @@ struct AppliedThresholds {
 }
 
 impl AppliedThresholds {
-    /// 外から動くのは構造類似度の閾値だけ（`--threshold`）。残りは定数。
-    fn of(structural_similarity: Threshold) -> Self {
+    /// 外から動くのは [`ConfiguredThresholds`] が持つ 3 つ。段数だけは定数。
+    fn of(configured: ConfiguredThresholds) -> Self {
         Self {
-            structural_similarity,
-            shared_imports: SHARED_IMPORTS_THRESHOLD,
+            structural_similarity: configured.structural_similarity,
+            shared_imports: configured.shared_imports,
             separate_directory_steps: SEPARATE_DIRECTORY_STEPS,
-            shared_caller_domains: SHARED_CALLER_DOMAINS_THRESHOLD,
+            shared_caller_domains: configured.shared_caller_domains,
         }
     }
 }
@@ -480,7 +547,7 @@ fn import_overlap_lean_of(signal: ImportOverlap, shared_threshold: Threshold) ->
 ///
 /// **閾値を引数で受ける。** 重なりを測っている集合はシグナルごとに違うので、
 /// 1 つの定数へ畳むと片方を調整したときにもう片方まで黙って動く
-/// （[`SHARED_IMPORTS_THRESHOLD`] の Why not と同じ理由）。畳んでいるのは
+/// （[`DEFAULT_SHARED_IMPORTS_THRESHOLD`] の Why not と同じ理由）。畳んでいるのは
 /// **閾値との比べ方と、測れなかったときの倒れ方**だけ。
 fn overlap_lean_of(overlap: Option<Similarity>, shared_threshold: Threshold) -> Lean {
     let Some(overlap) = overlap else {
@@ -584,7 +651,7 @@ mod tests {
             separate_directories(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::ExtractCandidate);
     }
@@ -598,7 +665,7 @@ mod tests {
             separate_directories(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::DoNotExtract);
     }
@@ -614,7 +681,7 @@ mod tests {
             same_directory(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::Review);
     }
@@ -629,7 +696,7 @@ mod tests {
             separate_directories(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::Review);
     }
@@ -645,7 +712,7 @@ mod tests {
             separate_directories(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::ExtractCandidate);
     }
@@ -660,7 +727,11 @@ mod tests {
             separate_directories(),
         );
 
-        let classification = classification_of(&signals, Threshold::from_literal(0.2));
+        let classification = classification_of(
+            &signals,
+            ConfiguredThresholds::default()
+                .with_structural_similarity(Threshold::from_literal(0.2)),
+        );
 
         assert_eq!(classification.verdict(), Verdict::DoNotExtract);
     }
@@ -674,7 +745,7 @@ mod tests {
             separate_directories(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::Review);
     }
@@ -689,7 +760,7 @@ mod tests {
             separate_directories(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::Review);
     }
@@ -702,7 +773,7 @@ mod tests {
             separate_directories(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.reasons().len(), 5);
     }
@@ -737,7 +808,7 @@ mod tests {
             },
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::Review);
     }
@@ -752,7 +823,7 @@ mod tests {
             },
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::ExtractCandidate);
     }
@@ -770,7 +841,7 @@ mod tests {
             },
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::ExtractCandidate);
     }
@@ -791,7 +862,7 @@ mod tests {
             callers_in_separate_domains(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::DoNotExtract);
     }
@@ -808,7 +879,7 @@ mod tests {
             callers_in_the_same_domain(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::Review);
     }
@@ -823,7 +894,7 @@ mod tests {
             callers_in_separate_domains(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::Review);
     }
@@ -850,7 +921,7 @@ mod tests {
             callers_in_the_same_domain(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::Review);
     }
@@ -862,7 +933,7 @@ mod tests {
         let signals = signals_of_a_caller_only_domain_match()
             .with_semantics(TypeSignatureMatch::Unifiable, callers_in_the_same_domain());
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::ExtractCandidate);
     }
@@ -878,7 +949,7 @@ mod tests {
             callers_in_separate_domains(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::DoNotExtract);
     }
@@ -897,7 +968,7 @@ mod tests {
             },
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::Review);
     }
@@ -915,7 +986,7 @@ mod tests {
             },
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::Review);
     }
@@ -931,7 +1002,7 @@ mod tests {
             CallerDomainOverlap::ProjectMembershipNotProvided,
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::Review);
     }
@@ -945,7 +1016,7 @@ mod tests {
             },
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert!(
             leans(
@@ -969,7 +1040,7 @@ mod tests {
             },
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert!(
             leans(
@@ -988,7 +1059,7 @@ mod tests {
     fn test_classification_without_asking_the_lsp_leans_the_stage2_reasons_neither_way() {
         let signals = signals_of_a_shared_domain();
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert!(
             leans(
@@ -1005,7 +1076,7 @@ mod tests {
                     signal: CallerDomainOverlap::Unavailable {
                         reason: SemanticsUnavailable::NotAsked
                     },
-                    threshold: SHARED_CALLER_DOMAINS_THRESHOLD,
+                    threshold: DEFAULT_SHARED_CALLER_DOMAINS_THRESHOLD,
                     lean: Lean::Neither,
                 }
             ),
@@ -1024,14 +1095,14 @@ mod tests {
             callers_in_separate_domains(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert!(
             leans(
                 &classification,
                 &Reason::CallerDomainOverlap {
                     signal: callers_in_separate_domains(),
-                    threshold: SHARED_CALLER_DOMAINS_THRESHOLD,
+                    threshold: DEFAULT_SHARED_CALLER_DOMAINS_THRESHOLD,
                     lean: Lean::TowardDoNotExtract,
                 }
             ),
@@ -1050,14 +1121,14 @@ mod tests {
             callers_in_the_same_domain(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert!(
             leans(
                 &classification,
                 &Reason::CallerDomainOverlap {
                     signal: callers_in_the_same_domain(),
-                    threshold: SHARED_CALLER_DOMAINS_THRESHOLD,
+                    threshold: DEFAULT_SHARED_CALLER_DOMAINS_THRESHOLD,
                     lean: Lean::TowardExtract,
                 }
             ),
@@ -1080,7 +1151,7 @@ mod tests {
             callers,
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(
             classification.verdict(),
@@ -1098,14 +1169,14 @@ mod tests {
             separate_directories(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert!(
             leans(
                 &classification,
                 &Reason::ImportOverlap {
                     signal: ImportOverlap::Measured(measured(0.0)),
-                    threshold: SHARED_IMPORTS_THRESHOLD,
+                    threshold: DEFAULT_SHARED_IMPORTS_THRESHOLD,
                     lean: Lean::TowardDoNotExtract,
                 }
             ),
@@ -1122,14 +1193,14 @@ mod tests {
             separate_directories(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert!(
             leans(
                 &classification,
                 &Reason::ImportOverlap {
                     signal: ImportOverlap::Measured(measured(1.0)),
-                    threshold: SHARED_IMPORTS_THRESHOLD,
+                    threshold: DEFAULT_SHARED_IMPORTS_THRESHOLD,
                     lean: Lean::TowardExtract,
                 }
             ),
@@ -1148,7 +1219,7 @@ mod tests {
             separate_directories(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert!(
             leans(
@@ -1172,7 +1243,7 @@ mod tests {
             separate_directories(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert!(
             leans(
@@ -1197,7 +1268,7 @@ mod tests {
             same_directory(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert!(
             leans(
@@ -1221,14 +1292,14 @@ mod tests {
             separate_directories(),
         );
 
-        let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert!(
             leans(
                 &classification,
                 &Reason::ImportOverlap {
                     signal: ImportOverlap::Unavailable(ImportsUnavailable::NoDeclarations),
-                    threshold: SHARED_IMPORTS_THRESHOLD,
+                    threshold: DEFAULT_SHARED_IMPORTS_THRESHOLD,
                     lean: Lean::Neither,
                 }
             ),
@@ -1333,8 +1404,7 @@ mod tests {
             )
             .with_semantics(signal, callers_in_the_same_domain());
 
-            let classification =
-                classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+            let classification = classification_of(&signals, ConfiguredThresholds::default());
 
             assert!(
                 leans(
@@ -1360,15 +1430,14 @@ mod tests {
             )
             .with_semantics(TypeSignatureMatch::Unifiable, signal.clone());
 
-            let classification =
-                classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+            let classification = classification_of(&signals, ConfiguredThresholds::default());
 
             assert!(
                 leans(
                     &classification,
                     &Reason::CallerDomainOverlap {
                         signal: signal.clone(),
-                        threshold: SHARED_CALLER_DOMAINS_THRESHOLD,
+                        threshold: DEFAULT_SHARED_CALLER_DOMAINS_THRESHOLD,
                         lean: Lean::Neither,
                     }
                 ),

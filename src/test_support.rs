@@ -9,12 +9,12 @@
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
+use crate::classification::ConfiguredThresholds;
 use crate::line_number::LineNumber;
 use crate::location::Location;
 use crate::lsp::{DeclarationSite, ServerCommand, SignatureText};
 use crate::pipeline::{Scan, scan_of};
 use crate::source_position::SourcePosition;
-use crate::threshold::Threshold;
 
 /// このリポジトリの中のパス。
 ///
@@ -101,8 +101,8 @@ pub(crate) fn location(path: &str, number: usize) -> Location {
 ///
 /// 走査を始められないとき。フィクスチャのディレクトリは実在するので、
 /// テストが渡すパスの書き間違い。
-pub(crate) fn scan_of_fixture(relative_path: &str, threshold: Threshold) -> Scan {
+pub(crate) fn scan_of_fixture(relative_path: &str, thresholds: ConfiguredThresholds) -> Scan {
     let root = repository_path(&format!("tests/fixtures/{relative_path}"));
 
-    scan_of(&root, threshold, &missing_server()).expect("フィクスチャのディレクトリは走査できる")
+    scan_of(&root, thresholds, &missing_server()).expect("フィクスチャのディレクトリは走査できる")
 }
