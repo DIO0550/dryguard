@@ -1,0 +1,6 @@
+# 3 つの閾値を、既定値（どれも 0.5）とも互いとも違う値にする。
+# 同じ値だと、別のキーへ書き込む実装でもテストが通る。
+[thresholds]
+structural_similarity = 0.8
+shared_imports = 0.7
+shared_caller_domains = 0.6

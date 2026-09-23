@@ -295,9 +295,10 @@ fn module_distance_text_of(
 
 /// `--explain` のときだけ付ける、そのシグナルに当てた閾値。
 ///
-/// 既定で付けないのは、**ハードコードの閾値は出力を読む側が動かせない**から。
-/// 動かせる `--threshold` だけは既定でも構造類似度の行に出る
-/// （閾値の設定ファイル外出しは Issue #35）。
+/// 3 つの閾値はどれも外から動かせる（`classification::ConfiguredThresholds`）が、
+/// 既定で出すのは構造類似度の行だけ。**`--threshold` はその実行の引数なので、
+/// 出力だけが残る場面（エージェント・CI のログ）から辿れない。** 残る 2 つを動かすのは
+/// リポジトリに残る `dryguard.toml` なので、出力に無くてもそちらを読める。
 fn applied_threshold_text_of(threshold: Threshold, explanation: Explanation) -> String {
     match explanation {
         Explanation::AskedSignals => String::new(),
@@ -597,7 +598,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
-    use crate::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
+    use crate::classification::{
+        ConfiguredThresholds, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of,
+    };
     use crate::similarity::Similarity;
     use crate::syntax::import::ImportsUnavailable;
     use crate::syntax::module_distance::ModuleDistance;
@@ -648,7 +651,10 @@ mod tests {
         text_of(
             &location("src/billing/discount.ts", 42),
             &location("src/inventory/reorder.ts", 18),
-            &classification_of(&signals, threshold),
+            &classification_of(
+                &signals,
+                ConfiguredThresholds::default().with_structural_similarity(threshold),
+            ),
             explanation,
         )
     }
@@ -687,7 +693,10 @@ mod tests {
         text_of(
             &location("src/billing/tax/rate.ts", 42),
             &location("src/billing/invoice.ts", 18),
-            &classification_of(&signals, threshold),
+            &classification_of(
+                &signals,
+                ConfiguredThresholds::default().with_structural_similarity(threshold),
+            ),
             Explanation::AllSignals,
         )
     }
@@ -738,8 +747,8 @@ mod tests {
     }
 
     #[test]
-    fn test_text_of_without_explain_omits_the_thresholds_of_the_hardcoded_signals() {
-        // 対照は同じ出力の構造類似度の行。`--threshold` で動かせる閾値だけは既定でも出る
+    fn test_text_of_without_explain_omits_the_thresholds_of_the_other_signals() {
+        // 対照は同じ出力の構造類似度の行。`--threshold` が動かす閾値だけは既定でも出る
         let text = text_of_accidental_duplication();
 
         assert!(
@@ -764,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn test_explained_text_of_reports_the_given_threshold_apart_from_the_hardcoded_one() {
+    fn test_explained_text_of_reports_the_given_threshold_apart_from_the_others() {
         // 既定と違う `--threshold` を渡す。既定と同じ値では、構造類似度の閾値を
         // すべてのシグナルへ流用する実装でも通ってしまう
         // （`rules/testing.md`「既定値と違う答えになる入力を選ぶ」）
@@ -778,7 +787,47 @@ mod tests {
         assert!(
             text.contains("構造類似度: 0.94 (閾値 0.8)")
                 && text.contains("依存先の重なり 0.00 (閾値 0.5)"),
-            "動かせる閾値と定数の閾値がシグナルごとに別々に出る: {text}"
+            "`--threshold` が動かした閾値と、動かさなかった閾値が別々に出る: {text}"
+        );
+    }
+
+    /// 3 つの閾値を、既定値（どれも 0.5）とも互いとも違う値にして `--explain` で出した text。
+    ///
+    /// 同じ値にすると、**1 つの閾値をすべてのシグナルへ流用する実装でも通る**
+    /// （`harness/records/pr-227.md` 指摘 2 が、動かす手立てが無いために
+    /// 塞げないと書き残していた穴）。
+    fn explained_text_of_three_moved_thresholds() -> String {
+        let thresholds = ConfiguredThresholds::default()
+            .with_structural_similarity(Threshold::from_literal(0.8))
+            .with_shared_imports(Threshold::from_literal(0.7))
+            .with_shared_caller_domains(Threshold::from_literal(0.6));
+        let signals = Signals::new(
+            StructuralSimilarity::Measured(measured(0.94)),
+            ImportOverlap::Measured(measured(0.0)),
+            separate_directories(),
+        )
+        .with_semantics(
+            TypeSignatureMatch::NotUnifiable,
+            callers_in_separate_domains(),
+        );
+
+        text_of(
+            &location("src/billing/discount.ts", 42),
+            &location("src/inventory/reorder.ts", 18),
+            &classification_of(&signals, thresholds),
+            Explanation::AllSignals,
+        )
+    }
+
+    #[test]
+    fn test_explained_text_of_reports_each_moved_threshold_on_its_own_signal() {
+        let text = explained_text_of_three_moved_thresholds();
+
+        assert!(
+            text.contains("構造類似度: 0.94 (閾値 0.8)")
+                && text.contains("依存先の重なり 0.00 (閾値 0.7)")
+                && text.contains("呼び出し元ドメインの重なり 0.00 (閾値 0.6)"),
+            "動かした 3 つの閾値が、それぞれのシグナルの行に出る: {text}"
         );
     }
 
@@ -965,10 +1014,8 @@ mod tests {
 
     /// 候補ペアが 1 組だけ出るフィクスチャの text。
     fn scan_text_of_fixture() -> String {
-        let threshold = DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
-
         scan_text_of(
-            &scan_of_fixture("scan", threshold),
+            &scan_of_fixture("scan", ConfiguredThresholds::default()),
             Explanation::AskedSignals,
         )
     }
@@ -992,8 +1039,11 @@ mod tests {
     fn test_scan_text_of_separates_the_pairs_it_lists_with_a_blank_line() {
         // 閾値を 0.0 まで下げて、比べたペアをすべて候補にする。1 組しか出ない
         // 入力では「並べた形」になっているかを確かめられない
-        let threshold = Threshold::from_literal(0.0);
-        let scan = scan_of_fixture("scan", threshold);
+        let scan = scan_of_fixture(
+            "scan",
+            ConfiguredThresholds::default()
+                .with_structural_similarity(Threshold::from_literal(0.0)),
+        );
 
         let text = scan_text_of(&scan, Explanation::AskedSignals);
 
@@ -1016,10 +1066,8 @@ mod tests {
 
     #[test]
     fn test_scan_text_of_reports_a_file_it_could_not_read() {
-        let threshold = DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
-
         let text = scan_text_of(
-            &scan_of_fixture("scan-skipped", threshold),
+            &scan_of_fixture("scan-skipped", ConfiguredThresholds::default()),
             Explanation::AskedSignals,
         );
 
@@ -1035,10 +1083,8 @@ mod tests {
 
     #[test]
     fn test_scan_text_of_reports_a_function_it_could_not_chunk() {
-        let threshold = DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
-
         let text = scan_text_of(
-            &scan_of_fixture("scan-skipped", threshold),
+            &scan_of_fixture("scan-skipped", ConfiguredThresholds::default()),
             Explanation::AskedSignals,
         );
 
@@ -1107,7 +1153,10 @@ mod tests {
         text_of(
             &location("src/billing/discount.ts", 42),
             &location("src/inventory/reorder.ts", 18),
-            &classification_of(&signals, threshold),
+            &classification_of(
+                &signals,
+                ConfiguredThresholds::default().with_structural_similarity(threshold),
+            ),
             explanation,
         )
     }

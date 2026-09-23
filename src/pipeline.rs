@@ -17,7 +17,9 @@ use crate::classification::signal::{
     CallerDomainOverlap, ImportOverlap, MeasuredCallerDomains, SemanticsUnavailable, Signals,
     StructuralSimilarity, TypeSignatureMatch,
 };
-use crate::classification::{Classification, classification_of, is_structurally_similar};
+use crate::classification::{
+    Classification, ConfiguredThresholds, classification_of, is_structurally_similar,
+};
 use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
 use crate::location::Location;
 use crate::lsp::{
@@ -253,7 +255,7 @@ impl MeasuredPair {
 
 /// ペアを Stage 1 で測り、候補ペアなら Stage 2 を LSP に尋ねて重ねる。
 ///
-/// `structural_similarity_threshold` は候補ペアと見なす構造類似度の下限、
+/// `thresholds` は判定に当てる閾値（候補ペアと見なす構造類似度の下限もここが持つ）、
 /// `server` は起こす LSP サーバの指定（TypeScript なら [`ServerCommand::typescript`]）。
 ///
 /// **候補ペアでなければサーバを起こさない。** 構造が似ていないペアの判定は Stage 2 で
@@ -266,14 +268,14 @@ impl MeasuredPair {
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
 pub fn measured_pair_of(
     pair: &ChunkPair,
-    structural_similarity_threshold: Threshold,
+    thresholds: ConfiguredThresholds,
     server: &ServerCommand,
 ) -> MeasuredPair {
     let signals = signals_of(&pair.chunk_a, &pair.chunk_b);
 
     let asked = if is_structurally_similar(
         signals.structural_similarity(),
-        structural_similarity_threshold,
+        thresholds.structural_similarity(),
     ) {
         semantics_of(pair, server)
     } else {
@@ -937,8 +939,8 @@ impl Error for SemanticsError {
 
 /// コードベース全体を走査して、候補ペアを判定する。
 ///
-/// `root` は走査を始めるディレクトリ、`structural_similarity_threshold` は
-/// 候補ペアとして拾う構造類似度の下限、`server` は起こす LSP サーバの指定。
+/// `root` は走査を始めるディレクトリ、`thresholds` は判定に当てる閾値
+/// （候補ペアとして拾う構造類似度の下限もここが持つ）、`server` は起こす LSP サーバの指定。
 ///
 /// 読めなかったファイルと切り出せなかった関数は、走査を止めずに結果へ残す。
 /// **1 ファイルのために全体を落とすと、他のペアの判定まで失われる**。
@@ -952,7 +954,7 @@ impl Error for SemanticsError {
 /// `root` がディレクトリでない / 途中のディレクトリを読めないとき。
 pub fn scan_of(
     root: &Path,
-    structural_similarity_threshold: Threshold,
+    thresholds: ConfiguredThresholds,
     server: &ServerCommand,
 ) -> Result<Scan, CodebaseError> {
     let paths = typescript_paths_of(root)?;
@@ -999,7 +1001,7 @@ pub fn scan_of(
 
     Ok(scan_of_chunks(
         &chunks,
-        structural_similarity_threshold,
+        thresholds,
         server,
         ScanInputs {
             file_count,
@@ -1087,7 +1089,7 @@ struct ScanInputs {
 /// **並列に回すのは Stage 1 まで**で、サーバとの会話は 1 本のセッションを順に使う。
 fn scan_of_chunks(
     chunks: &[ScannedChunk],
-    structural_similarity_threshold: Threshold,
+    thresholds: ConfiguredThresholds,
     server: &ServerCommand,
     inputs: ScanInputs,
 ) -> Scan {
@@ -1095,12 +1097,7 @@ fn scan_of_chunks(
         .par_iter()
         .enumerate()
         .map(|(index, scanned)| {
-            ComparedPairs::from_chunk(
-                index,
-                scanned,
-                &chunks[index + 1..],
-                structural_similarity_threshold,
-            )
+            ComparedPairs::from_chunk(index, scanned, &chunks[index + 1..], thresholds)
         })
         .collect();
 
@@ -1120,14 +1117,7 @@ fn scan_of_chunks(
     let semantics = scan_semantics_of(chunks, &asked_chunk_indices_of(&candidates), server);
     let candidate_pairs = candidates
         .into_iter()
-        .map(|candidate| {
-            candidate_pair_of(
-                chunks,
-                &semantics,
-                candidate,
-                structural_similarity_threshold,
-            )
-        })
+        .map(|candidate| candidate_pair_of(chunks, &semantics, candidate, thresholds))
         .collect();
 
     Scan {
@@ -1176,7 +1166,7 @@ impl ComparedPairs {
         index: usize,
         scanned: &ScannedChunk,
         following: &[ScannedChunk],
-        structural_similarity_threshold: Threshold,
+        thresholds: ConfiguredThresholds,
     ) -> Self {
         let chunk = &scanned.chunk;
         let mut candidates = Vec::new();
@@ -1191,7 +1181,7 @@ impl ComparedPairs {
             }
             compared_pair_count += 1;
 
-            if is_ruled_out_by_ceiling(chunk, other_chunk, structural_similarity_threshold) {
+            if is_ruled_out_by_ceiling(chunk, other_chunk, thresholds.structural_similarity()) {
                 pruned_pair_count += 1;
                 continue;
             }
@@ -1199,7 +1189,7 @@ impl ComparedPairs {
             let signals = signals_of(chunk, other_chunk);
             if !is_structurally_similar(
                 signals.structural_similarity(),
-                structural_similarity_threshold,
+                thresholds.structural_similarity(),
             ) {
                 continue;
             }
@@ -1224,7 +1214,7 @@ fn candidate_pair_of(
     chunks: &[ScannedChunk],
     semantics: &ScanSemantics,
     candidate: StructuralCandidate,
-    structural_similarity_threshold: Threshold,
+    thresholds: ConfiguredThresholds,
 ) -> CandidatePair {
     let signals = signals_with_semantics_of(
         candidate.signals,
@@ -1235,7 +1225,7 @@ fn candidate_pair_of(
     CandidatePair {
         location_a: start_of(&chunks[candidate.chunk_a].chunk),
         location_b: start_of(&chunks[candidate.chunk_b].chunk),
-        classification: classification_of(&signals, structural_similarity_threshold),
+        classification: classification_of(&signals, thresholds),
     }
 }
 
@@ -1893,7 +1883,6 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    use crate::classification::DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
     use crate::classification::verdict::Verdict;
     use crate::line_number::LineNumber;
     use crate::semantics::resolved_type::TracedTypeNames;
@@ -2497,12 +2486,15 @@ mod tests {
     /// 開発機で結果が変わる（`rules/testing.md`「LSP を要するテストは、飛ばしたことが
     /// 分かる形にする」）。実サーバでの走査は `tests/scan.rs` が `#[ignore]` 付きで見る。
     fn scan_of_fixture(relative_path: &str) -> Scan {
-        scan_with_threshold_of_fixture(relative_path, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD)
+        scan_with_threshold_of_fixture(relative_path, ConfiguredThresholds::default())
     }
 
     /// 渡した閾値で走査した結果。
-    fn scan_with_threshold_of_fixture(relative_path: &str, threshold: Threshold) -> Scan {
-        scan_of(&fixture(relative_path), threshold, &missing_server())
+    fn scan_with_threshold_of_fixture(
+        relative_path: &str,
+        thresholds: ConfiguredThresholds,
+    ) -> Scan {
+        scan_of(&fixture(relative_path), thresholds, &missing_server())
             .expect("フィクスチャのディレクトリは走査できる")
     }
 
@@ -2624,11 +2616,7 @@ mod tests {
     fn test_scan_of_a_missing_directory_reports_the_root_it_was_given() {
         let root = fixture("scan/missing");
 
-        let result = scan_of(
-            &root,
-            DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
-            &missing_server(),
-        );
+        let result = scan_of(&root, ConfiguredThresholds::default(), &missing_server());
 
         let Err(CodebaseError::RootNotADirectory { root: reported }) = result else {
             panic!("ディレクトリでない根は RootNotADirectory になる");

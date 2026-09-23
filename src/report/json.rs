@@ -578,7 +578,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::classification::signal::Signals;
-    use crate::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
+    use crate::classification::{
+        ConfiguredThresholds, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of,
+    };
     use crate::semantics::caller_domain::CallerDomains;
     use crate::similarity::Similarity;
     use crate::test_support::{line, location, overload_count, scan_of_fixture};
@@ -623,7 +625,10 @@ mod tests {
         let text = json_of(
             &location("src/billing/discount.ts", 42),
             &location("src/inventory/reorder.ts", 18),
-            &classification_of(signals, threshold),
+            &classification_of(
+                signals,
+                ConfiguredThresholds::default().with_structural_similarity(threshold),
+            ),
             explanation,
         );
 
@@ -887,7 +892,7 @@ mod tests {
 
     /// `tests/fixtures/` 配下のディレクトリを走査した JSON。
     fn scan_json_of_fixture(relative_path: &str) -> Value {
-        let scan = scan_of_fixture(relative_path, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+        let scan = scan_of_fixture(relative_path, ConfiguredThresholds::default());
         let text = scan_json_of(&scan, Explanation::AskedSignals);
 
         serde_json::from_str(&text).expect("組み立てた綴りは JSON として読み直せる")

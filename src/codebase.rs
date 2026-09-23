@@ -17,8 +17,9 @@ use crate::syntax::tree::Grammar;
 
 /// 走査から外すディレクトリの名前。
 ///
-/// Phase 1 ではハードコードにする。`dryguard.toml` への外出しは Phase 3 で、
-/// 実際に調整したくなった項目だけを切り出す（閾値と同じ方針）。
+/// ハードコードのまま置く。`dryguard.toml`（`crate::config`）が読むのは閾値だけで、
+/// **この一覧を調整したくなった記録はまだ無い**。記録が出てから外へ出す
+/// — まだ意味の分かっていないつまみを増やさないため。
 const EXCLUDED_DIRECTORY_NAMES: [&str; 5] = ["node_modules", "dist", "build", "target", ".git"];
 
 /// そのディレクトリ以下の TypeScript ファイル（`.ts` / `.tsx` / `.mts` / `.cts`）を、

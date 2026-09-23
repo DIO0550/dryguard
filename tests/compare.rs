@@ -18,7 +18,7 @@ use dryguard::classification::signal::{
     TypeSignatureMatch,
 };
 use dryguard::classification::verdict::Verdict;
-use dryguard::classification::{DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of};
+use dryguard::classification::{ConfiguredThresholds, classification_of};
 use dryguard::location::Location;
 use dryguard::pipeline::{
     ChunkPairError, MeasuredPair, chunk_pair_of, measured_pair_of, signals_of,
@@ -94,7 +94,7 @@ fn import_overlap(location_a: &Location, location_b: &Location) -> ImportOverlap
 fn verdict(location_a: &Location, location_b: &Location) -> Verdict {
     let signals = signals(location_a, location_b);
 
-    classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD).verdict()
+    classification_of(&signals, ConfiguredThresholds::default()).verdict()
 }
 
 #[test]
@@ -273,7 +273,7 @@ fn test_compare_of_similar_functions_in_separate_domains_reports_the_verdict_and
     let location_a = fixture("billing/discount.ts", 6);
     let location_b = fixture("inventory/reorder.ts", 6);
     let signals = signals(&location_a, &location_b);
-    let classification = classification_of(&signals, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+    let classification = classification_of(&signals, ConfiguredThresholds::default());
 
     let text = text_of(
         &location_a,
@@ -303,11 +303,7 @@ fn measured_without_an_lsp(location_a: &Location, location_b: &Location) -> Meas
         panic!("テストが渡す位置はどちらも関数の中を指している");
     };
 
-    measured_pair_of(
-        &pair,
-        DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
-        &missing_server(),
-    )
+    measured_pair_of(&pair, ConfiguredThresholds::default(), &missing_server())
 }
 
 #[test]
@@ -347,11 +343,7 @@ fn test_compare_asks_with_the_source_stage1_read_even_if_the_file_disappears() {
     };
     fs::remove_file(&vanishing).expect("テストが書いたファイルは消せる");
 
-    let measured = measured_pair_of(
-        &pair,
-        DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
-        &missing_server(),
-    );
+    let measured = measured_pair_of(&pair, ConfiguredThresholds::default(), &missing_server());
 
     fs::remove_dir_all(&directory).expect("テストが作ったディレクトリは消せる");
     assert_eq!(
@@ -413,8 +405,7 @@ fn test_compare_without_an_lsp_server_still_reaches_the_stage1_verdict() {
         &fixture("inventory/reorder.ts", 6),
     );
 
-    let verdict =
-        classification_of(measured.signals(), DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD).verdict();
+    let verdict = classification_of(measured.signals(), ConfiguredThresholds::default()).verdict();
     assert_eq!(verdict, Verdict::DoNotExtract);
 }
 
@@ -479,8 +470,7 @@ fn test_compare_without_an_lsp_server_reports_the_stage2_signals_as_unmeasured_i
     let location_a = fixture("billing/discount.ts", 6);
     let location_b = fixture("inventory/reorder.ts", 6);
     let measured = measured_without_an_lsp(&location_a, &location_b);
-    let classification =
-        classification_of(measured.signals(), DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD);
+    let classification = classification_of(measured.signals(), ConfiguredThresholds::default());
 
     let text = text_of(
         &location_a,
