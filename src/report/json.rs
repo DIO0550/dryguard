@@ -656,12 +656,16 @@ mod tests {
     }
 
     /// 出ている根拠のシグナル名。
-    fn signal_names_of(json: &Value) -> Vec<String> {
+    fn signal_names_of(json: &Value) -> Vec<&str> {
         json["reasons"]
             .as_array()
             .expect("根拠は配列で出る")
             .iter()
-            .map(|reason| reason["signal"].to_string())
+            .map(|reason| {
+                reason["signal"]
+                    .as_str()
+                    .expect("根拠のシグナル名は文字列で出る")
+            })
             .collect()
     }
 
@@ -778,15 +782,11 @@ mod tests {
 
         let names = signal_names_of(&json);
         assert!(
-            names
-                .iter()
-                .any(|name| name.contains("structural-similarity")),
+            names.contains(&"structural-similarity"),
             "尋ねたシグナルは出る: {names:?}"
         );
         assert!(
-            !names
-                .iter()
-                .any(|name| name.contains("type-signature-match")),
+            !names.contains(&"type-signature-match"),
             "尋ねていないシグナルは既定では出さない: {names:?}"
         );
     }
