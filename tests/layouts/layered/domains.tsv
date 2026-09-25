@@ -1,0 +1,8 @@
+models/invoice.ts	*	billing
+models/product.ts	*	inventory
+repositories/invoiceRepository.ts	*	billing
+repositories/productRepository.ts	*	inventory
+services/invoiceService.ts	*	billing
+services/productService.ts	*	inventory
+controllers/invoiceController.ts	*	billing
+controllers/productController.ts	*	inventory
