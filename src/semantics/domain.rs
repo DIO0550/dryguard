@@ -18,7 +18,8 @@ use crate::similarity::Similarity;
 /// 「billing のもの」と読むには、どの段が機能の境目かを決めることになり、
 /// それはリポジトリのレイアウト次第で変わる。境界の宣言は `dryguard.toml` の
 /// ドメイン宣言が持つ（`docs/dryguard-plan.md`「ドメイン境界の自動推定は難しい」。
-/// **記法はまだ決まっておらず、`crate::config` が今読むのは `[thresholds]` だけ**）。
+/// `[domains]` にパスの glob を並べる形に決めたが、**`crate::config` が今読むのは
+/// `[thresholds]` だけ**）。
 ///
 /// **Why not（`ModuleDistance` と同じ扱いにする）**: あちらは 2 つのファイルの間の
 /// 隔たりで、こちらは 1 つのファイルが属する場所。**距離では「どこに属するか」を
