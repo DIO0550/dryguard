@@ -106,6 +106,9 @@ jobs:
       - name: hook-canary
         run: bash .claude/hooks/hook-canary-test.sh
 
+      - name: session-url-notice
+        run: bash .claude/hooks/session-url-notice-test.sh
+
       # post-edit-rust のテストは使い捨てのクレートに fmt / clippy をかけるので、
       # check ジョブと同じくツールチェーンを明示して用意する。
       - name: Rust ツールチェーン
