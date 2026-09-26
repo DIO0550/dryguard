@@ -304,12 +304,15 @@ fn measured_without_an_lsp(location_a: &Location, location_b: &Location) -> Meas
         panic!("テストが渡す位置はどちらも関数の中を指している");
     };
 
-    measured_pair_of(
+    let Ok(measured) = measured_pair_of(
         &pair,
         ConfiguredThresholds::default(),
         &DomainDeclarations::default(),
         &missing_server(),
-    )
+    ) else {
+        panic!("宣言が無ければ食い違わない");
+    };
+    measured
 }
 
 #[test]
@@ -354,7 +357,8 @@ fn test_compare_asks_with_the_source_stage1_read_even_if_the_file_disappears() {
         ConfiguredThresholds::default(),
         &DomainDeclarations::default(),
         &missing_server(),
-    );
+    )
+    .expect("宣言が無ければ食い違わない");
 
     fs::remove_dir_all(&directory).expect("テストが作ったディレクトリは消せる");
     assert_eq!(

@@ -15,10 +15,11 @@ use crate::classification::Classification;
 use crate::classification::reason::{Lean, Reason};
 use crate::classification::signal::{
     CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, MeasuredCalleeDomains,
-    MeasuredCallerDomains, SemanticsUnavailable, StructuralSimilarity, TypeSignatureMatch,
+    MeasuredCallerDomains, ModuleSeparation, SemanticsUnavailable, StructuralSimilarity,
+    TypeSignatureMatch,
 };
 use crate::classification::verdict::Verdict;
-use crate::domain_declaration::AmbiguousDomain;
+use crate::domain_declaration::{AmbiguousDomain, DomainName};
 use crate::location::Location;
 use crate::pipeline::{Scan, SkippedFile};
 use crate::semantics::callee_domain::CalleeDomains;
@@ -27,7 +28,6 @@ use crate::semantics::domain::Domain;
 use crate::semantics::resolved_type::UnopenedReason;
 use crate::semantics::type_signature::UntracedReason;
 use crate::syntax::import::ImportsUnavailable;
-use crate::syntax::module_distance::ModuleDistance;
 use crate::threshold::Threshold;
 
 /// 見出しの行に付ける字下げ。
@@ -109,7 +109,7 @@ pub fn text_of(
                 lean,
             } => reason_texts.push(format!(
                 "{} → {}",
-                module_distance_text_of(*signal, *separate_directory_steps, explanation),
+                module_distance_text_of(signal, *separate_directory_steps, explanation),
                 lean_text_of(*lean)
             )),
             Reason::TypeSignatureMatch { signal, lean } => {
@@ -290,20 +290,35 @@ fn imports_unavailable_text_of(cause: ImportsUnavailable) -> String {
     }
 }
 
-/// モジュール距離の値。段数は必ず取れるので、測れなかった形にはならない。
+/// モジュール距離の値。段数も宣言も必ず取れるので、測れなかった形にはならない。
 ///
 /// `separate_directory_steps` は別のディレクトリと見なした段数で、`--explain` の
-/// ときだけ併記する。
+/// ときだけ併記する。**宣言で比べたときは併記しない**（当てていない閾値を出さない）。
 fn module_distance_text_of(
-    distance: ModuleDistance,
+    separation: &ModuleSeparation,
     separate_directory_steps: usize,
     explanation: Explanation,
 ) -> String {
-    format!(
-        "モジュール距離 {} 段{}",
-        distance.steps(),
-        applied_steps_text_of(separate_directory_steps, explanation)
-    )
+    match separation {
+        ModuleSeparation::Directories(distance) => format!(
+            "モジュール距離 {} 段{}",
+            distance.steps(),
+            applied_steps_text_of(separate_directory_steps, explanation)
+        ),
+        ModuleSeparation::Declared(declared) => format!(
+            "宣言したドメイン {} <-> {}",
+            declared_domain_text_of(declared.domain_a()),
+            declared_domain_text_of(declared.domain_b())
+        ),
+    }
+}
+
+/// 片側のファイルが当たった宣言。当たらなければ「宣言なし」。
+fn declared_domain_text_of(domain: Option<&DomainName>) -> String {
+    match domain {
+        Some(domain) => domain.to_string(),
+        None => "宣言なし".to_owned(),
+    }
 }
 
 /// `--explain` のときだけ付ける、そのシグナルに当てた閾値。
@@ -717,7 +732,9 @@ mod tests {
     use crate::line_number::LineNumber;
     use std::path::{Path, PathBuf};
 
-    use crate::classification::signal::{ImportOverlap, Signals, StructuralSimilarity};
+    use crate::classification::signal::{
+        DeclaredDomains, ImportOverlap, Signals, StructuralSimilarity,
+    };
     use crate::classification::{
         ConfiguredThresholds, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of,
     };
@@ -1929,6 +1946,45 @@ mod tests {
                  dryguard.toml の 2 つの宣言 billing / reporting に当たる) → どちらでもない"
             ),
             "直す先（どのファイルがどの 2 つに当たったか）が出る: {text}"
+        );
+    }
+
+    /// 構造が似ていて依存先を共有していない組に、宣言を重ねて判定した text。
+    fn explained_text_of_declared(declared: DeclaredDomains, explanation: Explanation) -> String {
+        let signals = Signals::new(
+            StructuralSimilarity::Measured(measured(0.94)),
+            ImportOverlap::Measured(measured(0.0)),
+            separate_directories(),
+        )
+        .with_declared_domains(declared);
+
+        text_of(
+            &location("src/billing/discount.ts", 42),
+            &location("src/inventory/reorder.ts", 18),
+            &classification_of(&signals, ConfiguredThresholds::default()),
+            explanation,
+        )
+    }
+
+    fn declared(domain_a: Option<&str>, domain_b: Option<&str>) -> DeclaredDomains {
+        let name = |spelling: &str| DomainName::new(spelling).expect("テストが渡す名前は裸のキー");
+
+        DeclaredDomains::new(domain_a.map(name), domain_b.map(name))
+            .expect("テストが渡す宣言はどちらかが当たっている")
+    }
+
+    #[test]
+    fn test_text_of_reports_declared_domains_instead_of_steps() {
+        let text =
+            explained_text_of_declared(declared(Some("billing"), None), Explanation::AllSignals);
+
+        assert!(
+            text.contains("宣言したドメイン billing <-> 宣言なし → 共通化しない側"),
+            "両側の宣言と向きが出る: {text}"
+        );
+        assert!(
+            !text.contains("モジュール距離") && !text.contains("段)"),
+            "宣言で比べたときは段数も、当てていない段数の閾値も出さない: {text}"
         );
     }
 }

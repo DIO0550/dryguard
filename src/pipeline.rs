@@ -14,14 +14,15 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::classification::signal::{
-    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, MeasuredCalleeDomains,
-    MeasuredCallerDomains, SemanticsUnavailable, Signals, StructuralSimilarity, TypeSignatureMatch,
+    CalleeDomainOverlap, CallerDomainOverlap, DeclaredDomains, ImportOverlap,
+    MeasuredCalleeDomains, MeasuredCallerDomains, SemanticsUnavailable, Signals,
+    StructuralSimilarity, TypeSignatureMatch,
 };
 use crate::classification::{
     Classification, ConfiguredThresholds, classification_of, is_structurally_similar,
 };
 use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
-use crate::domain_declaration::DomainDeclarations;
+use crate::domain_declaration::{AmbiguousDomain, DomainDeclarations, DomainName};
 use crate::location::Location;
 use crate::lsp::{
     Client, ClientError, DocumentError, ProjectMembershipOutcome, ProjectRoot, ServerCommand,
@@ -201,6 +202,37 @@ pub fn signals_of(chunk_a: &Chunk, chunk_b: &Chunk) -> Signals {
     )
 }
 
+/// [`signals_of`] に、2 つのファイルが当たった `dryguard.toml` の宣言を重ねる。
+///
+/// `declared_a` / `declared_b` はそれぞれのファイルが当たった宣言。**どちらかが当たれば
+/// モジュール距離を段数ではなく宣言で比べる**（宣言が推定に勝つ）。どちらも当たらなければ
+/// [`signals_of`] と同じ。
+fn declared_signals_of(
+    (chunk_a, declared_a): (&Chunk, Option<&DomainName>),
+    (chunk_b, declared_b): (&Chunk, Option<&DomainName>),
+) -> Signals {
+    let signals = signals_of(chunk_a, chunk_b);
+
+    match DeclaredDomains::new(declared_a.cloned(), declared_b.cloned()) {
+        Some(declared) => signals.with_declared_domains(declared),
+        None => signals,
+    }
+}
+
+/// そのファイルが当たった宣言。**名前の違う 2 つに当たれば、判定の前に止める。**
+///
+/// # Errors
+///
+/// 名前の違う 2 つの宣言に当たったとき。比べる 2 つのファイル（`scan` なら走査対象
+/// すべて）は **LSP に尋ねる前に分かる**ので、参照元のように「測れない」へ倒さず
+/// `Err` にする。`dryguard.toml` を直すまで、そのファイルの判定を出さない。
+fn declared_domain_of(
+    path: &Path,
+    declarations: &DomainDeclarations,
+) -> Result<Option<DomainName>, AmbiguousDomain> {
+    Ok(declarations.declared_domain_of(path)?.cloned())
+}
+
 /// 正規化トークン列の似かた。どちらかにトークンが無ければ測れない。
 fn structural_similarity_of(chunk_a: &Chunk, chunk_b: &Chunk) -> StructuralSimilarity {
     let (Some(tokens_a), Some(tokens_b)) = (chunk_a.tokens(), chunk_b.tokens()) else {
@@ -269,13 +301,23 @@ impl MeasuredPair {
 /// **サーバを使えなくても失敗にしない。** Stage 1 のシグナルだけで判定でき、
 /// 届かなかったことはシグナルと [`MeasuredPair::semantics_error`] に出る
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+///
+/// # Errors
+///
+/// どちらかのチャンクのファイルが、名前の違う 2 つの宣言に当たったとき
+/// （サーバを起こす前に止める）。
 pub fn measured_pair_of(
     pair: &ChunkPair,
     thresholds: ConfiguredThresholds,
     declarations: &DomainDeclarations,
     server: &ServerCommand,
-) -> MeasuredPair {
-    let signals = signals_of(&pair.chunk_a, &pair.chunk_b);
+) -> Result<MeasuredPair, AmbiguousDomain> {
+    let declared_a = declared_domain_of(pair.chunk_a.path(), declarations)?;
+    let declared_b = declared_domain_of(pair.chunk_b.path(), declarations)?;
+    let signals = declared_signals_of(
+        (&pair.chunk_a, declared_a.as_ref()),
+        (&pair.chunk_b, declared_b.as_ref()),
+    );
 
     let asked = if is_structurally_similar(
         signals.structural_similarity(),
@@ -286,12 +328,12 @@ pub fn measured_pair_of(
         AskedSemantics::unavailable(SemanticsUnavailable::NotACandidate, None)
     };
 
-    MeasuredPair {
+    Ok(MeasuredPair {
         signals: signals
             .with_semantics(asked.type_signature_match, asked.caller_domain_overlap)
             .with_callee_domain_overlap(asked.callee_domain_overlap),
         semantics_error: asked.error,
-    }
+    })
 }
 
 /// Stage 2 に尋ねた結果。
@@ -1069,15 +1111,23 @@ impl Error for SemanticsError {
 ///
 /// # Errors
 ///
-/// `root` がディレクトリでない / 途中のディレクトリを読めないとき。
+/// `root` がディレクトリでない / 途中のディレクトリを読めないとき、
+/// 走査対象のファイルが名前の違う 2 つの宣言に当たったとき（[`ScanError`]）。
 pub fn scan_of(
     root: &Path,
     thresholds: ConfiguredThresholds,
     declarations: &DomainDeclarations,
     server: &ServerCommand,
-) -> Result<Scan, CodebaseError> {
-    let paths = typescript_paths_of(root)?;
+) -> Result<Scan, ScanError> {
+    let paths = typescript_paths_of(root).map_err(ScanError::Codebase)?;
     let file_count = paths.len();
+    // **比べ始める前に全部確かめる。** 読めなかったファイルのように飛ばして続けると、
+    // 宣言の食い違いに気づかないまま、そのファイルの無い判定が出る
+    let declared: Vec<Option<DomainName>> = paths
+        .iter()
+        .map(|path| declared_domain_of(path, declarations))
+        .collect::<Result<_, _>>()
+        .map_err(ScanError::AmbiguousDomain)?;
 
     // ファイルごとの読み込み・パース・切り出しは互いに独立なので並列に回す。
     // 結果は `paths` と同じ並びで返るので、まとめ直しを順に行えば出力の並びは
@@ -1089,7 +1139,7 @@ pub fn scan_of(
     let mut skipped_files = Vec::new();
     let mut unchunkable = Vec::new();
 
-    for (path, chunked_file) in paths.iter().zip(chunked_files) {
+    for ((path, chunked_file), declared) in paths.iter().zip(chunked_files).zip(declared) {
         let chunked_file = match chunked_file {
             Ok(chunked_file) => chunked_file,
             Err(skipped) => {
@@ -1114,6 +1164,7 @@ pub fn scan_of(
                 .map(|chunk| ScannedChunk {
                     chunk,
                     source: Arc::clone(&chunked_file.source),
+                    declared: declared.clone(),
                 }),
         );
     }
@@ -1148,6 +1199,11 @@ struct ChunkedFile {
 struct ScannedChunk {
     chunk: Chunk,
     source: Arc<str>,
+    /// そのチャンクのファイルが当たった `dryguard.toml` の宣言。
+    ///
+    /// **ファイルごとに 1 度だけ引く**（`rules/architecture.md`「ファイル単位で決まる答えを
+    /// チャンク単位で問い合わせない」）。ペアごとに引くと、同じ照合をチャンクの組の数だけ繰り返す。
+    declared: Option<DomainName>,
 }
 
 /// そのファイルを読んで、中にある関数・メソッドをすべて切り出す。
@@ -1312,7 +1368,10 @@ impl ComparedPairs {
                 continue;
             }
 
-            let signals = signals_of(chunk, other_chunk);
+            let signals = declared_signals_of(
+                (chunk, scanned.declared.as_ref()),
+                (other_chunk, other.declared.as_ref()),
+            );
             if !is_structurally_similar(
                 signals.structural_similarity(),
                 thresholds.structural_similarity(),
@@ -2000,6 +2059,36 @@ impl Error for SkippedFile {
     }
 }
 
+/// 走査を始められなかった理由。
+///
+/// **直す先ごとに分ける**（`rules/coding.md`「エラー型は原因ごとにバリアントを分ける」）。
+/// 根のディレクトリの話と、`dryguard.toml` の宣言の話。
+#[derive(Debug)]
+pub enum ScanError {
+    /// 走査対象のファイルを集められなかった。
+    Codebase(CodebaseError),
+    /// 走査対象のファイルが、名前の違う 2 つの宣言に当たった。
+    AmbiguousDomain(AmbiguousDomain),
+}
+
+impl fmt::Display for ScanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Codebase(cause) => write!(formatter, "{cause}"),
+            Self::AmbiguousDomain(cause) => write!(formatter, "{cause}"),
+        }
+    }
+}
+
+impl Error for ScanError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Codebase(cause) => Some(cause),
+            Self::AmbiguousDomain(cause) => Some(cause),
+        }
+    }
+}
+
 /// チャンクを取り出せなかった理由。
 ///
 /// どちらの位置で失敗したかを持つ。`compare` は 2 箇所を受け取るので、
@@ -2064,13 +2153,17 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    use crate::classification::reason::Reason;
+    use crate::classification::signal::ModuleSeparation;
     use crate::classification::verdict::Verdict;
     use crate::line_number::LineNumber;
     use crate::semantics::resolved_type::TracedTypeNames;
     use crate::semantics::type_signature::normalized_outcome_of;
     use crate::similarity::Similarity;
     use crate::syntax::chunk::AnnotatedPositions;
-    use crate::test_support::{line, missing_server, overload_count, signature_text};
+    use crate::test_support::{
+        declarations_at, line, missing_server, overload_count, signature_text,
+    };
 
     fn measured(value: f64) -> Similarity {
         Similarity::new(value).expect("テストが渡す値は 0.0-1.0")
@@ -2431,7 +2524,10 @@ mod tests {
 
         let signals = signals_of(&chunk_a, &chunk_b);
 
-        assert_eq!(signals.module_distance().steps(), 2);
+        let ModuleSeparation::Directories(distance) = signals.module_separation() else {
+            panic!("宣言を渡していないので段数で測る");
+        };
+        assert_eq!(distance.steps(), 2);
     }
 
     /// 型シグネチャと参照元を尋ねた結果を持つチャンク。呼び出し先はサーバが答えている。
@@ -2753,6 +2849,7 @@ mod tests {
             .map(|&number| ScannedChunk {
                 chunk: chunk_of(path, number, &source),
                 source: Arc::clone(&source),
+                declared: None,
             })
             .collect()
     }
@@ -2946,9 +3043,121 @@ mod tests {
             &missing_server(),
         );
 
-        let Err(CodebaseError::RootNotADirectory { root: reported }) = result else {
+        let Err(ScanError::Codebase(CodebaseError::RootNotADirectory { root: reported })) = result
+        else {
             panic!("ディレクトリでない根は RootNotADirectory になる");
         };
         assert_eq!(reported, root);
+    }
+
+    /// `tests/fixtures/scan` を起点にした宣言で走査した結果。
+    fn declared_scan_of_fixture(declared: &[(&str, &[&str])]) -> Result<Scan, ScanError> {
+        let root = fixture("scan");
+
+        scan_of(
+            &root,
+            ConfiguredThresholds::default(),
+            &declarations_at(&root, declared),
+            &missing_server(),
+        )
+    }
+
+    /// `discount` と `reorder` の組（別々のディレクトリで、依存先を共有しない）。
+    fn discount_and_reorder(scan: &Scan) -> &CandidatePair {
+        scan.candidate_pairs()
+            .iter()
+            .find(|pair| {
+                pair.location_a()
+                    .to_string()
+                    .contains("billing/discount.ts")
+                    && pair
+                        .location_b()
+                        .to_string()
+                        .contains("inventory/reorder.ts")
+            })
+            .expect("構造の同じ 2 関数は候補ペアになる")
+    }
+
+    #[test]
+    fn test_scan_of_files_declared_in_one_domain_does_not_split_them_by_directory() {
+        // 対照は `test_scan_of_a_codebase_classifies_...as_do_not_extract`（宣言が無ければ
+        // 2 段離れているので DO-NOT-EXTRACT）。宣言が推定に勝つので、別ドメインとは言えなくなる
+        let scan = declared_scan_of_fixture(&[(
+            "pricing",
+            &["src/billing/discount.ts", "src/inventory/reorder.ts"],
+        )])
+        .expect("宣言は食い違わない");
+
+        let pair = discount_and_reorder(&scan);
+        assert_eq!(pair.classification().verdict(), Verdict::Review);
+        let module_distance =
+            pair.classification()
+                .reasons()
+                .iter()
+                .find_map(|reason| match reason {
+                    Reason::ModuleDistance { signal, .. } => Some(signal.clone()),
+                    _ => None,
+                });
+        assert!(
+            matches!(module_distance, Some(ModuleSeparation::Declared(ref declared)) if declared.is_same_domain()),
+            "段数ではなく宣言で比べる: {module_distance:?}"
+        );
+    }
+
+    #[test]
+    fn test_scan_without_declarations_keeps_the_verdict_by_directory() {
+        // 対照は上のテスト。同じ組を宣言なしで走査する
+        let scan = declared_scan_of_fixture(&[]).expect("宣言が無ければ食い違わない");
+
+        assert_eq!(
+            discount_and_reorder(&scan).classification().verdict(),
+            Verdict::DoNotExtract
+        );
+    }
+
+    #[test]
+    fn test_scan_of_a_file_matching_two_declarations_stops_before_classifying() {
+        let result = declared_scan_of_fixture(&[
+            ("billing", &["src/billing/**"]),
+            ("pricing", &["src/**/discount.ts"]),
+        ]);
+
+        let Err(ScanError::AmbiguousDomain(ambiguous)) = result else {
+            panic!("2 つの宣言に当たるファイルがあれば走査を始めない");
+        };
+        assert!(
+            ambiguous.path().ends_with("src/billing/discount.ts"),
+            "どのファイルが当たったかを持つ: {}",
+            ambiguous.path().display()
+        );
+    }
+
+    #[test]
+    fn test_measured_pair_of_a_file_matching_two_declarations_stops_before_asking() {
+        let root = fixture("scan");
+        let pair = chunk_pair_of(
+            &Location::new(root.join("src/billing/discount.ts"), line(3)),
+            &Location::new(root.join("src/inventory/reorder.ts"), line(3)),
+        )
+        .expect("フィクスチャの 2 箇所は関数の中");
+        let declarations = declarations_at(
+            &root,
+            &[
+                ("billing", &["src/billing/**"]),
+                ("pricing", &["src/**/discount.ts"]),
+            ],
+        );
+
+        let result = measured_pair_of(
+            &pair,
+            ConfiguredThresholds::default(),
+            &declarations,
+            &missing_server(),
+        );
+
+        assert!(
+            result.is_err(),
+            "2 つの宣言に当たるファイルの判定を出さない"
+        );
     }
 }

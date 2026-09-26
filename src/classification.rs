@@ -16,7 +16,7 @@
 //! |---|---|---|
 //! | 構造類似度 | 閾値に届いた | （傾けない。下の表の 1 行目） |
 //! | 依存先の重なり | 閾値に届いた | 届かなかった |
-//! | ディレクトリの隔たり | [`SEPARATE_DIRECTORY_STEPS`] 段未満 | 段以上 |
+//! | ディレクトリの隔たり | [`SEPARATE_DIRECTORY_STEPS`] 段未満 / 同じ宣言 | 段以上 / 別の宣言 |
 //! | 型シグネチャ | 単一化可能 | 単一化不能 |
 //! | 呼び出し元ドメインの重なり | 閾値に届いた | 届かなかった |
 //! | 呼び出し先ドメインの重なり | 閾値に届いた | 届かなかった |
@@ -67,12 +67,11 @@ pub mod verdict;
 
 use crate::classification::reason::{Lean, Reason};
 use crate::classification::signal::{
-    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, Signals, StructuralSimilarity,
-    TypeSignatureMatch,
+    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, ModuleSeparation, Signals,
+    StructuralSimilarity, TypeSignatureMatch,
 };
 use crate::classification::verdict::Verdict;
 use crate::similarity::Similarity;
-use crate::syntax::module_distance::ModuleDistance;
 use crate::threshold::Threshold;
 
 /// 構造が似ていると見なす類似度の下限。指定が無いときに使う。
@@ -303,7 +302,7 @@ impl Leans {
                 thresholds.shared_imports,
             ),
             module_distance: module_distance_lean_of(
-                signals.module_distance(),
+                signals.module_separation(),
                 thresholds.separate_directory_steps,
             ),
             type_signature: type_signature_lean_of(signals.type_signature_match()),
@@ -503,7 +502,7 @@ fn reasons_of(signals: &Signals, leans: &Leans, thresholds: AppliedThresholds) -
             lean: leans.import_overlap,
         },
         Reason::ModuleDistance {
-            signal: signals.module_distance(),
+            signal: signals.module_separation().clone(),
             separate_directory_steps: thresholds.separate_directory_steps,
             lean: leans.module_distance,
         },
@@ -638,13 +637,23 @@ fn overlap_lean_of(overlap: Option<Similarity>, shared_threshold: Threshold) -> 
     Lean::TowardDoNotExtract
 }
 
-/// ディレクトリの隔たりが傾けた向き。
+/// 2 つのファイルの隔たりが傾けた向き。
 ///
 /// `separate_directory_steps` は別のディレクトリへ下りていると見なす段数
-/// （[`AppliedThresholds::separate_directory_steps`]）。
+/// （[`AppliedThresholds::separate_directory_steps`]）。**どちらかのファイルが宣言に
+/// 当たっていれば段数を見ず**、同じ宣言かどうかで傾ける（宣言が推定に勝つ）。
 ///
-/// 段数は必ず取れるので `Neither` にはならない。
-fn module_distance_lean_of(distance: ModuleDistance, separate_directory_steps: usize) -> Lean {
+/// 段数も宣言も必ず取れるので `Neither` にはならない。
+fn module_distance_lean_of(separation: &ModuleSeparation, separate_directory_steps: usize) -> Lean {
+    let distance = match separation {
+        ModuleSeparation::Directories(distance) => distance,
+        ModuleSeparation::Declared(declared) => {
+            if declared.is_same_domain() {
+                return Lean::TowardExtract;
+            }
+            return Lean::TowardDoNotExtract;
+        }
+    };
     let in_separate_directories = distance.steps() >= separate_directory_steps;
 
     if in_separate_directories {
@@ -662,6 +671,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::classification::reason::{Lean, Reason};
+    use crate::classification::signal::DeclaredDomains;
     use crate::classification::signal::{
         CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, MeasuredCalleeDomains,
         MeasuredCallerDomains, SemanticsUnavailable, Signals, StructuralSimilarity,
@@ -669,6 +679,7 @@ mod tests {
     };
     use crate::classification::verdict::Verdict;
     use crate::domain_declaration::DomainDeclarations;
+    use crate::domain_declaration::DomainName;
     use crate::semantics::callee_domain::CalleeDomains;
     use crate::semantics::caller_domain::CallerDomains;
     use crate::semantics::resolved_type::UnopenedReason;
@@ -755,6 +766,29 @@ mod tests {
         )
     }
 
+    /// 片側ずつの宣言を、宣言した 2 つのドメインにする。どちらかは当たっている。
+    fn declared(domain_a: Option<&str>, domain_b: Option<&str>) -> DeclaredDomains {
+        let name = |spelling: &str| DomainName::new(spelling).expect("テストが渡す名前は裸のキー");
+
+        DeclaredDomains::new(domain_a.map(name), domain_b.map(name))
+            .expect("テストが渡す宣言はどちらかが当たっている")
+    }
+
+    /// 構造が似ていて依存先を共有していない組に、宣言を重ねて判定する。
+    fn classification_of_declared(
+        distance: ModuleDistance,
+        declared_domains: DeclaredDomains,
+    ) -> Classification {
+        let signals = Signals::new(
+            StructuralSimilarity::Measured(measured(0.9)),
+            ImportOverlap::Measured(measured(0.0)),
+            distance,
+        )
+        .with_declared_domains(declared_domains);
+
+        classification_of(&signals, ConfiguredThresholds::default())
+    }
+
     fn leans(classification: &Classification, expected: &Reason) -> bool {
         classification.reasons().contains(expected)
     }
@@ -800,6 +834,57 @@ mod tests {
         let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    #[test]
+    fn test_classification_of_one_directory_declared_as_two_domains_is_do_not_extract() {
+        // 対照は上のテスト（同じディレクトリで宣言が無ければ REVIEW）。宣言が推定に勝つ
+        let classification = classification_of_declared(
+            same_directory(),
+            declared(Some("billing"), Some("inventory")),
+        );
+
+        assert_eq!(classification.verdict(), Verdict::DoNotExtract);
+    }
+
+    #[test]
+    fn test_classification_of_separate_directories_declared_as_one_domain_is_not_do_not_extract() {
+        // 対照は 2 つ上のテスト（別のディレクトリで宣言が無ければ DO-NOT-EXTRACT）。
+        // 依存先を共有していないので、置き場所は「どちらとも言えない」まで
+        let classification = classification_of_declared(
+            separate_directories(),
+            declared(Some("billing"), Some("billing")),
+        );
+
+        assert_eq!(classification.verdict(), Verdict::Review);
+        assert!(
+            leans(
+                &classification,
+                &Reason::ModuleDistance {
+                    signal: ModuleSeparation::Declared(declared(Some("billing"), Some("billing"))),
+                    separate_directory_steps: SEPARATE_DIRECTORY_STEPS,
+                    lean: Lean::TowardExtract,
+                }
+            ),
+            "同じ宣言は共通化する側へ傾く: {:?}",
+            classification.reasons()
+        );
+    }
+
+    #[test]
+    fn test_classification_of_a_declared_file_against_an_undeclared_one_in_its_directory_is_separate()
+     {
+        // 宣言の名前とディレクトリは一致しない。同じディレクトリでも、宣言に含めなかった
+        // ファイルは宣言したドメインの一員ではない
+        let classification =
+            classification_of_declared(same_directory(), declared(Some("billing"), None));
+
+        assert_eq!(classification.verdict(), Verdict::DoNotExtract);
+    }
+
+    #[test]
+    fn test_declared_domains_need_at_least_one_declared_side() {
+        assert_eq!(DeclaredDomains::new(None, None), None);
     }
 
     #[test]
@@ -1507,7 +1592,7 @@ mod tests {
             leans(
                 &classification,
                 &Reason::ModuleDistance {
-                    signal: separate_directories(),
+                    signal: ModuleSeparation::Directories(separate_directories()),
                     separate_directory_steps: SEPARATE_DIRECTORY_STEPS,
                     lean: Lean::TowardDoNotExtract,
                 }
@@ -1532,7 +1617,7 @@ mod tests {
             leans(
                 &classification,
                 &Reason::ModuleDistance {
-                    signal: same_directory(),
+                    signal: ModuleSeparation::Directories(same_directory()),
                     separate_directory_steps: SEPARATE_DIRECTORY_STEPS,
                     lean: Lean::TowardExtract,
                 }

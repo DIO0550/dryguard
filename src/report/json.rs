@@ -19,7 +19,8 @@ use crate::classification::Classification;
 use crate::classification::reason::{Lean, Reason};
 use crate::classification::signal::{
     CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, MeasuredCalleeDomains,
-    MeasuredCallerDomains, SemanticsUnavailable, StructuralSimilarity, TypeSignatureMatch,
+    MeasuredCallerDomains, ModuleSeparation, SemanticsUnavailable, StructuralSimilarity,
+    TypeSignatureMatch,
 };
 use crate::domain_declaration::{AmbiguousDomain, DomainName};
 use crate::location::Location;
@@ -31,7 +32,6 @@ use crate::semantics::domain::Domain;
 use crate::semantics::resolved_type::UnopenedReason;
 use crate::semantics::type_signature::UntracedReason;
 use crate::syntax::import::ImportsUnavailable;
-use crate::syntax::module_distance::ModuleDistance;
 use crate::threshold::Threshold;
 
 /// シグナルの値が測れたときの `signal status`。
@@ -228,11 +228,11 @@ fn reason_value_of(reason: &Reason, explanation: Explanation) -> Option<Value> {
             separate_directory_steps,
             lean,
         } => {
-            let applied = explained_steps_of(*separate_directory_steps, explanation);
+            let applied = explained_steps_of(signal, *separate_directory_steps, explanation);
 
             Some(signal_value_of(
                 "module-distance",
-                module_distance_value_of(*signal),
+                module_distance_value_of(signal),
                 *lean,
                 applied,
             ))
@@ -324,13 +324,17 @@ fn explained_threshold_of(
 }
 
 /// `--explain` のときだけ付ける、別のディレクトリと見なした段数。
+///
+/// **宣言で比べたときは付けない。** 段数を当てていないので、付けると
+/// 当てていない閾値を出すことになる（`rules/architecture.md`「判定は 1 箇所にだけ置く」）。
 fn explained_steps_of(
+    separation: &ModuleSeparation,
     separate_directory_steps: usize,
     explanation: Explanation,
 ) -> Option<(&'static str, Value)> {
-    match explanation {
-        Explanation::AskedSignals => None,
-        Explanation::AllSignals => {
+    match (explanation, separation) {
+        (Explanation::AskedSignals, _) | (_, ModuleSeparation::Declared(_)) => None,
+        (Explanation::AllSignals, ModuleSeparation::Directories(_)) => {
             Some(("separate_directory_steps", json!(separate_directory_steps)))
         }
     }
@@ -374,12 +378,29 @@ fn imports_unavailable_value_of(cause: ImportsUnavailable) -> Value {
     }
 }
 
-/// モジュール距離の値。段数は必ず取れるので、測れなかった形にはならない。
+/// モジュール距離の値。段数も宣言も必ず取れるので、測れなかった形にはならない。
 ///
 /// **それでも `status` を置く。** シグナルごとに `value` の形が変わると、読む側は
 /// どのキーを先に見るかをシグナルの名前から分岐することになる。
-fn module_distance_value_of(distance: ModuleDistance) -> Value {
-    measured_value_of(vec![("steps", json!(distance.steps()))])
+///
+/// 宣言で比べたときは、段数の代わりに両側の宣言の名前を出す。**当たらなかった側は
+/// `null`**（宣言が無いことと、名前の綴りを取り違えない）。
+fn module_distance_value_of(separation: &ModuleSeparation) -> Value {
+    match separation {
+        ModuleSeparation::Directories(distance) => {
+            measured_value_of(vec![("steps", json!(distance.steps()))])
+        }
+        ModuleSeparation::Declared(declared) => measured_value_of(vec![
+            (
+                "declared_domain_a",
+                json!(declared.domain_a().map(DomainName::as_str)),
+            ),
+            (
+                "declared_domain_b",
+                json!(declared.domain_b().map(DomainName::as_str)),
+            ),
+        ]),
+    }
 }
 
 /// 型シグネチャの単一化の可否。尋ねていないだけなら既定で `None`。
@@ -682,13 +703,14 @@ mod tests {
 
     use std::path::{Path, PathBuf};
 
-    use crate::classification::signal::Signals;
+    use crate::classification::signal::{DeclaredDomains, Signals};
     use crate::classification::{
         ConfiguredThresholds, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of,
     };
     use crate::domain_declaration::DomainDeclarations;
     use crate::semantics::caller_domain::CallerDomains;
     use crate::similarity::Similarity;
+    use crate::syntax::module_distance::ModuleDistance;
     use crate::test_support::{declarations_of, line, location, overload_count, scan_of_fixture};
 
     /// テストが渡す 0.0-1.0 の値。
@@ -1227,5 +1249,47 @@ mod tests {
         assert_eq!(value["reason"], "ambiguous-domain");
         assert_eq!(value["path"], "/repo/src/billing/report.ts");
         assert_eq!(value["domains"], json!(["billing", "reporting"]));
+    }
+
+    /// [`accidental_duplication`] の片側だけが `billing` の宣言に当たった形。
+    fn accidental_duplication_with_one_declared_side() -> Signals {
+        let declared =
+            DeclaredDomains::new(Some(DomainName::new("billing").expect("裸のキー")), None)
+                .expect("片側は当たっている");
+
+        accidental_duplication().with_declared_domains(declared)
+    }
+
+    #[test]
+    fn test_json_of_reports_declared_domains_instead_of_steps() {
+        let json = json_of_signals(
+            &accidental_duplication_with_one_declared_side(),
+            Explanation::AskedSignals,
+        );
+
+        let value = reason_of(&json, "module-distance")["value"].clone();
+        assert_eq!(value["status"], "measured");
+        assert_eq!(value["declared_domain_a"], "billing");
+        assert_eq!(value["declared_domain_b"], Value::Null);
+        assert!(
+            value.get("steps").is_none(),
+            "宣言で比べたときは段数を出さない: {value:#}"
+        );
+    }
+
+    #[test]
+    fn test_json_of_with_explain_does_not_report_steps_it_did_not_apply() {
+        // 対照は `test_json_of_with_explain_reports_the_steps_it_counted_as_separate`
+        // （宣言が無ければ段数を出す）
+        let json = json_of_signals(
+            &accidental_duplication_with_one_declared_side(),
+            Explanation::AllSignals,
+        );
+
+        let reason = reason_of(&json, "module-distance");
+        assert!(
+            reason.get("separate_directory_steps").is_none(),
+            "当てていない段数を出さない: {reason:#}"
+        );
     }
 }

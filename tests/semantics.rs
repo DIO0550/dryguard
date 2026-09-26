@@ -514,12 +514,14 @@ fn measured_with_an_lsp(location_a: &Location, location_b: &Location) -> Measure
         panic!("テストが渡す位置はどちらも関数の中を指している");
     };
 
-    let measured = measured_pair_of(
+    let Ok(measured) = measured_pair_of(
         &pair,
         ConfiguredThresholds::default(),
         &DomainDeclarations::default(),
         &ServerCommand::typescript(),
-    );
+    ) else {
+        panic!("宣言が無ければ食い違わない");
+    };
     if let Some(error) = measured.semantics_error() {
         panic!("実サーバには尋ねられる: {error}");
     }

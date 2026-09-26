@@ -64,7 +64,8 @@ const CONFIG_DIRECTORY: &str = ".";
 
 /// `compare` の 2 箇所を判定して、理由付きで表示する。
 ///
-/// チャンクを取れなかったときは終了コードを 1 にする。切り出せなかったことを
+/// チャンクを取れなかったとき・比べるファイルが名前の違う 2 つの宣言に当たったときは
+/// 終了コードを 1 にする。切り出せなかったことを
 /// 成功として返すと、後段が「似ていない」と「見ていない」を区別できなくなる
 /// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
 ///
@@ -89,12 +90,20 @@ fn report_compare(
         }
     };
 
-    let measured = measured_pair_of(
+    // **宣言の食い違いは判定を出さずに止める。** 直す先は dryguard.toml で、
+    // どちらかの宣言へ寄せた判定を出すと、並べ替えただけで答えが変わる
+    let measured = match measured_pair_of(
         &pair,
         settings.thresholds,
         settings.declarations,
         &ServerCommand::typescript(),
-    );
+    ) {
+        Ok(measured) => measured,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
     if let Some(error) = measured.semantics_error() {
         // **どのシグナルが取れなかったかはここで言わない。** 片方だけ落ちることが
         // あるので数え上げると判定の根拠と食い違う。取れなかったシグナルは

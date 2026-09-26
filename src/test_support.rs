@@ -88,6 +88,15 @@ pub(crate) fn declaration_site(path: &str, number: usize) -> DeclarationSite {
 /// 名前が裸のキーでない・glob が読めない・glob が 1 つも無いとき。
 /// どれも設定の読み取りが `Err` にするので、テストが渡すのは書き間違い。
 pub(crate) fn declarations_of(declared: &[(&str, &[&str])]) -> DomainDeclarations {
+    declarations_at(Path::new("/repo"), declared)
+}
+
+/// `root` を起点にした、ドメインの宣言の一覧。実在するファイルに当てるテストが使う。
+///
+/// # Panics
+///
+/// [`declarations_of`] と同じ。
+pub(crate) fn declarations_at(root: &Path, declared: &[(&str, &[&str])]) -> DomainDeclarations {
     let declarations = declared
         .iter()
         .map(|(name, patterns)| {
@@ -102,7 +111,7 @@ pub(crate) fn declarations_of(declared: &[(&str, &[&str])]) -> DomainDeclaration
         })
         .collect();
 
-    DomainDeclarations::new(Path::new("/repo"), declarations)
+    DomainDeclarations::new(root, declarations)
 }
 
 /// ファイルと行で表した位置。
