@@ -91,3 +91,14 @@ jobs:
 
       - name: cargo test (LSP)
         run: cargo test -- --ignored
+
+  claude-hooks:
+    # 層 3 のフックそのものは CI では発火しないが、判定が壊れたことはここでしか
+    # 無条件に気づけない。壊れたまま入ると、push を取りこぼすか、push でないコマンドまで止める。
+    name: Claude Code hooks のテスト
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: pre-push-check
+        run: bash .claude/hooks/pre-push-check-test.sh
