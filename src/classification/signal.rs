@@ -6,6 +6,7 @@
 
 use std::num::NonZeroUsize;
 
+use crate::semantics::callee_domain::CalleeDomains;
 use crate::semantics::caller_domain::CallerDomains;
 use crate::semantics::resolved_type::UnopenedReason;
 use crate::semantics::type_signature::UntracedReason;
@@ -15,8 +16,7 @@ use crate::syntax::module_distance::ModuleDistance;
 
 /// 1 つのペアについて測ったシグナル一式。
 ///
-/// Stage 1（`syntax`）が採る 3 つと、Stage 2（`semantics`）が採る 2 つ。
-/// 呼び出し先（callHierarchy）は Phase 3 で足す
+/// Stage 1（`syntax`）が採る 3 つと、Stage 2（`semantics`）が採る 3 つ
 /// （`docs/dryguard-plan.md`「Stage 3: 分類」）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Signals {
@@ -25,12 +25,13 @@ pub struct Signals {
     module_distance: ModuleDistance,
     type_signature_match: TypeSignatureMatch,
     caller_domain_overlap: CallerDomainOverlap,
+    callee_domain_overlap: CalleeDomainOverlap,
 }
 
 impl Signals {
     /// Stage 1 で測った 3 つのシグナルをまとめる。
     ///
-    /// Stage 2 の 2 つは「LSP に尋ねていない」になる。**これは既定値ではなく、
+    /// Stage 2 の 3 つは「LSP に尋ねていない」になる。**これは既定値ではなく、
     /// 尋ねていないという実際の状態**で、尋ねようとして届かなかった
     /// （[`SemanticsUnavailable::LspUnusable`] など）とは別物
     /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
@@ -49,6 +50,9 @@ impl Signals {
             caller_domain_overlap: CallerDomainOverlap::Unavailable {
                 reason: SemanticsUnavailable::NotAsked,
             },
+            callee_domain_overlap: CalleeDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
         }
     }
 
@@ -64,6 +68,19 @@ impl Signals {
         Self {
             type_signature_match,
             caller_domain_overlap,
+            ..self
+        }
+    }
+
+    /// 呼び出し先ドメインの重なりを重ねる。
+    ///
+    /// **[`Self::with_semantics`] と分けてある。** 呼び出し先は hover / references と
+    /// 別の問い合わせ（callHierarchy）で、サーバによって答えが不安定なことがある
+    /// （`docs/dryguard-plan.md`「リスクと対処」）。重ねなければ「尋ねていない」のまま残り、
+    /// 残りの 5 つだけで判定できる。
+    pub fn with_callee_domain_overlap(self, callee_domain_overlap: CalleeDomainOverlap) -> Self {
+        Self {
+            callee_domain_overlap,
             ..self
         }
     }
@@ -91,6 +108,11 @@ impl Signals {
     /// 2 つのチャンクの呼び出し元ドメインの重なり。
     pub fn caller_domain_overlap(&self) -> &CallerDomainOverlap {
         &self.caller_domain_overlap
+    }
+
+    /// 2 つのチャンクの呼び出し先ドメインの重なり。
+    pub fn callee_domain_overlap(&self) -> &CalleeDomainOverlap {
+        &self.callee_domain_overlap
     }
 }
 
@@ -121,9 +143,9 @@ pub enum ImportOverlap {
 
 /// Stage 2 へ届かなかった理由。
 ///
-/// **どちらの Stage 2 シグナルも同じ理由で欠ける。** サーバに尋ねる前に止まるので、
-/// 片方だけが取れることはない。1 つの型を両方が持つことで、理由を足したときに
-/// 同じバリアントを 2 箇所へ書き足さずに済む。
+/// **どの Stage 2 シグナルも同じ理由で欠ける。** サーバに尋ねる前に止まるので、
+/// 1 つだけが取れることはない。1 つの型を全部が持つことで、理由を足したときに
+/// 同じバリアントを何箇所へも書き足さずに済む。
 ///
 /// **1 つにまとめない。** サーバを使えないのと、根を決められないのと、
 /// 候補ペアでないから尋ねていないのとで**利用者が次にすることが違う**
@@ -324,5 +346,82 @@ impl MeasuredCallerDomains {
     /// 後に列挙したほうのチャンクの呼び出し元。
     pub fn callers_b(&self) -> &CallerDomains {
         &self.callers_b
+    }
+}
+
+/// 呼び出し先ドメインの重なりのシグナル（Stage 2）。
+///
+/// **呼び出し元ドメインの重なりと同じ型にしない。** 向きが逆で（何に依存しているか /
+/// 誰が使っているか）、取れなかった理由も問い合わせごとに違う
+/// （`rules/naming.md`「`callee` と `reference` を混ぜない」）。
+///
+/// **依存先の重なり（[`ImportOverlap`]）とも別のシグナル。** あちらはファイル単位の宣言、
+/// こちらは**そのチャンクが実際に呼んでいるもの**（`rules/naming.md`
+/// 「`callee` を `import` と混ぜない」）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CalleeDomainOverlap {
+    /// 両側の呼び出し先が取れた。
+    Measured(MeasuredCalleeDomains),
+    /// サーバの答えまで届かなかった。
+    Unavailable {
+        /// 届かなかった理由。
+        reason: SemanticsUnavailable,
+    },
+    /// どちらかのチャンクが名前を持たず、尋ねる位置を決められなかった。
+    NoName,
+    /// どちらかのチャンクで、その位置に呼び出し関係の起点が無かった。
+    NoCallHierarchyItem,
+    /// どちらかのチャンクで起点が 2 つ以上返り、どれがそのチャンクのものか決められなかった。
+    SeveralCallHierarchyItems {
+        /// 返った起点の数。どれだけ曖昧だったかを出すのに要る。
+        count: usize,
+    },
+    /// どちらかのチャンクに呼び出し先が 1 件も返らなかった。
+    NoCallees,
+    /// どちらかのチャンクの呼び出し先が、どれも依存パッケージの中だった。
+    ///
+    /// **0.00 にしない。** 言語の lib しか呼ばない関数はどこにでもあり、それは
+    /// 依存先が食い違っている証拠でも、共有している証拠でもない
+    /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+    OnlyExternalCallees,
+    /// 呼び出し先は返ったが、パスとして読めない URI が混じっていた。
+    UnreadableCallees,
+    /// サーバが作業中で、落ち着いた答えを受け取れなかった。
+    ServerStillWorking,
+    /// サーバが callHierarchy を提供していない。
+    CallHierarchyNotProvided,
+}
+
+/// 両側の呼び出し先と、そこから出る重なり。
+///
+/// **重なりを別の値として持たない**のは [`MeasuredCallerDomains`] と同じ理由。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeasuredCalleeDomains {
+    callees_a: CalleeDomains,
+    callees_b: CalleeDomains,
+}
+
+impl MeasuredCalleeDomains {
+    /// 両側の呼び出し先からまとめる。
+    pub fn new(callees_a: CalleeDomains, callees_b: CalleeDomains) -> Self {
+        Self {
+            callees_a,
+            callees_b,
+        }
+    }
+
+    /// 呼び出し先ドメイン集合の Jaccard 係数。
+    pub fn overlap(&self) -> Similarity {
+        self.callees_a.jaccard(&self.callees_b)
+    }
+
+    /// 先に列挙したほうのチャンクの呼び出し先。
+    pub fn callees_a(&self) -> &CalleeDomains {
+        &self.callees_a
+    }
+
+    /// 後に列挙したほうのチャンクの呼び出し先。
+    pub fn callees_b(&self) -> &CalleeDomains {
+        &self.callees_b
     }
 }

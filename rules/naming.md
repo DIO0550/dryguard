@@ -125,8 +125,9 @@ if structurally_similar && domains_differ { ... }
 **`candidate` が指すのはペアであって chunk ではない。**
 
 **`configured threshold` を、判定に当てる閾値の全部と混ぜない。** 当てる閾値には
-ディレクトリの段数（`SEPARATE_DIRECTORY_STEPS`）も入るが、**そちらは外から動かせない**。
-1 語で呼ぶと、設定ファイルから段数を動かせるように読める。両者を合わせるのは
+ディレクトリの段数（`SEPARATE_DIRECTORY_STEPS`）と呼び出し先ドメインの重なりの下限
+（`SHARED_CALLEE_DOMAINS_THRESHOLD`）も入るが、**そちらは外から動かせない**。
+1 語で呼ぶと、設定ファイルからそれらを動かせるように読める。両者を合わせるのは
 `classification` の `AppliedThresholds::of` だけ（`rules/architecture.md`「判定は
 1 箇所にだけ置く」）。
 

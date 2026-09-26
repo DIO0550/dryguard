@@ -69,7 +69,8 @@ cli → pipeline → classification(分類) → semantics(意味情報収集) �
 
 **外から動かせるものと動かせないものを、型で分ける。** `ConfiguredThresholds` は
 `--threshold` / `dryguard.toml` が動かす 3 つだけを持ち、`SEPARATE_DIRECTORY_STEPS`
-（ディレクトリの段数）は持たない。**どのシグナルに何を当てるかを組むのは
+（ディレクトリの段数）と `SHARED_CALLEE_DOMAINS_THRESHOLD`（呼び出し先ドメインの重なり）は
+持たない。**どのシグナルに何を当てるかを組むのは
 `AppliedThresholds::of` の 1 箇所**で、そこだけが両者を合わせる。
 
 **同じ 1 箇所が「取れなかったシグナルの扱い」も持つ。** シグナルから傾き

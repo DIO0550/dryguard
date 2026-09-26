@@ -19,14 +19,18 @@
 //! | ディレクトリの隔たり | [`SEPARATE_DIRECTORY_STEPS`] 段未満 | 段以上 |
 //! | 型シグネチャ | 単一化可能 | 単一化不能 |
 //! | 呼び出し元ドメインの重なり | 閾値に届いた | 届かなかった |
+//! | 呼び出し先ドメインの重なり | 閾値に届いた | 届かなかった |
 //!
-//! 当てる閾値のうち 3 つは外から動く（[`ConfiguredThresholds`]）。段数だけは定数で、
-//! **どのシグナルにどれを当てるかを決めているのは [`AppliedThresholds::of`] だけ。**
+//! 当てる閾値のうち 3 つは外から動く（[`ConfiguredThresholds`]）。段数と呼び出し先の
+//! 閾値は定数で、**どのシグナルにどれを当てるかを決めているのは [`AppliedThresholds::of`] だけ。**
 //!
 //! 傾きからラベルまでは 2 段。まず**ドメインが同じか**を、置き場所（依存先の重なり →
-//! ディレクトリの隔たり）で決めてから**呼び出し元の観測を重ねて**出す
+//! ディレクトリの隔たり）で決めてから**呼び出し元・呼び出し先の観測を重ねて**出す
 //! （`placement_domain_match_of` → `domain_match_of`）。次にそれと型シグネチャの傾きで
 //! ラベルを決める（`verdict_of`）。
+//!
+//! 観測の 2 つは、置き場所に重ねる前に 1 つにまとめる（`observed_domain_match_of`）。
+//! **2 つが食い違えば、置き場所が何を言っていても「どちらとも言えない」。**
 //!
 //! | 構造が似ている | ドメイン | 型シグネチャ | ラベル |
 //! |---|---|---|---|
@@ -52,7 +56,7 @@
 //! （`EXTRACT-CANDIDATE` / `DO-NOT-EXTRACT`）には傾いた根拠が要るので、**傾けないまま
 //! 扱っても欠けが増えれば `REVIEW` へ寄る** — 弱めた結果ではなく、証拠が揃わない結果。
 //!
-//! **例外が 1 つある。** 型シグネチャが取れていないとき、呼び出し元の観測だけで
+//! **例外が 1 つある。** 型シグネチャが取れていないとき、呼び出し元・呼び出し先の観測だけで
 //! ドメインを「どちらとも言えない」から「同じ」へ上げたペアは候補に出さない
 //! （`stage1_shared_domain_verdict_of`）。これは中立ではなく弱める側の規則で、
 //! **hover だけが落ちた環境で判定が緩む側へ動く**のを防ぐために置いてある。
@@ -63,7 +67,8 @@ pub mod verdict;
 
 use crate::classification::reason::{Lean, Reason};
 use crate::classification::signal::{
-    CallerDomainOverlap, ImportOverlap, Signals, StructuralSimilarity, TypeSignatureMatch,
+    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, Signals, StructuralSimilarity,
+    TypeSignatureMatch,
 };
 use crate::classification::verdict::Verdict;
 use crate::similarity::Similarity;
@@ -102,6 +107,18 @@ const DEFAULT_SHARED_IMPORTS_THRESHOLD: Threshold = Threshold::from_literal(0.5)
 /// （依存先モジュールと呼び出し元ドメイン）。片方を調整したときに、もう片方まで
 /// 黙って動くのを避ける。**設定のキーを 2 つに分けてあるのも同じ理由。**
 const DEFAULT_SHARED_CALLER_DOMAINS_THRESHOLD: Threshold = Threshold::from_literal(0.5);
+
+/// 呼び出し先を共有していると見なす重なりの下限。
+///
+/// 半分以上のドメインが共通なら、同じ道具立ての上に書かれていると見る。
+///
+/// **Why not（[`DEFAULT_SHARED_CALLER_DOMAINS_THRESHOLD`] を使い回す）**: 測っている集合が
+/// 違う（呼び出し元と呼び出し先）。片方を調整したときに、もう片方まで黙って動くのを避ける。
+///
+/// **Why not（[`ConfiguredThresholds`] に入れて `dryguard.toml` から動かす）**:
+/// 実データで調整したくなった記録がまだ無い（`docs/dryguard-plan.md`「Phase 3」は
+/// 調整したくなった項目だけを切り出すとしている）。[`SEPARATE_DIRECTORY_STEPS`] と同じ扱い。
+const SHARED_CALLEE_DOMAINS_THRESHOLD: Threshold = Threshold::from_literal(0.5);
 
 /// 別のディレクトリへ下りていると見なす段数。
 ///
@@ -236,16 +253,18 @@ struct AppliedThresholds {
     shared_imports: Threshold,
     separate_directory_steps: usize,
     shared_caller_domains: Threshold,
+    shared_callee_domains: Threshold,
 }
 
 impl AppliedThresholds {
-    /// 外から動くのは [`ConfiguredThresholds`] が持つ 3 つ。段数だけは定数。
+    /// 外から動くのは [`ConfiguredThresholds`] が持つ 3 つ。段数と呼び出し先の閾値は定数。
     fn of(configured: ConfiguredThresholds) -> Self {
         Self {
             structural_similarity: configured.structural_similarity,
             shared_imports: configured.shared_imports,
             separate_directory_steps: SEPARATE_DIRECTORY_STEPS,
             shared_caller_domains: configured.shared_caller_domains,
+            shared_callee_domains: SHARED_CALLEE_DOMAINS_THRESHOLD,
         }
     }
 }
@@ -268,6 +287,7 @@ struct Leans {
     module_distance: Lean,
     type_signature: Lean,
     caller_domain: Lean,
+    callee_domain: Lean,
 }
 
 impl Leans {
@@ -290,6 +310,10 @@ impl Leans {
             caller_domain: caller_domain_lean_of(
                 signals.caller_domain_overlap(),
                 thresholds.shared_caller_domains,
+            ),
+            callee_domain: callee_domain_lean_of(
+                signals.callee_domain_overlap(),
+                thresholds.shared_callee_domains,
             ),
         }
     }
@@ -342,7 +366,7 @@ fn shared_domain_verdict_of(type_signature_lean: Lean, placement: DomainMatch) -
 /// 型シグネチャが取れていないときのラベル。**Stage 1 だけで同じドメインと言えている
 /// 場合に限って**候補に出す。
 ///
-/// 呼び出し元の観測だけで `Undecidable` から `Same` へ上げたペアをここで候補にすると、
+/// 呼び出し元・呼び出し先の観測だけで `Undecidable` から `Same` へ上げたペアをここで候補にすると、
 /// **単一化できるかを確かめないまま「共通化してよい」と言う**ことになる。
 /// これは hover だけが落ちた環境で起きるので、**環境の差で判定が緩む側へ動く**
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
@@ -377,28 +401,51 @@ enum DomainMatch {
     Undecidable,
 }
 
-/// 置き場所の判定に、実際に誰が使っているかの観測を重ねて、ドメインが同じかを決める。
+/// 置き場所の判定に、実際に誰が使い・何に依存しているかの観測を重ねて、ドメインが同じかを決める。
 ///
 /// **観測で置き換えない。** ディレクトリと依存先は「どこに置かれているか」、
-/// 呼び出し元は「誰が使っているか」で、片方がもう片方の言い換えではない
-/// (`rules/naming.md`「`module distance` と `caller domain` を混ぜない」)。
+/// 呼び出し元と呼び出し先は「どう使われ・何を使っているか」で、片方がもう片方の
+/// 言い換えではない (`rules/naming.md`「`module distance` と `caller domain` を混ぜない」)。
 ///
 /// `placement` は Stage 1 だけで出した判定（[`placement_domain_match_of`]）。
 ///
 /// - 観測が取れなければ、置き場所の判定のまま（LSP が無い環境が通る道）
-/// - 観測と置き場所が食い違えば `Undecidable`。**潰さずに人へ回す**
+/// - 観測どうし・観測と置き場所が食い違えば `Undecidable`。**潰さずに人へ回す**
 /// - 食い違わなければ観測の側に寄せる
 fn domain_match_of(placement: DomainMatch, leans: &Leans) -> DomainMatch {
-    match leans.caller_domain {
-        Lean::Neither => placement,
-        Lean::TowardExtract => match placement {
+    let Some(observed) = observed_domain_match_of(leans) else {
+        return placement;
+    };
+
+    match observed {
+        DomainMatch::Undecidable => DomainMatch::Undecidable,
+        DomainMatch::Same => match placement {
             DomainMatch::Same | DomainMatch::Undecidable => DomainMatch::Same,
             DomainMatch::Separate => DomainMatch::Undecidable,
         },
-        Lean::TowardDoNotExtract => match placement {
+        DomainMatch::Separate => match placement {
             DomainMatch::Separate | DomainMatch::Undecidable => DomainMatch::Separate,
             DomainMatch::Same => DomainMatch::Undecidable,
         },
+    }
+}
+
+/// 呼び出し元と呼び出し先の観測を、1 つのドメインの一致にまとめる。
+/// どちらも傾かなければ `None`（観測が無い）。
+///
+/// **置き場所へ重ねる前にまとめる。** 1 つずつ重ねると、置き場所と片方の観測が食い違って
+/// `Undecidable` になった後に、もう片方がそれを一方へ寄せる。**重ねる順で答えが変わる**
+/// （置き場所が別・呼び出し元が同じ・呼び出し先が別なら、この順で `Separate`、逆順で
+/// `Undecidable`）。
+fn observed_domain_match_of(leans: &Leans) -> Option<DomainMatch> {
+    match (leans.caller_domain, leans.callee_domain) {
+        (Lean::Neither, Lean::Neither) => None,
+        (Lean::TowardExtract, Lean::TowardExtract | Lean::Neither)
+        | (Lean::Neither, Lean::TowardExtract) => Some(DomainMatch::Same),
+        (Lean::TowardDoNotExtract, Lean::TowardDoNotExtract | Lean::Neither)
+        | (Lean::Neither, Lean::TowardDoNotExtract) => Some(DomainMatch::Separate),
+        (Lean::TowardExtract, Lean::TowardDoNotExtract)
+        | (Lean::TowardDoNotExtract, Lean::TowardExtract) => Some(DomainMatch::Undecidable),
     }
 }
 
@@ -469,6 +516,11 @@ fn reasons_of(signals: &Signals, leans: &Leans, thresholds: AppliedThresholds) -
             threshold: thresholds.shared_caller_domains,
             lean: leans.caller_domain,
         },
+        Reason::CalleeDomainOverlap {
+            signal: signals.callee_domain_overlap().clone(),
+            threshold: thresholds.shared_callee_domains,
+            lean: leans.callee_domain,
+        },
     ]
 }
 
@@ -510,6 +562,30 @@ fn caller_domain_lean_of(signal: &CallerDomainOverlap, shared_threshold: Thresho
         | CallerDomainOverlap::UnreadableReferences
         | CallerDomainOverlap::ServerStillWorking
         | CallerDomainOverlap::ReferencesNotProvided => None,
+    };
+
+    overlap_lean_of(measured, shared_threshold)
+}
+
+/// 呼び出し先ドメインの重なりが傾けた向き。尋ねていない / 測れなければ傾けない。
+///
+/// `shared_threshold` は呼び出し先を共有していると見なす下限
+/// （[`AppliedThresholds::shared_callee_domains`]）。
+///
+/// **依存パッケージしか呼んでいないときも傾けない。** 言語の lib しか呼ばない関数は
+/// どこにでもあり、どちらのドメインの証拠にもならない（`semantics::callee_domain`）。
+fn callee_domain_lean_of(signal: &CalleeDomainOverlap, shared_threshold: Threshold) -> Lean {
+    let measured = match signal {
+        CalleeDomainOverlap::Measured(measured) => Some(measured.overlap()),
+        CalleeDomainOverlap::Unavailable { .. }
+        | CalleeDomainOverlap::NoName
+        | CalleeDomainOverlap::NoCallHierarchyItem
+        | CalleeDomainOverlap::SeveralCallHierarchyItems { .. }
+        | CalleeDomainOverlap::NoCallees
+        | CalleeDomainOverlap::OnlyExternalCallees
+        | CalleeDomainOverlap::UnreadableCallees
+        | CalleeDomainOverlap::ServerStillWorking
+        | CalleeDomainOverlap::CallHierarchyNotProvided => None,
     };
 
     overlap_lean_of(measured, shared_threshold)
@@ -585,10 +661,12 @@ mod tests {
 
     use crate::classification::reason::{Lean, Reason};
     use crate::classification::signal::{
-        CallerDomainOverlap, ImportOverlap, MeasuredCallerDomains, SemanticsUnavailable, Signals,
-        StructuralSimilarity, TypeSignatureMatch,
+        CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, MeasuredCalleeDomains,
+        MeasuredCallerDomains, SemanticsUnavailable, Signals, StructuralSimilarity,
+        TypeSignatureMatch,
     };
     use crate::classification::verdict::Verdict;
+    use crate::semantics::callee_domain::CalleeDomains;
     use crate::semantics::caller_domain::CallerDomains;
     use crate::semantics::resolved_type::UnopenedReason;
     use crate::semantics::type_signature::UntracedReason;
@@ -621,6 +699,35 @@ mod tests {
             caller_domains(&["src/report/monthly.ts"]),
             caller_domains(&["src/report/daily.ts"]),
         ))
+    }
+
+    fn callee_domains(callee_paths: &[&str]) -> CalleeDomains {
+        let paths: Vec<PathBuf> = callee_paths.iter().map(PathBuf::from).collect();
+
+        CalleeDomains::from_callee_paths(&paths).expect("テストが渡す呼び出し先は 1 件以上")
+    }
+
+    /// 呼び出し先が別のドメインに分かれている（重なり 0.00）。
+    fn callees_in_separate_domains() -> CalleeDomainOverlap {
+        CalleeDomainOverlap::Measured(MeasuredCalleeDomains::new(
+            callee_domains(&["src/billing/invoice.ts"]),
+            callee_domains(&["src/inventory/stock.ts"]),
+        ))
+    }
+
+    /// 呼び出し先が同じドメインにある（重なり 1.00）。
+    fn callees_in_the_same_domain() -> CalleeDomainOverlap {
+        CalleeDomainOverlap::Measured(MeasuredCalleeDomains::new(
+            callee_domains(&["src/utils/formatDate.ts"]),
+            callee_domains(&["src/utils/pad.ts"]),
+        ))
+    }
+
+    /// 呼び出し元を尋ねていない形。呼び出し先だけの効き方を見るテストが使う。
+    fn callers_not_asked() -> CallerDomainOverlap {
+        CallerDomainOverlap::Unavailable {
+            reason: SemanticsUnavailable::NotAsked,
+        }
     }
 
     /// 別のディレクトリにある 2 ファイルの隔たり（2 段）。
@@ -775,7 +882,7 @@ mod tests {
 
         let classification = classification_of(&signals, ConfiguredThresholds::default());
 
-        assert_eq!(classification.reasons().len(), 5);
+        assert_eq!(classification.reasons().len(), 6);
     }
 
     /// 構造が似ていて依存先も共有している組（Stage 1 だけなら `EXTRACT-CANDIDATE`）。
@@ -1005,6 +1112,148 @@ mod tests {
         let classification = classification_of(&signals, ConfiguredThresholds::default());
 
         assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    #[test]
+    fn test_classification_of_callees_in_separate_domains_decides_an_undecidable_placement() {
+        // import が無いので Stage 1 だけでは REVIEW。呼び出し元の側と同じく、
+        // 実際に何へ依存しているかが取れて初めて別ドメインと言える
+        let signals = signals_of_a_caller_only_domain_match()
+            .with_semantics(
+                TypeSignatureMatch::Unavailable {
+                    reason: SemanticsUnavailable::LspUnusable,
+                },
+                callers_not_asked(),
+            )
+            .with_callee_domain_overlap(callees_in_separate_domains());
+
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
+
+        assert_eq!(classification.verdict(), Verdict::DoNotExtract);
+    }
+
+    #[test]
+    fn test_classification_of_callees_sharing_a_domain_against_a_separate_placement_is_review() {
+        // 置き場所は別ドメインと言っているのに、下りている先は同じドメイン。
+        // 呼び出し元の側と同じく、**観測で置き換えず食い違いとして人へ回す**
+        let signals = signals_of_separate_domains()
+            .with_semantics(TypeSignatureMatch::Unifiable, callers_not_asked())
+            .with_callee_domain_overlap(callees_in_the_same_domain());
+
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
+
+        assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    #[test]
+    fn test_classification_of_a_callee_only_domain_match_without_a_type_signature_is_review() {
+        // 呼び出し先だけで候補へ上げると、**単一化できるかを確かめないまま
+        // 「共通化してよい」と言う**ことになる（呼び出し元だけの場合と同じ）
+        let signals = signals_of_a_caller_only_domain_match()
+            .with_semantics(
+                TypeSignatureMatch::Unavailable {
+                    reason: SemanticsUnavailable::LspUnusable,
+                },
+                callers_not_asked(),
+            )
+            .with_callee_domain_overlap(callees_in_the_same_domain());
+
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
+
+        assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    #[test]
+    fn test_classification_of_a_callee_only_domain_match_with_a_type_signature_is_extract_candidate()
+     {
+        // 対照は上のテスト。型シグネチャが取れているかどうかだけが違う
+        let signals = signals_of_a_caller_only_domain_match()
+            .with_semantics(TypeSignatureMatch::Unifiable, callers_not_asked())
+            .with_callee_domain_overlap(callees_in_the_same_domain());
+
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
+
+        assert_eq!(classification.verdict(), Verdict::ExtractCandidate);
+    }
+
+    #[test]
+    fn test_classification_of_callers_and_callees_leaning_apart_is_review() {
+        // 置き場所は別ドメイン、呼び出し元は同じドメイン、呼び出し先は別ドメイン。
+        // 観測を 1 つずつ置き場所へ重ねると、重ねる順で答えが変わる
+        // （呼び出し元 → 呼び出し先の順なら DO-NOT-EXTRACT、逆なら REVIEW）。
+        // **観測どうしが食い違えば、置き場所がどちらを言っていても人へ回す**
+        let signals = signals_of_separate_domains()
+            .with_semantics(TypeSignatureMatch::Unifiable, callers_in_the_same_domain())
+            .with_callee_domain_overlap(callees_in_separate_domains());
+
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
+
+        assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    #[test]
+    fn test_classification_of_callers_and_callees_leaning_together_decides_an_undecidable_placement()
+     {
+        // 対照は上のテスト。置き場所を決められず、観測の 2 つがどちらも同じドメインを指す
+        let signals = signals_of_a_caller_only_domain_match()
+            .with_semantics(TypeSignatureMatch::Unifiable, callers_in_the_same_domain())
+            .with_callee_domain_overlap(callees_in_the_same_domain());
+
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
+
+        assert_eq!(classification.verdict(), Verdict::ExtractCandidate);
+    }
+
+    #[test]
+    fn test_classification_of_callees_only_in_dependencies_keeps_the_placement_verdict() {
+        // 言語の lib しか呼ばない 2 つの関数は、依存先を共有している証拠にならない。
+        // 共通化する側へ傾けていれば、置き場所の DO-NOT-EXTRACT と食い違って REVIEW になる
+        let signals = signals_of_separate_domains()
+            .with_semantics(TypeSignatureMatch::Unifiable, callers_not_asked())
+            .with_callee_domain_overlap(CalleeDomainOverlap::OnlyExternalCallees);
+
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
+
+        assert_eq!(classification.verdict(), Verdict::DoNotExtract);
+    }
+
+    #[test]
+    fn test_classification_of_callees_is_not_moved_by_the_caller_domain_threshold() {
+        // 共通は 1 ドメイン、合わせて 3 ドメイン（1/3）。呼び出し元の閾値を下げると
+        // 呼び出し元の側なら共通化する側へ傾く値。**同じ閾値を読んでいれば**
+        // 呼び出し先も共通化する側へ傾く
+        let signals = signals_of_a_caller_only_domain_match()
+            .with_semantics(TypeSignatureMatch::Unifiable, callers_not_asked())
+            .with_callee_domain_overlap(CalleeDomainOverlap::Measured(MeasuredCalleeDomains::new(
+                callee_domains(&["src/billing/invoice.ts", "src/utils/pad.ts"]),
+                callee_domains(&["src/inventory/stock.ts", "src/utils/pad.ts"]),
+            )));
+
+        let classification = classification_of(
+            &signals,
+            ConfiguredThresholds::default()
+                .with_shared_caller_domains(Threshold::from_literal(0.2)),
+        );
+
+        assert_eq!(classification.verdict(), Verdict::DoNotExtract);
+    }
+
+    #[test]
+    fn test_classification_reports_the_threshold_applied_to_the_callee_domain_overlap() {
+        let signals = signals_of_separate_domains()
+            .with_semantics(TypeSignatureMatch::Unifiable, callers_not_asked())
+            .with_callee_domain_overlap(callees_in_separate_domains());
+
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
+
+        assert!(leans(
+            &classification,
+            &Reason::CalleeDomainOverlap {
+                signal: callees_in_separate_domains(),
+                threshold: SHARED_CALLEE_DOMAINS_THRESHOLD,
+                lean: Lean::TowardDoNotExtract,
+            }
+        ));
     }
 
     #[test]

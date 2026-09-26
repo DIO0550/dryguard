@@ -14,8 +14,8 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::classification::signal::{
-    CallerDomainOverlap, ImportOverlap, MeasuredCallerDomains, SemanticsUnavailable, Signals,
-    StructuralSimilarity, TypeSignatureMatch,
+    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, MeasuredCalleeDomains,
+    MeasuredCallerDomains, SemanticsUnavailable, Signals, StructuralSimilarity, TypeSignatureMatch,
 };
 use crate::classification::{
     Classification, ConfiguredThresholds, classification_of, is_structurally_similar,
@@ -26,6 +26,7 @@ use crate::lsp::{
     Client, ClientError, DocumentError, ProjectMembershipOutcome, ProjectRoot, ServerCommand,
     Session, SourceDocument, WorkspaceError, WorkspaceRoot,
 };
+use crate::semantics::callee_domain::{CalleeDomainsOutcome, callee_domains_outcome_of};
 use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outcome_of};
 use crate::semantics::resolved_type::{
     TypeDeclaration, UnopenedReason, UnopenedTypeName, opened_type_names_of, traced_type_names_of,
@@ -283,7 +284,9 @@ pub fn measured_pair_of(
     };
 
     MeasuredPair {
-        signals: signals.with_semantics(asked.type_signature_match, asked.caller_domain_overlap),
+        signals: signals
+            .with_semantics(asked.type_signature_match, asked.caller_domain_overlap)
+            .with_callee_domain_overlap(asked.callee_domain_overlap),
         semantics_error: asked.error,
     }
 }
@@ -300,6 +303,7 @@ pub fn measured_pair_of(
 struct AskedSemantics {
     type_signature_match: TypeSignatureMatch,
     caller_domain_overlap: CallerDomainOverlap,
+    callee_domain_overlap: CalleeDomainOverlap,
     error: Option<SemanticsError>,
 }
 
@@ -444,14 +448,15 @@ impl AskedCallerDomains {
 }
 
 impl AskedSemantics {
-    /// どちらのシグナルも取れていない形。
+    /// どのシグナルも取れていない形。
     ///
-    /// **尋ねる前に止まったときだけこれになる。** そこまでは片方だけ取れることが
-    /// ないので、2 つに別々の理由を持たせない。
+    /// **尋ねる前に止まったときだけこれになる。** そこまでは 1 つだけ取れることが
+    /// ないので、それぞれに別々の理由を持たせない。
     fn unavailable(reason: SemanticsUnavailable, error: Option<SemanticsError>) -> Self {
         Self {
             type_signature_match: TypeSignatureMatch::Unavailable { reason },
             caller_domain_overlap: CallerDomainOverlap::Unavailable { reason },
+            callee_domain_overlap: CalleeDomainOverlap::Unavailable { reason },
             error,
         }
     }
@@ -532,12 +537,15 @@ fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
     asked
 }
 
-/// 開かせた 2 つのドキュメントに、hover と references を尋ねる。
+/// 開かせた 2 つのドキュメントに、hover と references と callHierarchy を尋ねる。
 ///
 /// hover を先に送るのは、**references が先の作業の落ち着きを待つ**ため
 /// （順序を入れ替えると、読み込み中に計算された答えを受け取る。
 /// `tests/semantics.rs` の `test_caller_domains_asked_after_a_type_signature_are_still_complete`）。
-/// 型名の解決も hover と同じ側に置くので、references は最後のまま。
+/// 型名の解決も hover と同じ側に置くので、references はその後。
+///
+/// **callHierarchy は最後に送る。** references と同じく落ち着いた答えだけを採る
+/// （`lsp::Connection::callees`）ので、前の 2 つの順序は動かさずに後ろへ足す。
 ///
 /// **hover の側の落ち着きは、この順序が担っているのではない。** hover 自身が
 /// 落ち着くまで尋ね直す（`lsp::Connection::hover`）ので、並べ替えても綴りは変わらない。
@@ -567,6 +575,7 @@ fn asked_semantics_of(
         return AskedSemantics {
             type_signature_match: TypeSignatureMatch::NoName,
             caller_domain_overlap: CallerDomainOverlap::NoName,
+            callee_domain_overlap: CalleeDomainOverlap::NoName,
             error: None,
         };
     };
@@ -581,11 +590,18 @@ fn asked_semantics_of(
     let mut membership_a = AskedMembership::ask(session, root, document_a);
     let mut membership_b = AskedMembership::ask(session, root, document_b);
 
+    let callers_a = AskedCallerDomains::ask(session, &mut membership_a, document_a, position_a);
+    let callers_b = AskedCallerDomains::ask(session, &mut membership_b, document_b, position_b);
+
+    // **呼び出し先は所属で絞らない。** outgoingCalls はそのファイル自身の import を辿るので、
+    // サーバがその場で組み立てたプロジェクトでも揃う（呼び出し元は逆向きなので揃わない）
+    let callees_a = callee_domains_outcome_of(session, document_a, position_a);
+    let callees_b = callee_domains_outcome_of(session, document_b, position_b);
+
     asked_semantics_of_outcomes(
-        signature_a,
-        signature_b,
-        AskedCallerDomains::ask(session, &mut membership_a, document_a, position_a),
-        AskedCallerDomains::ask(session, &mut membership_b, document_b, position_b),
+        (signature_a, signature_b),
+        (callers_a, callers_b),
+        (callees_a, callees_b),
     )
 }
 
@@ -673,28 +689,39 @@ fn unopened_declaring_documents_of(
     Ok(unopened)
 }
 
-/// 4 つの問い合わせの結果を、シグナルと落ちた理由にまとめる。
+/// 問い合わせの結果を、シグナルと落ちた理由にまとめる。
+///
+/// 引数はどれも 2 つのチャンクの組で、尋ねた順（型シグネチャ → 参照元 → 呼び出し先）に並ぶ。
 ///
 /// **落ちた側だけを「測れない」にする。** hover が答えていて references だけが
 /// 落ちた場合に両方を捨てると、比べ終わっていた型シグネチャまで失われる。
 fn asked_semantics_of_outcomes(
-    signature_a: Result<TypeSignatureOutcome, ClientError>,
-    signature_b: Result<TypeSignatureOutcome, ClientError>,
-    callers_a: AskedCallerDomains,
-    callers_b: AskedCallerDomains,
+    (signature_a, signature_b): (
+        Result<TypeSignatureOutcome, ClientError>,
+        Result<TypeSignatureOutcome, ClientError>,
+    ),
+    (callers_a, callers_b): (AskedCallerDomains, AskedCallerDomains),
+    (callees_a, callees_b): (
+        Result<CalleeDomainsOutcome, ClientError>,
+        Result<CalleeDomainsOutcome, ClientError>,
+    ),
 ) -> AskedSemantics {
     let type_signature_match = asked_type_signature_match_of(&signature_a, &signature_b);
     let caller_domain_overlap = asked_caller_domain_overlap_of(&callers_a, &callers_b);
+    let callee_domain_overlap = asked_callee_domain_overlap_of(&callees_a, &callees_b);
 
     AskedSemantics {
         type_signature_match,
         caller_domain_overlap,
+        callee_domain_overlap,
         // 先に落ちたほうを出す。後の失敗で上書きすると、何が起きたのかが入れ替わる。
         error: signature_a
             .err()
             .or_else(|| signature_b.err())
             .or_else(|| callers_a.into_error())
             .or_else(|| callers_b.into_error())
+            .or_else(|| callees_a.err())
+            .or_else(|| callees_b.err())
             .map(SemanticsError::Client),
     }
 }
@@ -754,6 +781,20 @@ fn asked_caller_domain_overlap_of(
             caller_domain_overlap_of(callers_a, callers_b)
         }
     }
+}
+
+/// 呼び出し先を尋ねた結果から、呼び出し先ドメインの重なりのシグナルにする。
+fn asked_callee_domain_overlap_of(
+    callees_a: &Result<CalleeDomainsOutcome, ClientError>,
+    callees_b: &Result<CalleeDomainsOutcome, ClientError>,
+) -> CalleeDomainOverlap {
+    let (Ok(callees_a), Ok(callees_b)) = (callees_a, callees_b) else {
+        return CalleeDomainOverlap::Unavailable {
+            reason: SemanticsUnavailable::LspUnusable,
+        };
+    };
+
+    callee_domain_overlap_of(callees_a, callees_b)
 }
 
 /// そのチャンクのファイルを、サーバに開かせる形にする。
@@ -897,6 +938,50 @@ fn caller_domain_overlap_of(
         (CallerDomainsOutcome::ReferencesNotProvided, _)
         | (_, CallerDomainsOutcome::ReferencesNotProvided) => {
             CallerDomainOverlap::ReferencesNotProvided
+        }
+    }
+}
+
+/// 両側の呼び出し先から、ドメインの重なりのシグナルにする。
+///
+/// **片方でも取れていなければ 0.00 にしない**のは [`caller_domain_overlap_of`] と同じ理由。
+///
+/// **並びの軸は [`type_signature_match_of`] と同じく「環境を直しても変わらない理由を先に
+/// 出す」。** 何も呼んでいない・依存パッケージしか呼んでいないのはチャンクの形そのもので、
+/// 待つ・サーバを替えると変わりうる理由より先に置く。
+fn callee_domain_overlap_of(
+    callees_a: &CalleeDomainsOutcome,
+    callees_b: &CalleeDomainsOutcome,
+) -> CalleeDomainOverlap {
+    match (callees_a, callees_b) {
+        (CalleeDomainsOutcome::Counted(counted_a), CalleeDomainsOutcome::Counted(counted_b)) => {
+            CalleeDomainOverlap::Measured(MeasuredCalleeDomains::new(
+                counted_a.clone(),
+                counted_b.clone(),
+            ))
+        }
+        (CalleeDomainsOutcome::NoCallees, _) | (_, CalleeDomainsOutcome::NoCallees) => {
+            CalleeDomainOverlap::NoCallees
+        }
+        (CalleeDomainsOutcome::OnlyExternalCallees, _)
+        | (_, CalleeDomainsOutcome::OnlyExternalCallees) => {
+            CalleeDomainOverlap::OnlyExternalCallees
+        }
+        (CalleeDomainsOutcome::ServerStillWorking, _)
+        | (_, CalleeDomainsOutcome::ServerStillWorking) => CalleeDomainOverlap::ServerStillWorking,
+        (CalleeDomainsOutcome::NoCallHierarchyItem, _)
+        | (_, CalleeDomainsOutcome::NoCallHierarchyItem) => {
+            CalleeDomainOverlap::NoCallHierarchyItem
+        }
+        (CalleeDomainsOutcome::SeveralCallHierarchyItems { count }, _)
+        | (_, CalleeDomainsOutcome::SeveralCallHierarchyItems { count }) => {
+            CalleeDomainOverlap::SeveralCallHierarchyItems { count: *count }
+        }
+        (CalleeDomainsOutcome::UnreadableCallees, _)
+        | (_, CalleeDomainsOutcome::UnreadableCallees) => CalleeDomainOverlap::UnreadableCallees,
+        (CalleeDomainsOutcome::CallHierarchyNotProvided, _)
+        | (_, CalleeDomainsOutcome::CallHierarchyNotProvided) => {
+            CalleeDomainOverlap::CallHierarchyNotProvided
         }
     }
 }
@@ -1240,27 +1325,25 @@ fn signals_with_semantics_of(
     semantics_b: &ChunkSemantics,
 ) -> Signals {
     match (semantics_a, semantics_b) {
-        (
-            ChunkSemantics::Asked {
-                type_signature: signature_a,
-                caller_domains: callers_a,
-            },
-            ChunkSemantics::Asked {
-                type_signature: signature_b,
-                caller_domains: callers_b,
-            },
-        ) => signals.with_semantics(
-            asked_type_signature_match_of(signature_a, signature_b),
-            asked_caller_domain_overlap_of(callers_a, callers_b),
-        ),
+        (ChunkSemantics::Asked(asked_a), ChunkSemantics::Asked(asked_b)) => signals
+            .with_semantics(
+                asked_type_signature_match_of(&asked_a.type_signature, &asked_b.type_signature),
+                asked_caller_domain_overlap_of(&asked_a.caller_domains, &asked_b.caller_domains),
+            )
+            .with_callee_domain_overlap(asked_callee_domain_overlap_of(
+                &asked_a.callee_domains,
+                &asked_b.callee_domains,
+            )),
         (ChunkSemantics::Unavailable { reason }, _)
-        | (_, ChunkSemantics::Unavailable { reason }) => signals.with_semantics(
-            TypeSignatureMatch::Unavailable { reason: *reason },
-            CallerDomainOverlap::Unavailable { reason: *reason },
-        ),
-        (ChunkSemantics::NoName, _) | (_, ChunkSemantics::NoName) => {
-            signals.with_semantics(TypeSignatureMatch::NoName, CallerDomainOverlap::NoName)
-        }
+        | (_, ChunkSemantics::Unavailable { reason }) => signals
+            .with_semantics(
+                TypeSignatureMatch::Unavailable { reason: *reason },
+                CallerDomainOverlap::Unavailable { reason: *reason },
+            )
+            .with_callee_domain_overlap(CalleeDomainOverlap::Unavailable { reason: *reason }),
+        (ChunkSemantics::NoName, _) | (_, ChunkSemantics::NoName) => signals
+            .with_semantics(TypeSignatureMatch::NoName, CallerDomainOverlap::NoName)
+            .with_callee_domain_overlap(CalleeDomainOverlap::NoName),
         (ChunkSemantics::NotACandidate, _) | (_, ChunkSemantics::NotACandidate) => signals
             .with_semantics(
                 TypeSignatureMatch::Unavailable {
@@ -1269,7 +1352,10 @@ fn signals_with_semantics_of(
                 CallerDomainOverlap::Unavailable {
                     reason: SemanticsUnavailable::NotACandidate,
                 },
-            ),
+            )
+            .with_callee_domain_overlap(CalleeDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotACandidate,
+            }),
     }
 }
 
@@ -1328,9 +1414,10 @@ impl ScanSemantics {
     /// Stage 2 を尋ねられなかった理由。尋ねられた / そもそも尋ねなかったときは `None`。
     ///
     /// **先に落ちたものを出す**（後の失敗で上書きすると、何が起きたのかが入れ替わる）。
-    /// [`asked_scan_semantics_of`] は型シグネチャをすべて送ってから参照元を送るので、**チャンクを
-    /// 1 つずつ見て 2 つの結果を確かめる形にすると、尋ねた順と食い違う**（チャンク 0 の
-    /// 参照元が、チャンク 1 の型シグネチャより先に落ちたことになってしまう）。
+    /// [`asked_scan_semantics_of`] は型シグネチャをすべて送ってから参照元を、参照元を
+    /// すべて送ってから呼び出し先を送るので、**チャンクを 1 つずつ見て結果を確かめる形に
+    /// すると、尋ねた順と食い違う**（チャンク 0 の参照元が、チャンク 1 の型シグネチャより
+    /// 先に落ちたことになってしまう）。
     ///
     /// 取り出すのに自分を消費するのは、`ClientError` を複製できないため。
     fn into_error(self) -> Option<SemanticsError> {
@@ -1340,21 +1427,25 @@ impl ScanSemantics {
 
         let mut first_signature_error = None;
         let mut first_caller_error = None;
+        let mut first_callee_error = None;
         for semantics in self.per_chunk {
-            let ChunkSemantics::Asked {
-                type_signature,
-                caller_domains,
-            } = semantics
-            else {
+            let ChunkSemantics::Asked(asked) = semantics else {
                 continue;
             };
+            let AskedChunkSemantics {
+                type_signature,
+                caller_domains,
+                callee_domains,
+            } = *asked;
 
             first_signature_error = first_signature_error.or_else(|| type_signature.err());
             first_caller_error = first_caller_error.or_else(|| caller_domains.into_error());
+            first_callee_error = first_callee_error.or_else(|| callee_domains.err());
         }
 
         first_signature_error
             .or(first_caller_error)
+            .or(first_callee_error)
             .map(SemanticsError::Client)
     }
 }
@@ -1375,12 +1466,20 @@ enum ChunkSemantics {
     /// 名前を持たず、尋ねる位置を決められなかった。
     NoName,
     /// 尋ねた。
-    Asked {
-        /// 型シグネチャを尋ねた結果。
-        type_signature: Result<TypeSignatureOutcome, ClientError>,
-        /// 参照元を尋ねた結果。**印が無ければ尋ねていない**。
-        caller_domains: AskedCallerDomains,
-    },
+    ///
+    /// **箱に入れる。** 走査は全チャンクぶんを並べて持つので、尋ねなかったチャンクまで
+    /// 3 つの問い合わせの結果の大きさを取ることになる。
+    Asked(Box<AskedChunkSemantics>),
+}
+
+/// 1 つのチャンクへ尋ねた結果。
+struct AskedChunkSemantics {
+    /// 型シグネチャを尋ねた結果。
+    type_signature: Result<TypeSignatureOutcome, ClientError>,
+    /// 参照元を尋ねた結果。**印が無ければ尋ねていない**。
+    caller_domains: AskedCallerDomains,
+    /// 呼び出し先を尋ねた結果。**印の有無によらず尋ねる**（[`asked_semantics_of`]）。
+    callee_domains: Result<CalleeDomainsOutcome, ClientError>,
 }
 
 /// 候補ペアに現れるチャンクへ、Stage 2 のシグナルを尋ねる。
@@ -1508,11 +1607,16 @@ fn asked_paths_of(chunks: &[ScannedChunk], asked: &BTreeSet<usize>) -> Vec<PathB
     unique.into_iter().collect()
 }
 
-/// 開かせたドキュメントに、チャンクごとの hover と references を尋ねる。
+/// 開かせたドキュメントに、チャンクごとの hover と references と callHierarchy を尋ねる。
 ///
 /// **hover をすべて先に送る。** references は先の作業の落ち着きを待つので
 /// （`tests/semantics.rs` の `test_caller_domains_asked_after_a_type_signature_are_still_complete`）、
-/// 1 チャンクずつ交互に送ると読み込み中に計算された答えを受け取る。
+/// 1 チャンクずつ交互に送ると読み込み中に計算された答えを受け取る。callHierarchy は
+/// [`asked_semantics_of`] と同じく最後に送る。
+///
+/// **呼び出し先はチャンクごとに尋ねる。** 答えは関数ごとに違うので、所属のように
+/// ファイル単位へは畳めない（`rules/architecture.md`
+/// 「ファイル単位で決まる答えをチャンク単位で問い合わせない」の対象外の側）。
 ///
 /// **hover の側の落ち着きは、この順序が担っているのではない。** hover 自身が
 /// 落ち着くまで尋ね直す（`lsp::Connection::hover`）ので、並べ替えても綴りは変わらない。
@@ -1563,11 +1667,33 @@ fn asked_scan_semantics_of(
             askable.position,
         ));
     }
+    let callees: Vec<Result<CalleeDomainsOutcome, ClientError>> = askable
+        .iter()
+        .map(|askable| callee_domains_outcome_of(session, askable.document, askable.position))
+        .collect();
 
     ScanSemantics {
-        per_chunk: per_chunk_semantics_of(chunks.len(), asked, &askable, signatures, callers),
+        per_chunk: per_chunk_semantics_of(
+            chunks.len(),
+            asked,
+            &askable,
+            AskedOutcomes {
+                signatures,
+                callers,
+                callees,
+            },
+        ),
         setup_error: None,
     }
+}
+
+/// 尋ねる位置が決まったチャンクへ尋ねた結果。どれも [`AskableChunk`] と同じ並び。
+///
+/// [`per_chunk_semantics_of`] の引数をまとめるためだけの型なので公開しない。
+struct AskedOutcomes {
+    signatures: Vec<Result<TypeSignatureOutcome, ClientError>>,
+    callers: Vec<AskedCallerDomains>,
+    callees: Vec<Result<CalleeDomainsOutcome, ClientError>>,
 }
 
 /// 尋ねる位置が決まったチャンク。
@@ -1608,25 +1734,29 @@ fn askable_chunks_of<'a>(
 
 /// 尋ねた結果を、チャンクと同じ並びに戻す。
 ///
-/// `signatures` と `callers` は `askable` と同じ並び。
+/// `outcomes` の中身は `askable` と同じ並び。
 fn per_chunk_semantics_of(
     chunk_count: usize,
     asked: &BTreeSet<usize>,
     askable: &[AskableChunk<'_>],
-    signatures: Vec<Result<TypeSignatureOutcome, ClientError>>,
-    callers: Vec<AskedCallerDomains>,
+    outcomes: AskedOutcomes,
 ) -> Vec<ChunkSemantics> {
     let mut per_chunk: Vec<ChunkSemantics> = (0..chunk_count)
         .map(|index| unasked_chunk_semantics_of(index, asked))
         .collect();
 
-    for (askable, (type_signature, caller_domains)) in
-        askable.iter().zip(signatures.into_iter().zip(callers))
+    let answers = outcomes
+        .signatures
+        .into_iter()
+        .zip(outcomes.callers)
+        .zip(outcomes.callees);
+    for (askable, ((type_signature, caller_domains), callee_domains)) in askable.iter().zip(answers)
     {
-        per_chunk[askable.index] = ChunkSemantics::Asked {
+        per_chunk[askable.index] = ChunkSemantics::Asked(Box::new(AskedChunkSemantics {
             type_signature,
             caller_domains,
-        };
+            callee_domains,
+        }));
     }
 
     per_chunk
@@ -1938,10 +2068,29 @@ mod tests {
         AskedCallerDomains::Answered(Ok(outcome))
     }
 
+    /// 呼び出し先を尋ねて、サーバが答えた形。型シグネチャ・参照元の側を見るテストが使う。
+    fn callees_that_answered() -> Result<CalleeDomainsOutcome, ClientError> {
+        Ok(CalleeDomainsOutcome::NoCallees)
+    }
+
+    /// 呼び出し先はサーバが答えた、型シグネチャと参照元の問い合わせの結果。
+    fn asked_semantics_answering_callees_of(
+        signature_a: Result<TypeSignatureOutcome, ClientError>,
+        signature_b: Result<TypeSignatureOutcome, ClientError>,
+        callers_a: AskedCallerDomains,
+        callers_b: AskedCallerDomains,
+    ) -> AskedSemantics {
+        asked_semantics_of_outcomes(
+            (signature_a, signature_b),
+            (callers_a, callers_b),
+            (callees_that_answered(), callees_that_answered()),
+        )
+    }
+
     #[test]
     fn test_asked_semantics_do_not_call_a_pair_not_unifiable_with_an_unopened_type_name() {
         // 比較に残る型名を開けていないので、綴りのまま比べた結果は答えにならない
-        let asked = asked_semantics_of_outcomes(
+        let asked = asked_semantics_answering_callees_of(
             Ok(TypeSignatureOutcome::UnopenedTypeName {
                 reason: UnopenedReason::TypeDefinitionNotProvided,
             }),
@@ -1961,7 +2110,7 @@ mod tests {
     #[test]
     fn test_asked_semantics_call_a_pair_not_unifiable_when_both_signatures_were_read() {
         // 対照は上のテスト。どちらも読めていれば、重ならないことを言い切ってよい
-        let asked = asked_semantics_of_outcomes(
+        let asked = asked_semantics_answering_callees_of(
             Ok(normalized("function totalOf(values: string[]): number")),
             Ok(normalized("function sumOf(amounts: number[]): number")),
             answered(CallerDomainsOutcome::NoReferences),
@@ -1975,7 +2124,7 @@ mod tests {
     fn test_asked_semantics_do_not_call_a_pair_unifiable_with_a_miscounted_overload_set() {
         // 対照は上のテスト。片側のオーバーロードが揃っていないので、綴り 1 本を
         // 比べた結果は答えにならない。**両側が同じ 1 本でも単一化可能と言わない**
-        let asked = asked_semantics_of_outcomes(
+        let asked = asked_semantics_answering_callees_of(
             Ok(TypeSignatureOutcome::OverloadSetMiscounted {
                 counted: overload_count(2),
                 found: 1,
@@ -1998,7 +2147,7 @@ mod tests {
     fn test_asked_semantics_carry_the_reason_a_type_name_could_not_be_opened() {
         // 対照は 2 つ上のテスト（サーバが提供していない場合）。**サーバは宣言を持っており、
         // 読めないのはこちら側の穴**なので、理由まで運ばないと直す先が入れ替わる
-        let asked = asked_semantics_of_outcomes(
+        let asked = asked_semantics_answering_callees_of(
             Ok(TypeSignatureOutcome::UnopenedTypeName {
                 reason: UnopenedReason::UnreadableTypeDefinition,
             }),
@@ -2017,7 +2166,7 @@ mod tests {
 
     /// hover は答えたが references が落ちた、4 つの問い合わせの結果。
     fn references_that_failed() -> AskedSemantics {
-        asked_semantics_of_outcomes(
+        asked_semantics_answering_callees_of(
             Ok(normalized("function totalOf(values: number[]): number")),
             Ok(normalized("function sumOf(amounts: number[]): number")),
             AskedCallerDomains::Answered(Err(ClientError::PipesNotWired)),
@@ -2050,6 +2199,72 @@ mod tests {
             "落ちたことは理由として残る: {:?}",
             asked.error.map(|error| error.to_string())
         );
+    }
+
+    /// hover と references は答えたが、callHierarchy が片側で落ちた問い合わせの結果。
+    fn callees_that_failed() -> AskedSemantics {
+        asked_semantics_of_outcomes(
+            (
+                Ok(normalized("function totalOf(values: number[]): number")),
+                Ok(normalized("function sumOf(amounts: number[]): number")),
+            ),
+            (
+                answered(CallerDomainsOutcome::NoReferences),
+                answered(CallerDomainsOutcome::NoReferences),
+            ),
+            (Err(ClientError::PipesNotWired), callees_that_answered()),
+        )
+    }
+
+    #[test]
+    fn test_asked_semantics_keep_the_other_signals_when_call_hierarchy_fails() {
+        // 最後に尋ねる呼び出し先が落ちても、先に取れていた 2 つを「測れない」に化けさせない
+        let asked = callees_that_failed();
+
+        assert_eq!(asked.type_signature_match, TypeSignatureMatch::Unifiable);
+        assert_eq!(
+            asked.caller_domain_overlap,
+            CallerDomainOverlap::NoReferences
+        );
+    }
+
+    #[test]
+    fn test_asked_semantics_mark_only_the_callee_domain_when_call_hierarchy_fails() {
+        // 対照は上のテスト。落ちた側だけが取れない扱いになり、理由も残る
+        let asked = callees_that_failed();
+
+        assert_eq!(
+            asked.callee_domain_overlap,
+            CalleeDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::LspUnusable
+            }
+        );
+        assert!(
+            asked.error.is_some(),
+            "落ちたことは理由として残る: {:?}",
+            asked.error.map(|error| error.to_string())
+        );
+    }
+
+    #[test]
+    fn test_callee_domain_overlap_of_a_side_calling_only_dependencies_outranks_a_working_server() {
+        // 並びの軸は「環境を直しても変わらない理由を先に出す」。待てば変わる側の理由で
+        // 覆うと、依存パッケージしか呼ばないチャンクだという案内が消える。
+        // **引数を入れ替えても同じ理由が出る**ことも見る
+        let only_external_first = callee_domain_overlap_of(
+            &CalleeDomainsOutcome::OnlyExternalCallees,
+            &CalleeDomainsOutcome::ServerStillWorking,
+        );
+        let working_first = callee_domain_overlap_of(
+            &CalleeDomainsOutcome::ServerStillWorking,
+            &CalleeDomainsOutcome::OnlyExternalCallees,
+        );
+
+        assert_eq!(
+            only_external_first,
+            CalleeDomainOverlap::OnlyExternalCallees
+        );
+        assert_eq!(working_first, only_external_first);
     }
 
     #[test]
@@ -2168,15 +2383,16 @@ mod tests {
         assert_eq!(signals.module_distance().steps(), 2);
     }
 
-    /// 尋ねた 2 つの結果を持つチャンク。
+    /// 型シグネチャと参照元を尋ねた結果を持つチャンク。呼び出し先はサーバが答えている。
     fn asked(
         type_signature: Result<TypeSignatureOutcome, ClientError>,
         caller_domains: AskedCallerDomains,
     ) -> ChunkSemantics {
-        ChunkSemantics::Asked {
+        ChunkSemantics::Asked(Box::new(AskedChunkSemantics {
             type_signature,
             caller_domains,
-        }
+            callee_domains: callees_that_answered(),
+        }))
     }
 
     /// 名前で見分けられる往復の失敗。
@@ -2414,6 +2630,57 @@ mod tests {
                 .as_deref()
                 .is_some_and(|text| text.contains("only-references")),
             "参照元の失敗が出る: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_scan_semantics_report_a_caller_domain_failure_before_an_earlier_callee_failure() {
+        // 参照元をすべて送ってから呼び出し先を送るので、後ろのチャンクの参照元の失敗が
+        // 先のチャンクの呼び出し先の失敗より先に起きている
+        let semantics = ScanSemantics {
+            per_chunk: vec![
+                ChunkSemantics::Asked(Box::new(AskedChunkSemantics {
+                    type_signature: Ok(TypeSignatureOutcome::NoTypeThere),
+                    caller_domains: answered(CallerDomainsOutcome::NoReferences),
+                    callee_domains: Err(failure("later-call-hierarchy")),
+                })),
+                asked(
+                    Ok(TypeSignatureOutcome::NoTypeThere),
+                    AskedCallerDomains::Answered(Err(failure("earlier-references"))),
+                ),
+            ],
+            setup_error: None,
+        };
+
+        let error = semantics.into_error().map(|error| error.to_string());
+
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|text| text.contains("earlier-references")),
+            "先に送った参照元の失敗が出る: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_scan_semantics_report_a_callee_domain_failure_when_everything_else_answered() {
+        // 対照は上のテスト。先に送った問い合わせが 1 つも落ちていなければ、呼び出し先の失敗が出る
+        let semantics = ScanSemantics {
+            per_chunk: vec![ChunkSemantics::Asked(Box::new(AskedChunkSemantics {
+                type_signature: Ok(TypeSignatureOutcome::NoTypeThere),
+                caller_domains: answered(CallerDomainsOutcome::NoReferences),
+                callee_domains: Err(failure("only-call-hierarchy")),
+            }))],
+            setup_error: None,
+        };
+
+        let error = semantics.into_error().map(|error| error.to_string());
+
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|text| text.contains("only-call-hierarchy")),
+            "呼び出し先の失敗が出る: {error:?}"
         );
     }
 
