@@ -225,6 +225,11 @@ Claude Code セッションの URL をコメントする（`https://claude.ai/co
   起点を「止まったとき」ではなく「着手したとき」に置く
 - 通知にだけ載せるのでは足りない。**通知は流れるが Issue は残る**
 
+**URL は `SessionStart` のフック（`.claude/hooks/session-url-notice.sh`）がコンテキストに出す。**
+URL はセッションの中からしか作れないので、規約だけだと「残そうと思ったが URL が分からない」で
+止まる。ブランチが `claude/issue-<N>-...` なら Issue 番号も添える。**URL を組み立てられないと
+出たら、推測で書かない**（フックの出力が無いときも同じ。層 3 は発火しない環境がある）。
+
 ## Common Commands
 
 リポジトリルートで実行する。
@@ -241,6 +246,7 @@ bash harness/ci/pr-body-diff-test.sh        # PR 本文の差分規模を突き�
 bash .claude/hooks/pre-push-check-test.sh   # 層 3 の push 前検査フックのテスト
 bash .claude/hooks/post-edit-rust-test.sh   # 層 3 の編集後 fmt / clippy フックのテスト
 bash .claude/hooks/hook-canary-test.sh      # 層 3 のカナリア（フックの発火の確認）のテスト
+bash .claude/hooks/session-url-notice-test.sh  # 層 3 のセッション URL の通知のテスト
 ```
 
 PR 本文の差分規模の突き合わせ自体は、本文をファイルに落として走らせる

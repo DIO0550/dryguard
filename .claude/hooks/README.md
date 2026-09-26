@@ -10,6 +10,7 @@
 | フック | イベント | すること |
 | --- | --- | --- |
 | `wire-githooks.sh` | `SessionStart` | `core.hooksPath` を `harness/githooks` へ向ける（`harness/githooks/README.md`「配線 — cargo に `prepare` が無い」） |
+| `session-url-notice.sh` | `SessionStart` | このセッションの URL（`https://claude.ai/code/session_<id>`）を組み立ててコンテキストに出す。ブランチが `claude/issue-<N>-...` なら Issue 番号も添える |
 | `pre-push-check.sh` | `PreToolUse`（`Bash`） | コマンドに `git push` があれば `harness/githooks/pre-push` を走らせ、落ちたら exit 2 で止める |
 | `hook-canary.sh` | `PreToolUse`（`Bash`） | コマンドが `echo hook-canary` そのものなら exit 2 で止める。このセッションでフックが発火しているかを確かめるためだけのもの |
 | `post-edit-rust.sh` | `PostToolUse`（`Edit` / `Write` / `MultiEdit`） | `.rs` を編集したら、そのクレートに `cargo fmt` をかけ、`cargo clippy` が落ちたら診断を exit 2 で返す |
@@ -86,6 +87,25 @@ push の前に `echo hook-canary` を 1 度実行する。**止められれば**
 `.claude/settings.json` はセッションの起動時に読まれるので、配線より前のブランチから
 起動したセッションでは通って当たり前（`AGENTS.md`「実装を始める前に」）。
 
+## `session-url-notice.sh` — URL はセッションの中からしか作れない
+
+`AGENTS.md`「Issue に紐づいて起動したら、セッションの URL を Issue に残す」の材料。
+見たいのは GitHub のコメントでリポジトリに痕跡が残らないので、層 2・層 1 へは上げられない。
+
+- **ID は `CLAUDE_CODE_REMOTE_SESSION_ID`（`cse_<id>`）の接頭辞を `session_` に替えたもの。**
+  stdin の `session_id` と `CLAUDE_CODE_SESSION_ID` はローカルの UUID で URL の ID とは別物
+- **組み立てられないときは黙らず、組み立てられないと出す。** 環境変数が無い（ローカルの CLI）・
+  `cse_<英数字>` の形でない、のどちらも。黙ると不発と区別できず、URL を推測で書く余地が残る
+- **Issue 番号はブランチ名だけから読む。** `claude/issue-<N>` の後ろが `-` か終わりのときだけ。
+  トリガーが渡す Issue はフックからは見えない
+- **判定も出力も bash の組み込みで行う。** 外部コマンドはブランチ名を読む `git` だけで、
+  無ければ Issue 番号を添えないだけ（URL は出す）。`jq` で `additionalContext` を組む形にしないのは、
+  素の stdout でも SessionStart ではコンテキストに入り、`jq` が無い環境で黙って不発になる経路を作らないため
+- **終了コードは常に 0。** セッションの開始を止める理由は無い
+
+**移植元は読んでいない。** Issue #51 は design-composer の `session-url-notice.sh` を参照に挙げたが、
+実装したセッションからは読めなかったため新規に書いた。
+
 ## 強制力の序列
 
 `AGENTS.md`「強制力の序列」が持つ。
@@ -96,6 +116,7 @@ push の前に `echo hook-canary` を 1 度実行する。**止められれば**
 bash .claude/hooks/pre-push-check-test.sh
 bash .claude/hooks/post-edit-rust-test.sh
 bash .claude/hooks/hook-canary-test.sh
+bash .claude/hooks/session-url-notice-test.sh
 ```
 
 CI（`.github/workflows/rust.yml` の `claude-hooks`）でも走る。
