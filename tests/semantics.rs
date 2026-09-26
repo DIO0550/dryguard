@@ -13,18 +13,21 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use dryguard::classification::signal::{CallerDomainOverlap, TypeSignatureMatch};
+use dryguard::classification::signal::{
+    CalleeDomainOverlap, CallerDomainOverlap, TypeSignatureMatch,
+};
 use dryguard::classification::verdict::Verdict;
 use dryguard::classification::{ConfiguredThresholds, classification_of};
 use dryguard::codebase::source_of;
 use dryguard::location::Location;
 use dryguard::lsp::{
-    CalleesOutcome, Client, ReferencesOutcome, ServerCommand, Session, SourceDocument,
-    WorkspaceRoot,
+    Client, ReferencesOutcome, ServerCommand, Session, SourceDocument, WorkspaceRoot,
 };
 use dryguard::pipeline::{MeasuredPair, chunk_pair_of, measured_pair_of};
 use dryguard::report::{Explanation, text_of};
-use dryguard::semantics::callee_domain::CalleeDomains;
+use dryguard::semantics::callee_domain::{
+    CalleeDomains, CalleeDomainsOutcome, callee_domains_outcome_of,
+};
 use dryguard::semantics::caller_domain::CallerDomains;
 use dryguard::semantics::resolved_type::traced_type_names_of;
 use dryguard::semantics::type_signature::{
@@ -339,8 +342,11 @@ fn test_two_functions_called_from_the_same_domain_share_their_caller_domains() {
     );
 }
 
-/// そのチャンクが呼んでいる相手のファイル。サーバに尋ねて取り出す。
-fn callee_paths_of(session: &mut Session, chunk: &Chunk) -> Vec<PathBuf> {
+/// そのチャンクの呼び出し先を、サーバに尋ねてドメインごとに数えた結果。
+///
+/// **`semantics` が数える経路をそのまま通す。** 依存パッケージを落とすのはそこなので、
+/// 返ったパスを直に数えると `compare` が使う値と別のものを見ることになる。
+fn callee_domains_outcome(session: &mut Session, chunk: &Chunk) -> CalleeDomainsOutcome {
     let document = document(chunk.path());
     if session.open_document(&document).is_err() {
         panic!("ファイルを開かせられる: {}", chunk.path().display());
@@ -352,22 +358,21 @@ fn callee_paths_of(session: &mut Session, chunk: &Chunk) -> Vec<PathBuf> {
             chunk.path().display()
         );
     };
-    let outcome = session.callees(&document, position);
-    let Ok(CalleesOutcome::Answered(callee_paths)) = outcome else {
-        panic!(
-            "名前の位置には呼び出し先が返る: {} ({outcome:?})",
-            chunk.path().display()
-        );
+    let Ok(outcome) = callee_domains_outcome_of(session, &document, position) else {
+        panic!("呼び出し先を尋ねられる: {}", chunk.path().display());
     };
-    callee_paths
+    outcome
 }
 
 /// そのチャンクの呼び出し先が属するドメイン。サーバに尋ねて数える。
 fn callee_domains_of(session: &mut Session, chunk: &Chunk) -> CalleeDomains {
-    let callee_paths = callee_paths_of(session, chunk);
+    let outcome = callee_domains_outcome(session, chunk);
 
-    let Some(callee_domains) = CalleeDomains::from_callee_paths(&callee_paths) else {
-        panic!("返った呼び出し先は 1 件以上ある: {callee_paths:?}");
+    let CalleeDomainsOutcome::Counted(callee_domains) = outcome else {
+        panic!(
+            "コードベースの中の呼び出し先が返る: {} ({outcome:?})",
+            chunk.path().display()
+        );
     };
     callee_domains
 }
@@ -396,9 +401,9 @@ fn callee_domain_overlap(location_a: &Location, location_b: &Location) -> f64 {
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_two_functions_calling_into_the_same_domains_share_their_callee_domains() {
     // **置かれているディレクトリは utils と report で分かれている**が、呼び出し先の
-    // ドメインは両方とも同じ 2 つ（`utils/pad` の utils と、`Date` のメソッドが
-    // 宣言されている TypeScript の lib）。呼び出し元ドメインの側と同じ主張の裏返しで、
-    // 置き場所ではなく実際に何へ依存しているかを見る
+    // ドメインは両方とも utils（`utils/pad`）。`Date` のメソッドが宣言されている
+    // TypeScript の lib は依存パッケージの中なので数えない。呼び出し元ドメインの側と
+    // 同じ主張の裏返しで、置き場所ではなく実際に何へ依存しているかを見る
     let formats_a_date = fixture("references/src/utils/formatDate.ts", 3);
     let helps_with_dates = fixture("references/src/report/dateHelper.ts", 3);
 
@@ -412,19 +417,36 @@ fn test_two_functions_calling_into_the_same_domains_share_their_callee_domains()
 #[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
 fn test_two_functions_sharing_one_of_their_two_callee_domains_partly_overlap() {
     // 対照は上のテスト。`monthlyLabel` が下りるのは utils（`formatDate`）と
-    // report（`dateHelper`）で、`formatDate` が下りるのは utils（`pad`）と
-    // TypeScript の lib（`Date.getMonth`）。**共通は utils の 1 つだけ**で、
-    // 合わせて 3 ドメインなので 1/3。ドメインを 1 つに畳んでいれば 1.0 になる
-    //
-    // **TypeScript の lib が 1 ドメインとして数えられていることを、この値が固定する。**
-    // 落とすかどうかは #220 が決めるので、決まった回にこのテストが落ちて更新を促す
+    // report（`dateHelper`）で、`formatDate` が下りるのは utils（`pad`）だけ
+    // （`Date.getMonth` の TypeScript の lib は数えない）。**共通は utils の 1 つだけ**で、
+    // 合わせて 2 ドメインなので 1/2。ドメインを 1 つに畳んでいれば 1.0、
+    // lib を 1 ドメインとして数えていれば 1/3 になる
     let labels_a_month = fixture("references/src/report/monthly.ts", 4);
     let formats_a_date = fixture("references/src/utils/formatDate.ts", 3);
 
     assert_eq!(
         callee_domain_overlap(&labels_a_month, &formats_a_date),
-        1.0 / 3.0
+        1.0 / 2.0
     );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_a_function_calling_only_the_language_lib_has_no_callee_domain_to_compare() {
+    // `applyDiscount` が呼ぶのは `Math.max` だけで、宣言は TypeScript の lib にある。
+    // 数えていれば、同じく `Math.max` しか呼ばない `reorderAmount` と 1.0 で重なる
+    let (discounts_an_invoice, _) = accidental_duplication_pair();
+    let Ok(pair) = chunk_pair_of(&discounts_an_invoice, &discounts_an_invoice) else {
+        panic!("テストが渡す位置は関数の中を指している");
+    };
+    let mut session = session_over(&[discounts_an_invoice.path().to_path_buf()]);
+
+    let outcome = callee_domains_outcome(&mut session, pair.chunk_a());
+
+    if session.shutdown().is_err() {
+        panic!("サーバを終わらせられる");
+    }
+    assert_eq!(outcome, CalleeDomainsOutcome::OnlyExternalCallees);
 }
 
 #[test]
@@ -648,6 +670,39 @@ fn test_compare_with_an_lsp_finds_the_accidental_duplication_not_unifiable() {
     assert_eq!(
         measured.signals().type_signature_match(),
         TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_measures_the_callee_domains_the_shared_utility_pair_shares() {
+    // `compare` の経路（hover → references → callHierarchy）を 1 つのセッションで通す。
+    // 先の 2 つの問い合わせのあとでも、呼び出し先が落ち着いた答えで返る
+    let (formats_a_date, helps_with_dates) = shared_utility_pair();
+
+    let measured = measured_with_an_lsp(&formats_a_date, &helps_with_dates);
+
+    let CalleeDomainOverlap::Measured(callees) = measured.signals().callee_domain_overlap() else {
+        panic!(
+            "呼び出し先ドメインを測れる: {:?}",
+            measured.signals().callee_domain_overlap()
+        );
+    };
+    assert_eq!(callees.overlap().value(), 1.0);
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_an_lsp_does_not_measure_callees_only_in_the_language_lib() {
+    // 対照は上のテスト。どちらも `Math.max` しか呼ばないので、呼び出し先のドメインは
+    // 重なりを測る材料にならない。呼び出し元の側（0.00）と食い違わせない
+    let (discounts_an_invoice, reorders_stock) = accidental_duplication_pair();
+
+    let measured = measured_with_an_lsp(&discounts_an_invoice, &reorders_stock);
+
+    assert_eq!(
+        measured.signals().callee_domain_overlap(),
+        &CalleeDomainOverlap::OnlyExternalCallees
     );
 }
 
