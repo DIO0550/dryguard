@@ -6,6 +6,7 @@
 
 use std::num::NonZeroUsize;
 
+use crate::domain_declaration::{AmbiguousDomain, DomainName};
 use crate::semantics::callee_domain::CalleeDomains;
 use crate::semantics::caller_domain::CallerDomains;
 use crate::semantics::resolved_type::UnopenedReason;
@@ -22,7 +23,7 @@ use crate::syntax::module_distance::ModuleDistance;
 pub struct Signals {
     structural_similarity: StructuralSimilarity,
     import_overlap: ImportOverlap,
-    module_distance: ModuleDistance,
+    module_separation: ModuleSeparation,
     type_signature_match: TypeSignatureMatch,
     caller_domain_overlap: CallerDomainOverlap,
     callee_domain_overlap: CalleeDomainOverlap,
@@ -30,6 +31,9 @@ pub struct Signals {
 
 impl Signals {
     /// Stage 1 で測った 3 つのシグナルをまとめる。
+    ///
+    /// `module_distance` はディレクトリの段数で、**宣言を見ない**。どちらかのファイルが
+    /// `dryguard.toml` の宣言に当たったときは [`Self::with_declared_domains`] で重ねる。
     ///
     /// Stage 2 の 3 つは「LSP に尋ねていない」になる。**これは既定値ではなく、
     /// 尋ねていないという実際の状態**で、尋ねようとして届かなかった
@@ -43,7 +47,7 @@ impl Signals {
         Self {
             structural_similarity,
             import_overlap,
-            module_distance,
+            module_separation: ModuleSeparation::Directories(module_distance),
             type_signature_match: TypeSignatureMatch::Unavailable {
                 reason: SemanticsUnavailable::NotAsked,
             },
@@ -72,6 +76,20 @@ impl Signals {
         }
     }
 
+    /// 2 つのファイルが当たった `dryguard.toml` の宣言を重ねる。ディレクトリの段数は見なくなる。
+    ///
+    /// **宣言が推定に勝つ**（`docs/dryguard-plan.md`「Stage 3: 分類」）。
+    ///
+    /// **[`Self::new`] と分けてある。** 宣言は Stage 1 のシグナルではなく設定から来るもので、
+    /// 宣言を書かない利用者の組み立ては今までと同じ形で済む
+    /// （[`Self::with_callee_domain_overlap`] を分けているのと同じ形）。
+    pub fn with_declared_domains(self, declared_domains: DeclaredDomains) -> Self {
+        Self {
+            module_separation: ModuleSeparation::Declared(declared_domains),
+            ..self
+        }
+    }
+
     /// 呼び出し先ドメインの重なりを重ねる。
     ///
     /// **[`Self::with_semantics`] と分けてある。** 呼び出し先は hover / references と
@@ -95,9 +113,9 @@ impl Signals {
         self.import_overlap
     }
 
-    /// 2 つのファイルを隔てているディレクトリの段数。
-    pub fn module_distance(&self) -> ModuleDistance {
-        self.module_distance
+    /// 2 つのファイルの隔たり。ディレクトリの段数か、宣言したドメイン。
+    pub fn module_separation(&self) -> &ModuleSeparation {
+        &self.module_separation
     }
 
     /// 2 つのチャンクの型シグネチャが単一化できるか。
@@ -139,6 +157,64 @@ pub enum ImportOverlap {
     /// **理由を落とさない。** 宣言が無いのと、書いてあるのに読み取れなかったのとで
     /// **利用者が次にすることが違う** (`rules/architecture.md`「理由は落とさない」)。
     Unavailable(ImportsUnavailable),
+}
+
+/// 2 つのファイルの隔たりのシグナル（`module separation`）。
+///
+/// **どちらかのファイルが宣言に当たれば、段数を見ない。** 段数はドメイン境界の代理指標で、
+/// 宣言は利用者が明示した境界（`docs/dryguard-plan.md`「Stage 3: 分類」の「宣言が推定に勝つ」）。
+///
+/// **Why not（段数を宣言で書き換える）**: 宣言した 2 つのドメインの間に「何段」は無い。
+/// 同じ宣言なら 0 段と読ませるような値を作ると、`--explain` が測っていない段数を出す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleSeparation {
+    /// どちらのファイルも宣言に当たらず、ディレクトリの段数で測った。
+    Directories(ModuleDistance),
+    /// 少なくとも片方のファイルが宣言に当たり、宣言したドメインで比べた。
+    Declared(DeclaredDomains),
+}
+
+/// 2 つのファイルが当たった宣言。**少なくとも片方は当たっている。**
+///
+/// 両方とも当たっていない形を作らせないのは、それが [`ModuleSeparation::Directories`] の
+/// 役目だから（`rules/coding.md`「不正な状態を型で表現できなくする」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredDomains {
+    domain_a: Option<DomainName>,
+    domain_b: Option<DomainName>,
+}
+
+impl DeclaredDomains {
+    /// 両側が当たった宣言から作る。当たらなかった側は `None`。
+    ///
+    /// どちらも当たっていなければ作れないので `None` を返す。
+    pub fn new(domain_a: Option<DomainName>, domain_b: Option<DomainName>) -> Option<Self> {
+        if domain_a.is_none() && domain_b.is_none() {
+            return None;
+        }
+        Some(Self { domain_a, domain_b })
+    }
+
+    /// 先に指定されたほうのファイルが当たった宣言。
+    pub fn domain_a(&self) -> Option<&DomainName> {
+        self.domain_a.as_ref()
+    }
+
+    /// 後に指定されたほうのファイルが当たった宣言。
+    pub fn domain_b(&self) -> Option<&DomainName> {
+        self.domain_b.as_ref()
+    }
+
+    /// 2 つのファイルが同じ宣言に当たったか。
+    ///
+    /// **片方だけが当たったときは同じにしない。** 宣言に当たらなかったファイルは、
+    /// 宣言を書いた人がそのドメインに含めなかったファイル（`semantics::domain::Domain`）。
+    pub fn is_same_domain(&self) -> bool {
+        match (&self.domain_a, &self.domain_b) {
+            (Some(domain_a), Some(domain_b)) => domain_a == domain_b,
+            (Some(_), None) | (None, Some(_)) | (None, None) => false,
+        }
+    }
 }
 
 /// Stage 2 へ届かなかった理由。
@@ -308,6 +384,11 @@ pub enum CallerDomainOverlap {
     ServerStillWorking,
     /// サーバが references を提供していない。
     ReferencesNotProvided,
+    /// 参照元のファイルが、`dryguard.toml` の名前の違う 2 つの宣言に当たった。
+    ///
+    /// **利用者が直す先は宣言の側**（glob を狭める）。サーバや対象のコードの話ではないので、
+    /// 他の「測れない」と分ける。
+    AmbiguousDomain(AmbiguousDomain),
 }
 
 /// 両側の呼び出し元と、そこから出る重なり。
@@ -390,6 +471,10 @@ pub enum CalleeDomainOverlap {
     ServerStillWorking,
     /// サーバが callHierarchy を提供していない。
     CallHierarchyNotProvided,
+    /// 呼び出し先のファイルが、`dryguard.toml` の名前の違う 2 つの宣言に当たった。
+    ///
+    /// 分ける理由は [`CallerDomainOverlap::AmbiguousDomain`] と同じ。
+    AmbiguousDomain(AmbiguousDomain),
 }
 
 /// 両側の呼び出し先と、そこから出る重なり。

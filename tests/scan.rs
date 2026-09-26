@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use dryguard::classification::ConfiguredThresholds;
 use dryguard::classification::verdict::Verdict;
+use dryguard::domain_declaration::DomainDeclarations;
 use dryguard::lsp::ServerCommand;
 use dryguard::pipeline::{CandidatePair, Scan, scan_of};
 use dryguard::report::{Explanation, scan_text_of};
@@ -44,7 +45,12 @@ fn corpus_root() -> PathBuf {
 
 /// そのディレクトリを既定の閾値で走査した結果。
 fn scan_of_root(root: &Path, server: &ServerCommand) -> Scan {
-    let Ok(scan) = scan_of(root, ConfiguredThresholds::default(), server) else {
+    let Ok(scan) = scan_of(
+        root,
+        ConfiguredThresholds::default(),
+        &DomainDeclarations::default(),
+        server,
+    ) else {
         panic!("テストが渡す根は走査できる: {}", root.display());
     };
     scan

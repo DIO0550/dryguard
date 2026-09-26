@@ -19,6 +19,7 @@ use dryguard::classification::signal::{
 use dryguard::classification::verdict::Verdict;
 use dryguard::classification::{ConfiguredThresholds, classification_of};
 use dryguard::codebase::source_of;
+use dryguard::domain_declaration::DomainDeclarations;
 use dryguard::location::Location;
 use dryguard::lsp::{
     Client, ReferencesOutcome, ServerCommand, Session, SourceDocument, WorkspaceRoot,
@@ -29,6 +30,7 @@ use dryguard::semantics::callee_domain::{
     CalleeDomains, CalleeDomainsOutcome, callee_domains_outcome_of,
 };
 use dryguard::semantics::caller_domain::CallerDomains;
+use dryguard::semantics::domain::Domain;
 use dryguard::semantics::resolved_type::traced_type_names_of;
 use dryguard::semantics::type_signature::{
     OverloadSet, TypeSignatureOutcome, UntracedReason, type_signature_outcome_of,
@@ -278,7 +280,11 @@ fn reference_paths_of(session: &mut Session, chunk: &Chunk) -> Vec<PathBuf> {
 fn caller_domains_of(session: &mut Session, chunk: &Chunk) -> CallerDomains {
     let reference_paths = reference_paths_of(session, chunk);
 
-    let Some(caller_domains) = CallerDomains::from_reference_paths(&reference_paths) else {
+    let Some(caller_domains) =
+        CallerDomains::from_reference_paths(&reference_paths, &DomainDeclarations::default())
+            .ok()
+            .flatten()
+    else {
         panic!("返った参照元は 1 件以上ある: {reference_paths:?}");
     };
     caller_domains
@@ -358,7 +364,9 @@ fn callee_domains_outcome(session: &mut Session, chunk: &Chunk) -> CalleeDomains
             chunk.path().display()
         );
     };
-    let Ok(outcome) = callee_domains_outcome_of(session, &document, position) else {
+    let Ok(outcome) =
+        callee_domains_outcome_of(session, &document, position, &DomainDeclarations::default())
+    else {
         panic!("呼び出し先を尋ねられる: {}", chunk.path().display());
     };
     outcome
@@ -506,11 +514,14 @@ fn measured_with_an_lsp(location_a: &Location, location_b: &Location) -> Measure
         panic!("テストが渡す位置はどちらも関数の中を指している");
     };
 
-    let measured = measured_pair_of(
+    let Ok(measured) = measured_pair_of(
         &pair,
         ConfiguredThresholds::default(),
+        &DomainDeclarations::default(),
         &ServerCommand::typescript(),
-    );
+    ) else {
+        panic!("宣言が無ければ食い違わない");
+    };
     if let Some(error) = measured.semantics_error() {
         panic!("実サーバには尋ねられる: {error}");
     }
@@ -531,8 +542,10 @@ fn references_per_domain_of_a(measured: &MeasuredPair) -> Vec<(String, usize)> {
         .references_per_domain()
         .iter()
         .map(|(domain, count)| {
-            let name = domain
-                .directory()
+            let Domain::Directory(directory) = domain else {
+                panic!("宣言を渡していないので、ドメインはディレクトリ: {domain:?}");
+            };
+            let name = directory
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default()

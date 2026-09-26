@@ -19,6 +19,7 @@ use dryguard::classification::signal::{
 };
 use dryguard::classification::verdict::Verdict;
 use dryguard::classification::{ConfiguredThresholds, classification_of};
+use dryguard::domain_declaration::DomainDeclarations;
 use dryguard::location::Location;
 use dryguard::pipeline::{
     ChunkPairError, MeasuredPair, chunk_pair_of, measured_pair_of, signals_of,
@@ -303,7 +304,15 @@ fn measured_without_an_lsp(location_a: &Location, location_b: &Location) -> Meas
         panic!("テストが渡す位置はどちらも関数の中を指している");
     };
 
-    measured_pair_of(&pair, ConfiguredThresholds::default(), &missing_server())
+    let Ok(measured) = measured_pair_of(
+        &pair,
+        ConfiguredThresholds::default(),
+        &DomainDeclarations::default(),
+        &missing_server(),
+    ) else {
+        panic!("宣言が無ければ食い違わない");
+    };
+    measured
 }
 
 #[test]
@@ -343,7 +352,13 @@ fn test_compare_asks_with_the_source_stage1_read_even_if_the_file_disappears() {
     };
     fs::remove_file(&vanishing).expect("テストが書いたファイルは消せる");
 
-    let measured = measured_pair_of(&pair, ConfiguredThresholds::default(), &missing_server());
+    let measured = measured_pair_of(
+        &pair,
+        ConfiguredThresholds::default(),
+        &DomainDeclarations::default(),
+        &missing_server(),
+    )
+    .expect("宣言が無ければ食い違わない");
 
     fs::remove_dir_all(&directory).expect("テストが作ったディレクトリは消せる");
     assert_eq!(

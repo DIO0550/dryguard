@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::domain_declaration::{AmbiguousDomain, DomainDeclarations};
 use crate::lsp::{CalleesOutcome, ClientError, Session, SourceDocument};
 use crate::semantics::domain::{Domain, DomainCounts};
 use crate::similarity::Similarity;
@@ -64,12 +65,19 @@ pub enum CalleeDomainsOutcome {
     ServerStillWorking,
     /// サーバが callHierarchy を提供していない。
     CallHierarchyNotProvided,
+    /// 呼び出し先のファイルが、`dryguard.toml` の名前の違う 2 つの宣言に当たった。
+    ///
+    /// 落として数えない・`Err` にしない理由は
+    /// [`CallerDomainsOutcome::AmbiguousDomain`](super::caller_domain::CallerDomainsOutcome::AmbiguousDomain)
+    /// と同じ。
+    AmbiguousDomain(AmbiguousDomain),
 }
 
 /// その位置にある名前が呼んでいる相手を尋ねて、ドメインごとに数える。
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
-/// `Chunk::name_position` が指す識別子の位置。
+/// `Chunk::name_position` が指す識別子の位置。`declarations` は呼び出し先のファイルを
+/// どのドメインに数えるかを決める `dryguard.toml` の宣言。
 ///
 /// # Errors
 ///
@@ -80,8 +88,12 @@ pub fn callee_domains_outcome_of(
     session: &mut Session,
     document: &SourceDocument,
     position: SourcePosition,
+    declarations: &DomainDeclarations,
 ) -> Result<CalleeDomainsOutcome, ClientError> {
-    Ok(outcome_of(session.callees(document, position)?))
+    Ok(outcome_of(
+        session.callees(document, position)?,
+        declarations,
+    ))
 }
 
 /// callHierarchy の答えを、ドメインごとに数えた結果へ読み替える。
@@ -89,9 +101,9 @@ pub fn callee_domains_outcome_of(
 /// **サーバとの往復から切り離してある。** ここを [`callee_domains_outcome_of`] の中に
 /// 置くと、読み替えの枝が実サーバのテストからしか通らなくなる
 /// (`rules/tdd.md`「`lsp` は『応答を受け取ってから先』を切り出す」)。
-fn outcome_of(callees: CalleesOutcome) -> CalleeDomainsOutcome {
+fn outcome_of(callees: CalleesOutcome, declarations: &DomainDeclarations) -> CalleeDomainsOutcome {
     match callees {
-        CalleesOutcome::Answered(callee_paths) => counted_outcome_of(&callee_paths),
+        CalleesOutcome::Answered(callee_paths) => counted_outcome_of(&callee_paths, declarations),
         CalleesOutcome::NoItem => CalleeDomainsOutcome::NoCallHierarchyItem,
         CalleesOutcome::SeveralItems { count } => {
             CalleeDomainsOutcome::SeveralCallHierarchyItems { count }
@@ -108,7 +120,10 @@ fn outcome_of(callees: CalleesOutcome) -> CalleeDomainsOutcome {
 /// **自分のドメインへの呼び出しは落とさない。** 計画の出力イメージ
 /// `依存先ドメイン不一致 (billing::Invoice vs inventory::Stock)` は、それぞれが
 /// **自分のドメインへ下りている**ことを根拠にしている。
-fn counted_outcome_of(callee_paths: &[PathBuf]) -> CalleeDomainsOutcome {
+fn counted_outcome_of(
+    callee_paths: &[PathBuf],
+    declarations: &DomainDeclarations,
+) -> CalleeDomainsOutcome {
     if callee_paths.is_empty() {
         return CalleeDomainsOutcome::NoCallees;
     }
@@ -119,9 +134,10 @@ fn counted_outcome_of(callee_paths: &[PathBuf]) -> CalleeDomainsOutcome {
         .cloned()
         .collect();
 
-    match CalleeDomains::from_callee_paths(&in_codebase) {
-        Some(callee_domains) => CalleeDomainsOutcome::Counted(callee_domains),
-        None => CalleeDomainsOutcome::OnlyExternalCallees,
+    match CalleeDomains::from_callee_paths(&in_codebase, declarations) {
+        Ok(Some(callee_domains)) => CalleeDomainsOutcome::Counted(callee_domains),
+        Ok(None) => CalleeDomainsOutcome::OnlyExternalCallees,
+        Err(ambiguous) => CalleeDomainsOutcome::AmbiguousDomain(ambiguous),
     }
 }
 
@@ -143,10 +159,18 @@ pub struct CalleeDomains(DomainCounts);
 impl CalleeDomains {
     /// 呼び出し先のファイルから、ドメインごとの件数にまとめる。
     ///
-    /// `callee_paths` は `lsp::CalleesOutcome::Answered` が持つ呼び出し先。
-    /// 1 件も無ければ作れないので `None` を返す。
-    pub fn from_callee_paths(callee_paths: &[PathBuf]) -> Option<Self> {
-        DomainCounts::from_paths(callee_paths).map(Self)
+    /// `callee_paths` は `lsp::CalleesOutcome::Answered` が持つ呼び出し先、
+    /// `declarations` は `dryguard.toml` のドメインの宣言。
+    /// 1 件も無ければ作れないので `Ok(None)` を返す。
+    ///
+    /// # Errors
+    ///
+    /// どれかの呼び出し先が、名前の違う 2 つの宣言に当たったとき。
+    pub fn from_callee_paths(
+        callee_paths: &[PathBuf],
+        declarations: &DomainDeclarations,
+    ) -> Result<Option<Self>, AmbiguousDomain> {
+        Ok(DomainCounts::from_paths(callee_paths, declarations)?.map(Self))
     }
 
     /// 2 つの呼び出し先集合の Jaccard 係数。
@@ -165,7 +189,18 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    use crate::domain_declaration::DomainName;
     use crate::lsp::UriPathError;
+    use crate::test_support::declarations_of;
+
+    fn undeclared_outcome_of(callees: CalleesOutcome) -> CalleeDomainsOutcome {
+        outcome_of(callees, &DomainDeclarations::default())
+    }
+
+    fn directory_of(path: &str) -> Domain {
+        Domain::of_path(Path::new(path), &DomainDeclarations::default())
+            .expect("宣言が無ければ食い違わない")
+    }
 
     fn answered(callee_paths: &[&str]) -> CalleesOutcome {
         CalleesOutcome::Answered(callee_paths.iter().map(PathBuf::from).collect())
@@ -173,7 +208,7 @@ mod tests {
 
     #[test]
     fn test_callee_domains_outcome_of_answers_counts_them_per_domain() {
-        let outcome = outcome_of(answered(&[
+        let outcome = undeclared_outcome_of(answered(&[
             "/repo/src/utils/formatDate.ts",
             "/repo/src/report/dateHelper.ts",
             "/repo/src/report/label.ts",
@@ -185,14 +220,8 @@ mod tests {
         assert_eq!(
             callees.callees_per_domain(),
             vec![
-                (
-                    &Domain::of_path(Path::new("/repo/src/report/dateHelper.ts")),
-                    2
-                ),
-                (
-                    &Domain::of_path(Path::new("/repo/src/utils/formatDate.ts")),
-                    1
-                ),
+                (&directory_of("/repo/src/report/dateHelper.ts"), 2),
+                (&directory_of("/repo/src/utils/formatDate.ts"), 1),
             ]
         );
     }
@@ -202,7 +231,7 @@ mod tests {
         // 対照は上のテスト。`Counted` にすると、後段は 0 ドメインを
         // 「依存先が食い違っていない」と読む
         assert_eq!(
-            outcome_of(CalleesOutcome::NoCallees),
+            undeclared_outcome_of(CalleesOutcome::NoCallees),
             CalleeDomainsOutcome::NoCallees
         );
     }
@@ -211,7 +240,10 @@ mod tests {
     fn test_callee_domains_outcome_of_an_empty_answer_is_not_a_counted_empty_set() {
         // `lsp` は空配列を `NoCallees` に倒すが、ここでも受けておかないと
         // 0 件の `Answered` が「数えられた」側へ落ちる
-        assert_eq!(outcome_of(answered(&[])), CalleeDomainsOutcome::NoCallees);
+        assert_eq!(
+            undeclared_outcome_of(answered(&[])),
+            CalleeDomainsOutcome::NoCallees
+        );
     }
 
     #[test]
@@ -219,7 +251,7 @@ mod tests {
         // 対照は上の `NoCallees` のテスト。畳むと、尋ねる位置が悪かったことと
         // 本当に何も呼んでいないことが同じ答えになる
         assert_eq!(
-            outcome_of(CalleesOutcome::NoItem),
+            undeclared_outcome_of(CalleesOutcome::NoItem),
             CalleeDomainsOutcome::NoCallHierarchyItem
         );
     }
@@ -227,7 +259,7 @@ mod tests {
     #[test]
     fn test_callee_domains_outcome_of_several_starts_keeps_how_many_came_back() {
         assert_eq!(
-            outcome_of(CalleesOutcome::SeveralItems { count: 3 }),
+            undeclared_outcome_of(CalleesOutcome::SeveralItems { count: 3 }),
             CalleeDomainsOutcome::SeveralCallHierarchyItems { count: 3 }
         );
     }
@@ -235,7 +267,7 @@ mod tests {
     #[test]
     fn test_callee_domains_outcome_of_an_unreadable_uri_is_not_no_callees() {
         // 「読めなかった」を「1 件も無い」に畳むと、利用者が直す先が消える
-        let outcome = outcome_of(CalleesOutcome::Unreadable {
+        let outcome = undeclared_outcome_of(CalleesOutcome::Unreadable {
             cause: UriPathError::NotAFileUri {
                 uri: "untitled:Untitled-1".to_owned(),
             },
@@ -247,7 +279,7 @@ mod tests {
     #[test]
     fn test_callee_domains_outcome_of_a_working_server_is_not_no_callees() {
         assert_eq!(
-            outcome_of(CalleesOutcome::ServerStillWorking),
+            undeclared_outcome_of(CalleesOutcome::ServerStillWorking),
             CalleeDomainsOutcome::ServerStillWorking
         );
     }
@@ -255,7 +287,7 @@ mod tests {
     #[test]
     fn test_callee_domains_outcome_of_a_server_without_call_hierarchy_is_not_no_callees() {
         assert_eq!(
-            outcome_of(CalleesOutcome::NotSupported),
+            undeclared_outcome_of(CalleesOutcome::NotSupported),
             CalleeDomainsOutcome::CallHierarchyNotProvided
         );
     }
@@ -264,7 +296,7 @@ mod tests {
     fn test_callee_domains_outcome_of_does_not_count_a_callee_in_node_modules() {
         // `Date.getMonth()` のような素の言語機能でも、TypeScript の lib が
         // 呼び出し先として返る。数えると、lib しか呼ばない 2 つの関数が重なる
-        let outcome = outcome_of(answered(&[
+        let outcome = undeclared_outcome_of(answered(&[
             "/repo/src/utils/pad.ts",
             "/repo/node_modules/typescript/lib/lib.es5.d.ts",
         ]));
@@ -274,7 +306,7 @@ mod tests {
         };
         assert_eq!(
             callees.callees_per_domain(),
-            vec![(&Domain::of_path(Path::new("/repo/src/utils/pad.ts")), 1)]
+            vec![(&directory_of("/repo/src/utils/pad.ts"), 1)]
         );
     }
 
@@ -282,7 +314,7 @@ mod tests {
     fn test_callee_domains_outcome_of_only_callees_in_node_modules_is_not_no_callees() {
         // 対照は上のテスト。コードベースの中の呼び出し先が 1 件も無い。`NoCallees` に
         // 畳むと、何も呼んでいないのと、依存パッケージだけを呼んでいるのが同じ答えになる
-        let outcome = outcome_of(answered(&[
+        let outcome = undeclared_outcome_of(answered(&[
             "/repo/node_modules/typescript/lib/lib.es5.d.ts",
             "/repo/node_modules/lodash/index.d.ts",
         ]));
@@ -294,7 +326,7 @@ mod tests {
     fn test_callee_domains_outcome_of_a_directory_merely_named_like_node_modules_is_counted() {
         // 段の名前が一致したときだけ落とす。綴りの一部を見ていると、
         // `node_modules_backup` のような自分のディレクトリまで落ちる
-        let outcome = outcome_of(answered(&["/repo/src/node_modules_backup/pad.ts"]));
+        let outcome = undeclared_outcome_of(answered(&["/repo/src/node_modules_backup/pad.ts"]));
 
         assert!(
             matches!(outcome, CalleeDomainsOutcome::Counted(_)),
@@ -304,17 +336,28 @@ mod tests {
 
     #[test]
     fn test_callee_domains_of_no_callees_cannot_be_built() {
-        assert_eq!(CalleeDomains::from_callee_paths(&[]), None);
+        assert_eq!(
+            CalleeDomains::from_callee_paths(&[], &DomainDeclarations::default()),
+            Ok(None)
+        );
     }
 
     #[test]
     fn test_callee_domains_calling_into_separate_domains_do_not_overlap() {
-        let billing =
-            CalleeDomains::from_callee_paths(&[PathBuf::from("/repo/src/billing/invoice.ts")])
-                .expect("テストが渡す呼び出し先は 1 件以上");
-        let inventory =
-            CalleeDomains::from_callee_paths(&[PathBuf::from("/repo/src/inventory/stock.ts")])
-                .expect("テストが渡す呼び出し先は 1 件以上");
+        let billing = CalleeDomains::from_callee_paths(
+            &[PathBuf::from("/repo/src/billing/invoice.ts")],
+            &DomainDeclarations::default(),
+        )
+        .ok()
+        .flatten()
+        .expect("テストが渡す呼び出し先は 1 件以上");
+        let inventory = CalleeDomains::from_callee_paths(
+            &[PathBuf::from("/repo/src/inventory/stock.ts")],
+            &DomainDeclarations::default(),
+        )
+        .ok()
+        .flatten()
+        .expect("テストが渡す呼び出し先は 1 件以上");
 
         assert_eq!(billing.jaccard(&inventory).value(), 0.0);
     }
@@ -324,13 +367,68 @@ mod tests {
         // 対照は上のテスト。呼び出し先のファイル数は同じで、属するドメインだけが揃っている。
         // 上は集合が持つドメインで名付けているが、ここは両方 utils なので、
         // 見分けが付く呼び出し先のほうで名付ける
-        let calls_format_date =
-            CalleeDomains::from_callee_paths(&[PathBuf::from("/repo/src/utils/formatDate.ts")])
-                .expect("テストが渡す呼び出し先は 1 件以上");
-        let calls_pad =
-            CalleeDomains::from_callee_paths(&[PathBuf::from("/repo/src/utils/pad.ts")])
-                .expect("テストが渡す呼び出し先は 1 件以上");
+        let calls_format_date = CalleeDomains::from_callee_paths(
+            &[PathBuf::from("/repo/src/utils/formatDate.ts")],
+            &DomainDeclarations::default(),
+        )
+        .ok()
+        .flatten()
+        .expect("テストが渡す呼び出し先は 1 件以上");
+        let calls_pad = CalleeDomains::from_callee_paths(
+            &[PathBuf::from("/repo/src/utils/pad.ts")],
+            &DomainDeclarations::default(),
+        )
+        .ok()
+        .flatten()
+        .expect("テストが渡す呼び出し先は 1 件以上");
 
         assert_eq!(calls_format_date.jaccard(&calls_pad).value(), 1.0);
+    }
+
+    #[test]
+    fn test_callee_domains_outcome_of_counts_a_declared_callee_by_its_declared_name() {
+        // 層で分けた置き方。ディレクトリで数えると、請求と在庫のリポジトリが
+        // 同じ repositories/ に畳まれる
+        let declarations = declarations_of(&[("billing", &["src/**/invoice*.ts"])]);
+
+        let outcome = outcome_of(
+            answered(&[
+                "/repo/src/repositories/invoiceRepository.ts",
+                "/repo/src/repositories/auditRepository.ts",
+            ]),
+            &declarations,
+        );
+
+        let CalleeDomainsOutcome::Counted(callees) = outcome else {
+            panic!("呼び出し先を数えられる: {outcome:?}");
+        };
+        assert_eq!(
+            callees.callees_per_domain(),
+            vec![
+                (
+                    &Domain::Declared(DomainName::new("billing").expect("裸のキー")),
+                    1
+                ),
+                (
+                    &directory_of("/repo/src/repositories/auditRepository.ts"),
+                    1
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_callee_domains_outcome_of_a_callee_matching_two_declarations_is_not_counted() {
+        let declarations = declarations_of(&[
+            ("billing", &["src/billing/**"]),
+            ("reporting", &["src/**/report*.ts"]),
+        ]);
+
+        let outcome = outcome_of(answered(&["/repo/src/billing/report.ts"]), &declarations);
+
+        assert!(
+            matches!(outcome, CalleeDomainsOutcome::AmbiguousDomain(_)),
+            "2 つの宣言に当たる呼び出し先は数えない: {outcome:?}"
+        );
     }
 }

@@ -19,17 +19,19 @@ use crate::classification::Classification;
 use crate::classification::reason::{Lean, Reason};
 use crate::classification::signal::{
     CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, MeasuredCalleeDomains,
-    MeasuredCallerDomains, SemanticsUnavailable, StructuralSimilarity, TypeSignatureMatch,
+    MeasuredCallerDomains, ModuleSeparation, SemanticsUnavailable, StructuralSimilarity,
+    TypeSignatureMatch,
 };
+use crate::domain_declaration::{AmbiguousDomain, DomainName};
 use crate::location::Location;
 use crate::pipeline::{Scan, SkippedFile};
 use crate::report::Explanation;
 use crate::semantics::callee_domain::CalleeDomains;
 use crate::semantics::caller_domain::CallerDomains;
+use crate::semantics::domain::Domain;
 use crate::semantics::resolved_type::UnopenedReason;
 use crate::semantics::type_signature::UntracedReason;
 use crate::syntax::import::ImportsUnavailable;
-use crate::syntax::module_distance::ModuleDistance;
 use crate::threshold::Threshold;
 
 /// シグナルの値が測れたときの `signal status`。
@@ -226,11 +228,11 @@ fn reason_value_of(reason: &Reason, explanation: Explanation) -> Option<Value> {
             separate_directory_steps,
             lean,
         } => {
-            let applied = explained_steps_of(*separate_directory_steps, explanation);
+            let applied = explained_steps_of(signal, *separate_directory_steps, explanation);
 
             Some(signal_value_of(
                 "module-distance",
-                module_distance_value_of(*signal),
+                module_distance_value_of(signal),
                 *lean,
                 applied,
             ))
@@ -322,13 +324,17 @@ fn explained_threshold_of(
 }
 
 /// `--explain` のときだけ付ける、別のディレクトリと見なした段数。
+///
+/// **宣言で比べたときは付けない。** 段数を当てていないので、付けると
+/// 当てていない閾値を出すことになる（`rules/architecture.md`「判定は 1 箇所にだけ置く」）。
 fn explained_steps_of(
+    separation: &ModuleSeparation,
     separate_directory_steps: usize,
     explanation: Explanation,
 ) -> Option<(&'static str, Value)> {
-    match explanation {
-        Explanation::AskedSignals => None,
-        Explanation::AllSignals => {
+    match (explanation, separation) {
+        (Explanation::AskedSignals, _) | (_, ModuleSeparation::Declared(_)) => None,
+        (Explanation::AllSignals, ModuleSeparation::Directories(_)) => {
             Some(("separate_directory_steps", json!(separate_directory_steps)))
         }
     }
@@ -372,12 +378,29 @@ fn imports_unavailable_value_of(cause: ImportsUnavailable) -> Value {
     }
 }
 
-/// モジュール距離の値。段数は必ず取れるので、測れなかった形にはならない。
+/// モジュール距離の値。段数も宣言も必ず取れるので、測れなかった形にはならない。
 ///
 /// **それでも `status` を置く。** シグナルごとに `value` の形が変わると、読む側は
 /// どのキーを先に見るかをシグナルの名前から分岐することになる。
-fn module_distance_value_of(distance: ModuleDistance) -> Value {
-    measured_value_of(vec![("steps", json!(distance.steps()))])
+///
+/// 宣言で比べたときは、段数の代わりに両側の宣言の名前を出す。**当たらなかった側は
+/// `null`**（宣言が無いことと、名前の綴りを取り違えない）。
+fn module_distance_value_of(separation: &ModuleSeparation) -> Value {
+    match separation {
+        ModuleSeparation::Directories(distance) => {
+            measured_value_of(vec![("steps", json!(distance.steps()))])
+        }
+        ModuleSeparation::Declared(declared) => measured_value_of(vec![
+            (
+                "declared_domain_a",
+                json!(declared.domain_a().map(DomainName::as_str)),
+            ),
+            (
+                "declared_domain_b",
+                json!(declared.domain_b().map(DomainName::as_str)),
+            ),
+        ]),
+    }
 }
 
 /// 型シグネチャの単一化の可否。尋ねていないだけなら既定で `None`。
@@ -451,6 +474,7 @@ fn caller_domain_value_of(signal: &CallerDomainOverlap, explanation: Explanation
         CallerDomainOverlap::ReferencesNotProvided => {
             unmeasurable_value_of("references-not-provided")
         }
+        CallerDomainOverlap::AmbiguousDomain(ambiguous) => ambiguous_domain_value_of(ambiguous),
     };
 
     Some(value)
@@ -477,6 +501,7 @@ fn callee_domain_value_of(signal: &CalleeDomainOverlap, explanation: Explanation
         CalleeDomainOverlap::CallHierarchyNotProvided => {
             unmeasurable_value_of("call-hierarchy-not-provided")
         }
+        CalleeDomainOverlap::AmbiguousDomain(ambiguous) => ambiguous_domain_value_of(ambiguous),
     };
 
     Some(value)
@@ -499,13 +524,45 @@ fn callees_value_of(callees: &CalleeDomains) -> Value {
         .into_iter()
         .map(|(domain, callees)| {
             json!({
-                "domain": domain.directory().display().to_string(),
+                "domain": domain_value_of(domain),
+                "declared": matches!(domain, Domain::Declared(_)),
                 "callees": callees,
             })
         })
         .collect();
 
     Value::Array(per_domain)
+}
+
+/// ドメイン 1 つの綴り。宣言の名前か、ディレクトリ。
+///
+/// どちらだったかは隣の `declared` が持つ。**綴りだけでは見分けられない**
+/// （宣言の名前と同じ綴りのディレクトリがありうる）。
+fn domain_value_of(domain: &Domain) -> String {
+    match domain {
+        Domain::Declared(name) => name.to_string(),
+        Domain::Directory(directory) => directory.display().to_string(),
+    }
+}
+
+/// 2 つの宣言に当たったファイルと、その 2 つの名前。
+fn ambiguous_domain_value_of(ambiguous: &AmbiguousDomain) -> Value {
+    detailed_unmeasurable_value_of(
+        "ambiguous-domain",
+        vec![
+            ("path", json!(ambiguous.path().display().to_string())),
+            (
+                "domains",
+                json!(
+                    ambiguous
+                        .domains()
+                        .iter()
+                        .map(DomainName::as_str)
+                        .collect::<Vec<_>>()
+                ),
+            ),
+        ],
+    )
 }
 
 /// 測れた重なりと、両側のドメインごとの件数。
@@ -527,7 +584,8 @@ fn callers_value_of(callers: &CallerDomains) -> Value {
         .into_iter()
         .map(|(domain, references)| {
             json!({
-                "domain": domain.directory().display().to_string(),
+                "domain": domain_value_of(domain),
+                "declared": matches!(domain, Domain::Declared(_)),
                 "references": references,
             })
         })
@@ -645,13 +703,15 @@ mod tests {
 
     use std::path::{Path, PathBuf};
 
-    use crate::classification::signal::Signals;
+    use crate::classification::signal::{DeclaredDomains, Signals};
     use crate::classification::{
         ConfiguredThresholds, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of,
     };
+    use crate::domain_declaration::DomainDeclarations;
     use crate::semantics::caller_domain::CallerDomains;
     use crate::similarity::Similarity;
-    use crate::test_support::{line, location, overload_count, scan_of_fixture};
+    use crate::syntax::module_distance::ModuleDistance;
+    use crate::test_support::{declarations_of, line, location, overload_count, scan_of_fixture};
 
     /// テストが渡す 0.0-1.0 の値。
     fn measured(value: f64) -> Similarity {
@@ -852,8 +912,12 @@ mod tests {
         ];
         let paths_b = [PathBuf::from("/repo/src/inventory/stock.ts")];
         let (Some(callees_a), Some(callees_b)) = (
-            CalleeDomains::from_callee_paths(&paths_a),
-            CalleeDomains::from_callee_paths(&paths_b),
+            CalleeDomains::from_callee_paths(&paths_a, &DomainDeclarations::default())
+                .ok()
+                .flatten(),
+            CalleeDomains::from_callee_paths(&paths_b, &DomainDeclarations::default())
+                .ok()
+                .flatten(),
         ) else {
             panic!("テストが渡す呼び出し先は 1 件以上");
         };
@@ -1037,8 +1101,12 @@ mod tests {
         let paths_a = [PathBuf::from("/repo/src/billing/invoice.ts")];
         let paths_b = [PathBuf::from("/repo/src/inventory/stock.ts")];
         let (Some(callers_a), Some(callers_b)) = (
-            CallerDomains::from_reference_paths(&paths_a),
-            CallerDomains::from_reference_paths(&paths_b),
+            CallerDomains::from_reference_paths(&paths_a, &DomainDeclarations::default())
+                .ok()
+                .flatten(),
+            CallerDomains::from_reference_paths(&paths_b, &DomainDeclarations::default())
+                .ok()
+                .flatten(),
         ) else {
             panic!("テストが渡す参照元は 1 件以上");
         };
@@ -1052,6 +1120,7 @@ mod tests {
         let value = reason_of(&json, "caller-domain-overlap")["value"].clone();
         assert_eq!(value["overlap"], 0.0);
         assert_eq!(value["callers_a"][0]["domain"], "/repo/src/billing");
+        assert_eq!(value["callers_a"][0]["declared"], false);
         assert_eq!(value["callers_a"][0]["references"], 1);
         assert_eq!(value["callers_b"][0]["domain"], "/repo/src/inventory");
     }
@@ -1132,5 +1201,95 @@ mod tests {
 
         assert_eq!(json["skipped_files"].as_array().map(Vec::len), Some(0));
         assert_eq!(json["unchunkable"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn test_json_of_reports_a_declared_caller_domain_by_its_name() {
+        // 対照は上のテスト（宣言が無ければディレクトリで、declared は false）
+        let declarations = declarations_of(&[
+            ("billing", &["src/**/invoice*.ts"]),
+            ("inventory", &["src/**/product*.ts"]),
+        ]);
+        let callers = |path: &str| {
+            CallerDomains::from_reference_paths(&[PathBuf::from(path)], &declarations)
+                .expect("宣言は食い違わない")
+                .expect("参照元は 1 件")
+        };
+        let signals = accidental_duplication().with_semantics(
+            TypeSignatureMatch::NoName,
+            CallerDomainOverlap::Measured(MeasuredCallerDomains::new(
+                callers("/repo/src/services/invoiceService.ts"),
+                callers("/repo/src/services/productService.ts"),
+            )),
+        );
+
+        let json = json_of_signals(&signals, Explanation::AskedSignals);
+
+        let value = reason_of(&json, "caller-domain-overlap")["value"].clone();
+        assert_eq!(value["callers_a"][0]["domain"], "billing");
+        assert_eq!(value["callers_a"][0]["declared"], true);
+        assert_eq!(value["callers_b"][0]["domain"], "inventory");
+    }
+
+    #[test]
+    fn test_json_of_names_the_file_and_the_two_declarations_a_callee_matched() {
+        let ambiguous = declarations_of(&[
+            ("billing", &["src/billing/**"]),
+            ("reporting", &["src/**/report*.ts"]),
+        ])
+        .declared_domain_of(Path::new("/repo/src/billing/report.ts"))
+        .expect_err("2 つの宣言に当たる");
+        let signals = accidental_duplication()
+            .with_callee_domain_overlap(CalleeDomainOverlap::AmbiguousDomain(ambiguous));
+
+        let json = json_of_signals(&signals, Explanation::AskedSignals);
+
+        let value = reason_of(&json, "callee-domain-overlap")["value"].clone();
+        assert_eq!(value["status"], "unmeasurable");
+        assert_eq!(value["reason"], "ambiguous-domain");
+        assert_eq!(value["path"], "/repo/src/billing/report.ts");
+        assert_eq!(value["domains"], json!(["billing", "reporting"]));
+    }
+
+    /// [`accidental_duplication`] の片側だけが `billing` の宣言に当たった形。
+    fn accidental_duplication_with_one_declared_side() -> Signals {
+        let declared =
+            DeclaredDomains::new(Some(DomainName::new("billing").expect("裸のキー")), None)
+                .expect("片側は当たっている");
+
+        accidental_duplication().with_declared_domains(declared)
+    }
+
+    #[test]
+    fn test_json_of_reports_declared_domains_instead_of_steps() {
+        let json = json_of_signals(
+            &accidental_duplication_with_one_declared_side(),
+            Explanation::AskedSignals,
+        );
+
+        let value = reason_of(&json, "module-distance")["value"].clone();
+        assert_eq!(value["status"], "measured");
+        assert_eq!(value["declared_domain_a"], "billing");
+        assert_eq!(value["declared_domain_b"], Value::Null);
+        assert!(
+            value.get("steps").is_none(),
+            "宣言で比べたときは段数を出さない: {value:#}"
+        );
+    }
+
+    #[test]
+    fn test_json_of_with_explain_does_not_report_steps_it_did_not_apply() {
+        // 対照は `test_json_of_with_explain_reports_the_steps_it_counted_as_separate`
+        // （宣言が無ければ段数を出す）
+        let json = json_of_signals(
+            &accidental_duplication_with_one_declared_side(),
+            Explanation::AllSignals,
+        );
+
+        let reason = reason_of(&json, "module-distance");
+        assert!(
+            reason.get("separate_directory_steps").is_none(),
+            "当てていない段数を出さない: {reason:#}"
+        );
     }
 }

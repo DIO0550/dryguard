@@ -24,7 +24,20 @@
 | 3 | 正解のドメイン |
 
 **これはドメイン宣言の記法ではない。** 記法を決めるための材料で、関数単位まで書けるのは
-`grab-bag/` の同居を正解として書き表すため。`dryguard.toml` に何を書かせるかは Issue #36 が決める。
+`grab-bag/` の同居を正解として書き表すため。`dryguard.toml` に何を書かせるかは Issue #36 で
+決めた（パスの glob。ファイル単位まで）。
+
+## `dryguard.toml` は正解を宣言で書いたもの
+
+`layered/` と `nested/` には、`domains.tsv` の正解を `[domains]` の glob で書いた
+`dryguard.toml` を置いてある。`probe.sh` はこれがある置き方で、**宣言付きの `scan` が
+正解で出し直した判定と一致するか**を突き合わせる（Issue #237）。
+
+`grab-bag/` には置かない。正解が関数単位（`utils/helpers.ts` の中の同居）で、ファイル単位の
+宣言では書き表せない。
+
+`domains.tsv` を直したら `dryguard.toml` も直す。**片方だけ直すと、突き合わせが
+正解の食い違いを宣言の実装の誤りとして報告する**。
 
 ## `tests/corpus` と何が違うか
 

@@ -5,10 +5,9 @@
 //! シグナルの値だけを並べても、読む側はそれが判定にどう効いたのかを再現できない。
 
 use crate::classification::signal::{
-    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, StructuralSimilarity,
-    TypeSignatureMatch,
+    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, ModuleSeparation,
+    StructuralSimilarity, TypeSignatureMatch,
 };
-use crate::syntax::module_distance::ModuleDistance;
 use crate::threshold::Threshold;
 
 /// シグナル 1 つが判定をどちらへ傾けたか。
@@ -50,12 +49,13 @@ pub enum Reason {
         threshold: Threshold,
         lean: Lean,
     },
-    /// ディレクトリの隔たりが傾けた。
+    /// 2 つのファイルの隔たり（ディレクトリの段数か、宣言したドメイン）が傾けた。
     ModuleDistance {
-        signal: ModuleDistance,
-        /// 別のディレクトリへ下りていると見なした段数。
+        signal: ModuleSeparation,
+        /// 別のディレクトリへ下りていると見なした段数。**宣言で比べたときは当てていない**
+        /// （出力側は [`ModuleSeparation::Declared`] のときこれを出さない）。
         ///
-        /// **[`ModuleDistance`] で持たない。** あちらは 2 つのファイルの間を測った結果で、
+        /// **`ModuleDistance` で持たない。** あちらは 2 つのファイルの間を測った結果で、
         /// こちらは測っていない境目。同じ型にすると、**測っていない値を測った結果として
         /// 渡せてしまう**（`rules/coding.md`「不正な状態を型で表現できなくする」）。
         separate_directory_steps: usize,

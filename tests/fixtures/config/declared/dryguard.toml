@@ -1,0 +1,3 @@
+# glob の起点がこのディレクトリになることを見る（Issue #237）。
+[domains]
+billing = ["src/**/invoice*.ts"]

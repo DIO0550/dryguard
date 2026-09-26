@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use crate::domain_declaration::{AmbiguousDomain, DomainDeclarations};
 use crate::lsp::{ClientError, ReferencesOutcome, Session, SourceDocument};
 use crate::semantics::domain::{Domain, DomainCounts};
 use crate::similarity::Similarity;
@@ -29,12 +30,19 @@ pub enum CallerDomainsOutcome {
     ServerStillWorking,
     /// サーバが references を提供していない。
     ReferencesNotProvided,
+    /// 参照元のファイルが、`dryguard.toml` の名前の違う 2 つの宣言に当たった。
+    ///
+    /// **そのファイルを落として数えない。** 落とすと、残った参照元だけで重なりを出し、
+    /// 材料が欠けたことが判定から見えなくなる。**`Err` にもしない** — 参照元は
+    /// サーバが答えるまで分からず、`scan` の途中で落とすと出せていた候補ペアまで捨てる。
+    AmbiguousDomain(AmbiguousDomain),
 }
 
 /// その位置にある名前の参照元を尋ねて、ドメインごとに数える。
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
-/// `Chunk::name_position` が指す識別子の位置。
+/// `Chunk::name_position` が指す識別子の位置。`declarations` は参照元のファイルを
+/// どのドメインに数えるかを決める `dryguard.toml` の宣言。
 ///
 /// # Errors
 ///
@@ -45,8 +53,12 @@ pub fn caller_domains_outcome_of(
     session: &mut Session,
     document: &SourceDocument,
     position: SourcePosition,
+    declarations: &DomainDeclarations,
 ) -> Result<CallerDomainsOutcome, ClientError> {
-    Ok(outcome_of(session.references(document, position)?))
+    Ok(outcome_of(
+        session.references(document, position)?,
+        declarations,
+    ))
 }
 
 /// references の答えを、ドメインごとに数えた結果へ読み替える。
@@ -54,12 +66,16 @@ pub fn caller_domains_outcome_of(
 /// **サーバとの往復から切り離してある。** ここを [`caller_domains_outcome_of`] の中に
 /// 置くと、読み替えの枝が実サーバのテストからしか通らなくなる
 /// (`rules/tdd.md`「`lsp` は『応答を受け取ってから先』を切り出す」)。
-fn outcome_of(references: ReferencesOutcome) -> CallerDomainsOutcome {
+fn outcome_of(
+    references: ReferencesOutcome,
+    declarations: &DomainDeclarations,
+) -> CallerDomainsOutcome {
     match references {
         ReferencesOutcome::Answered(reference_paths) => {
-            match CallerDomains::from_reference_paths(&reference_paths) {
-                Some(caller_domains) => CallerDomainsOutcome::Counted(caller_domains),
-                None => CallerDomainsOutcome::NoReferences,
+            match CallerDomains::from_reference_paths(&reference_paths, declarations) {
+                Ok(Some(caller_domains)) => CallerDomainsOutcome::Counted(caller_domains),
+                Ok(None) => CallerDomainsOutcome::NoReferences,
+                Err(ambiguous) => CallerDomainsOutcome::AmbiguousDomain(ambiguous),
             }
         }
         ReferencesOutcome::NoAnswer => CallerDomainsOutcome::NoReferences,
@@ -81,10 +97,18 @@ pub struct CallerDomains(DomainCounts);
 impl CallerDomains {
     /// 参照元のファイルから、ドメインごとの件数にまとめる。
     ///
-    /// `reference_paths` は `lsp::ReferencesOutcome::Answered` が持つ参照元。
-    /// 1 件も無ければ作れないので `None` を返す。
-    pub fn from_reference_paths(reference_paths: &[PathBuf]) -> Option<Self> {
-        DomainCounts::from_paths(reference_paths).map(Self)
+    /// `reference_paths` は `lsp::ReferencesOutcome::Answered` が持つ参照元、
+    /// `declarations` は `dryguard.toml` のドメインの宣言。
+    /// 1 件も無ければ作れないので `Ok(None)` を返す。
+    ///
+    /// # Errors
+    ///
+    /// どれかの参照元が、名前の違う 2 つの宣言に当たったとき。
+    pub fn from_reference_paths(
+        reference_paths: &[PathBuf],
+        declarations: &DomainDeclarations,
+    ) -> Result<Option<Self>, AmbiguousDomain> {
+        Ok(DomainCounts::from_paths(reference_paths, declarations)?.map(Self))
     }
 
     /// 2 つの呼び出し元集合の Jaccard 係数。
@@ -104,6 +128,25 @@ mod tests {
     use std::path::Path;
 
     use crate::lsp::UriPathError;
+    use crate::test_support::declarations_of;
+
+    fn undeclared_outcome_of(references: ReferencesOutcome) -> CallerDomainsOutcome {
+        outcome_of(references, &DomainDeclarations::default())
+    }
+
+    fn directory_of(path: &str) -> Domain {
+        Domain::of_path(Path::new(path), &DomainDeclarations::default())
+            .expect("宣言が無ければ食い違わない")
+    }
+
+    fn undeclared_callers(reference_path: &str) -> CallerDomains {
+        CallerDomains::from_reference_paths(
+            &[PathBuf::from(reference_path)],
+            &DomainDeclarations::default(),
+        )
+        .expect("宣言が無ければ食い違わない")
+        .expect("テストが渡す参照元は 1 件以上")
+    }
 
     fn answered(reference_paths: &[&str]) -> ReferencesOutcome {
         ReferencesOutcome::Answered(reference_paths.iter().map(PathBuf::from).collect())
@@ -111,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_caller_domains_outcome_of_answers_counts_them_per_domain() {
-        let outcome = outcome_of(answered(&[
+        let outcome = undeclared_outcome_of(answered(&[
             "/repo/src/billing/invoice.ts",
             "/repo/src/inventory/stock.ts",
             "/repo/src/inventory/restock.ts",
@@ -123,14 +166,8 @@ mod tests {
         assert_eq!(
             callers.references_per_domain(),
             vec![
-                (
-                    &Domain::of_path(Path::new("/repo/src/billing/invoice.ts")),
-                    1
-                ),
-                (
-                    &Domain::of_path(Path::new("/repo/src/inventory/stock.ts")),
-                    2
-                ),
+                (&directory_of("/repo/src/billing/invoice.ts"), 1),
+                (&directory_of("/repo/src/inventory/stock.ts"), 2),
             ]
         );
     }
@@ -140,7 +177,7 @@ mod tests {
         // 対照は上のテスト。`Counted` にすると、後段は 0 ドメインを
         // 「別ドメインに散っていない」と読む
         assert_eq!(
-            outcome_of(ReferencesOutcome::NoAnswer),
+            undeclared_outcome_of(ReferencesOutcome::NoAnswer),
             CallerDomainsOutcome::NoReferences
         );
     }
@@ -150,7 +187,7 @@ mod tests {
         // `lsp` は空配列を `NoAnswer` に倒すが、ここでも受けておかないと
         // 0 件の `Answered` が「数えられた」側へ落ちる
         assert_eq!(
-            outcome_of(answered(&[])),
+            undeclared_outcome_of(answered(&[])),
             CallerDomainsOutcome::NoReferences
         );
     }
@@ -158,7 +195,7 @@ mod tests {
     #[test]
     fn test_caller_domains_outcome_of_an_unreadable_uri_is_not_no_references() {
         // 「読めなかった」を「1 件も無い」に畳むと、利用者が直す先が消える
-        let outcome = outcome_of(ReferencesOutcome::Unreadable {
+        let outcome = undeclared_outcome_of(ReferencesOutcome::Unreadable {
             cause: UriPathError::NotAFileUri {
                 uri: "untitled:Untitled-1".to_owned(),
             },
@@ -170,7 +207,7 @@ mod tests {
     #[test]
     fn test_caller_domains_outcome_of_a_working_server_is_not_no_references() {
         assert_eq!(
-            outcome_of(ReferencesOutcome::ServerStillWorking),
+            undeclared_outcome_of(ReferencesOutcome::ServerStillWorking),
             CallerDomainsOutcome::ServerStillWorking
         );
     }
@@ -178,25 +215,47 @@ mod tests {
     #[test]
     fn test_caller_domains_outcome_of_a_server_without_references_is_not_no_references() {
         assert_eq!(
-            outcome_of(ReferencesOutcome::NotSupported),
+            undeclared_outcome_of(ReferencesOutcome::NotSupported),
             CallerDomainsOutcome::ReferencesNotProvided
         );
     }
 
     #[test]
     fn test_caller_domains_of_no_references_cannot_be_built() {
-        assert_eq!(CallerDomains::from_reference_paths(&[]), None);
+        assert_eq!(
+            CallerDomains::from_reference_paths(&[], &DomainDeclarations::default()),
+            Ok(None)
+        );
     }
 
     #[test]
     fn test_caller_domains_called_from_separate_domains_do_not_overlap() {
-        let billing =
-            CallerDomains::from_reference_paths(&[PathBuf::from("/repo/src/billing/invoice.ts")])
-                .expect("テストが渡す参照元は 1 件以上");
-        let inventory =
-            CallerDomains::from_reference_paths(&[PathBuf::from("/repo/src/inventory/stock.ts")])
-                .expect("テストが渡す参照元は 1 件以上");
+        let billing = undeclared_callers("/repo/src/billing/invoice.ts");
+        let inventory = undeclared_callers("/repo/src/inventory/stock.ts");
 
         assert_eq!(billing.jaccard(&inventory).value(), 0.0);
+    }
+
+    #[test]
+    fn test_caller_domains_outcome_of_a_reference_matching_two_declarations_is_not_counted() {
+        // 対照は 1 つ目のテスト。そのファイルを落として数えると、材料が欠けたことが
+        // 重なりの値からは見えない
+        let declarations = declarations_of(&[
+            ("billing", &["src/billing/**"]),
+            ("reporting", &["src/**/report*.ts"]),
+        ]);
+
+        let outcome = outcome_of(
+            answered(&[
+                "/repo/src/billing/invoice.ts",
+                "/repo/src/billing/report.ts",
+            ]),
+            &declarations,
+        );
+
+        let CallerDomainsOutcome::AmbiguousDomain(ambiguous) = outcome else {
+            panic!("2 つの宣言に当たる参照元は数えない: {outcome:?}");
+        };
+        assert_eq!(ambiguous.path(), Path::new("/repo/src/billing/report.ts"));
     }
 }
