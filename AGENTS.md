@@ -237,6 +237,7 @@ cargo test                                  # テスト
 bash harness/githooks/pre-push              # push 前の検査をまとめて走らせる
 bash harness/ci/pr-body-diff-test.sh        # PR 本文の差分規模を突き合わせる検査のテスト
 bash .claude/hooks/pre-push-check-test.sh   # 層 3 の push 前検査フックのテスト
+bash .claude/hooks/post-edit-rust-test.sh   # 層 3 の編集後 fmt / clippy フックのテスト
 ```
 
 PR 本文の差分規模の突き合わせ自体は、本文をファイルに落として走らせる
