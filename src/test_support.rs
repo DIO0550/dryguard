@@ -10,6 +10,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use crate::classification::ConfiguredThresholds;
+use crate::domain_declaration::{DomainDeclaration, DomainDeclarations, DomainName};
 use crate::line_number::LineNumber;
 use crate::location::Location;
 use crate::lsp::{DeclarationSite, ServerCommand, SignatureText};
@@ -77,6 +78,33 @@ pub(crate) fn declaration_site(path: &str, number: usize) -> DeclarationSite {
     DeclarationSite::new(Path::new(path), position).expect("テストが渡すパスは絶対パス")
 }
 
+/// `/repo` を起点にした、ドメインの宣言の一覧。
+///
+/// `declared` は宣言の名前と、その glob の組。照合は綴りだけを見るので、
+/// `/repo` は実在しなくてよい。
+///
+/// # Panics
+///
+/// 名前が裸のキーでない・glob が読めない・glob が 1 つも無いとき。
+/// どれも設定の読み取りが `Err` にするので、テストが渡すのは書き間違い。
+pub(crate) fn declarations_of(declared: &[(&str, &[&str])]) -> DomainDeclarations {
+    let declarations = declared
+        .iter()
+        .map(|(name, patterns)| {
+            DomainDeclaration::new(
+                DomainName::new(name).expect("テストが渡す名前は裸のキー"),
+                patterns
+                    .iter()
+                    .map(|pattern| pattern.parse().expect("テストが渡す glob は読める"))
+                    .collect(),
+            )
+            .expect("テストが渡す宣言は glob を 1 つ以上持つ")
+        })
+        .collect();
+
+    DomainDeclarations::new(Path::new("/repo"), declarations)
+}
+
 /// ファイルと行で表した位置。
 ///
 /// 実在するファイルを指さなくてよい（綴りを出すだけのテストが使う）。
@@ -104,5 +132,11 @@ pub(crate) fn location(path: &str, number: usize) -> Location {
 pub(crate) fn scan_of_fixture(relative_path: &str, thresholds: ConfiguredThresholds) -> Scan {
     let root = repository_path(&format!("tests/fixtures/{relative_path}"));
 
-    scan_of(&root, thresholds, &missing_server()).expect("フィクスチャのディレクトリは走査できる")
+    scan_of(
+        &root,
+        thresholds,
+        &DomainDeclarations::default(),
+        &missing_server(),
+    )
+    .expect("フィクスチャのディレクトリは走査できる")
 }

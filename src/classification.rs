@@ -561,7 +561,8 @@ fn caller_domain_lean_of(signal: &CallerDomainOverlap, shared_threshold: Thresho
         | CallerDomainOverlap::NoReferences
         | CallerDomainOverlap::UnreadableReferences
         | CallerDomainOverlap::ServerStillWorking
-        | CallerDomainOverlap::ReferencesNotProvided => None,
+        | CallerDomainOverlap::ReferencesNotProvided
+        | CallerDomainOverlap::AmbiguousDomain(_) => None,
     };
 
     overlap_lean_of(measured, shared_threshold)
@@ -585,7 +586,8 @@ fn callee_domain_lean_of(signal: &CalleeDomainOverlap, shared_threshold: Thresho
         | CalleeDomainOverlap::OnlyExternalCallees
         | CalleeDomainOverlap::UnreadableCallees
         | CalleeDomainOverlap::ServerStillWorking
-        | CalleeDomainOverlap::CallHierarchyNotProvided => None,
+        | CalleeDomainOverlap::CallHierarchyNotProvided
+        | CalleeDomainOverlap::AmbiguousDomain(_) => None,
     };
 
     overlap_lean_of(measured, shared_threshold)
@@ -666,6 +668,7 @@ mod tests {
         TypeSignatureMatch,
     };
     use crate::classification::verdict::Verdict;
+    use crate::domain_declaration::DomainDeclarations;
     use crate::semantics::callee_domain::CalleeDomains;
     use crate::semantics::caller_domain::CallerDomains;
     use crate::semantics::resolved_type::UnopenedReason;
@@ -682,7 +685,10 @@ mod tests {
     fn caller_domains(reference_paths: &[&str]) -> CallerDomains {
         let paths: Vec<PathBuf> = reference_paths.iter().map(PathBuf::from).collect();
 
-        CallerDomains::from_reference_paths(&paths).expect("テストが渡す参照元は 1 件以上")
+        CallerDomains::from_reference_paths(&paths, &DomainDeclarations::default())
+            .ok()
+            .flatten()
+            .expect("テストが渡す参照元は 1 件以上")
     }
 
     /// 呼び出し元が別のドメインに分かれている（重なり 0.00）。
@@ -704,7 +710,10 @@ mod tests {
     fn callee_domains(callee_paths: &[&str]) -> CalleeDomains {
         let paths: Vec<PathBuf> = callee_paths.iter().map(PathBuf::from).collect();
 
-        CalleeDomains::from_callee_paths(&paths).expect("テストが渡す呼び出し先は 1 件以上")
+        CalleeDomains::from_callee_paths(&paths, &DomainDeclarations::default())
+            .ok()
+            .flatten()
+            .expect("テストが渡す呼び出し先は 1 件以上")
     }
 
     /// 呼び出し先が別のドメインに分かれている（重なり 0.00）。

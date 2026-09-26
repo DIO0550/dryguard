@@ -21,6 +21,7 @@ use crate::classification::{
     Classification, ConfiguredThresholds, classification_of, is_structurally_similar,
 };
 use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
+use crate::domain_declaration::DomainDeclarations;
 use crate::location::Location;
 use crate::lsp::{
     Client, ClientError, DocumentError, ProjectMembershipOutcome, ProjectRoot, ServerCommand,
@@ -257,6 +258,7 @@ impl MeasuredPair {
 /// ペアを Stage 1 で測り、候補ペアなら Stage 2 を LSP に尋ねて重ねる。
 ///
 /// `thresholds` は判定に当てる閾値（候補ペアと見なす構造類似度の下限もここが持つ）、
+/// `declarations` は `dryguard.toml` のドメインの宣言、
 /// `server` は起こす LSP サーバの指定（TypeScript なら [`ServerCommand::typescript`]）。
 ///
 /// **候補ペアでなければサーバを起こさない。** 構造が似ていないペアの判定は Stage 2 で
@@ -270,6 +272,7 @@ impl MeasuredPair {
 pub fn measured_pair_of(
     pair: &ChunkPair,
     thresholds: ConfiguredThresholds,
+    declarations: &DomainDeclarations,
     server: &ServerCommand,
 ) -> MeasuredPair {
     let signals = signals_of(&pair.chunk_a, &pair.chunk_b);
@@ -278,7 +281,7 @@ pub fn measured_pair_of(
         signals.structural_similarity(),
         thresholds.structural_similarity(),
     ) {
-        semantics_of(pair, server)
+        semantics_of(pair, declarations, server)
     } else {
         AskedSemantics::unavailable(SemanticsUnavailable::NotACandidate, None)
     };
@@ -413,6 +416,7 @@ impl AskedCallerDomains {
         membership: &mut AskedMembership,
         document: &SourceDocument,
         position: SourcePosition,
+        declarations: &DomainDeclarations,
     ) -> Self {
         match membership {
             AskedMembership::Unrooted { markers } => Self::Unrooted {
@@ -427,9 +431,12 @@ impl AskedCallerDomains {
             // 「取れなかったシグナルを既定値で埋めない」）。
             AskedMembership::NotProvided => Self::MembershipNotProvided,
             AskedMembership::Unreachable(cause) => Self::MembershipUnreachable(cause.take()),
-            AskedMembership::Askable => {
-                Self::Answered(caller_domains_outcome_of(session, document, position))
-            }
+            AskedMembership::Askable => Self::Answered(caller_domains_outcome_of(
+                session,
+                document,
+                position,
+                declarations,
+            )),
         }
     }
 
@@ -488,7 +495,11 @@ fn unavailable_of(cause: &SemanticsError) -> SemanticsUnavailable {
 /// 根が印より下に来たときに**参照元が一部しか返らない**。
 ///
 /// 尋ねる前に止まったときも失敗にしない。取れなかったことを持つ [`AskedSemantics`] を返す。
-fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
+fn semantics_of(
+    pair: &ChunkPair,
+    declarations: &DomainDeclarations,
+    server: &ServerCommand,
+) -> AskedSemantics {
     let document_a = match document_of(&pair.chunk_a, &pair.source_a) {
         Ok(document) => document,
         Err(cause) => return AskedSemantics::from_setup_failure(cause),
@@ -522,10 +533,9 @@ fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
     let asked = asked_semantics_of(
         &mut session,
         &root,
-        &pair.chunk_a,
-        &document_a,
-        &pair.chunk_b,
-        &document_b,
+        (&pair.chunk_a, &document_a),
+        (&pair.chunk_b, &document_b),
+        declarations,
     );
 
     // **答えを受け取っていても、異常終了したサーバの答えは採らない。** 途中で
@@ -555,10 +565,9 @@ fn semantics_of(pair: &ChunkPair, server: &ServerCommand) -> AskedSemantics {
 fn asked_semantics_of(
     session: &mut Session,
     root: &ProjectRoot,
-    chunk_a: &Chunk,
-    document_a: &SourceDocument,
-    chunk_b: &Chunk,
-    document_b: &SourceDocument,
+    (chunk_a, document_a): (&Chunk, &SourceDocument),
+    (chunk_b, document_b): (&Chunk, &SourceDocument),
+    declarations: &DomainDeclarations,
 ) -> AskedSemantics {
     // 開かせられなければ 1 つも尋ねられないので、ここは降りてよい。
     if let Err(cause) = session.open_document(document_a) {
@@ -590,13 +599,25 @@ fn asked_semantics_of(
     let mut membership_a = AskedMembership::ask(session, root, document_a);
     let mut membership_b = AskedMembership::ask(session, root, document_b);
 
-    let callers_a = AskedCallerDomains::ask(session, &mut membership_a, document_a, position_a);
-    let callers_b = AskedCallerDomains::ask(session, &mut membership_b, document_b, position_b);
+    let callers_a = AskedCallerDomains::ask(
+        session,
+        &mut membership_a,
+        document_a,
+        position_a,
+        declarations,
+    );
+    let callers_b = AskedCallerDomains::ask(
+        session,
+        &mut membership_b,
+        document_b,
+        position_b,
+        declarations,
+    );
 
     // **呼び出し先は所属で絞らない。** outgoingCalls はそのファイル自身の import を辿るので、
     // サーバがその場で組み立てたプロジェクトでも揃う（呼び出し元は逆向きなので揃わない）
-    let callees_a = callee_domains_outcome_of(session, document_a, position_a);
-    let callees_b = callee_domains_outcome_of(session, document_b, position_b);
+    let callees_a = callee_domains_outcome_of(session, document_a, position_a, declarations);
+    let callees_b = callee_domains_outcome_of(session, document_b, position_b, declarations);
 
     asked_semantics_of_outcomes(
         (signature_a, signature_b),
@@ -915,6 +936,9 @@ fn unifiable_match_of(unifiable: bool) -> TypeSignatureMatch {
 ///
 /// **片方でも取れていなければ 0.00 にしない。** 重なりが無いのと材料が無いのは
 /// 別の話で、同じ値にすると判定も読者も区別できない。
+///
+/// **宣言が食い違ったほうを先に出す。** 直す先が `dryguard.toml` で、サーバや対象の
+/// コードを直しても変わらない（[`callee_domain_overlap_of`] と同じ軸）。
 fn caller_domain_overlap_of(
     callers_a: &CallerDomainsOutcome,
     callers_b: &CallerDomainsOutcome,
@@ -925,6 +949,10 @@ fn caller_domain_overlap_of(
                 counted_a.clone(),
                 counted_b.clone(),
             ))
+        }
+        (CallerDomainsOutcome::AmbiguousDomain(ambiguous), _)
+        | (_, CallerDomainsOutcome::AmbiguousDomain(ambiguous)) => {
+            CallerDomainOverlap::AmbiguousDomain(ambiguous.clone())
         }
         (CallerDomainsOutcome::NoReferences, _) | (_, CallerDomainsOutcome::NoReferences) => {
             CallerDomainOverlap::NoReferences
@@ -959,6 +987,10 @@ fn callee_domain_overlap_of(
                 counted_a.clone(),
                 counted_b.clone(),
             ))
+        }
+        (CalleeDomainsOutcome::AmbiguousDomain(ambiguous), _)
+        | (_, CalleeDomainsOutcome::AmbiguousDomain(ambiguous)) => {
+            CalleeDomainOverlap::AmbiguousDomain(ambiguous.clone())
         }
         (CalleeDomainsOutcome::NoCallees, _) | (_, CalleeDomainsOutcome::NoCallees) => {
             CalleeDomainOverlap::NoCallees
@@ -1025,7 +1057,8 @@ impl Error for SemanticsError {
 /// コードベース全体を走査して、候補ペアを判定する。
 ///
 /// `root` は走査を始めるディレクトリ、`thresholds` は判定に当てる閾値
-/// （候補ペアとして拾う構造類似度の下限もここが持つ）、`server` は起こす LSP サーバの指定。
+/// （候補ペアとして拾う構造類似度の下限もここが持つ）、`declarations` は `dryguard.toml` の
+/// ドメインの宣言、`server` は起こす LSP サーバの指定。
 ///
 /// 読めなかったファイルと切り出せなかった関数は、走査を止めずに結果へ残す。
 /// **1 ファイルのために全体を落とすと、他のペアの判定まで失われる**。
@@ -1040,6 +1073,7 @@ impl Error for SemanticsError {
 pub fn scan_of(
     root: &Path,
     thresholds: ConfiguredThresholds,
+    declarations: &DomainDeclarations,
     server: &ServerCommand,
 ) -> Result<Scan, CodebaseError> {
     let paths = typescript_paths_of(root)?;
@@ -1087,6 +1121,7 @@ pub fn scan_of(
     Ok(scan_of_chunks(
         &chunks,
         thresholds,
+        declarations,
         server,
         ScanInputs {
             file_count,
@@ -1175,6 +1210,7 @@ struct ScanInputs {
 fn scan_of_chunks(
     chunks: &[ScannedChunk],
     thresholds: ConfiguredThresholds,
+    declarations: &DomainDeclarations,
     server: &ServerCommand,
     inputs: ScanInputs,
 ) -> Scan {
@@ -1199,7 +1235,12 @@ fn scan_of_chunks(
         .flat_map(|compared| compared.candidates)
         .collect();
 
-    let semantics = scan_semantics_of(chunks, &asked_chunk_indices_of(&candidates), server);
+    let semantics = scan_semantics_of(
+        chunks,
+        &asked_chunk_indices_of(&candidates),
+        declarations,
+        server,
+    );
     let candidate_pairs = candidates
         .into_iter()
         .map(|candidate| candidate_pair_of(chunks, &semantics, candidate, thresholds))
@@ -1497,6 +1538,7 @@ struct AskedChunkSemantics {
 fn scan_semantics_of(
     chunks: &[ScannedChunk],
     asked: &BTreeSet<usize>,
+    declarations: &DomainDeclarations,
     server: &ServerCommand,
 ) -> ScanSemantics {
     if asked.is_empty() {
@@ -1534,7 +1576,13 @@ fn scan_semantics_of(
         }
     };
 
-    let semantics = asked_scan_semantics_of(&mut session, &root, chunks, asked, &documents);
+    let semantics = asked_scan_semantics_of(
+        &mut session,
+        &root,
+        chunks,
+        (asked, &documents),
+        declarations,
+    );
 
     // **答えを受け取っていても、異常終了したサーバの答えは採らない**（[`semantics_of`]）。
     if let Err(cause) = session.shutdown() {
@@ -1627,8 +1675,8 @@ fn asked_scan_semantics_of(
     session: &mut Session,
     root: &ProjectRoot,
     chunks: &[ScannedChunk],
-    asked: &BTreeSet<usize>,
-    documents: &AskedDocuments,
+    (asked, documents): (&BTreeSet<usize>, &AskedDocuments),
+    declarations: &DomainDeclarations,
 ) -> ScanSemantics {
     // 開かせられなければ 1 つも尋ねられないので、ここは降りてよい。
     for document in &documents.documents {
@@ -1665,11 +1713,14 @@ fn asked_scan_semantics_of(
             membership,
             askable.document,
             askable.position,
+            declarations,
         ));
     }
     let callees: Vec<Result<CalleeDomainsOutcome, ClientError>> = askable
         .iter()
-        .map(|askable| callee_domains_outcome_of(session, askable.document, askable.position))
+        .map(|askable| {
+            callee_domains_outcome_of(session, askable.document, askable.position, declarations)
+        })
         .collect();
 
     ScanSemantics {
@@ -2761,8 +2812,13 @@ mod tests {
         relative_path: &str,
         thresholds: ConfiguredThresholds,
     ) -> Scan {
-        scan_of(&fixture(relative_path), thresholds, &missing_server())
-            .expect("フィクスチャのディレクトリは走査できる")
+        scan_of(
+            &fixture(relative_path),
+            thresholds,
+            &DomainDeclarations::default(),
+            &missing_server(),
+        )
+        .expect("フィクスチャのディレクトリは走査できる")
     }
 
     #[test]
@@ -2883,7 +2939,12 @@ mod tests {
     fn test_scan_of_a_missing_directory_reports_the_root_it_was_given() {
         let root = fixture("scan/missing");
 
-        let result = scan_of(&root, ConfiguredThresholds::default(), &missing_server());
+        let result = scan_of(
+            &root,
+            ConfiguredThresholds::default(),
+            &DomainDeclarations::default(),
+            &missing_server(),
+        );
 
         let Err(CodebaseError::RootNotADirectory { root: reported }) = result else {
             panic!("ディレクトリでない根は RootNotADirectory になる");

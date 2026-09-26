@@ -423,27 +423,14 @@ impl Error for AmbiguousDomain {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const ROOT: &str = "/repo";
+    use crate::test_support::declarations_of;
 
     fn name(spelling: &str) -> DomainName {
         DomainName::new(spelling).expect("テストが渡す名前は裸のキー")
     }
 
-    fn pattern(spelling: &str) -> DomainPattern {
-        spelling.parse().expect("テストが渡す glob は読める")
-    }
-
     fn declarations(declared: &[(&str, &[&str])]) -> DomainDeclarations {
-        let declarations = declared
-            .iter()
-            .map(|(domain, patterns)| {
-                DomainDeclaration::new(name(domain), patterns.iter().map(|p| pattern(p)).collect())
-                    .expect("テストが渡す宣言は glob を持つ")
-            })
-            .collect();
-
-        DomainDeclarations::new(Path::new(ROOT), declarations)
+        declarations_of(declared)
     }
 
     fn declared(declarations: &DomainDeclarations, path: &str) -> Option<String> {

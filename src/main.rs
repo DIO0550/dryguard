@@ -5,7 +5,7 @@
 //! `--format` が人の読む text とエージェントの読む JSON を切り替える。
 //!
 //! 判定に当てる閾値は `--threshold` > `dryguard.toml` > 既定値の順に決まる
-//! （[`configured_thresholds_of`]）。
+//! （[`configured_thresholds_of`]）。ドメインの宣言は `dryguard.toml` の `[domains]` だけが持つ。
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -14,7 +14,8 @@ use clap::Parser;
 
 use dryguard::classification::{ConfiguredThresholds, classification_of};
 use dryguard::cli::{Cli, Command, CommonOptions, OutputFormat};
-use dryguard::config::{ConfigError, configuration_of};
+use dryguard::config::configuration_of;
+use dryguard::domain_declaration::DomainDeclarations;
 use dryguard::location::Location;
 use dryguard::lsp::ServerCommand;
 use dryguard::pipeline::{chunk_pair_of, measured_pair_of, scan_of};
@@ -25,21 +26,33 @@ fn main() -> ExitCode {
 
     // **判定を始める前に落とす。** 設定を読めないまま既定値で走らせると、
     // 置いた設定が効いていないことを出力から確かめられない
-    let thresholds = match configured_thresholds_of(&cli.options) {
-        Ok(thresholds) => thresholds,
+    let configuration = match configuration_of(Path::new(CONFIG_DIRECTORY)) {
+        Ok(configuration) => configuration,
         Err(error) => {
             eprintln!("{error}");
             return ExitCode::FAILURE;
         }
+    };
+    let settings = Settings {
+        thresholds: configured_thresholds_of(configuration.thresholds(), &cli.options),
+        declarations: configuration.domain_declarations(),
     };
 
     match &cli.command {
         Command::Compare {
             location_a,
             location_b,
-        } => report_compare(location_a, location_b, &cli.options, thresholds),
-        Command::Scan { path } => report_scan(path, &cli.options, thresholds),
+        } => report_compare(location_a, location_b, &cli.options, &settings),
+        Command::Scan { path } => report_scan(path, &cli.options, &settings),
     }
+}
+
+/// 判定に当てる閾値と、ドメインの宣言。
+///
+/// [`report_compare`] と [`report_scan`] の引数をまとめるためだけの型。
+struct Settings<'a> {
+    thresholds: ConfiguredThresholds,
+    declarations: &'a DomainDeclarations,
 }
 
 /// 設定ファイルを探すディレクトリ。
@@ -66,7 +79,7 @@ fn report_compare(
     location_a: &Location,
     location_b: &Location,
     options: &CommonOptions,
-    thresholds: ConfiguredThresholds,
+    settings: &Settings<'_>,
 ) -> ExitCode {
     let pair = match chunk_pair_of(location_a, location_b) {
         Ok(pair) => pair,
@@ -76,7 +89,12 @@ fn report_compare(
         }
     };
 
-    let measured = measured_pair_of(&pair, thresholds, &ServerCommand::typescript());
+    let measured = measured_pair_of(
+        &pair,
+        settings.thresholds,
+        settings.declarations,
+        &ServerCommand::typescript(),
+    );
     if let Some(error) = measured.semantics_error() {
         // **どのシグナルが取れなかったかはここで言わない。** 片方だけ落ちることが
         // あるので数え上げると判定の根拠と食い違う。取れなかったシグナルは
@@ -84,7 +102,7 @@ fn report_compare(
         eprintln!("LSP への問い合わせが最後まで通りませんでした: {error}");
     }
 
-    let classification = classification_of(measured.signals(), thresholds);
+    let classification = classification_of(measured.signals(), settings.thresholds);
     let explanation = explanation_of(options);
 
     let report = match options.format {
@@ -104,8 +122,13 @@ fn report_compare(
 ///
 /// **LSP サーバを使えなくても失敗にしない。** 理由を stderr へ回す分担は
 /// [`report_compare`] と同じ（stdout は判定の出力に保つ）。
-fn report_scan(root: &Path, options: &CommonOptions, thresholds: ConfiguredThresholds) -> ExitCode {
-    let scan = match scan_of(root, thresholds, &ServerCommand::typescript()) {
+fn report_scan(root: &Path, options: &CommonOptions, settings: &Settings<'_>) -> ExitCode {
+    let scan = match scan_of(
+        root,
+        settings.thresholds,
+        settings.declarations,
+        &ServerCommand::typescript(),
+    ) {
         Ok(scan) => scan,
         Err(error) => {
             eprintln!("{error}");
@@ -139,18 +162,16 @@ fn explanation_of(options: &CommonOptions) -> Explanation {
 
 /// 判定に当てる閾値。**`--threshold` > `dryguard.toml` > 既定値**。
 ///
+/// `from_file` は `dryguard.toml` の書かれていたキーを既定値へ重ねたもの。
+///
 /// 優先順位を条件で書かずに**重ねる順番**で表す。既定値から始めて、設定ファイルに
 /// 書かれていたキーを重ね、最後に `--threshold` を重ねるので、後から重ねたほうが残る。
-///
-/// # Errors
-///
-/// `dryguard.toml` が在るのに読めない / 書式が違うとき。**無いことは失敗ではない**
-/// （設定を置かずに使える）。
-fn configured_thresholds_of(options: &CommonOptions) -> Result<ConfiguredThresholds, ConfigError> {
-    let thresholds = configuration_of(Path::new(CONFIG_DIRECTORY))?.thresholds();
-
+fn configured_thresholds_of(
+    from_file: ConfiguredThresholds,
+    options: &CommonOptions,
+) -> ConfiguredThresholds {
     let Some(threshold) = options.threshold else {
-        return Ok(thresholds);
+        return from_file;
     };
-    Ok(thresholds.with_structural_similarity(threshold))
+    from_file.with_structural_similarity(threshold)
 }

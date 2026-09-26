@@ -6,6 +6,7 @@
 
 use std::num::NonZeroUsize;
 
+use crate::domain_declaration::AmbiguousDomain;
 use crate::semantics::callee_domain::CalleeDomains;
 use crate::semantics::caller_domain::CallerDomains;
 use crate::semantics::resolved_type::UnopenedReason;
@@ -308,6 +309,11 @@ pub enum CallerDomainOverlap {
     ServerStillWorking,
     /// サーバが references を提供していない。
     ReferencesNotProvided,
+    /// 参照元のファイルが、`dryguard.toml` の名前の違う 2 つの宣言に当たった。
+    ///
+    /// **利用者が直す先は宣言の側**（glob を狭める）。サーバや対象のコードの話ではないので、
+    /// 他の「測れない」と分ける。
+    AmbiguousDomain(AmbiguousDomain),
 }
 
 /// 両側の呼び出し元と、そこから出る重なり。
@@ -390,6 +396,10 @@ pub enum CalleeDomainOverlap {
     ServerStillWorking,
     /// サーバが callHierarchy を提供していない。
     CallHierarchyNotProvided,
+    /// 呼び出し先のファイルが、`dryguard.toml` の名前の違う 2 つの宣言に当たった。
+    ///
+    /// 分ける理由は [`CallerDomainOverlap::AmbiguousDomain`] と同じ。
+    AmbiguousDomain(AmbiguousDomain),
 }
 
 /// 両側の呼び出し先と、そこから出る重なり。

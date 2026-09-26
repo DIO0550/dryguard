@@ -21,11 +21,13 @@ use crate::classification::signal::{
     CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, MeasuredCalleeDomains,
     MeasuredCallerDomains, SemanticsUnavailable, StructuralSimilarity, TypeSignatureMatch,
 };
+use crate::domain_declaration::{AmbiguousDomain, DomainName};
 use crate::location::Location;
 use crate::pipeline::{Scan, SkippedFile};
 use crate::report::Explanation;
 use crate::semantics::callee_domain::CalleeDomains;
 use crate::semantics::caller_domain::CallerDomains;
+use crate::semantics::domain::Domain;
 use crate::semantics::resolved_type::UnopenedReason;
 use crate::semantics::type_signature::UntracedReason;
 use crate::syntax::import::ImportsUnavailable;
@@ -451,6 +453,7 @@ fn caller_domain_value_of(signal: &CallerDomainOverlap, explanation: Explanation
         CallerDomainOverlap::ReferencesNotProvided => {
             unmeasurable_value_of("references-not-provided")
         }
+        CallerDomainOverlap::AmbiguousDomain(ambiguous) => ambiguous_domain_value_of(ambiguous),
     };
 
     Some(value)
@@ -477,6 +480,7 @@ fn callee_domain_value_of(signal: &CalleeDomainOverlap, explanation: Explanation
         CalleeDomainOverlap::CallHierarchyNotProvided => {
             unmeasurable_value_of("call-hierarchy-not-provided")
         }
+        CalleeDomainOverlap::AmbiguousDomain(ambiguous) => ambiguous_domain_value_of(ambiguous),
     };
 
     Some(value)
@@ -499,13 +503,45 @@ fn callees_value_of(callees: &CalleeDomains) -> Value {
         .into_iter()
         .map(|(domain, callees)| {
             json!({
-                "domain": domain.directory().display().to_string(),
+                "domain": domain_value_of(domain),
+                "declared": matches!(domain, Domain::Declared(_)),
                 "callees": callees,
             })
         })
         .collect();
 
     Value::Array(per_domain)
+}
+
+/// ドメイン 1 つの綴り。宣言の名前か、ディレクトリ。
+///
+/// どちらだったかは隣の `declared` が持つ。**綴りだけでは見分けられない**
+/// （宣言の名前と同じ綴りのディレクトリがありうる）。
+fn domain_value_of(domain: &Domain) -> String {
+    match domain {
+        Domain::Declared(name) => name.to_string(),
+        Domain::Directory(directory) => directory.display().to_string(),
+    }
+}
+
+/// 2 つの宣言に当たったファイルと、その 2 つの名前。
+fn ambiguous_domain_value_of(ambiguous: &AmbiguousDomain) -> Value {
+    detailed_unmeasurable_value_of(
+        "ambiguous-domain",
+        vec![
+            ("path", json!(ambiguous.path().display().to_string())),
+            (
+                "domains",
+                json!(
+                    ambiguous
+                        .domains()
+                        .iter()
+                        .map(DomainName::as_str)
+                        .collect::<Vec<_>>()
+                ),
+            ),
+        ],
+    )
 }
 
 /// 測れた重なりと、両側のドメインごとの件数。
@@ -527,7 +563,8 @@ fn callers_value_of(callers: &CallerDomains) -> Value {
         .into_iter()
         .map(|(domain, references)| {
             json!({
-                "domain": domain.directory().display().to_string(),
+                "domain": domain_value_of(domain),
+                "declared": matches!(domain, Domain::Declared(_)),
                 "references": references,
             })
         })
@@ -649,9 +686,10 @@ mod tests {
     use crate::classification::{
         ConfiguredThresholds, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of,
     };
+    use crate::domain_declaration::DomainDeclarations;
     use crate::semantics::caller_domain::CallerDomains;
     use crate::similarity::Similarity;
-    use crate::test_support::{line, location, overload_count, scan_of_fixture};
+    use crate::test_support::{declarations_of, line, location, overload_count, scan_of_fixture};
 
     /// テストが渡す 0.0-1.0 の値。
     fn measured(value: f64) -> Similarity {
@@ -852,8 +890,12 @@ mod tests {
         ];
         let paths_b = [PathBuf::from("/repo/src/inventory/stock.ts")];
         let (Some(callees_a), Some(callees_b)) = (
-            CalleeDomains::from_callee_paths(&paths_a),
-            CalleeDomains::from_callee_paths(&paths_b),
+            CalleeDomains::from_callee_paths(&paths_a, &DomainDeclarations::default())
+                .ok()
+                .flatten(),
+            CalleeDomains::from_callee_paths(&paths_b, &DomainDeclarations::default())
+                .ok()
+                .flatten(),
         ) else {
             panic!("テストが渡す呼び出し先は 1 件以上");
         };
@@ -1037,8 +1079,12 @@ mod tests {
         let paths_a = [PathBuf::from("/repo/src/billing/invoice.ts")];
         let paths_b = [PathBuf::from("/repo/src/inventory/stock.ts")];
         let (Some(callers_a), Some(callers_b)) = (
-            CallerDomains::from_reference_paths(&paths_a),
-            CallerDomains::from_reference_paths(&paths_b),
+            CallerDomains::from_reference_paths(&paths_a, &DomainDeclarations::default())
+                .ok()
+                .flatten(),
+            CallerDomains::from_reference_paths(&paths_b, &DomainDeclarations::default())
+                .ok()
+                .flatten(),
         ) else {
             panic!("テストが渡す参照元は 1 件以上");
         };
@@ -1052,6 +1098,7 @@ mod tests {
         let value = reason_of(&json, "caller-domain-overlap")["value"].clone();
         assert_eq!(value["overlap"], 0.0);
         assert_eq!(value["callers_a"][0]["domain"], "/repo/src/billing");
+        assert_eq!(value["callers_a"][0]["declared"], false);
         assert_eq!(value["callers_a"][0]["references"], 1);
         assert_eq!(value["callers_b"][0]["domain"], "/repo/src/inventory");
     }
@@ -1132,5 +1179,53 @@ mod tests {
 
         assert_eq!(json["skipped_files"].as_array().map(Vec::len), Some(0));
         assert_eq!(json["unchunkable"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn test_json_of_reports_a_declared_caller_domain_by_its_name() {
+        // 対照は上のテスト（宣言が無ければディレクトリで、declared は false）
+        let declarations = declarations_of(&[
+            ("billing", &["src/**/invoice*.ts"]),
+            ("inventory", &["src/**/product*.ts"]),
+        ]);
+        let callers = |path: &str| {
+            CallerDomains::from_reference_paths(&[PathBuf::from(path)], &declarations)
+                .expect("宣言は食い違わない")
+                .expect("参照元は 1 件")
+        };
+        let signals = accidental_duplication().with_semantics(
+            TypeSignatureMatch::NoName,
+            CallerDomainOverlap::Measured(MeasuredCallerDomains::new(
+                callers("/repo/src/services/invoiceService.ts"),
+                callers("/repo/src/services/productService.ts"),
+            )),
+        );
+
+        let json = json_of_signals(&signals, Explanation::AskedSignals);
+
+        let value = reason_of(&json, "caller-domain-overlap")["value"].clone();
+        assert_eq!(value["callers_a"][0]["domain"], "billing");
+        assert_eq!(value["callers_a"][0]["declared"], true);
+        assert_eq!(value["callers_b"][0]["domain"], "inventory");
+    }
+
+    #[test]
+    fn test_json_of_names_the_file_and_the_two_declarations_a_callee_matched() {
+        let ambiguous = declarations_of(&[
+            ("billing", &["src/billing/**"]),
+            ("reporting", &["src/**/report*.ts"]),
+        ])
+        .declared_domain_of(Path::new("/repo/src/billing/report.ts"))
+        .expect_err("2 つの宣言に当たる");
+        let signals = accidental_duplication()
+            .with_callee_domain_overlap(CalleeDomainOverlap::AmbiguousDomain(ambiguous));
+
+        let json = json_of_signals(&signals, Explanation::AskedSignals);
+
+        let value = reason_of(&json, "callee-domain-overlap")["value"].clone();
+        assert_eq!(value["status"], "unmeasurable");
+        assert_eq!(value["reason"], "ambiguous-domain");
+        assert_eq!(value["path"], "/repo/src/billing/report.ts");
+        assert_eq!(value["domains"], json!(["billing", "reporting"]));
     }
 }

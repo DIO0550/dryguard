@@ -18,10 +18,12 @@ use crate::classification::signal::{
     MeasuredCallerDomains, SemanticsUnavailable, StructuralSimilarity, TypeSignatureMatch,
 };
 use crate::classification::verdict::Verdict;
+use crate::domain_declaration::AmbiguousDomain;
 use crate::location::Location;
 use crate::pipeline::{Scan, SkippedFile};
 use crate::semantics::callee_domain::CalleeDomains;
 use crate::semantics::caller_domain::CallerDomains;
+use crate::semantics::domain::Domain;
 use crate::semantics::resolved_type::UnopenedReason;
 use crate::semantics::type_signature::UntracedReason;
 use crate::syntax::import::ImportsUnavailable;
@@ -478,6 +480,12 @@ fn caller_domain_overlap_text_of(
         CallerDomainOverlap::UnreadableReferences => "読めない URI が混じっている",
         CallerDomainOverlap::ServerStillWorking => "サーバが作業中で答えが落ち着かない",
         CallerDomainOverlap::ReferencesNotProvided => "サーバが references を提供していない",
+        CallerDomainOverlap::AmbiguousDomain(ambiguous) => {
+            return Some(format!(
+                "呼び出し元ドメインの重なりを測れない (参照元の {})",
+                ambiguous_domain_text_of(ambiguous)
+            ));
+        }
     };
 
     Some(format!(
@@ -525,6 +533,12 @@ fn callee_domain_overlap_text_of(
         CalleeDomainOverlap::UnreadableCallees => "読めない URI が混じっている",
         CalleeDomainOverlap::ServerStillWorking => "サーバが作業中で答えが落ち着かない",
         CalleeDomainOverlap::CallHierarchyNotProvided => "サーバが callHierarchy を提供していない",
+        CalleeDomainOverlap::AmbiguousDomain(ambiguous) => {
+            return Some(format!(
+                "呼び出し先ドメインの重なりを測れない (呼び出し先の {})",
+                ambiguous_domain_text_of(ambiguous)
+            ));
+        }
     };
 
     Some(format!(
@@ -622,7 +636,7 @@ fn references_per_domain_text_of(callers: &CallerDomains) -> String {
     callers
         .references_per_domain()
         .iter()
-        .map(|(domain, count)| format!("{} {count}件", domain.directory().display()))
+        .map(|(domain, count)| format!("{} {count}件", domain_text_of(domain)))
         .collect::<Vec<String>>()
         .join(" / ")
 }
@@ -648,9 +662,30 @@ fn callees_per_domain_text_of(callees: &CalleeDomains) -> String {
     callees
         .callees_per_domain()
         .iter()
-        .map(|(domain, count)| format!("{} {count}件", domain.directory().display()))
+        .map(|(domain, count)| format!("{} {count}件", domain_text_of(domain)))
         .collect::<Vec<String>>()
         .join(" / ")
+}
+
+/// ドメイン 1 つの綴り。宣言の名前には `(宣言)` を添える。
+///
+/// **添えないと、宣言の名前と同じ綴りのディレクトリを見分けられない。** 両者は
+/// 別のドメインとして数えている（`semantics::domain::Domain`）ので、同じ綴りに
+/// 見えると重なり 0.00 の理由が読めなくなる。
+fn domain_text_of(domain: &Domain) -> String {
+    match domain {
+        Domain::Declared(name) => format!("{name} (宣言)"),
+        Domain::Directory(directory) => directory.display().to_string(),
+    }
+}
+
+/// 2 つの宣言に当たったファイルと、その 2 つの名前（`dryguard.toml` を直す先）。
+fn ambiguous_domain_text_of(ambiguous: &AmbiguousDomain) -> String {
+    let [first, second] = ambiguous.domains();
+    format!(
+        "{} が dryguard.toml の 2 つの宣言 {first} / {second} に当たる",
+        ambiguous.path().display()
+    )
 }
 
 /// シグナルが判定を傾けた向き。
@@ -678,6 +713,7 @@ fn suggestion_of(verdict: Verdict) -> &'static str {
 mod tests {
     use super::*;
 
+    use crate::domain_declaration::DomainDeclarations;
     use crate::line_number::LineNumber;
     use std::path::{Path, PathBuf};
 
@@ -688,7 +724,7 @@ mod tests {
     use crate::similarity::Similarity;
     use crate::syntax::import::ImportsUnavailable;
     use crate::syntax::module_distance::ModuleDistance;
-    use crate::test_support::{location, overload_count, scan_of_fixture};
+    use crate::test_support::{declarations_of, location, overload_count, scan_of_fixture};
     use crate::threshold::Threshold;
 
     fn measured(value: f64) -> Similarity {
@@ -1208,8 +1244,12 @@ mod tests {
         let paths_a = [PathBuf::from("/repo/src/billing/invoice.ts")];
         let paths_b = [PathBuf::from("/repo/src/inventory/stock.ts")];
         let (Some(callers_a), Some(callers_b)) = (
-            CallerDomains::from_reference_paths(&paths_a),
-            CallerDomains::from_reference_paths(&paths_b),
+            CallerDomains::from_reference_paths(&paths_a, &DomainDeclarations::default())
+                .ok()
+                .flatten(),
+            CallerDomains::from_reference_paths(&paths_b, &DomainDeclarations::default())
+                .ok()
+                .flatten(),
         ) else {
             panic!("テストが渡す参照元は 1 件以上");
         };
@@ -1726,8 +1766,12 @@ mod tests {
         ];
         let paths_b = [PathBuf::from("/repo/src/inventory/stock.ts")];
         let (Some(callees_a), Some(callees_b)) = (
-            CalleeDomains::from_callee_paths(&paths_a),
-            CalleeDomains::from_callee_paths(&paths_b),
+            CalleeDomains::from_callee_paths(&paths_a, &DomainDeclarations::default())
+                .ok()
+                .flatten(),
+            CalleeDomains::from_callee_paths(&paths_b, &DomainDeclarations::default())
+                .ok()
+                .flatten(),
         ) else {
             panic!("テストが渡す呼び出し先は 1 件以上");
         };
@@ -1828,6 +1872,63 @@ mod tests {
         assert!(
             text.contains("  提案: 判断材料が足りない。人が見て決める。"),
             "中間ケースの提案が出る: {text}"
+        );
+    }
+
+    /// 層で分けた置き方の 2 つの参照元を、請求と在庫の宣言で数えた重なり。
+    fn callers_in_separate_declared_domains() -> CallerDomainOverlap {
+        let declarations = declarations_of(&[
+            ("billing", &["src/**/invoice*.ts"]),
+            ("inventory", &["src/**/product*.ts"]),
+        ]);
+        let callers = |path: &str| {
+            CallerDomains::from_reference_paths(&[PathBuf::from(path)], &declarations)
+                .expect("宣言は食い違わない")
+                .expect("参照元は 1 件")
+        };
+
+        CallerDomainOverlap::Measured(MeasuredCallerDomains::new(
+            callers("/repo/src/services/invoiceService.ts"),
+            callers("/repo/src/services/productService.ts"),
+        ))
+    }
+
+    #[test]
+    fn test_text_of_marks_a_declared_caller_domain_as_declared() {
+        // 印が無いと、宣言の名前と同じ綴りのディレクトリを見分けられない
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::NoName,
+            callers_in_separate_declared_domains(),
+        );
+
+        assert!(
+            text.contains(
+                "呼び出し元ドメインの重なり 0.00 (billing (宣言) 1件 <-> inventory (宣言) 1件)"
+            ),
+            "宣言の名前で数えた分布が出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_names_the_file_and_the_two_declarations_a_reference_matched() {
+        let ambiguous = declarations_of(&[
+            ("billing", &["src/billing/**"]),
+            ("reporting", &["src/**/report*.ts"]),
+        ])
+        .declared_domain_of(Path::new("/repo/src/billing/report.ts"))
+        .expect_err("2 つの宣言に当たる");
+
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::NoName,
+            CallerDomainOverlap::AmbiguousDomain(ambiguous),
+        );
+
+        assert!(
+            text.contains(
+                "呼び出し元ドメインの重なりを測れない (参照元の /repo/src/billing/report.ts が \
+                 dryguard.toml の 2 つの宣言 billing / reporting に当たる) → どちらでもない"
+            ),
+            "直す先（どのファイルがどの 2 つに当たったか）が出る: {text}"
         );
     }
 }
