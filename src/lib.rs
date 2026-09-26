@@ -33,6 +33,7 @@ pub mod classification;
 pub mod cli;
 pub mod codebase;
 pub mod config;
+pub mod domain_declaration;
 pub mod line_number;
 pub mod location;
 pub mod lsp;
