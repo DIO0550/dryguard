@@ -14,12 +14,13 @@ pub use json::{json_of, scan_json_of};
 use crate::classification::Classification;
 use crate::classification::reason::{Lean, Reason};
 use crate::classification::signal::{
-    CallerDomainOverlap, ImportOverlap, MeasuredCallerDomains, SemanticsUnavailable,
-    StructuralSimilarity, TypeSignatureMatch,
+    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, MeasuredCalleeDomains,
+    MeasuredCallerDomains, SemanticsUnavailable, StructuralSimilarity, TypeSignatureMatch,
 };
 use crate::classification::verdict::Verdict;
 use crate::location::Location;
 use crate::pipeline::{Scan, SkippedFile};
+use crate::semantics::callee_domain::CalleeDomains;
 use crate::semantics::caller_domain::CallerDomains;
 use crate::semantics::resolved_type::UnopenedReason;
 use crate::semantics::type_signature::UntracedReason;
@@ -63,7 +64,7 @@ pub enum Explanation {
 ///
 /// 末尾に改行は付けない（呼ぶ側が `println!` で出す）。
 ///
-/// Stage 2（LSP）が要る行——型シグネチャ・呼び出し元の分布——は、**尋ねたときだけ**出す。
+/// Stage 2（LSP）が要る行——型シグネチャ・呼び出し元と呼び出し先の分布——は、**尋ねたときだけ**出す。
 /// 尋ねていないものを空欄やダミーで埋めずに行ごと出さない
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
 /// **尋ねて取れなかったときは理由まで出す**（環境が悪いのか材料が無いのかで、
@@ -126,6 +127,16 @@ pub fn text_of(
             } => {
                 reason_texts.extend(
                     caller_domain_overlap_text_of(signal, *threshold, explanation)
+                        .map(|signal_text| format!("{signal_text} → {}", lean_text_of(*lean))),
+                );
+            }
+            Reason::CalleeDomainOverlap {
+                signal,
+                threshold,
+                lean,
+            } => {
+                reason_texts.extend(
+                    callee_domain_overlap_text_of(signal, *threshold, explanation)
                         .map(|signal_text| format!("{signal_text} → {}", lean_text_of(*lean))),
                 );
             }
@@ -474,6 +485,53 @@ fn caller_domain_overlap_text_of(
     ))
 }
 
+/// 呼び出し先ドメインの重なりの値と分布。測れていなければ、その理由。
+///
+/// 尋ねていないときに `None` を返すのは [`type_signature_text_of`] と同じ理由。
+///
+/// **測れなかった理由を 1 つの文に畳まない。** callHierarchy が使えなかったときほど
+/// 判定は残りのシグナルに寄るので、どのシグナルで出た判定なのかを読む側が知れないと
+/// **判定の重みを誤る**。理由ごとに直す先も違う（サーバを替える / 待つ / 対象のコード）。
+fn callee_domain_overlap_text_of(
+    signal: &CalleeDomainOverlap,
+    threshold: Threshold,
+    explanation: Explanation,
+) -> Option<String> {
+    let unmeasured = match signal {
+        CalleeDomainOverlap::Measured(measured) => {
+            return Some(measured_callee_domains_text_of(
+                measured,
+                threshold,
+                explanation,
+            ));
+        }
+        CalleeDomainOverlap::Unavailable { reason } => {
+            let unavailable = semantics_unavailable_text_of(*reason, explanation)?;
+
+            return Some(format!("呼び出し先ドメインの重なりを{unavailable}"));
+        }
+        CalleeDomainOverlap::NoName => "チャンクが名前を持たない",
+        CalleeDomainOverlap::NoCallHierarchyItem => "サーバが呼び出し関係の起点を返さない",
+        // 数は曖昧さそのもの。**どれだけ曖昧だったか**を落とさない
+        CalleeDomainOverlap::SeveralCallHierarchyItems { count } => {
+            return Some(format!(
+                "呼び出し先ドメインの重なりを測れない (呼び出し関係の起点が {count} 個返り、どれか決められない)"
+            ));
+        }
+        CalleeDomainOverlap::NoCallees => "呼び出し先が 1 件も返らない",
+        CalleeDomainOverlap::OnlyExternalCallees => {
+            "呼び出し先がどれも依存パッケージ (node_modules) の中にある"
+        }
+        CalleeDomainOverlap::UnreadableCallees => "読めない URI が混じっている",
+        CalleeDomainOverlap::ServerStillWorking => "サーバが作業中で答えが落ち着かない",
+        CalleeDomainOverlap::CallHierarchyNotProvided => "サーバが callHierarchy を提供していない",
+    };
+
+    Some(format!(
+        "呼び出し先ドメインの重なりを測れない ({unmeasured})"
+    ))
+}
+
 /// プロジェクトの印が見つからなかったことと、置けば揃う印の名前。
 ///
 /// `markers` はそのサーバが探した印の名前（`lsp::ServerCommand::project_markers`）。
@@ -519,7 +577,7 @@ fn outside_project_text_of(markers: &[String]) -> String {
 /// （そこだけ行が消えると、読む側は「シグナルを全表示」の一覧から何が抜けたのかを
 /// 数え直すことになる）。
 ///
-/// 頭を「測れない」「尋ねていない」に揃えてあるのは、呼び出し元ドメイン側が
+/// 頭を「測れない」「尋ねていない」に揃えてあるのは、呼び出し元・呼び出し先ドメイン側が
 /// `…の重なりを` の後ろに続けて使うため。
 fn semantics_unavailable_text_of(
     reason: SemanticsUnavailable,
@@ -563,6 +621,32 @@ fn measured_caller_domains_text_of(
 fn references_per_domain_text_of(callers: &CallerDomains) -> String {
     callers
         .references_per_domain()
+        .iter()
+        .map(|(domain, count)| format!("{} {count}件", domain.directory().display()))
+        .collect::<Vec<String>>()
+        .join(" / ")
+}
+
+/// 測れた重なりと、両側のドメインごとの呼び出し先の件数。当てた閾値は `--explain` のときだけ。
+fn measured_callee_domains_text_of(
+    measured: &MeasuredCalleeDomains,
+    threshold: Threshold,
+    explanation: Explanation,
+) -> String {
+    format!(
+        "呼び出し先ドメインの重なり {}{} ({} <-> {})",
+        measured.overlap(),
+        applied_threshold_text_of(threshold, explanation),
+        callees_per_domain_text_of(measured.callees_a()),
+        callees_per_domain_text_of(measured.callees_b())
+    )
+}
+
+/// 片側のドメインごとの呼び出し先の件数。ディレクトリを縮めない理由は
+/// [`references_per_domain_text_of`] と同じ。
+fn callees_per_domain_text_of(callees: &CalleeDomains) -> String {
+    callees
+        .callees_per_domain()
         .iter()
         .map(|(domain, count)| format!("{} {count}件", domain.directory().display()))
         .collect::<Vec<String>>()
@@ -848,7 +932,9 @@ mod tests {
         let text = text_of_accidental_duplication();
 
         assert!(
-            !text.contains("型シグネチャ") && !text.contains("呼び出し元ドメイン"),
+            !text.contains("型シグネチャ")
+                && !text.contains("呼び出し元ドメイン")
+                && !text.contains("呼び出し先ドメイン"),
             "尋ねていないシグナルは行ごと出さない: {text}"
         );
         assert!(
@@ -872,7 +958,14 @@ mod tests {
                 "呼び出し元ドメインの重なりを尋ねていない \
                  (Stage 1 のシグナルだけで組み立てた) → どちらでもない"
             ),
-            "尋ねなかった Stage 2 のシグナルは 2 つとも出る: {text}"
+            "尋ねなかった Stage 2 のシグナルは呼び出し元も出る: {text}"
+        );
+        assert!(
+            text.contains(
+                "呼び出し先ドメインの重なりを尋ねていない \
+                 (Stage 1 のシグナルだけで組み立てた) → どちらでもない"
+            ),
+            "尋ねなかった Stage 2 のシグナルは呼び出し先も出る: {text}"
         );
     }
 
@@ -1594,6 +1687,133 @@ mod tests {
                  (/repo/src/billing 1件 <-> /repo/src/inventory 1件) → 共通化しない側"
             ),
             "当てた閾値が重なりの値と分布のあいだに出る: {text}"
+        );
+    }
+
+    /// 構造が似ていて依存先を共有していない組に、呼び出し先だけを重ねて判定した text。
+    fn text_of_accidental_duplication_with_callees(
+        callee_domain_overlap: CalleeDomainOverlap,
+        explanation: Explanation,
+    ) -> String {
+        let signals = Signals::new(
+            StructuralSimilarity::Measured(measured(0.94)),
+            ImportOverlap::Measured(measured(0.0)),
+            separate_directories(),
+        )
+        .with_semantics(
+            TypeSignatureMatch::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        )
+        .with_callee_domain_overlap(callee_domain_overlap);
+
+        text_of(
+            &location("src/billing/discount.ts", 42),
+            &location("src/inventory/reorder.ts", 18),
+            &classification_of(&signals, ConfiguredThresholds::default()),
+            explanation,
+        )
+    }
+
+    /// 呼び出し先が別のドメインに分かれている（重なり 0.00）。
+    fn callees_in_separate_domains() -> CalleeDomainOverlap {
+        let paths_a = [
+            PathBuf::from("/repo/src/billing/invoice.ts"),
+            PathBuf::from("/repo/src/billing/rate.ts"),
+        ];
+        let paths_b = [PathBuf::from("/repo/src/inventory/stock.ts")];
+        let (Some(callees_a), Some(callees_b)) = (
+            CalleeDomains::from_callee_paths(&paths_a),
+            CalleeDomains::from_callee_paths(&paths_b),
+        ) else {
+            panic!("テストが渡す呼び出し先は 1 件以上");
+        };
+
+        CalleeDomainOverlap::Measured(MeasuredCalleeDomains::new(callees_a, callees_b))
+    }
+
+    #[test]
+    fn test_text_of_reports_how_many_callees_each_callee_domain_has() {
+        let text = text_of_accidental_duplication_with_callees(
+            callees_in_separate_domains(),
+            Explanation::AskedSignals,
+        );
+
+        assert!(
+            text.contains(
+                "呼び出し先ドメインの重なり 0.00 \
+                 (/repo/src/billing 2件 <-> /repo/src/inventory 1件) → 共通化しない側"
+            ),
+            "重なりの値と、両側の分布と、傾きが 1 行で読める: {text}"
+        );
+    }
+
+    #[test]
+    fn test_explained_text_of_reports_the_threshold_beside_the_callee_domain_overlap() {
+        // 対照は上のテスト。既定では同じ行に閾値が入らない
+        let text = text_of_accidental_duplication_with_callees(
+            callees_in_separate_domains(),
+            Explanation::AllSignals,
+        );
+
+        assert!(
+            text.contains(
+                "呼び出し先ドメインの重なり 0.00 (閾値 0.5) \
+                 (/repo/src/billing 2件 <-> /repo/src/inventory 1件) → 共通化しない側"
+            ),
+            "当てた閾値が重なりの値と分布のあいだに出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_only_external_callees_says_so_instead_of_calling_them_none() {
+        // 言語の lib しか呼ばない関数を「呼び出し先が無い」と出すと、
+        // 読む側は callHierarchy が取り損ねたと読む
+        let text = text_of_accidental_duplication_with_callees(
+            CalleeDomainOverlap::OnlyExternalCallees,
+            Explanation::AskedSignals,
+        );
+
+        assert!(
+            text.contains(
+                "呼び出し先ドメインの重なりを測れない \
+                 (呼び出し先がどれも依存パッケージ (node_modules) の中にある) → どちらでもない"
+            ),
+            "依存パッケージしか呼んでいないことが理由として出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_several_call_hierarchy_items_says_how_many_came_back() {
+        let text = text_of_accidental_duplication_with_callees(
+            CalleeDomainOverlap::SeveralCallHierarchyItems { count: 3 },
+            Explanation::AskedSignals,
+        );
+
+        assert!(
+            text.contains("呼び出し関係の起点が 3 個返り、どれか決められない"),
+            "返った起点の数が出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_without_call_hierarchy_says_the_server_lacks_it() {
+        // callHierarchy を使えなかった判定は、残りのシグナルだけで出ている。
+        // それを読む側が知れないと、判定の重みを誤る
+        let text = text_of_accidental_duplication_with_callees(
+            CalleeDomainOverlap::CallHierarchyNotProvided,
+            Explanation::AskedSignals,
+        );
+
+        assert!(
+            text.contains(
+                "呼び出し先ドメインの重なりを測れない \
+                 (サーバが callHierarchy を提供していない) → どちらでもない"
+            ),
+            "callHierarchy を使えなかったことが既定の出力にも出る: {text}"
         );
     }
 

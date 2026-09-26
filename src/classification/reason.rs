@@ -5,7 +5,8 @@
 //! シグナルの値だけを並べても、読む側はそれが判定にどう効いたのかを再現できない。
 
 use crate::classification::signal::{
-    CallerDomainOverlap, ImportOverlap, StructuralSimilarity, TypeSignatureMatch,
+    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, StructuralSimilarity,
+    TypeSignatureMatch,
 };
 use crate::syntax::module_distance::ModuleDistance;
 use crate::threshold::Threshold;
@@ -71,6 +72,14 @@ pub enum Reason {
     CallerDomainOverlap {
         signal: CallerDomainOverlap,
         /// 呼び出し元を共有していると見なした下限。
+        threshold: Threshold,
+        lean: Lean,
+    },
+    /// 呼び出し先ドメインの重なりが傾けた。
+    CalleeDomainOverlap {
+        signal: CalleeDomainOverlap,
+        /// 呼び出し先を共有していると見なした下限。**外から動かせない**
+        /// （`classification::SHARED_CALLEE_DOMAINS_THRESHOLD`）。
         threshold: Threshold,
         lean: Lean,
     },

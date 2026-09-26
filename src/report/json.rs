@@ -18,12 +18,13 @@ use serde_json::{Map, Value, json};
 use crate::classification::Classification;
 use crate::classification::reason::{Lean, Reason};
 use crate::classification::signal::{
-    CallerDomainOverlap, ImportOverlap, MeasuredCallerDomains, SemanticsUnavailable,
-    StructuralSimilarity, TypeSignatureMatch,
+    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, MeasuredCalleeDomains,
+    MeasuredCallerDomains, SemanticsUnavailable, StructuralSimilarity, TypeSignatureMatch,
 };
 use crate::location::Location;
 use crate::pipeline::{Scan, SkippedFile};
 use crate::report::Explanation;
+use crate::semantics::callee_domain::CalleeDomains;
 use crate::semantics::caller_domain::CallerDomains;
 use crate::semantics::resolved_type::UnopenedReason;
 use crate::semantics::type_signature::UntracedReason;
@@ -255,6 +256,21 @@ fn reason_value_of(reason: &Reason, explanation: Explanation) -> Option<Value> {
                 applied,
             ))
         }
+        Reason::CalleeDomainOverlap {
+            signal,
+            threshold,
+            lean,
+        } => {
+            let value = callee_domain_value_of(signal, explanation)?;
+            let applied = explained_threshold_of(&value, *threshold, explanation);
+
+            Some(signal_value_of(
+                "callee-domain-overlap",
+                value,
+                *lean,
+                applied,
+            ))
+        }
     }
 }
 
@@ -438,6 +454,58 @@ fn caller_domain_value_of(signal: &CallerDomainOverlap, explanation: Explanation
     };
 
     Some(value)
+}
+
+/// 呼び出し先ドメインの重なりと分布。尋ねていないだけなら既定で `None`。
+fn callee_domain_value_of(signal: &CalleeDomainOverlap, explanation: Explanation) -> Option<Value> {
+    let value = match signal {
+        CalleeDomainOverlap::Measured(measured) => measured_callee_domains_value_of(measured),
+        CalleeDomainOverlap::Unavailable { reason } => {
+            semantics_unavailable_value_of(*reason, explanation)?
+        }
+        CalleeDomainOverlap::NoName => unmeasurable_value_of("no-name"),
+        CalleeDomainOverlap::NoCallHierarchyItem => unmeasurable_value_of("no-call-hierarchy-item"),
+        // 数は text にも出している。**どれだけ曖昧だったか**を落とさない
+        CalleeDomainOverlap::SeveralCallHierarchyItems { count } => detailed_unmeasurable_value_of(
+            "several-call-hierarchy-items",
+            vec![("count", json!(count))],
+        ),
+        CalleeDomainOverlap::NoCallees => unmeasurable_value_of("no-callees"),
+        CalleeDomainOverlap::OnlyExternalCallees => unmeasurable_value_of("only-external-callees"),
+        CalleeDomainOverlap::UnreadableCallees => unmeasurable_value_of("unreadable-callees"),
+        CalleeDomainOverlap::ServerStillWorking => unmeasurable_value_of("server-still-working"),
+        CalleeDomainOverlap::CallHierarchyNotProvided => {
+            unmeasurable_value_of("call-hierarchy-not-provided")
+        }
+    };
+
+    Some(value)
+}
+
+/// 測れた重なりと、両側のドメインごとの呼び出し先の件数。
+fn measured_callee_domains_value_of(measured: &MeasuredCalleeDomains) -> Value {
+    measured_value_of(vec![
+        ("overlap", json!(measured.overlap().value())),
+        ("callees_a", callees_value_of(measured.callees_a())),
+        ("callees_b", callees_value_of(measured.callees_b())),
+    ])
+}
+
+/// 片側のドメインごとの呼び出し先の件数。ディレクトリを縮めない理由は
+/// [`callers_value_of`] と同じ。
+fn callees_value_of(callees: &CalleeDomains) -> Value {
+    let per_domain: Vec<Value> = callees
+        .callees_per_domain()
+        .into_iter()
+        .map(|(domain, callees)| {
+            json!({
+                "domain": domain.directory().display().to_string(),
+                "callees": callees,
+            })
+        })
+        .collect();
+
+    Value::Array(per_domain)
 }
 
 /// 測れた重なりと、両側のドメインごとの件数。
@@ -773,6 +841,104 @@ mod tests {
         assert!(
             reason.get("threshold").is_none(),
             "0.0-1.0 の閾値と同じキーに入れない: {reason:#}"
+        );
+    }
+
+    /// 呼び出し先が別のドメインに分かれている組を、既定の閾値で判定した JSON。
+    fn json_of_callees_in_separate_domains(explanation: Explanation) -> Value {
+        let paths_a = [
+            PathBuf::from("/repo/src/billing/invoice.ts"),
+            PathBuf::from("/repo/src/billing/rate.ts"),
+        ];
+        let paths_b = [PathBuf::from("/repo/src/inventory/stock.ts")];
+        let (Some(callees_a), Some(callees_b)) = (
+            CalleeDomains::from_callee_paths(&paths_a),
+            CalleeDomains::from_callee_paths(&paths_b),
+        ) else {
+            panic!("テストが渡す呼び出し先は 1 件以上");
+        };
+        let signals = accidental_duplication()
+            .with_semantics(
+                TypeSignatureMatch::NoName,
+                CallerDomainOverlap::NoReferences,
+            )
+            .with_callee_domain_overlap(CalleeDomainOverlap::Measured(MeasuredCalleeDomains::new(
+                callees_a, callees_b,
+            )));
+
+        json_of_signals(&signals, explanation)
+    }
+
+    #[test]
+    fn test_json_of_reports_the_callee_domains_of_both_sides() {
+        let json = json_of_callees_in_separate_domains(Explanation::AskedSignals);
+
+        let reason = reason_of(&json, "callee-domain-overlap");
+        assert_eq!(reason["value"]["overlap"], 0.0);
+        assert_eq!(
+            reason["value"]["callees_a"][0]["domain"],
+            "/repo/src/billing"
+        );
+        assert_eq!(reason["value"]["callees_a"][0]["callees"], 2);
+        assert_eq!(
+            reason["value"]["callees_b"][0]["domain"],
+            "/repo/src/inventory"
+        );
+        assert_eq!(reason["lean"], "toward-do-not-extract");
+    }
+
+    #[test]
+    fn test_json_of_with_explain_reports_the_threshold_of_the_callee_domain_overlap() {
+        // 対照は上のテスト（既定）。呼び出し先の閾値は外から動かせないので、
+        // 既定では出さない
+        let asked = json_of_callees_in_separate_domains(Explanation::AskedSignals);
+        let explained = json_of_callees_in_separate_domains(Explanation::AllSignals);
+
+        assert!(
+            reason_of(&asked, "callee-domain-overlap")
+                .get("threshold")
+                .is_none(),
+            "動かせない閾値は既定では出さない: {asked:#}"
+        );
+        assert_eq!(
+            reason_of(&explained, "callee-domain-overlap")["threshold"],
+            0.5
+        );
+    }
+
+    #[test]
+    fn test_json_of_several_call_hierarchy_items_keeps_how_many_came_back() {
+        let signals = accidental_duplication()
+            .with_semantics(
+                TypeSignatureMatch::NoName,
+                CallerDomainOverlap::NoReferences,
+            )
+            .with_callee_domain_overlap(CalleeDomainOverlap::SeveralCallHierarchyItems {
+                count: 3,
+            });
+
+        let json = json_of_signals(&signals, Explanation::AskedSignals);
+
+        let value = reason_of(&json, "callee-domain-overlap")["value"].clone();
+        assert_eq!(value["status"], "unmeasurable");
+        assert_eq!(value["reason"], "several-call-hierarchy-items");
+        assert_eq!(value["count"], 3);
+    }
+
+    #[test]
+    fn test_json_of_only_external_callees_is_not_no_callees() {
+        let signals = accidental_duplication()
+            .with_semantics(
+                TypeSignatureMatch::NoName,
+                CallerDomainOverlap::NoReferences,
+            )
+            .with_callee_domain_overlap(CalleeDomainOverlap::OnlyExternalCallees);
+
+        let json = json_of_signals(&signals, Explanation::AskedSignals);
+
+        assert_eq!(
+            reason_of(&json, "callee-domain-overlap")["value"]["reason"],
+            "only-external-callees"
         );
     }
 
