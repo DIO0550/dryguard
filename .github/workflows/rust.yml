@@ -103,6 +103,9 @@ jobs:
       - name: pre-push-check
         run: bash .claude/hooks/pre-push-check-test.sh
 
+      - name: hook-canary
+        run: bash .claude/hooks/hook-canary-test.sh
+
       # post-edit-rust のテストは使い捨てのクレートに fmt / clippy をかけるので、
       # check ジョブと同じくツールチェーンを明示して用意する。
       - name: Rust ツールチェーン
