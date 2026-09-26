@@ -59,6 +59,15 @@
     ],
     "PostToolUse": [
       {
+        "matcher": "mcp__github__merge_pull_request|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/post-merge-review.sh\""
+          }
+        ]
+      },
+      {
         "matcher": "Edit|Write|MultiEdit",
         "hooks": [
           {
