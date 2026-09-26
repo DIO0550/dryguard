@@ -1,0 +1,5 @@
+# domains.tsv の正解を、dryguard.toml の宣言で書いたもの（Issue #237）。
+# probe.sh はこれがある置き方で、宣言で走らせた scan と正解で出し直した判定を突き合わせる。
+[domains]
+billing = ["src/**/invoice*.ts"]
+inventory = ["src/**/product*.ts"]
