@@ -13,6 +13,7 @@
 | `session-url-notice.sh` | `SessionStart` | このセッションの URL（`https://claude.ai/code/session_<id>`）を組み立ててコンテキストに出す。ブランチが `claude/issue-<N>-...` なら Issue 番号も添える |
 | `pre-push-check.sh` | `PreToolUse`（`Bash`） | コマンドに `git push` があれば `harness/githooks/pre-push` を走らせ、落ちたら exit 2 で止める |
 | `hook-canary.sh` | `PreToolUse`（`Bash`） | コマンドが `echo hook-canary` そのものなら exit 2 で止める。このセッションでフックが発火しているかを確かめるためだけのもの |
+| `post-merge-review.sh` | `PostToolUse`（`mcp__github__merge_pull_request` / `Bash`） | PR のマージ（MCP のマージか `gh pr merge`）を検知したら、Issue への追記と `harness/records/pr-<N>.md` の記録を `additionalContext` で促す。止めない |
 | `post-edit-rust.sh` | `PostToolUse`（`Edit` / `Write` / `MultiEdit`） | `.rs` を編集したら、そのクレートに `cargo fmt` をかけ、`cargo clippy` が落ちたら診断を exit 2 で返す |
 
 ## `pre-push-check.sh` — 層 2 との違いは発火条件だけ
@@ -24,7 +25,7 @@ fmt / clippy / test の並びを持つのはそこだけ。こちらが足すの
 **`core.hooksPath` が配線されていても走る。** 同じ push で検査が 2 回走るが、
 配線済みなら飛ばす形にすると `git push --no-verify` が素通りする。
 
-**`git push` の見つけ方**（`lib/git-push-command.sh`）:
+**`git push` の見つけ方**（`lib/git-push-command.sh`。区切り方は `lib/command-segments.sh`）:
 
 - 引用符の中身を落としてから `&&` / `||` / `;` / `|` / `&` / 括弧 / 改行で区切り、
   区切った 1 つずつの**先頭**が `git push` かを見る。環境変数の代入と `git` の大域オプション
@@ -106,6 +107,33 @@ push の前に `echo hook-canary` を 1 度実行する。**止められれば**
 **移植元は読んでいない。** Issue #51 は design-composer の `session-url-notice.sh` を参照に挙げたが、
 実装したセッションからは読めなかったため新規に書いた。
 
+## `post-merge-review.sh` — マージ後の振り返りへの入口
+
+マージを検知したら、関連 Issue への追記と `harness/records/pr-<N>.md` の記録
+（`harness-record` スキル・`harness/records/README.md`）を促す。
+
+- **止めない。** `additionalContext` を返すだけで、終了コードは常に 0。マージは人の判断で
+  行われるので、記録が無いことを理由に止めても記録の質は上がらない
+- **検知するのは `mcp__github__merge_pull_request` と `gh pr merge` だけ。** 素の `git merge` は
+  ベースブランチの取り込みで日常的に走るので見ない。**`--auto` / `--disable-auto` 付きの
+  `gh pr merge` も見ない** — auto-merge を予約・解除するだけで、マージはその場では起きない
+  （`mcp__github__enable_pr_auto_merge` を配線しないのと同じ扱い）
+- **`gh pr merge` の見つけ方は `git push` と同じ。** 引用符の中身を落として区切った 1 つずつの
+  先頭を見る（`lib/command-segments.sh` を `lib/git-push-command.sh` と共有する）。
+  読み損ねた形は「マージではない」側へ倒す — 取りこぼしても促しが出ないだけだが、
+  マージでないコマンドをマージと読むと、まだ続いている PR の記録を書き始めさせてしまう
+- **PR の番号が読めなくても促す。** ブランチ名で指定した `gh pr merge` も振り返りの対象で、
+  番号は PR から引き直せる。その場合は「番号を読めなかった」と出す
+- **マージの成否は見ない。** MCP / `gh` の応答の形を持ち込まないため、文言を
+  「マージが成功していれば」に留める
+
+**黙って通す条件**: `jq` が無い・入力の JSON が読めない。Bash の `command` はエスケープを含む
+JSON の文字列なので、`hook-canary.sh` のように組み込みの正規表現では読まない。`jq` の欠けは
+`hook-canary.sh` が報告する。
+
+**移植元は読んでいない。** Issue #52 は design-composer の `post-merge-review.sh` を参照に挙げたが、
+実装したセッションからは読めなかったため新規に書いた。
+
 ## 強制力の序列
 
 `AGENTS.md`「強制力の序列」が持つ。
@@ -117,6 +145,7 @@ bash .claude/hooks/pre-push-check-test.sh
 bash .claude/hooks/post-edit-rust-test.sh
 bash .claude/hooks/hook-canary-test.sh
 bash .claude/hooks/session-url-notice-test.sh
+bash .claude/hooks/post-merge-review-test.sh
 ```
 
 CI（`.github/workflows/rust.yml` の `claude-hooks`）でも走る。
