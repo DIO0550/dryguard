@@ -87,10 +87,12 @@ Issue の一覧（開いているか閉じているか）からは読めない�
   多くの場合そこに書いてある（pr-74: 依存先集合の置き場所を実装中に変えたが、
   `docs/dryguard-plan.md` の Stage 1 の記述は最初からその置き場所を指していた）
 - **`echo hook-canary` が deny されずに通っただけでは「フックが発火しない環境」と
-  断定しない。** `.claude/settings.json` の `PreToolUse` に canary を deny するフックが
-  配線されているかを確かめ、配線されていなければ「canary が無いので層 3 を判定できなかった」と書く
-  （`PreToolUse` 自体は `pre-push-check.sh` のために配線してあり、**canary を deny しない**。
-  `PreToolUse` があることだけを見ると、canary が通ったことを不発と読み違える）
+  断定しない。** **セッションを起動した時点の** `.claude/settings.json` の `PreToolUse` に
+  `hook-canary.sh` が配線されていたかを確かめ、配線されていなければ「canary が無いので層 3 を
+  判定できなかった」と書く（フックはセッションの起動時に読まれるので、配線より前のブランチから
+  起動したセッションでは、作業中のブランチに配線があっても canary は通る。`PreToolUse` には
+  `pre-push-check.sh` も配線されていて、**こちらは canary を deny しない**。`PreToolUse` が
+  あることだけを見ると、canary が通ったことを不発と読み違える）
   （pr-95 / pr-97: `分類: plan` として同じ誤断定が 2 回記録されている。pr-90 は
   nightly の有無について同型の未検証の断定、pr-93 は同じ誤りを記録の実行環境メモに
   書いているが、どちらも `分類: plan` の指摘としては立てていない。pr-101 以降は
@@ -238,6 +240,7 @@ bash harness/githooks/pre-push              # push 前の検査をまとめて�
 bash harness/ci/pr-body-diff-test.sh        # PR 本文の差分規模を突き合わせる検査のテスト
 bash .claude/hooks/pre-push-check-test.sh   # 層 3 の push 前検査フックのテスト
 bash .claude/hooks/post-edit-rust-test.sh   # 層 3 の編集後 fmt / clippy フックのテスト
+bash .claude/hooks/hook-canary-test.sh      # 層 3 のカナリア（フックの発火の確認）のテスト
 ```
 
 PR 本文の差分規模の突き合わせ自体は、本文をファイルに落として走らせる

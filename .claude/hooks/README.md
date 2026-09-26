@@ -11,6 +11,7 @@
 | --- | --- | --- |
 | `wire-githooks.sh` | `SessionStart` | `core.hooksPath` を `harness/githooks` へ向ける（`harness/githooks/README.md`「配線 — cargo に `prepare` が無い」） |
 | `pre-push-check.sh` | `PreToolUse`（`Bash`） | コマンドに `git push` があれば `harness/githooks/pre-push` を走らせ、落ちたら exit 2 で止める |
+| `hook-canary.sh` | `PreToolUse`（`Bash`） | コマンドが `echo hook-canary` そのものなら exit 2 で止める。このセッションでフックが発火しているかを確かめるためだけのもの |
 | `post-edit-rust.sh` | `PostToolUse`（`Edit` / `Write` / `MultiEdit`） | `.rs` を編集したら、そのクレートに `cargo fmt` をかけ、`cargo clippy` が落ちたら診断を exit 2 で返す |
 
 ## `pre-push-check.sh` — 層 2 との違いは発火条件だけ
@@ -61,6 +62,30 @@ git の作業ツリーでない。`cargo` が無い環境は `harness/githooks/p
 `format-and-lint.sh` を移植元に挙げたが、実装したセッションからは読めなかったため新規に書いた。
 プラグインを有効化しない理由（スキルゲートが一緒に入る）は Issue #59 / #48。
 
+## `hook-canary.sh` — 発火しているかを確かめる
+
+push の前に `echo hook-canary` を 1 度実行する。**止められれば**このセッションでフックが
+発火しており、**通ってしまえば**発火していない（PR 本文と `harness/records/` の記録に残す）。
+層 3 の不発はフェイルオープンかつサイレントなので、これが無いと通ったのか検査されなかったのかを
+区別できない。
+
+**止めるのは害の無いコマンド 1 つだけで、ゲートではない。** 検出が失敗しても
+ガードは破れない（ゲートは層 2 と層 1 にある）。
+
+- **判定も出力も bash の組み込みだけで行う。** `PreToolUse` は exit 2 以外の異常終了を
+  素通りさせるので、`jq` が無くて exit 127 で落ちると、配線が読まれていないのと同じ見え方になる。
+  stdin の JSON を正規表現で読み、`command` の値が `echo hook-canary` そのもののときだけ当てる
+- **`jq` が在っても `jq` では読まない。** 環境によって判定の経路が変わると、同じ入力で答えが割れうる
+- **止めたとき、他のフックが使う `jq` / `cargo` が無ければその名前も出す。** 発火していても、
+  それらが欠けていれば他のフックは黙って素通りする。**`python3` は見ない** — このリポジトリの
+  フックは呼ばないので、欠けていても素通りするフックが無い
+- **止め方は exit 2 と stderr。** stdout に `permissionDecision` の JSON を出す形は、
+  組み立てを誤ると非ブロック扱いで黙って通る
+
+**`echo hook-canary` が通っても、セッションの起動時点で配線されていたとは限らない。**
+`.claude/settings.json` はセッションの起動時に読まれるので、配線より前のブランチから
+起動したセッションでは通って当たり前（`AGENTS.md`「実装を始める前に」）。
+
 ## 強制力の序列
 
 `AGENTS.md`「強制力の序列」が持つ。
@@ -70,6 +95,7 @@ git の作業ツリーでない。`cargo` が無い環境は `harness/githooks/p
 ```bash
 bash .claude/hooks/pre-push-check-test.sh
 bash .claude/hooks/post-edit-rust-test.sh
+bash .claude/hooks/hook-canary-test.sh
 ```
 
 CI（`.github/workflows/rust.yml` の `claude-hooks`）でも走る。
