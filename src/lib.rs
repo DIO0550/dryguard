@@ -12,7 +12,8 @@
 //! 現在は Phase 2 の途中。CLI の受け口（`compare` と `scan`）、`codebase` の対象ファイル
 //! 収集、`syntax` のチャンク化・構造類似度・import 収集、`classification` の 3 ラベルの判定、
 //! `report` の理由付き出力までがある。判定に当てる閾値は `--threshold` >
-//! `config` が読む `dryguard.toml` > 既定値の順に決まる。
+//! `config` が読む `dryguard.toml` > 既定値の順に決まる。`dryguard.toml` の `[domains]` が
+//! 宣言したドメイン（`domain_declaration`）は、ディレクトリからの推定に勝つ。
 //! 出力は `--format` が人の読む text とエージェントの読む JSON を切り替える
 //! （**どちらにも同じ根拠が出る**。JSON のスキーマ安定化は Phase 5）。
 //!

@@ -69,12 +69,15 @@ if structurally_similar && domains_differ { ... }
 | `signal status` | シグナルの値が**測れた / 測れない / 尋ねていない**のどれか。`--format json` がこの語で出し、text は文に組み立てる |
 | `explanation` | 根拠をどこまで出すか。`--explain` が切り替える。**尋ねなかったシグナル**と**当てた閾値**を出すかどうかで分かれる |
 | `configured threshold` | 外から動かせる閾値。`--threshold` と `dryguard.toml` が決める 3 つ（構造類似度・依存先の重なり・呼び出し元ドメインの重なり）。**既定値は持たず**、指定が無いキーに何を当てるかは `classification` が決める |
-| `domain` | ドメイン。ディレクトリ構造からの推定と `dryguard.toml` の宣言で決まる |
+| `domain` | ドメイン。ディレクトリ構造からの推定と `dryguard.toml` の宣言で決まる。**宣言に当たったファイルは宣言の名前、当たらなければすぐ上のディレクトリ** |
+| `domain declaration` | `dryguard.toml` の `[domains]` の 1 行。ドメインの名前と、そのドメインに属するファイルを指すパスの glob |
+| `declared domain` | ファイルが当たった `domain declaration` の名前。**名前の違う 2 つに当たったら決めない**（`AmbiguousDomain`） |
 | `domain counts` | ドメインごとのファイルの件数。**向きを持たない** — `caller domain` と `callee domain` が中身として持つ |
 | `import` | 依存の宣言。ソースに書かれた `import` / `export ... from` / `require` そのもの |
 | `specifier` | 依存の宣言が依存先として書いている文字列（`from` の後ろ・`require` の引数。`"./pad"`）。**解決前** |
 | `module path` | 指定子を importer の位置から解決した依存先（`src/utils/pad`）。**解決後** |
 | `module distance` | 2 つのファイルを隔てているディレクトリの段数 |
+| `module separation` | 2 つのファイルの隔たりのシグナル。どちらも宣言に当たらなければ `module distance`、どちらかが当たれば両側の `declared domain` |
 | `frame` | LSP のストリーム上の 1 通分。`Content-Length` ヘッダと、それが数えた本文 |
 | `payload` | frame の本文。JSON-RPC のメッセージ 1 通そのもの |
 | `handshake` | `initialize` 要求 → 応答 → `initialized` 通知。ここまでで 1 つ |
@@ -349,6 +352,16 @@ setter がまとめて「注釈が無い」側へ落ちる**（コンストラ�
 **ジェネリック関数がまとめて測れない側へ落ちる**（`rules/architecture.md`
 「どこまでを「取れなかった」に数えるか」）。ただし**外側のスコープが束縛した型変数は数える** —
 そのシグネチャからは辿れないので、落とすと別のファイルの同じ綴りと重なる。
+
+**`module separation` を `module distance` と呼ばない。** 宣言で比べたときは段数が無い。
+1 語で呼ぶと、宣言した 2 つのドメインの間に「何段」があるように読め、`--explain` が
+**当てていない段数の閾値**を出してよいかが言えなくなる（`report` は宣言で比べたときに
+段数の閾値を出さない）。**出力のシグナル名（`module-distance`）は据え置く** —
+シグナルの行としては同じもので、変えると JSON を読む側の分岐が名前で割れる。
+
+**`declared domain` とディレクトリのドメインを同じ綴りで比べない。** 宣言に当たらなかった
+ファイルが `billing/` に置かれていても、宣言した `billing` とは別のドメイン。宣言を書いた人は
+そのファイルを宣言に含めていない（`semantics::domain::Domain` が 2 つのバリアントに分けている）。
 
 **`module distance` と `caller domain` を混ぜない。** どちらもディレクトリで測るが、
 前者は**そのチャンク自身がどこに置かれているか**、後者は**実際に誰が使っているか**。

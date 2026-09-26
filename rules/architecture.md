@@ -17,7 +17,7 @@ cli → pipeline → classification(分類) → semantics(意味情報収集) �
 | モジュール | 責務 | 持たないもの | 計画での呼び名 |
 |---|---|---|---|
 | `cli` | 引数の受け口と値の解釈 | 判定・I/O の手順 | — |
-| `config` | `dryguard.toml` を読んで、外から動かせる閾値にする | 判定・**既定値** | — |
+| `config` | `dryguard.toml` を読んで、外から動かせる閾値とドメインの宣言にする | 判定・**既定値**・宣言の照合 | — |
 | `pipeline` | ステージを呼ぶ順序 | 判定・チャンク化 | — |
 | `codebase` | 走査対象のファイルを集めて読む | 判定・チャンク化・順序 | — |
 | `syntax` | チャンク化・AST 正規化・類似度・import 収集 | 判定 | Stage 1 |
@@ -52,6 +52,11 @@ cli → pipeline → classification(分類) → semantics(意味情報収集) �
 - **`classification` は `config` を知らない。** 外から動かせる閾値は
   `ConfiguredThresholds` として**受け取る**。設定ファイルが無くても・読めなくても
   判定そのものは同じ形で動く（`lsp` を直接触らないのと同じ形）
+- **ドメインの宣言の型と照合は `domain_declaration` に置き、`config` に置かない。**
+  宣言を持つのは `semantics`（呼び出し元・呼び出し先の数え方）と `classification::signal`
+  （モジュール距離）で、`config` に置くと `classification` が `config` を知ることになる。
+  `domain_declaration` は `threshold` と同じく**どこからも使う値の型**で、I/O を持たない。
+  **`syntax` は宣言を知らない** — 段数は宣言に関わらず測り、宣言で重ねるのは `pipeline`
 - 循環依存は全面禁止
 
 ## 判定は 1 箇所にだけ置く

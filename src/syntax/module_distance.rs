@@ -1,10 +1,10 @@
 //! 2 つのファイルの間の、ディレクトリツリー上の隔たり。
 //!
 //! **ドメイン境界の代理指標でしかない。** ディレクトリが分かれていることと
-//! ドメインが違うことは別で、本格的な宣言は `dryguard.toml` のドメイン宣言で行う
-//! （`[domains]` にパスの glob を並べる形に決めたが、`crate::config` が今読むのは
-//! `[thresholds]` だけ）
-//! （`docs/dryguard-plan.md`「ドメイン境界の自動推定は難しい」）。
+//! ドメインが違うことは別で、本格的な宣言は `dryguard.toml` の `[domains]` で行う
+//! （`docs/dryguard-plan.md`「ドメイン境界の自動推定は難しい」）。どちらかのファイルが
+//! 宣言に当たれば、判定は段数を見ない（`classification::signal::ModuleSeparation`）。
+//! **ここは宣言を知らない** — `syntax` は `dryguard.toml` の中身に依存しない。
 //! Phase 0 では代理指標と割り切り、ディレクトリ構造だけでどこまで言えるかを見る材料にする。
 
 use std::path::{Component, Path};
