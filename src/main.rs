@@ -14,7 +14,7 @@ use clap::Parser;
 
 use dryguard::classification::{ConfiguredThresholds, classification_of};
 use dryguard::cli::{Cli, Command, CommonOptions, OutputFormat};
-use dryguard::config::{ConfigError, thresholds_of};
+use dryguard::config::{ConfigError, configuration_of};
 use dryguard::location::Location;
 use dryguard::lsp::ServerCommand;
 use dryguard::pipeline::{chunk_pair_of, measured_pair_of, scan_of};
@@ -147,7 +147,7 @@ fn explanation_of(options: &CommonOptions) -> Explanation {
 /// `dryguard.toml` が在るのに読めない / 書式が違うとき。**無いことは失敗ではない**
 /// （設定を置かずに使える）。
 fn configured_thresholds_of(options: &CommonOptions) -> Result<ConfiguredThresholds, ConfigError> {
-    let thresholds = thresholds_of(Path::new(CONFIG_DIRECTORY))?;
+    let thresholds = configuration_of(Path::new(CONFIG_DIRECTORY))?.thresholds();
 
     let Some(threshold) = options.threshold else {
         return Ok(thresholds);
