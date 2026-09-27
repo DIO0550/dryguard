@@ -109,6 +109,9 @@ jobs:
       - name: session-url-notice
         run: bash .claude/hooks/session-url-notice-test.sh
 
+      - name: post-merge-review
+        run: bash .claude/hooks/post-merge-review-test.sh
+
       # post-edit-rust のテストは使い捨てのクレートに fmt / clippy をかけるので、
       # check ジョブと同じくツールチェーンを明示して用意する。
       - name: Rust ツールチェーン
