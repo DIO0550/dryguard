@@ -57,11 +57,7 @@ impl ModulePath {
             let source_root_text = source_root.to_string_lossy();
             let normalized_root = with_forward_separators(&source_root_text);
             let suffix = specifier.strip_prefix("crate::").unwrap_or("");
-            return Self(format!(
-                "{}/{}",
-                normalized_root,
-                suffix.replace("::", "/")
-            ));
+            return Self(format!("{}/{}", normalized_root, suffix.replace("::", "/")));
         }
         if specifier == "self"
             || specifier == "super"
@@ -1573,10 +1569,8 @@ mod tests {
             "crate::shared::math",
             Path::new("project/src/billing/discount.rs"),
         );
-        let self_path = ModulePath::from_rust_use(
-            "self::math",
-            Path::new(r"project\src\billing\discount.rs"),
-        );
+        let self_path =
+            ModulePath::from_rust_use("self::math", Path::new(r"project\src\billing\discount.rs"));
 
         assert_eq!(crate_path.as_str(), "project/src/shared/math");
         assert_eq!(
