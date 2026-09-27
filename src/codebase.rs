@@ -22,6 +22,24 @@ use crate::syntax::tree::Grammar;
 /// — まだ意味の分かっていないつまみを増やさないため。
 const EXCLUDED_DIRECTORY_NAMES: [&str; 5] = ["node_modules", "dist", "build", "target", ".git"];
 
+/// 走査するソースの言語。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceLanguage {
+    TypeScript,
+    Rust,
+    Auto,
+}
+
+impl SourceLanguage {
+    fn accepts(self, grammar: Grammar) -> bool {
+        match self {
+            Self::TypeScript => grammar != Grammar::Rust,
+            Self::Rust => grammar == Grammar::Rust,
+            Self::Auto => true,
+        }
+    }
+}
+
 /// そのディレクトリ以下の TypeScript ファイル（`.ts` / `.tsx` / `.mts` / `.cts`）を、
 /// パス順に集める。
 ///
@@ -41,6 +59,15 @@ const EXCLUDED_DIRECTORY_NAMES: [&str; 5] = ["node_modules", "dist", "build", "t
 ///
 /// `root` がディレクトリでない / 途中のディレクトリを読めないとき。
 pub fn typescript_paths_of(root: &Path) -> Result<Vec<PathBuf>, CodebaseError> {
+    source_paths_of(root, SourceLanguage::TypeScript)
+}
+
+/// 指定した言語のソースをパス順で集める。
+///
+/// # Errors
+///
+/// 根がディレクトリでない / 途中のディレクトリを読めないとき。
+pub fn source_paths_of(root: &Path, language: SourceLanguage) -> Result<Vec<PathBuf>, CodebaseError> {
     if !root.is_dir() {
         return Err(CodebaseError::RootNotADirectory {
             root: root.to_path_buf(),
@@ -71,7 +98,8 @@ pub fn typescript_paths_of(root: &Path) -> Result<Vec<PathBuf>, CodebaseError> {
                 continue;
             }
 
-            let is_readable_source = file_type.is_file() && Grammar::of_path(&path).is_some();
+            let is_readable_source = file_type.is_file()
+                && Grammar::of_path(&path).is_some_and(|grammar| language.accepts(grammar));
             if is_readable_source {
                 paths.insert(path);
             }

@@ -21,7 +21,7 @@ use crate::syntax::import::{ImportSet, ImportsUnavailable};
 use crate::syntax::line_range::LineRange;
 use crate::syntax::token::TokenSequence;
 use crate::syntax::tree::{
-    SyntaxTree, source_position_of, transparent_wrappers_of, unwrapped_parent_of,
+    Grammar, SyntaxTree, source_position_of, transparent_wrappers_of, unwrapped_parent_of,
 };
 use crate::syntax::type_reference::{
     TypeReference, constructed_class_of, constructed_class_references_of, type_references_of,
@@ -38,6 +38,7 @@ use crate::syntax::type_reference::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     path: PathBuf,
+    grammar: Grammar,
     lines: LineRange,
     name_position: Option<SourcePosition>,
     annotated: AnnotatedPositions,
@@ -148,6 +149,7 @@ impl Chunk {
             enclosing,
             location.path(),
             tree.source(),
+            tree.grammar(),
             ImportSet::from_tree(tree, location.path()),
         ))
     }
@@ -164,17 +166,34 @@ impl Chunk {
         node: Node<'_>,
         path: &Path,
         source: &str,
+        grammar: Grammar,
         imports: Result<ImportSet, ImportsUnavailable>,
     ) -> Self {
         let lines = line_range_of(node);
 
         Self {
             path: path.to_path_buf(),
+            grammar,
             lines,
             name_position: name_position_of(node, source),
-            annotated: annotated_positions_of(node, source),
-            overload_declarations: overload_declarations_of(node, source),
-            type_references: chunk_type_references_of(node, source),
+            annotated: if grammar == Grammar::Rust {
+                AnnotatedPositions::Declared {
+                    value_type: TypeAnnotation::Omitted,
+                    parameters: Vec::new(),
+                }
+            } else {
+                annotated_positions_of(node, source)
+            },
+            overload_declarations: if grammar == Grammar::Rust {
+                Vec::new()
+            } else {
+                overload_declarations_of(node, source)
+            },
+            type_references: if grammar == Grammar::Rust {
+                Vec::new()
+            } else {
+                chunk_type_references_of(node, source)
+            },
             source: source_of_lines(source, lines),
             tokens: TokenSequence::from_node(node),
             imports,
@@ -184,6 +203,11 @@ impl Chunk {
     /// 切り出し元のファイルパス。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 切り出し元の grammar。異なる言語のチャンクを比較しないために使う。
+    pub fn grammar(&self) -> Grammar {
+        self.grammar
     }
 
     /// 切り出した行範囲。
@@ -293,7 +317,7 @@ impl FileChunks {
         let mut unparsable_starts = Vec::new();
 
         for node in tree.named_descendants() {
-            if !CHUNK_KINDS.contains(&node.kind()) {
+            if !is_chunk_node(node, tree.grammar()) {
                 continue;
             }
 
@@ -303,7 +327,13 @@ impl FileChunks {
                 continue;
             }
 
-            chunks.push(Chunk::from_node(node, path, tree.source(), imports.clone()));
+            chunks.push(Chunk::from_node(
+                node,
+                path,
+                tree.source(),
+                tree.grammar(),
+                imports.clone(),
+            ));
         }
 
         Self {
@@ -368,8 +398,7 @@ impl Error for ChunkingError {}
 /// (rules/naming.md「このツールの語彙を固定する」の `chunk`)。
 /// クラスのメソッドとオブジェクトのメソッドは、grammar が同じ `method_definition` で表す。
 ///
-/// `class_declaration` を入れないのは、比較の単位が関数だから。impl ブロックは
-/// Phase 4 の Rust 対応で grammar ごと足す。
+/// `class_declaration` と Rust の `impl_item` を入れないのは、比較の単位がメソッドだから。
 /// 代入を表すノードの種別。左辺が関数の名前になる形を見分けるのに使う。
 const ASSIGNMENT_KIND: &str = "assignment_expression";
 
@@ -384,6 +413,15 @@ const CHUNK_KINDS: [&str; 6] = [
     "arrow_function",
     "method_definition",
 ];
+
+/// Rust は自由関数も `impl` / トレイト実装のメソッドも `function_item`。
+/// 本体のないトレイトの宣言 (`function_signature_item`) は比較しない。
+fn is_chunk_node(node: Node<'_>, grammar: Grammar) -> bool {
+    if grammar == Grammar::Rust {
+        return node.kind() == "function_item" && node.child_by_field_name("body").is_some();
+    }
+    CHUNK_KINDS.contains(&node.kind())
+}
 
 /// オーバーロード宣言を表すノードの種別。
 ///
@@ -451,7 +489,7 @@ fn innermost_chunk_node<'tree>(
 ) -> Option<Node<'tree>> {
     tree.named_descendants()
         .into_iter()
-        .filter(|node| CHUNK_KINDS.contains(&node.kind()))
+        .filter(|node| is_chunk_node(*node, tree.grammar()))
         .filter(|node| line_range_of(*node).contains(line))
         .min_by_key(|node| node.byte_range().len())
 }

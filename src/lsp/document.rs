@@ -96,6 +96,8 @@ enum LanguageId {
     TypeScript,
     /// `.tsx`
     TypeScriptReact,
+    /// `.rs`
+    Rust,
 }
 
 impl LanguageId {
@@ -103,6 +105,7 @@ impl LanguageId {
         match grammar {
             Grammar::TypeScript => Self::TypeScript,
             Grammar::Tsx => Self::TypeScriptReact,
+            Grammar::Rust => Self::Rust,
         }
     }
 
@@ -111,6 +114,7 @@ impl LanguageId {
         match self {
             Self::TypeScript => "typescript",
             Self::TypeScriptReact => "typescriptreact",
+            Self::Rust => "rust",
         }
     }
 }

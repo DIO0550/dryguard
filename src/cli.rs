@@ -80,13 +80,12 @@ pub struct CommonOptions {
 
 /// `--lang` が取る値。
 ///
-/// `rust` は Phase 4 で足す。**まだ動かない選択肢をヘルプに並べない** —
-/// 選べるのに結果が変わらない値があると、使う側は指定が効いていないのか
-/// 未対応なのかを区別できない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum LanguageOption {
     /// TypeScript
     Ts,
+    /// Rust
+    Rust,
     /// 対象から判定する
     Auto,
 }

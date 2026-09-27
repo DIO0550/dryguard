@@ -13,13 +13,15 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use dryguard::classification::{ConfiguredThresholds, classification_of};
-use dryguard::cli::{Cli, Command, CommonOptions, OutputFormat};
+use dryguard::cli::{Cli, Command, CommonOptions, LanguageOption, OutputFormat};
+use dryguard::codebase::SourceLanguage;
 use dryguard::config::configuration_of;
 use dryguard::domain_declaration::DomainDeclarations;
 use dryguard::location::Location;
 use dryguard::lsp::ServerCommand;
-use dryguard::pipeline::{chunk_pair_of, measured_pair_of, scan_of};
+use dryguard::pipeline::{chunk_pair_of, measured_pair_of, scan_of_language};
 use dryguard::report::{Explanation, json_of, scan_json_of, scan_text_of, text_of};
+use dryguard::syntax::tree::Grammar;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -89,6 +91,13 @@ fn report_compare(
             return ExitCode::FAILURE;
         }
     };
+    let is_rust = pair.chunk_a().grammar() == Grammar::Rust;
+    if matches!(options.lang, LanguageOption::Ts) && is_rust
+        || matches!(options.lang, LanguageOption::Rust) && !is_rust
+    {
+        eprintln!("指定した --lang と比較するファイルの言語が一致しません");
+        return ExitCode::FAILURE;
+    }
 
     // **宣言の食い違いは判定を出さずに止める。** 直す先は dryguard.toml で、
     // どちらかの宣言へ寄せた判定を出すと、並べ替えただけで答えが変わる
@@ -132,8 +141,14 @@ fn report_compare(
 /// **LSP サーバを使えなくても失敗にしない。** 理由を stderr へ回す分担は
 /// [`report_compare`] と同じ（stdout は判定の出力に保つ）。
 fn report_scan(root: &Path, options: &CommonOptions, settings: &Settings<'_>) -> ExitCode {
-    let scan = match scan_of(
+    let language = match options.lang {
+        LanguageOption::Ts => SourceLanguage::TypeScript,
+        LanguageOption::Rust => SourceLanguage::Rust,
+        LanguageOption::Auto => SourceLanguage::Auto,
+    };
+    let scan = match scan_of_language(
         root,
+        language,
         settings.thresholds,
         settings.declarations,
         &ServerCommand::typescript(),
