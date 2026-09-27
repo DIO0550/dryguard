@@ -185,6 +185,32 @@ fn test_compare_of_two_locations_yields_a_chunk_for_each() {
 }
 
 #[test]
+fn test_compare_of_rust_and_typescript_functions_reports_different_languages() {
+    let rust = fixture("rust-scan/src/billing/discount.rs", 3);
+    let typescript = fixture("billing/discount.ts", 6);
+
+    let result = chunk_pair_of(&rust, &typescript);
+
+    let Err(ChunkPairError::DifferentLanguages {
+        location_a,
+        location_b,
+    }) = result
+    else {
+        panic!("Rust と TypeScript の関数は DifferentLanguages になる");
+    };
+    assert_eq!(location_a, rust);
+    assert_eq!(location_b, typescript);
+    assert_eq!(
+        ChunkPairError::DifferentLanguages {
+            location_a,
+            location_b,
+        }
+        .to_string(),
+        format!("異なる言語の関数は比較できません: {rust} / {typescript}")
+    );
+}
+
+#[test]
 fn test_compare_of_two_locations_yields_the_function_that_encloses_each_line() {
     let pair = chunk_pair_of(
         &fixture("billing/discount.ts", 6),

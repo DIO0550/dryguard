@@ -54,10 +54,12 @@ impl ModulePath {
                 .find(|path| path.file_name().is_some_and(|name| name == "src"))
                 .or_else(|| importer.parent())
                 .unwrap_or_else(|| Path::new(""));
+            let source_root_text = source_root.to_string_lossy();
+            let normalized_root = with_forward_separators(&source_root_text);
             let suffix = specifier.strip_prefix("crate::").unwrap_or("");
             return Self(format!(
                 "{}/{}",
-                source_root.display(),
+                normalized_root,
                 suffix.replace("::", "/")
             ));
         }
@@ -66,7 +68,9 @@ impl ModulePath {
             || specifier.starts_with("self::")
             || specifier.starts_with("super::")
         {
-            return Self(format!("{}::{specifier}", importer.display()));
+            let importer_text = importer.to_string_lossy();
+            let normalized_importer = with_forward_separators(&importer_text);
+            return Self(format!("{normalized_importer}::{specifier}"));
         }
         Self(specifier.to_owned())
     }
@@ -1561,6 +1565,24 @@ mod tests {
         let direct = ImportSet::from_tree(&direct, Path::new("src/inventory/reorder.rs"))
             .expect("直接の use を読める");
         assert_eq!(grouped.jaccard(&direct).value(), 0.5);
+    }
+
+    #[test]
+    fn test_rust_use_paths_use_forward_separators_for_importer_locations() {
+        let crate_path = ModulePath::from_rust_use(
+            "crate::shared::math",
+            Path::new("project/src/billing/discount.rs"),
+        );
+        let self_path = ModulePath::from_rust_use(
+            "self::math",
+            Path::new(r"project\src\billing\discount.rs"),
+        );
+
+        assert_eq!(crate_path.as_str(), "project/src/shared/math");
+        assert_eq!(
+            self_path.as_str(),
+            "project/src/billing/discount.rs::self::math"
+        );
     }
 
     #[test]
