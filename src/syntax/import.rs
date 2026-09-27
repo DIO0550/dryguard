@@ -171,12 +171,39 @@ impl ImportSet {
     }
 }
 
+/// Rust の `use` に現れる構文ノード。tree-sitter の種別名は変換時だけ読む。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustUseNodeKind {
+    Declaration,
+    ScopedList,
+    List,
+    Alias,
+    Wildcard,
+    Path,
+    SelfPath,
+}
+
+impl RustUseNodeKind {
+    fn of(node: Node<'_>) -> Option<Self> {
+        match node.kind() {
+            "use_declaration" => Some(Self::Declaration),
+            "scoped_use_list" => Some(Self::ScopedList),
+            "use_list" => Some(Self::List),
+            "use_as_clause" => Some(Self::Alias),
+            "use_wildcard" => Some(Self::Wildcard),
+            "identifier" | "scoped_identifier" | "crate" | "super" => Some(Self::Path),
+            "self" => Some(Self::SelfPath),
+            _ => None,
+        }
+    }
+}
+
 /// Rust の `use` を、同じ依存先集合に入れる。グループは各 leaf に展開し、
 /// `as` の別名は落とす。読み取れない宣言は部分集合を返さない。
 fn rust_use_paths_of(tree: &SyntaxTree<'_>) -> Result<Vec<String>, ImportsUnavailable> {
     let mut paths = Vec::new();
     for node in tree.named_descendants() {
-        if node.kind() != "use_declaration" {
+        if RustUseNodeKind::of(node) != Some(RustUseNodeKind::Declaration) {
             continue;
         }
         let line = LineNumber::from_index(node.start_position().row);
@@ -199,24 +226,25 @@ fn rust_use_leaves_of(
     prefix: &str,
     paths: &mut Vec<String>,
 ) -> Option<()> {
-    match node.kind() {
-        "scoped_use_list" => {
+    let kind = RustUseNodeKind::of(node)?;
+    match kind {
+        RustUseNodeKind::ScopedList => {
             let path = node.child_by_field_name("path")?;
             let list = node.child_by_field_name("list")?;
             rust_use_leaves_of(tree, list, &rust_join(prefix, tree.text_of(path)?), paths)
         }
-        "use_list" => {
+        RustUseNodeKind::List => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 rust_use_leaves_of(tree, child, prefix, paths)?;
             }
             Some(())
         }
-        "use_as_clause" => {
+        RustUseNodeKind::Alias => {
             let path = node.child_by_field_name("path")?;
             rust_use_leaves_of(tree, path, prefix, paths)
         }
-        "use_wildcard" => {
+        RustUseNodeKind::Wildcard => {
             let mut cursor = node.walk();
             let path = node.named_children(&mut cursor).next();
             let base = match path {
@@ -226,9 +254,9 @@ fn rust_use_leaves_of(
             paths.push(rust_join(&base, "*"));
             Some(())
         }
-        "identifier" | "scoped_identifier" | "crate" | "self" | "super" => {
+        RustUseNodeKind::Path | RustUseNodeKind::SelfPath => {
             let name = tree.text_of(node)?;
-            let full = if name == "self" && !prefix.is_empty() {
+            let full = if kind == RustUseNodeKind::SelfPath && !prefix.is_empty() {
                 prefix.to_owned()
             } else {
                 rust_join(prefix, name)
@@ -236,7 +264,7 @@ fn rust_use_leaves_of(
             paths.push(full);
             Some(())
         }
-        _ => None,
+        RustUseNodeKind::Declaration => None,
     }
 }
 
