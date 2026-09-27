@@ -75,7 +75,7 @@ enum Normalization {
 /// 型名（`type_identifier` / `predefined_type`）を混ぜているのは、**ここが構造だけを見る層**で、
 /// 型の違いは Stage 2 が見るため。`x: number` と `x: string` を別物にすると、
 /// 型注釈を書き換えただけで構造が違って見える。
-const NAME_KINDS: [&str; 8] = [
+const NAME_KINDS: [&str; 9] = [
     "identifier",
     "property_identifier",
     "shorthand_property_identifier",
@@ -84,6 +84,7 @@ const NAME_KINDS: [&str; 8] = [
     "statement_identifier",
     "type_identifier",
     "predefined_type",
+    "field_identifier",
 ];
 
 /// リテラルのノード種別と、その型タグ。
@@ -91,7 +92,7 @@ const NAME_KINDS: [&str; 8] = [
 /// `string_fragment` が要るのは、テンプレートリテラルへ降りるため。`string` は
 /// そこで潰れるので `string_fragment` が現れないが、`` `a ${b} c` `` では
 /// 文字の部分が `string_fragment` として出てくる。
-const LITERAL_KINDS: [(&str, LiteralType); 8] = [
+const LITERAL_KINDS: [(&str, LiteralType); 15] = [
     ("number", LiteralType::Number),
     ("string", LiteralType::Text),
     ("string_fragment", LiteralType::Text),
@@ -100,6 +101,13 @@ const LITERAL_KINDS: [(&str, LiteralType); 8] = [
     ("false", LiteralType::Boolean),
     ("null", LiteralType::Null),
     ("undefined", LiteralType::Undefined),
+    ("integer_literal", LiteralType::Number),
+    ("float_literal", LiteralType::Number),
+    ("string_literal", LiteralType::Text),
+    ("raw_string_literal", LiteralType::Text),
+    ("char_literal", LiteralType::Text),
+    ("boolean_literal", LiteralType::Boolean),
+    ("unit_expression", LiteralType::Null),
 ];
 
 /// コメントのノード種別。

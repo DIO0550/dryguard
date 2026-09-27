@@ -66,7 +66,7 @@ cargo run -- compare <locA> <locB>   # 特定の 2 関数を比較 (file:line)
 cargo run -- scan [path]             # コードベース全体をスキャン (既定は .)
 
 オプション:
-  --lang ts|auto
+  --lang ts|rust|auto
   --format text|json
   --threshold <0-1>
   --explain                          # 判定根拠のシグナル値を全表示
@@ -77,7 +77,12 @@ cargo run -- scan [path]             # コードベース全体をスキャン (
 **各シグナルに当てた閾値**。**既定でも判定に効いた根拠は出る**ので、`--explain` は
 結論に理由を足すのではなく、**閾値との突き合わせまで見せる**ためのもの。
 
-`scan` が見るのは `.ts` と `.tsx` で、`node_modules` / `dist` / `build` / `target` / `.git` は
+`scan` は `.ts` / `.tsx` / `.mts` / `.cts` / `.rs` を見る。`--lang ts` / `--lang rust` で
+対象を絞り、`auto` では両方を走査する（異なる言語の関数同士は比較しない）。Rust の
+自由関数・`impl` 内のメソッド・トレイト実装のメソッドをそれぞれ 1 チャンクにする。
+Rust の意味情報収集は未対応で、Stage 2 のシグナルは「尋ねていない」として扱う。
+
+`node_modules` / `dist` / `build` / `target` / `.git` は
 降りない。**読むときの grammar は拡張子で選ぶ**（JSX は TypeScript の grammar では読めず、
 型アサーション `<T>value` は TSX の grammar では JSX に見えるので、片方で兼ねられない）。
 読めなかったファイルと構文エラーで切り出せなかった関数は、

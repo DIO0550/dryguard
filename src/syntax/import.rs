@@ -13,7 +13,7 @@ use tree_sitter::Node;
 
 use crate::line_number::LineNumber;
 use crate::similarity::Similarity;
-use crate::syntax::tree::SyntaxTree;
+use crate::syntax::tree::{Grammar, SyntaxTree};
 
 /// 解決済みの依存先。相対指定は importer の位置から畳んである。
 ///
@@ -42,6 +42,33 @@ impl ModulePath {
 
         let directory = importer.parent().unwrap_or_else(|| Path::new(""));
         Self(folded_path(directory, &written))
+    }
+
+    /// `crate::` は importer のソース根から解決する。別クレートの同じ綴りを
+    /// 同じ依存先として数えない。`self` / `super` はモジュール宣言を辿らずに
+    /// 正確な位置を確定できないため、ファイルを付けて偽の共有を避ける。
+    fn from_rust_use(specifier: &str, importer: &Path) -> Self {
+        if specifier == "crate" || specifier.starts_with("crate::") {
+            let source_root = importer
+                .ancestors()
+                .find(|path| path.file_name().is_some_and(|name| name == "src"))
+                .or_else(|| importer.parent())
+                .unwrap_or_else(|| Path::new(""));
+            let source_root_text = source_root.to_string_lossy();
+            let normalized_root = with_forward_separators(&source_root_text);
+            let suffix = specifier.strip_prefix("crate::").unwrap_or("");
+            return Self(format!("{}/{}", normalized_root, suffix.replace("::", "/")));
+        }
+        if specifier == "self"
+            || specifier == "super"
+            || specifier.starts_with("self::")
+            || specifier.starts_with("super::")
+        {
+            let importer_text = importer.to_string_lossy();
+            let normalized_importer = with_forward_separators(&importer_text);
+            return Self(format!("{normalized_importer}::{specifier}"));
+        }
+        Self(specifier.to_owned())
     }
 
     /// 解決済みの依存先そのもの。
@@ -109,6 +136,17 @@ impl ImportSet {
     /// 重なりは過大にも過小にも動くので、**落ちたことが構造に出ないと区別できない**
     /// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
     pub fn from_tree(tree: &SyntaxTree<'_>, importer: &Path) -> Result<Self, ImportsUnavailable> {
+        if tree.grammar() == Grammar::Rust {
+            let paths: HashSet<ModulePath> = rust_use_paths_of(tree)?
+                .into_iter()
+                .map(|specifier| ModulePath::from_rust_use(&specifier, importer))
+                .collect();
+            if paths.is_empty() {
+                return Err(ImportsUnavailable::NoDeclarations);
+            }
+            return Ok(Self(paths));
+        }
+
         let specifiers = specifiers_of(tree)?;
         let paths: HashSet<ModulePath> = specifiers
             .iter()
@@ -131,6 +169,110 @@ impl ImportSet {
 
         Similarity::from_shared_count(shared, combined)
     }
+}
+
+/// Rust の `use` に現れる構文ノード。tree-sitter の種別名は変換時だけ読む。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustUseNodeKind {
+    Declaration,
+    ScopedList,
+    List,
+    Alias,
+    Wildcard,
+    Path,
+    SelfPath,
+}
+
+impl RustUseNodeKind {
+    fn of(node: Node<'_>) -> Option<Self> {
+        match node.kind() {
+            "use_declaration" => Some(Self::Declaration),
+            "scoped_use_list" => Some(Self::ScopedList),
+            "use_list" => Some(Self::List),
+            "use_as_clause" => Some(Self::Alias),
+            "use_wildcard" => Some(Self::Wildcard),
+            "identifier" | "scoped_identifier" | "crate" | "super" => Some(Self::Path),
+            "self" => Some(Self::SelfPath),
+            _ => None,
+        }
+    }
+}
+
+/// Rust の `use` を、同じ依存先集合に入れる。グループは各 leaf に展開し、
+/// `as` の別名は落とす。読み取れない宣言は部分集合を返さない。
+fn rust_use_paths_of(tree: &SyntaxTree<'_>) -> Result<Vec<String>, ImportsUnavailable> {
+    let mut paths = Vec::new();
+    for node in tree.named_descendants() {
+        if RustUseNodeKind::of(node) != Some(RustUseNodeKind::Declaration) {
+            continue;
+        }
+        let line = LineNumber::from_index(node.start_position().row);
+        if node.has_error() {
+            return Err(ImportsUnavailable::UnreadableDeclaration { line });
+        }
+        let argument = node
+            .child_by_field_name("argument")
+            .ok_or(ImportsUnavailable::UnreadableDeclaration { line })?;
+        rust_use_leaves_of(tree, argument, "", &mut paths)
+            .ok_or(ImportsUnavailable::UnreadableDeclaration { line })?;
+    }
+    Ok(paths)
+}
+
+/// グループの prefix を leaf に伝える。`self` はその prefix 自身を指す。
+fn rust_use_leaves_of(
+    tree: &SyntaxTree<'_>,
+    node: Node<'_>,
+    prefix: &str,
+    paths: &mut Vec<String>,
+) -> Option<()> {
+    let kind = RustUseNodeKind::of(node)?;
+    match kind {
+        RustUseNodeKind::ScopedList => {
+            let path = node.child_by_field_name("path")?;
+            let list = node.child_by_field_name("list")?;
+            rust_use_leaves_of(tree, list, &rust_join(prefix, tree.text_of(path)?), paths)
+        }
+        RustUseNodeKind::List => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                rust_use_leaves_of(tree, child, prefix, paths)?;
+            }
+            Some(())
+        }
+        RustUseNodeKind::Alias => {
+            let path = node.child_by_field_name("path")?;
+            rust_use_leaves_of(tree, path, prefix, paths)
+        }
+        RustUseNodeKind::Wildcard => {
+            let mut cursor = node.walk();
+            let path = node.named_children(&mut cursor).next();
+            let base = match path {
+                Some(path) => rust_join(prefix, tree.text_of(path)?),
+                None => prefix.to_owned(),
+            };
+            paths.push(rust_join(&base, "*"));
+            Some(())
+        }
+        RustUseNodeKind::Path | RustUseNodeKind::SelfPath => {
+            let name = tree.text_of(node)?;
+            let full = if kind == RustUseNodeKind::SelfPath && !prefix.is_empty() {
+                prefix.to_owned()
+            } else {
+                rust_join(prefix, name)
+            };
+            paths.push(full);
+            Some(())
+        }
+        RustUseNodeKind::Declaration => None,
+    }
+}
+
+fn rust_join(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        return name.to_owned();
+    }
+    format!("{prefix}::{name}")
 }
 
 /// 依存先を宣言する文の種別。どちらも `source` フィールドに指定子の文字列を持つ。
@@ -1430,6 +1572,50 @@ mod tests {
     fn tree_of(source: &str) -> SyntaxTree<'_> {
         SyntaxTree::from_source(source, Grammar::TypeScript)
             .expect("テストが渡すソースは木にできる")
+    }
+
+    #[test]
+    fn test_rust_use_group_and_alias_share_the_same_import_set_as_direct_use() {
+        let grouped = SyntaxTree::from_source(
+            "use crate::shared::{math::scale as convert, tax};",
+            Grammar::Rust,
+        )
+        .expect("Rust の木にできる");
+        let direct = SyntaxTree::from_source("use crate::shared::math::scale;", Grammar::Rust)
+            .expect("Rust の木にできる");
+
+        let grouped = ImportSet::from_tree(&grouped, Path::new("src/billing/discount.rs"))
+            .expect("グループを展開できる");
+        let direct = ImportSet::from_tree(&direct, Path::new("src/inventory/reorder.rs"))
+            .expect("直接の use を読める");
+        assert_eq!(grouped.jaccard(&direct).value(), 0.5);
+    }
+
+    #[test]
+    fn test_rust_use_paths_use_forward_separators_for_importer_locations() {
+        let crate_path = ModulePath::from_rust_use(
+            "crate::shared::math",
+            Path::new("project/src/billing/discount.rs"),
+        );
+        let self_path =
+            ModulePath::from_rust_use("self::math", Path::new(r"project\src\billing\discount.rs"));
+
+        assert_eq!(crate_path.as_str(), "project/src/shared/math");
+        assert_eq!(
+            self_path.as_str(),
+            "project/src/billing/discount.rs::self::math"
+        );
+    }
+
+    #[test]
+    fn test_rust_source_without_use_has_no_import_signal() {
+        let tree = SyntaxTree::from_source("fn total() -> i32 { 1 }", Grammar::Rust)
+            .expect("Rust の木にできる");
+
+        assert_eq!(
+            ImportSet::from_tree(&tree, Path::new("src/billing/discount.rs")),
+            Err(ImportsUnavailable::NoDeclarations)
+        );
     }
 
     fn tsx_tree_of(source: &str) -> SyntaxTree<'_> {

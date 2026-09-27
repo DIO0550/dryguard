@@ -27,6 +27,8 @@ pub enum Grammar {
     TypeScript,
     /// `.tsx`
     Tsx,
+    /// `.rs`
+    Rust,
 }
 
 impl Grammar {
@@ -45,6 +47,7 @@ impl Grammar {
             // TSX の grammar にはならない
             "ts" | "mts" | "cts" => Some(Self::TypeScript),
             "tsx" => Some(Self::Tsx),
+            "rs" => Some(Self::Rust),
             _ => None,
         }
     }
@@ -54,7 +57,17 @@ impl Grammar {
         match self {
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Self::Rust => tree_sitter_rust::LANGUAGE.into(),
         }
+    }
+
+    /// TS と TSX は同じ言語のチャンクとして比較する。
+    pub fn same_language_as(self, other: Self) -> bool {
+        matches!((self, other), (Self::Rust, Self::Rust))
+            || matches!(
+                (self, other),
+                (Self::TypeScript | Self::Tsx, Self::TypeScript | Self::Tsx)
+            )
     }
 }
 
@@ -68,6 +81,7 @@ impl Grammar {
 pub struct SyntaxTree<'source> {
     tree: tree_sitter::Tree,
     source: &'source str,
+    grammar: Grammar,
 }
 
 impl<'source> SyntaxTree<'source> {
@@ -89,7 +103,16 @@ impl<'source> SyntaxTree<'source> {
 
         let tree = parser.parse(source, None).ok_or(ParseError::NoTree)?;
 
-        Ok(Self { tree, source })
+        Ok(Self {
+            tree,
+            source,
+            grammar,
+        })
+    }
+
+    /// この木を読んだ grammar。
+    pub fn grammar(&self) -> Grammar {
+        self.grammar
     }
 
     /// 木の中の名前付きノードを、根から前順（ソースに書かれた順）で返す。
@@ -226,7 +249,7 @@ impl fmt::Display for ParseError {
         match self {
             Self::GrammarRejected => write!(
                 formatter,
-                "TypeScript の grammar が tree-sitter の実行時と噛み合っていません"
+                "grammar が tree-sitter の実行時と噛み合っていません"
             ),
             Self::NoTree => write!(formatter, "ソースをパースできませんでした"),
         }

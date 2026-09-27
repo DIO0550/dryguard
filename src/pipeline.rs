@@ -21,7 +21,7 @@ use crate::classification::signal::{
 use crate::classification::{
     Classification, ConfiguredThresholds, classification_of, is_structurally_similar,
 };
-use crate::codebase::{CodebaseError, source_of, typescript_paths_of};
+use crate::codebase::{CodebaseError, SourceLanguage, source_of, source_paths_of};
 use crate::domain_declaration::{AmbiguousDomain, DomainDeclarations, DomainName};
 use crate::location::Location;
 use crate::lsp::{
@@ -93,6 +93,12 @@ pub fn chunk_pair_of(
 
     let (chunk_a, source_a) = chunk_at(location_a)?;
     let (chunk_b, source_b) = chunk_at(location_b)?;
+    if !chunk_a.grammar().same_language_as(chunk_b.grammar()) {
+        return Err(ChunkPairError::DifferentLanguages {
+            location_a: location_a.clone(),
+            location_b: location_b.clone(),
+        });
+    }
 
     Ok(ChunkPair {
         chunk_a,
@@ -319,14 +325,17 @@ pub fn measured_pair_of(
         (&pair.chunk_b, declared_b.as_ref()),
     );
 
-    let asked = if is_structurally_similar(
-        signals.structural_similarity(),
-        thresholds.structural_similarity(),
-    ) {
-        semantics_of(pair, declarations, server)
-    } else {
-        AskedSemantics::unavailable(SemanticsUnavailable::NotACandidate, None)
-    };
+    let asked =
+        if pair.chunk_a.grammar() == Grammar::Rust || pair.chunk_b.grammar() == Grammar::Rust {
+            AskedSemantics::unavailable(SemanticsUnavailable::NotAsked, None)
+        } else if is_structurally_similar(
+            signals.structural_similarity(),
+            thresholds.structural_similarity(),
+        ) {
+            semantics_of(pair, declarations, server)
+        } else {
+            AskedSemantics::unavailable(SemanticsUnavailable::NotACandidate, None)
+        };
 
     Ok(MeasuredPair {
         signals: signals
@@ -1119,7 +1128,28 @@ pub fn scan_of(
     declarations: &DomainDeclarations,
     server: &ServerCommand,
 ) -> Result<Scan, ScanError> {
-    let paths = typescript_paths_of(root).map_err(ScanError::Codebase)?;
+    scan_of_language(
+        root,
+        SourceLanguage::TypeScript,
+        thresholds,
+        declarations,
+        server,
+    )
+}
+
+/// 指定した言語のソースを走査する。Rust の候補は Stage 1 のシグナルだけで判定する。
+///
+/// # Errors
+///
+/// [`scan_of`] と同じ。
+pub fn scan_of_language(
+    root: &Path,
+    language: SourceLanguage,
+    thresholds: ConfiguredThresholds,
+    declarations: &DomainDeclarations,
+    server: &ServerCommand,
+) -> Result<Scan, ScanError> {
+    let paths = source_paths_of(root, language).map_err(ScanError::Codebase)?;
     let file_count = paths.len();
     // **比べ始める前に全部確かめる。** 読めなかったファイルのように飛ばして続けると、
     // 宣言の食い違いに気づかないまま、そのファイルの無い判定が出る
@@ -1291,12 +1321,18 @@ fn scan_of_chunks(
         .flat_map(|compared| compared.candidates)
         .collect();
 
-    let semantics = scan_semantics_of(
-        chunks,
-        &asked_chunk_indices_of(&candidates),
-        declarations,
-        server,
-    );
+    let asked: BTreeSet<usize> = asked_chunk_indices_of(&candidates)
+        .into_iter()
+        .filter(|index| chunks[*index].chunk.grammar() != Grammar::Rust)
+        .collect();
+    let mut semantics = scan_semantics_of(chunks, &asked, declarations, server);
+    for (index, chunk) in chunks.iter().enumerate() {
+        if chunk.chunk.grammar() == Grammar::Rust {
+            semantics.per_chunk[index] = ChunkSemantics::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            };
+        }
+    }
     let candidate_pairs = candidates
         .into_iter()
         .map(|candidate| candidate_pair_of(chunks, &semantics, candidate, thresholds))
@@ -1358,7 +1394,9 @@ impl ComparedPairs {
         for (offset, other) in following.iter().enumerate() {
             let other_chunk = &other.chunk;
 
-            if is_nested(chunk, other_chunk) {
+            if !chunk.grammar().same_language_as(other_chunk.grammar())
+                || is_nested(chunk, other_chunk)
+            {
                 continue;
             }
             compared_pair_count += 1;
@@ -2095,6 +2133,11 @@ impl Error for ScanError {
 /// 位置が分からないと利用者はどちらを直せばよいか分からない。
 #[derive(Debug)]
 pub enum ChunkPairError {
+    /// 異なる言語の構文は同じ正規化トークン列で比較できない。
+    DifferentLanguages {
+        location_a: Location,
+        location_b: Location,
+    },
     /// 拡張子から grammar を選べなかった。
     ///
     /// 読める拡張子でないファイルは、読めたふりをせずここで断る。TypeScript の
@@ -2121,6 +2164,15 @@ pub enum ChunkPairError {
 impl fmt::Display for ChunkPairError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DifferentLanguages {
+                location_a,
+                location_b,
+            } => {
+                write!(
+                    formatter,
+                    "異なる言語の関数は比較できません: {location_a} / {location_b}"
+                )
+            }
             Self::UnreadableExtension { location } => {
                 write!(formatter, "{location} は読める拡張子ではありません")
             }
@@ -2140,6 +2192,7 @@ impl fmt::Display for ChunkPairError {
 impl Error for ChunkPairError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::DifferentLanguages { .. } => None,
             Self::UnreadableExtension { .. } => None,
             Self::SourceUnreadable { cause, .. } => Some(cause),
             Self::SourceUnparsable { cause, .. } => Some(cause),
