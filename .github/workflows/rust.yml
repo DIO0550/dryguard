@@ -89,6 +89,18 @@ jobs:
           echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
           node_modules/.bin/typescript-language-server --version
 
+      - name: rust-analyzer
+        run: |
+          # 版と配布物の中身を固定する。開発機と同じバイナリで実サーバテストを走らせる。
+          curl --fail --location --silent --show-error --retry 3 \
+            --output rust-analyzer.gz \
+            https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-21/rust-analyzer-x86_64-unknown-linux-gnu.gz
+          echo 'b2d24ce2bda2ea05b1ad7c2917d205f8111775f703ccd908e6061803ae8257d0  rust-analyzer.gz' | sha256sum --check
+          gzip --decompress rust-analyzer.gz
+          chmod +x rust-analyzer
+          echo "$PWD" >> "$GITHUB_PATH"
+          ./rust-analyzer --version
+
       - name: cargo test (LSP)
         run: cargo test -- --ignored
 

@@ -46,6 +46,7 @@ use lsp_types::{
 };
 
 use crate::source_position::SourcePosition;
+use crate::syntax::tree::Grammar;
 use connection::Connection;
 
 // 開かせるドキュメントとワークスペースの根は、呼ぶ側が組み立てて渡す。
@@ -74,6 +75,9 @@ pub use uri::{PathUriError, UriPathError};
 /// TypeScript の LSP サーバの実行ファイル名。
 const TYPESCRIPT_SERVER: &str = "typescript-language-server";
 
+/// Rust の LSP サーバの実行ファイル名。
+const RUST_SERVER: &str = "rust-analyzer";
+
 /// stdio でしゃべらせる指定。付けないとサーバは使い方を表示して終わる。
 const STDIO_OPTION: &str = "--stdio";
 
@@ -84,10 +88,18 @@ const STDIO_OPTION: &str = "--stdio";
 /// **import を辿る向きの逆にある参照元が返らない**。
 const TYPESCRIPT_PROJECT_MARKERS: [&str; 2] = ["tsconfig.json", "jsconfig.json"];
 
+/// rust-analyzer がワークスペースを見つけるためのマニフェスト。
+const RUST_PROJECT_MARKERS: [&str; 1] = ["Cargo.toml"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ServerLanguage {
+    TypeScript,
+    Rust,
+}
+
 /// どの LSP サーバをどう起動するか。
 ///
-/// **サーバごとの差はここに閉じる。** Phase 4 で rust-analyzer を挿すときに
-/// 足すのはこの値で、[`Client`] 側は変わらない
+/// **起動方法・プロジェクトの印・言語はこの値で揃える。**
 /// (`docs/dryguard-plan.md`「LSPサーバ: TS は typescript-language-server、
 /// Rust は rust-analyzer」)。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +107,7 @@ pub struct ServerCommand {
     program: String,
     args: Vec<String>,
     project_markers: Vec<String>,
+    language: ServerLanguage,
 }
 
 impl ServerCommand {
@@ -103,6 +116,7 @@ impl ServerCommand {
     /// `project_markers` はそのサーバがプロジェクトの根と見なすファイルの名前。
     /// **印で範囲を決めないサーバには空を渡す。** 根が範囲そのものになるので、
     /// 参照元は揃う扱いになる（`WorkspaceRoot::enclosing_project`）。
+    /// 独自サーバは TypeScript の問い合わせ形式を使う。Rust は [`Self::rust`] を使う。
     pub fn new(
         program: impl Into<String>,
         args: Vec<String>,
@@ -112,6 +126,7 @@ impl ServerCommand {
             program: program.into(),
             args,
             project_markers,
+            language: ServerLanguage::TypeScript,
         }
     }
 
@@ -122,6 +137,20 @@ impl ServerCommand {
             vec![STDIO_OPTION.to_owned()],
             TYPESCRIPT_PROJECT_MARKERS.map(str::to_owned).to_vec(),
         )
+    }
+
+    /// rust-analyzer を stdio で起動する指定。
+    ///
+    /// rust-analyzer は引数を付けずに起動すると LSP サーバになる。
+    pub fn rust() -> Self {
+        Self {
+            language: ServerLanguage::Rust,
+            ..Self::new(
+                RUST_SERVER,
+                Vec::new(),
+                RUST_PROJECT_MARKERS.map(str::to_owned).to_vec(),
+            )
+        }
     }
 
     /// 実行ファイル名。
@@ -135,6 +164,14 @@ impl ServerCommand {
     /// なのでサーバの指定と一緒に置く（`rules/naming.md`「このツールの語彙を固定する」）。
     pub fn project_markers(&self) -> &[String] {
         &self.project_markers
+    }
+
+    /// このサーバで問い合わせられるソースの言語。
+    pub(crate) fn supports(&self, grammar: Grammar) -> bool {
+        match self.language {
+            ServerLanguage::TypeScript => grammar != Grammar::Rust,
+            ServerLanguage::Rust => grammar == Grammar::Rust,
+        }
     }
 }
 
@@ -185,7 +222,8 @@ impl Client {
 
         Ok(Self {
             child,
-            connection: Connection::new(BufReader::new(stdout), stdin),
+            connection: Connection::new(BufReader::new(stdout), stdin)
+                .with_language(command.language),
             program: command.program.clone(),
             terminated: false,
         })
@@ -226,6 +264,10 @@ pub struct Session {
 }
 
 impl Session {
+    /// Rust は Cargo.toml でワークスペースを決め、tsserver の projectInfo を持たない。
+    pub(crate) fn needs_project_membership_query(&self) -> bool {
+        self.client.connection.language() == ServerLanguage::TypeScript
+    }
     /// サーバができること。
     pub fn capabilities(&self) -> &ServerCapabilities {
         &self.capabilities
@@ -1004,6 +1046,17 @@ mod tests {
             command.project_markers(),
             ["tsconfig.json".to_owned(), "jsconfig.json".to_owned()]
         );
+    }
+
+    #[test]
+    fn test_server_command_for_rust_uses_cargo_workspace() {
+        let command = ServerCommand::rust();
+
+        assert_eq!(command.program(), "rust-analyzer");
+        assert!(command.args.is_empty(), "引数無しで stdio を使う");
+        assert_eq!(command.project_markers(), ["Cargo.toml".to_owned()]);
+        assert!(command.supports(Grammar::Rust));
+        assert!(!command.supports(Grammar::TypeScript));
     }
 
     #[test]
