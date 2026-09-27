@@ -16,8 +16,8 @@
 use std::path::{Path, PathBuf};
 
 use dryguard::classification::ConfiguredThresholds;
-use dryguard::codebase::SourceLanguage;
 use dryguard::classification::verdict::Verdict;
+use dryguard::codebase::SourceLanguage;
 use dryguard::domain_declaration::DomainDeclarations;
 use dryguard::lsp::ServerCommand;
 use dryguard::pipeline::{CandidatePair, Scan, scan_of, scan_of_language};
@@ -43,24 +43,40 @@ fn test_rust_scan_lists_free_functions_and_impl_methods_without_asking_typescrip
     .expect("Rust のフィクスチャを走査できる");
 
     assert_eq!(scan.file_count(), 2);
-    assert_eq!(scan.chunk_count(), 6, "本体のないトレイト宣言や impl 全体は数えない");
+    assert_eq!(
+        scan.chunk_count(),
+        6,
+        "本体のないトレイト宣言や impl 全体は数えない"
+    );
     assert_eq!(scan.compared_pair_count(), 15);
-    assert!(scan.semantics_error().is_none(), "Rust の Stage 2 はまだ尋ねない");
-    assert!(scan.candidate_pairs().iter().any(|pair| is_pair_of(
-        pair,
-        "billing/discount.rs:3",
-        "inventory/reorder.rs:3"
-    )), "自由関数の候補ペアを列挙する");
-    assert!(scan.candidate_pairs().iter().any(|pair| is_pair_of(
-        pair,
-        "billing/discount.rs:9",
-        "inventory/reorder.rs:9"
-    )), "固有メソッドを列挙する");
-    assert!(scan.candidate_pairs().iter().any(|pair| is_pair_of(
-        pair,
-        "billing/discount.rs:18",
-        "inventory/reorder.rs:18"
-    )), "トレイト実装のメソッドを列挙する");
+    assert!(
+        scan.semantics_error().is_none(),
+        "Rust の Stage 2 はまだ尋ねない"
+    );
+    assert!(
+        scan.candidate_pairs().iter().any(|pair| is_pair_of(
+            pair,
+            "billing/discount.rs:3",
+            "inventory/reorder.rs:3"
+        )),
+        "自由関数の候補ペアを列挙する"
+    );
+    assert!(
+        scan.candidate_pairs().iter().any(|pair| is_pair_of(
+            pair,
+            "billing/discount.rs:9",
+            "inventory/reorder.rs:9"
+        )),
+        "固有メソッドを列挙する"
+    );
+    assert!(
+        scan.candidate_pairs().iter().any(|pair| is_pair_of(
+            pair,
+            "billing/discount.rs:18",
+            "inventory/reorder.rs:18"
+        )),
+        "トレイト実装のメソッドを列挙する"
+    );
 }
 
 #[test]
@@ -80,7 +96,11 @@ fn test_auto_scan_does_not_compare_rust_with_typescript() {
 
     assert_eq!(scan.file_count(), 3);
     assert_eq!(scan.chunk_count(), 7);
-    assert_eq!(scan.compared_pair_count(), 15, "TS と Rust の 6 組は比較しない");
+    assert_eq!(
+        scan.compared_pair_count(),
+        15,
+        "TS と Rust の 6 組は比較しない"
+    );
     assert!(scan.candidate_pairs().iter().all(|pair| {
         !pair.location_a().to_string().ends_with("summary.ts:1")
             && !pair.location_b().to_string().ends_with("summary.ts:1")

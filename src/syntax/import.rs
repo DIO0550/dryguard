@@ -55,7 +55,11 @@ impl ModulePath {
                 .or_else(|| importer.parent())
                 .unwrap_or_else(|| Path::new(""));
             let suffix = specifier.strip_prefix("crate::").unwrap_or("");
-            return Self(format!("{}/{}", source_root.display(), suffix.replace("::", "/")));
+            return Self(format!(
+                "{}/{}",
+                source_root.display(),
+                suffix.replace("::", "/")
+            ));
         }
         if specifier == "self"
             || specifier == "super"
@@ -1549,11 +1553,8 @@ mod tests {
             Grammar::Rust,
         )
         .expect("Rust の木にできる");
-        let direct = SyntaxTree::from_source(
-            "use crate::shared::math::scale;",
-            Grammar::Rust,
-        )
-        .expect("Rust の木にできる");
+        let direct = SyntaxTree::from_source("use crate::shared::math::scale;", Grammar::Rust)
+            .expect("Rust の木にできる");
 
         let grouped = ImportSet::from_tree(&grouped, Path::new("src/billing/discount.rs"))
             .expect("グループを展開できる");

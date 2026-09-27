@@ -325,18 +325,17 @@ pub fn measured_pair_of(
         (&pair.chunk_b, declared_b.as_ref()),
     );
 
-    let asked = if pair.chunk_a.grammar() == Grammar::Rust
-        || pair.chunk_b.grammar() == Grammar::Rust
-    {
-        AskedSemantics::unavailable(SemanticsUnavailable::NotAsked, None)
-    } else if is_structurally_similar(
-        signals.structural_similarity(),
-        thresholds.structural_similarity(),
-    ) {
-        semantics_of(pair, declarations, server)
-    } else {
-        AskedSemantics::unavailable(SemanticsUnavailable::NotACandidate, None)
-    };
+    let asked =
+        if pair.chunk_a.grammar() == Grammar::Rust || pair.chunk_b.grammar() == Grammar::Rust {
+            AskedSemantics::unavailable(SemanticsUnavailable::NotAsked, None)
+        } else if is_structurally_similar(
+            signals.structural_similarity(),
+            thresholds.structural_similarity(),
+        ) {
+            semantics_of(pair, declarations, server)
+        } else {
+            AskedSemantics::unavailable(SemanticsUnavailable::NotACandidate, None)
+        };
 
     Ok(MeasuredPair {
         signals: signals
@@ -1129,7 +1128,13 @@ pub fn scan_of(
     declarations: &DomainDeclarations,
     server: &ServerCommand,
 ) -> Result<Scan, ScanError> {
-    scan_of_language(root, SourceLanguage::TypeScript, thresholds, declarations, server)
+    scan_of_language(
+        root,
+        SourceLanguage::TypeScript,
+        thresholds,
+        declarations,
+        server,
+    )
 }
 
 /// 指定した言語のソースを走査する。Rust の候補は Stage 1 のシグナルだけで判定する。
@@ -2159,8 +2164,14 @@ pub enum ChunkPairError {
 impl fmt::Display for ChunkPairError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DifferentLanguages { location_a, location_b } => {
-                write!(formatter, "異なる言語の関数は比較できません: {location_a} / {location_b}")
+            Self::DifferentLanguages {
+                location_a,
+                location_b,
+            } => {
+                write!(
+                    formatter,
+                    "異なる言語の関数は比較できません: {location_a} / {location_b}"
+                )
             }
             Self::UnreadableExtension { location } => {
                 write!(formatter, "{location} は読める拡張子ではありません")

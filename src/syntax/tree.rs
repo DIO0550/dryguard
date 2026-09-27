@@ -64,7 +64,10 @@ impl Grammar {
     /// TS と TSX は同じ言語のチャンクとして比較する。
     pub fn same_language_as(self, other: Self) -> bool {
         matches!((self, other), (Self::Rust, Self::Rust))
-            || matches!((self, other), (Self::TypeScript | Self::Tsx, Self::TypeScript | Self::Tsx))
+            || matches!(
+                (self, other),
+                (Self::TypeScript | Self::Tsx, Self::TypeScript | Self::Tsx)
+            )
     }
 }
 
@@ -100,7 +103,11 @@ impl<'source> SyntaxTree<'source> {
 
         let tree = parser.parse(source, None).ok_or(ParseError::NoTree)?;
 
-        Ok(Self { tree, source, grammar })
+        Ok(Self {
+            tree,
+            source,
+            grammar,
+        })
     }
 
     /// この木を読んだ grammar。

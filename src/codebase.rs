@@ -67,7 +67,10 @@ pub fn typescript_paths_of(root: &Path) -> Result<Vec<PathBuf>, CodebaseError> {
 /// # Errors
 ///
 /// 根がディレクトリでない / 途中のディレクトリを読めないとき。
-pub fn source_paths_of(root: &Path, language: SourceLanguage) -> Result<Vec<PathBuf>, CodebaseError> {
+pub fn source_paths_of(
+    root: &Path,
+    language: SourceLanguage,
+) -> Result<Vec<PathBuf>, CodebaseError> {
     if !root.is_dir() {
         return Err(CodebaseError::RootNotADirectory {
             root: root.to_path_buf(),
