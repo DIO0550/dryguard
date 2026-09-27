@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use dryguard::classification::signal::{
-    CallerDomainOverlap, ImportOverlap, SemanticsUnavailable, Signals, StructuralSimilarity,
-    TypeSignatureMatch,
+    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, SemanticsUnavailable, Signals,
+    StructuralSimilarity, TypeSignatureMatch,
 };
 use dryguard::classification::verdict::Verdict;
 use dryguard::classification::{ConfiguredThresholds, classification_of};
@@ -339,6 +339,38 @@ fn measured_without_an_lsp(location_a: &Location, location_b: &Location) -> Meas
         panic!("宣言が無ければ食い違わない");
     };
     measured
+}
+
+#[test]
+fn test_compare_of_rust_functions_does_not_ask_stage2() {
+    let measured = measured_without_an_lsp(
+        &fixture("rust-scan/src/billing/discount.rs", 3),
+        &fixture("rust-scan/src/inventory/reorder.rs", 3),
+    );
+
+    assert!(
+        measured.semantics_error().is_none(),
+        "Rust は LSP を起動していない: {:?}",
+        measured.semantics_error().map(ToString::to_string)
+    );
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unavailable {
+            reason: SemanticsUnavailable::NotAsked
+        }
+    );
+    assert_eq!(
+        measured.signals().caller_domain_overlap(),
+        &CallerDomainOverlap::Unavailable {
+            reason: SemanticsUnavailable::NotAsked
+        }
+    );
+    assert_eq!(
+        measured.signals().callee_domain_overlap(),
+        &CalleeDomainOverlap::Unavailable {
+            reason: SemanticsUnavailable::NotAsked
+        }
+    );
 }
 
 #[test]
