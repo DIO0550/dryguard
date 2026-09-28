@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::classification::verdict::Verdict;
 use crate::location::Location;
 use crate::threshold::Threshold;
 
@@ -108,6 +109,19 @@ pub enum OutputFormat {
 pub enum FailOn {
     /// 共通化すべきでないペアがあれば失敗にする
     DoNotExtract,
+}
+
+impl FailOn {
+    /// その判定が、この指定で失敗にする判定か。
+    ///
+    /// **判定そのものは `classification` が出したものを受け取るだけ。** ここが持つのは
+    /// `--fail-on` の値がどの判定を指すかの解釈で、決定木には触らない
+    /// （rules/architecture.md「判定は 1 箇所にだけ置く」）。
+    pub fn is_met_by(self, verdict: Verdict) -> bool {
+        match self {
+            Self::DoNotExtract => verdict == Verdict::DoNotExtract,
+        }
+    }
 }
 
 #[cfg(test)]
