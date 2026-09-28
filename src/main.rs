@@ -4,6 +4,8 @@
 //! （`docs/dryguard-plan.md`「CLI仕様 (案)」の出力イメージ）。
 //! `--format` が人の読む text とエージェントの読む JSON を切り替える。
 //!
+//! 終了コードは 3 つ（[`FAILED_ON_VERDICT`] / [`NOT_CLASSIFIED`] と成功）。
+//!
 //! 判定に当てる閾値は `--threshold` > `dryguard.toml` > 既定値の順に決まる
 //! （[`configured_thresholds_of`]）。ドメインの宣言は `dryguard.toml` の `[domains]` だけが持つ。
 
@@ -12,8 +14,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+use dryguard::classification::verdict::Verdict;
 use dryguard::classification::{ConfiguredThresholds, classification_of};
-use dryguard::cli::{Cli, Command, CommonOptions, LanguageOption, OutputFormat};
+use dryguard::cli::{Cli, Command, CommonOptions, FailOn, LanguageOption, OutputFormat};
 use dryguard::codebase::SourceLanguage;
 use dryguard::config::configuration_of;
 use dryguard::domain_declaration::DomainDeclarations;
@@ -32,7 +35,7 @@ fn main() -> ExitCode {
         Ok(configuration) => configuration,
         Err(error) => {
             eprintln!("{error}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(NOT_CLASSIFIED);
         }
     };
     let settings = Settings {
@@ -48,6 +51,17 @@ fn main() -> ExitCode {
         Command::Scan { path } => report_scan(path, &cli.options, &settings),
     }
 }
+
+/// 判定を出し終えたうえで、`--fail-on` に指定した判定が 1 件以上出た。
+///
+/// 計画書と README が書いてきた「非推奨ペアがあれば exit 1」をそのまま使う。
+const FAILED_ON_VERDICT: u8 = 1;
+
+/// 判定を出せなかった（設定を読めない・チャンクを切り出せない・走査を始められないなど）。
+///
+/// **[`FAILED_ON_VERDICT`] と同じコードにしない。** 同じだと CI が「非推奨ペアがあった」と
+/// 「検査できなかった」を区別できない。2 にするのは、clap が引数の誤りを 2 で落とすのと揃えるため。
+const NOT_CLASSIFIED: u8 = 2;
 
 /// 判定に当てる閾値と、ドメインの宣言。
 ///
@@ -67,7 +81,7 @@ const CONFIG_DIRECTORY: &str = ".";
 /// `compare` の 2 箇所を判定して、理由付きで表示する。
 ///
 /// チャンクを取れなかったとき・比べるファイルが名前の違う 2 つの宣言に当たったときは
-/// 終了コードを 1 にする。切り出せなかったことを
+/// 終了コードを [`NOT_CLASSIFIED`] にする。切り出せなかったことを
 /// 成功として返すと、後段が「似ていない」と「見ていない」を区別できなくなる
 /// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
 ///
@@ -88,7 +102,7 @@ fn report_compare(
         Ok(pair) => pair,
         Err(error) => {
             eprintln!("{error}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(NOT_CLASSIFIED);
         }
     };
     let is_rust = pair.chunk_a().grammar() == Grammar::Rust;
@@ -96,7 +110,7 @@ fn report_compare(
         || matches!(options.lang, LanguageOption::Rust) && !is_rust
     {
         eprintln!("指定した --lang と比較するファイルの言語が一致しません");
-        return ExitCode::FAILURE;
+        return ExitCode::from(NOT_CLASSIFIED);
     }
 
     let server = if is_rust {
@@ -111,7 +125,7 @@ fn report_compare(
             Ok(measured) => measured,
             Err(error) => {
                 eprintln!("{error}");
-                return ExitCode::FAILURE;
+                return ExitCode::from(NOT_CLASSIFIED);
             }
         };
     if let Some(error) = measured.semantics_error() {
@@ -130,12 +144,12 @@ fn report_compare(
     };
     println!("{report}");
 
-    ExitCode::SUCCESS
+    exit_code_of(options.fail_on, [classification.verdict()])
 }
 
 /// `scan` の対象ディレクトリを走査して、候補ペアを理由付きで表示する。
 ///
-/// 走査そのものが始められなかったときだけ終了コードを 1 にする。読めなかった
+/// 走査そのものが始められなかったときだけ終了コードを [`NOT_CLASSIFIED`] にする。読めなかった
 /// 1 ファイルで全体を失敗にすると、出せていた候補ペアまで捨てることになる
 /// （飛ばしたものは出力に残る）。
 ///
@@ -158,7 +172,7 @@ fn report_scan(root: &Path, options: &CommonOptions, settings: &Settings<'_>) ->
         Ok(scan) => scan,
         Err(error) => {
             eprintln!("{error}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(NOT_CLASSIFIED);
         }
     };
     for error in scan.semantics_errors() {
@@ -175,7 +189,32 @@ fn report_scan(root: &Path, options: &CommonOptions, settings: &Settings<'_>) ->
     };
     println!("{report}");
 
-    ExitCode::SUCCESS
+    let verdicts = scan
+        .candidate_pairs()
+        .iter()
+        .map(|pair| pair.classification().verdict());
+    exit_code_of(options.fail_on, verdicts)
+}
+
+/// 判定を出し終えたときの終了コード。`--fail-on` に指定した判定が 1 件でも出たら
+/// [`FAILED_ON_VERDICT`]、出なければ成功。
+///
+/// 失敗にするときも**判定の出力は stdout に出し終えてから**にし、理由を stderr に 1 行出す。
+/// stdout に混ぜると `--format json` を読む側が壊れる。
+fn exit_code_of(fail_on: Option<FailOn>, verdicts: impl IntoIterator<Item = Verdict>) -> ExitCode {
+    let Some(fail_on) = fail_on else {
+        return ExitCode::SUCCESS;
+    };
+    let met_count = verdicts
+        .into_iter()
+        .filter(|verdict| fail_on.is_met_by(*verdict))
+        .count();
+    if met_count == 0 {
+        return ExitCode::SUCCESS;
+    }
+
+    eprintln!("--fail-on に指定した判定が {met_count} 件出ました");
+    ExitCode::from(FAILED_ON_VERDICT)
 }
 
 /// 根拠をどこまで出すか。`--explain` があれば、尋ねなかったシグナルと当てた閾値まで。
