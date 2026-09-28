@@ -99,13 +99,13 @@ fn report_compare(
         return ExitCode::FAILURE;
     }
 
-    // **宣言の食い違いは判定を出さずに止める。** 直す先は dryguard.toml で、
-    // どちらかの宣言へ寄せた判定を出すと、並べ替えただけで答えが変わる
     let server = if is_rust {
         ServerCommand::rust()
     } else {
         ServerCommand::typescript()
     };
+    // **宣言の食い違いは判定を出さずに止める。** 直す先は dryguard.toml で、
+    // どちらかの宣言へ寄せた判定を出すと、並べ替えただけで答えが変わる
     let measured =
         match measured_pair_of(&pair, settings.thresholds, settings.declarations, &server) {
             Ok(measured) => measured,

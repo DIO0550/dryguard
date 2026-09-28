@@ -80,10 +80,10 @@ cargo run -- scan [path]             # コードベース全体をスキャン (
 `scan` は `.ts` / `.tsx` / `.mts` / `.cts` / `.rs` を見る。`--lang ts` / `--lang rust` で
 対象を絞り、`auto` では両方を走査する（異なる言語の関数同士は比較しない）。Rust の
 自由関数・`impl` 内のメソッド・トレイト実装のメソッドをそれぞれ 1 チャンクにする。
-Rust の CLI からの LSP サーバ選択は #39 で行う。現時点では CLI の Rust 候補の
-Stage 2 は「尋ねていない」として扱う。ライブラリの `scan_of_language` に
-`ServerCommand::rust()` を渡すと、候補を揃えてから 1 つの rust-analyzer セッションで
-hover / references を問い合わせる。Rust の型シグネチャ比較は #40 まで「測れない」。
+CLI は拡張子から TypeScript と Rust の LSP サーバを選ぶ。`scan --lang auto` では
+言語ごとに候補を揃え、TypeScript は typescript-language-server、Rust は rust-analyzer の
+セッションで hover / references を問い合わせる。Rust の型シグネチャ比較は #40 まで
+「測れない」。
 
 `node_modules` / `dist` / `build` / `target` / `.git` は
 降りない。**読むときの grammar は拡張子で選ぶ**（JSX は TypeScript の grammar では読めず、
