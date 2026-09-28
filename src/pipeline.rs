@@ -25,8 +25,8 @@ use crate::codebase::{CodebaseError, SourceLanguage, source_of, source_paths_of}
 use crate::domain_declaration::{AmbiguousDomain, DomainDeclarations, DomainName};
 use crate::location::Location;
 use crate::lsp::{
-    Client, ClientError, DocumentError, ProjectMembershipOutcome, ProjectRoot, ServerCommand,
-    Session, SourceDocument, WorkspaceError, WorkspaceRoot,
+    Client, ClientError, DocumentError, HoverOutcome, ProjectMembershipOutcome, ProjectRoot,
+    ServerCommand, Session, SourceDocument, WorkspaceError, WorkspaceRoot,
 };
 use crate::semantics::callee_domain::{CalleeDomainsOutcome, callee_domains_outcome_of};
 use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outcome_of};
@@ -326,7 +326,7 @@ pub fn measured_pair_of(
     );
 
     let asked =
-        if pair.chunk_a.grammar() == Grammar::Rust || pair.chunk_b.grammar() == Grammar::Rust {
+        if !server.supports(pair.chunk_a.grammar()) || !server.supports(pair.chunk_b.grammar()) {
             AskedSemantics::unavailable(SemanticsUnavailable::NotAsked, None)
         } else if is_structurally_similar(
             signals.structural_similarity(),
@@ -441,6 +441,12 @@ impl AskedMembership {
             return Self::Unrooted {
                 markers: root.markers().to_vec(),
             };
+        }
+
+        // rust-analyzer には tsserver の projectInfo が無い。Cargo.toml の下なら
+        // ワークスペースの根を渡して参照元を尋ねられる。
+        if !session.needs_project_membership_query() {
+            return Self::Askable;
         }
 
         match session.project_membership(document) {
@@ -692,6 +698,18 @@ fn resolved_type_signature_outcome_of(
     document: &SourceDocument,
     position: SourcePosition,
 ) -> Result<TypeSignatureOutcome, ClientError> {
+    if chunk.grammar() == Grammar::Rust {
+        // Rust の境界を含む型シグネチャの比較は #40。TS の構文で Rust の綴りを
+        // 読み、誤って単一化可能と判定しない。hover の答え自体は受け取る。
+        return Ok(match session.hover(document, position)? {
+            HoverOutcome::Answered(_) => TypeSignatureOutcome::UnreadableSignature,
+            HoverOutcome::NoAnswer => TypeSignatureOutcome::NoTypeThere,
+            HoverOutcome::Unreadable => TypeSignatureOutcome::UnreadableHover,
+            HoverOutcome::ServerStillWorking => TypeSignatureOutcome::ServerStillWorking,
+            HoverOutcome::NotSupported => TypeSignatureOutcome::HoverNotProvided,
+        });
+    }
+
     let traced = traced_type_names_of(session, document, chunk.type_references())?;
     let unopened = unopened_declaring_documents_of(session, traced.declared())?;
     let traced = opened_type_names_of(session, traced.with_unopened(unopened))?;
@@ -1137,7 +1155,8 @@ pub fn scan_of(
     )
 }
 
-/// 指定した言語のソースを走査する。Rust の候補は Stage 1 のシグナルだけで判定する。
+/// 指定した言語のソースを走査する。Rust は `ServerCommand::rust()` を渡すと
+/// 候補を確定した後で rust-analyzer にまとめて問い合わせる。
 ///
 /// # Errors
 ///
@@ -1323,11 +1342,11 @@ fn scan_of_chunks(
 
     let asked: BTreeSet<usize> = asked_chunk_indices_of(&candidates)
         .into_iter()
-        .filter(|index| chunks[*index].chunk.grammar() != Grammar::Rust)
+        .filter(|index| server.supports(chunks[*index].chunk.grammar()))
         .collect();
     let mut semantics = scan_semantics_of(chunks, &asked, declarations, server);
     for (index, chunk) in chunks.iter().enumerate() {
-        if chunk.chunk.grammar() == Grammar::Rust {
+        if !server.supports(chunk.chunk.grammar()) {
             semantics.per_chunk[index] = ChunkSemantics::Unavailable {
                 reason: SemanticsUnavailable::NotAsked,
             };

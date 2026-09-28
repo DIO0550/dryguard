@@ -4,6 +4,7 @@
 //! こちらが読める形へ直す変換だけなので、サーバを起動せずに確かめられる
 //! (rules/tdd.md「`lsp` は『応答を受け取ってから先』を切り出す」)。
 
+use super::ServerLanguage;
 use lsp_types::{Hover, HoverContents};
 
 /// マークダウンのコードフェンスの印。
@@ -81,7 +82,13 @@ pub enum HoverOutcome {
 ///
 /// 綴りの正規化（引数名を落とすなど）は `semantics` が行う。ここは応答の形を
 /// 読むところまで。
+#[cfg(test)]
 pub(super) fn outcome_of(hover: &Hover) -> HoverOutcome {
+    outcome_for_language(hover, ServerLanguage::TypeScript)
+}
+
+/// サーバの hover レイアウトに応じてシグネチャを読む。
+pub(super) fn outcome_for_language(hover: &Hover, language: ServerLanguage) -> HoverOutcome {
     let HoverContents::Markup(content) = &hover.contents else {
         // `MarkedString` は LSP 3.15 で非推奨になった形。今つないでいるサーバは
         // どれも `Markup` を返すので、読める形は要る相手が現れたときに足す。
@@ -89,32 +96,39 @@ pub(super) fn outcome_of(hover: &Hover) -> HoverOutcome {
         return HoverOutcome::Unreadable;
     };
 
-    match fenced_text_of(&content.value).and_then(SignatureText::new) {
+    let text = match language {
+        ServerLanguage::TypeScript => fenced_text_of(&content.value, 0),
+        ServerLanguage::Rust => {
+            fenced_text_of(&content.value, 1).or_else(|| fenced_text_of(&content.value, 0))
+        }
+    };
+    match text.and_then(SignatureText::new) {
         Some(signature_text) => HoverOutcome::Answered(signature_text),
         None => HoverOutcome::Unreadable,
     }
 }
 
-/// 最初のコードフェンスの中身。フェンスが 1 つも無ければ `None`。
+/// 指定したコードフェンスの中身。無ければ `None`。
 ///
 /// **フェンスの言語名は見ない。** typescript-language-server は `typescript`、
-/// rust-analyzer は `rust` と書くので、名前で選ぶとサーバごとの一覧を持つことになる。
-/// どちらも型の綴りを最初のフェンスに置き、続くフェンスは doc コメントの中身になる。
+/// rust-analyzer は `rust` と書くので、名前で選ばない。
 ///
 /// 改行は畳まずにそのまま残す。TS のサーバはオブジェクト型リテラルを複数行に展開して
 /// 返す（`<T extends {\n    id: string;\n}, U>`）が、**どう畳むかは綴りを読む側が決める。**
-fn fenced_text_of(markdown: &str) -> Option<String> {
-    let mut lines = markdown
+fn fenced_text_of(markdown: &str, index: usize) -> Option<String> {
+    // フェンスの開始と終了を数えて、対象の開始位置へ進む。
+    let mut fences = markdown
         .lines()
-        .skip_while(|line| !line.trim_start().starts_with(FENCE));
+        .enumerate()
+        .filter(|(_, line)| line.trim_start().starts_with(FENCE));
+    let (start, _) = fences.nth(index * 2)?;
+    let (end, _) = fences.next()?;
 
-    // 開きのフェンスの行そのものは中身ではない。無ければフェンスが 1 つも無かった。
-    lines.next()?;
-
-    // 中身が空かどうかはここで見ない。綴りとして通せるかは [`SignatureText::new`] が
-    // 決める（検証の置き場所を 1 つにする）。
-    let body: Vec<&str> = lines
-        .take_while(|line| !line.trim_start().starts_with(FENCE))
+    // 中身の検証は [`SignatureText::new`] が持つ。
+    let body: Vec<&str> = markdown
+        .lines()
+        .skip(start + 1)
+        .take(end - start - 1)
         .collect();
 
     Some(body.join("\n"))
@@ -146,6 +160,18 @@ mod tests {
         assert_eq!(
             outcome_of(&hover),
             HoverOutcome::Answered(signature_text("function decl(a: string): number"))
+        );
+    }
+
+    #[test]
+    fn test_rust_analyzer_hover_reads_the_declaration_after_the_crate_name() {
+        let hover = markdown_hover(
+            "```rust\ndryguard_fixture\n```\n\n```rust\npub fn first(value: i32) -> i32\n```",
+        );
+
+        assert_eq!(
+            outcome_for_language(&hover, ServerLanguage::Rust),
+            HoverOutcome::Answered(signature_text("pub fn first(value: i32) -> i32"))
         );
     }
 

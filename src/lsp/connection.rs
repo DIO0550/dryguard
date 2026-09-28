@@ -27,6 +27,7 @@ use lsp_types::{
 };
 use serde_json::{Value, json};
 
+use super::ServerLanguage;
 use super::call_hierarchy::{self, CallHierarchyStart, CalleesOutcome};
 use super::document::SourceDocument;
 use super::framing::{self, FramingError};
@@ -54,6 +55,13 @@ const CLIENT_NAME: &str = "dryguard";
 /// `HoverOutcome::ServerStillWorking` / `CalleesOutcome::ServerStillWorking`）。
 const SETTLED_ATTEMPTS: usize = 3;
 
+/// rust-analyzer は読み込みの進捗を複数の作業として報告する。
+/// 途中の応答を採らずに、その一連の作業が落ち着くまで尋ね直す上限。
+const RUST_SETTLED_ATTEMPTS: usize = 32;
+
+/// LSP の `ContentModified`。rust-analyzer は読み込みが進んでいる間の要求に返す。
+const CONTENT_MODIFIED: i64 = -32801;
+
 /// LSP サーバとの往復。
 ///
 /// 1 本のストリームを要求と応答が行き来するので、id の発番と対応付けをここが持つ。
@@ -76,6 +84,7 @@ pub struct Connection<R: BufRead, W: Write> {
     /// **減らさない。** 始まって終わった作業は [`Self::running_progress`] から消えるので、
     /// 尋ねている間に何か起きたかは数でしか追えない。
     noticed_progress_count: usize,
+    language: ServerLanguage,
 }
 
 impl<R: BufRead, W: Write> Connection<R, W> {
@@ -89,7 +98,18 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             prepared_progress: Vec::new(),
             running_progress: Vec::new(),
             noticed_progress_count: 0,
+            language: ServerLanguage::TypeScript,
         }
+    }
+
+    /// サーバの言語に応じて、進捗待ちと hover の読み方を選ぶ。
+    pub(super) fn with_language(mut self, language: ServerLanguage) -> Self {
+        self.language = language;
+        self
+    }
+
+    pub(super) fn language(&self) -> ServerLanguage {
+        self.language
     }
 
     /// サーバと握手し、サーバができることを受け取る。
@@ -137,7 +157,10 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             // `client/registerCapability` を投げてくる。支えていない要求を呼び込まない。
             "capabilities": {
                 "window": { "workDoneProgress": true },
-                "textDocument": { "callHierarchy": { "dynamicRegistration": false } },
+                "textDocument": {
+                    "callHierarchy": { "dynamicRegistration": false },
+                    "hover": { "contentFormat": ["markdown"] },
+                },
             },
             "rootUri": root.uri().as_str(),
         });
@@ -324,7 +347,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             })?;
 
         Ok(match answered.as_ref() {
-            Some(hover) => hover::outcome_of(hover),
+            Some(hover) => hover::outcome_for_language(hover, self.language),
             None => HoverOutcome::NoAnswer,
         })
     }
@@ -570,7 +593,10 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         // 読み込み中に返ってきた答えは、**サーバがまだ見ていないファイルの分が抜けている**
         // （references なら呼び出し元が欠け、hover なら推論された型が `any` になる）。
         // 作業が終わってから尋ね直し、**作業に触れていない答えだけを採る**。
-        let mut attempts_left = SETTLED_ATTEMPTS;
+        let mut attempts_left = match self.language {
+            ServerLanguage::TypeScript => SETTLED_ATTEMPTS,
+            ServerLanguage::Rust => RUST_SETTLED_ATTEMPTS,
+        };
 
         while attempts_left > 0 {
             // **尋ねる前に、動いている作業を待ち切る。** 動いている最中に送ると、
@@ -579,7 +605,15 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             self.wait_for_running_progress()?;
 
             let noticed_before = self.noticed_progress_count;
-            let answered = ask_once(self, params.clone())?;
+            let answered = match ask_once(self, params.clone()) {
+                Ok(answered) => Some(answered),
+                Err(ConnectionError::ServerFailure { failure, .. })
+                    if failure.code == CONTENT_MODIFIED =>
+                {
+                    None
+                }
+                Err(cause) => return Err(cause),
+            };
 
             // 「今動いているか」だけでは足りない。**尋ねている間に始まって終わった作業**が
             // あると、読み込み前に計算された答えを受け取りながら、手元では何も動いて
@@ -590,7 +624,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             let work_is_pending =
                 !self.running_progress.is_empty() || !self.prepared_progress.is_empty();
             let untouched_by_work = !noticed_while_answering && !work_is_pending;
-            if untouched_by_work {
+            if untouched_by_work && let Some(answered) = answered {
                 return Ok(answered);
             }
 
@@ -1482,6 +1516,40 @@ mod tests {
             outcome,
             HoverOutcome::Answered(signature_text("(getter) Holder.value: Result")),
             "読み込みが終わってから尋ね直した綴りを返す"
+        );
+    }
+
+    #[test]
+    fn test_rust_hover_waits_through_several_progress_phases_and_content_modified() {
+        let server_output = frames_of(&[
+            &progress_begin_notification("fetching"),
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32801,"message":"content modified"}}"#,
+            &progress_end_notification("fetching"),
+            &progress_begin_notification("crate-graph"),
+            &hover_response(2, "old answer"),
+            &progress_end_notification("crate-graph"),
+            &progress_begin_notification("roots"),
+            &hover_response(3, "partial answer"),
+            &progress_end_notification("roots"),
+            &hover_response(4, "fn ready()"),
+        ]);
+        let mut connection = connection_over(&server_output).with_language(ServerLanguage::Rust);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .hover(&document, position_after(5, "export function "))
+            .expect("インデックス完了後に尋ねられる");
+
+        assert_eq!(
+            outcome,
+            HoverOutcome::Answered(signature_text("fn ready()"))
+        );
+        assert_eq!(
+            sent_methods(&connection.writer)
+                .iter()
+                .filter(|method| *method == HoverRequest::METHOD)
+                .count(),
+            4
         );
     }
 
