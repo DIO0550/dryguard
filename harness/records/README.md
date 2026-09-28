@@ -35,6 +35,8 @@ bash harness/records/count.sh
 ## 書き方
 
 形式・層の語彙・分類の語彙は [`TEMPLATE.md`](TEMPLATE.md)。
+対象の PR の決め方から記録だけの PR を出すまでの手順は `harness-record` スキル
+（[`.claude/skills/harness-record/SKILL.md`](../../.claude/skills/harness-record/SKILL.md)）。
 
 - 指摘 1 件 = 1 ブロック（まとめない）
 - **指摘 0 件の回も記録を残す**（「順調だった」もデータ）
