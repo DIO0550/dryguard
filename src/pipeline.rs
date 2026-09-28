@@ -1155,8 +1155,8 @@ pub fn scan_of(
     )
 }
 
-/// 指定した言語のソースを走査する。Rust は `ServerCommand::rust()` を渡すと
-/// 候補を確定した後で rust-analyzer にまとめて問い合わせる。
+/// 指定した言語のソースを走査する。渡したサーバが対応する言語だけに尋ねる。
+/// 混在走査で両方へ尋ねる場合は [`scan_with_language_servers`] を使う。
 ///
 /// # Errors
 ///
@@ -1167,6 +1167,40 @@ pub fn scan_of_language(
     thresholds: ConfiguredThresholds,
     declarations: &DomainDeclarations,
     server: &ServerCommand,
+) -> Result<Scan, ScanError> {
+    scan_with_servers(root, language, thresholds, declarations, server, None)
+}
+
+/// 混在したコードベースを、言語ごとに対応する LSP サーバで走査する。
+///
+/// # Errors
+///
+/// [`scan_of`] と同じ。
+pub fn scan_with_language_servers(
+    root: &Path,
+    language: SourceLanguage,
+    thresholds: ConfiguredThresholds,
+    declarations: &DomainDeclarations,
+    typescript_server: &ServerCommand,
+    rust_server: &ServerCommand,
+) -> Result<Scan, ScanError> {
+    scan_with_servers(
+        root,
+        language,
+        thresholds,
+        declarations,
+        typescript_server,
+        Some(rust_server),
+    )
+}
+
+fn scan_with_servers(
+    root: &Path,
+    language: SourceLanguage,
+    thresholds: ConfiguredThresholds,
+    declarations: &DomainDeclarations,
+    server: &ServerCommand,
+    other_server: Option<&ServerCommand>,
 ) -> Result<Scan, ScanError> {
     let paths = source_paths_of(root, language).map_err(ScanError::Codebase)?;
     let file_count = paths.len();
@@ -1223,6 +1257,7 @@ pub fn scan_of_language(
         thresholds,
         declarations,
         server,
+        other_server,
         ScanInputs {
             file_count,
             skipped_files,
@@ -1317,6 +1352,7 @@ fn scan_of_chunks(
     thresholds: ConfiguredThresholds,
     declarations: &DomainDeclarations,
     server: &ServerCommand,
+    other_server: Option<&ServerCommand>,
     inputs: ScanInputs,
 ) -> Scan {
     let compared: Vec<ComparedPairs> = chunks
@@ -1340,21 +1376,38 @@ fn scan_of_chunks(
         .flat_map(|compared| compared.candidates)
         .collect();
 
-    let asked: BTreeSet<usize> = asked_chunk_indices_of(&candidates)
+    let asked = asked_chunk_indices_of(&candidates);
+    let typescript_server = [Some(server), other_server]
         .into_iter()
-        .filter(|index| server.supports(chunks[*index].chunk.grammar()))
-        .collect();
-    let mut semantics = scan_semantics_of(chunks, &asked, declarations, server);
-    for (index, chunk) in chunks.iter().enumerate() {
-        if !server.supports(chunk.chunk.grammar()) {
-            semantics.per_chunk[index] = ChunkSemantics::Unavailable {
-                reason: SemanticsUnavailable::NotAsked,
-            };
-        }
-    }
+        .flatten()
+        .find(|server| server.supports(Grammar::TypeScript));
+    let rust_server = [Some(server), other_server]
+        .into_iter()
+        .flatten()
+        .find(|server| server.supports(Grammar::Rust));
+    let typescript_semantics = semantics_for_language_of(
+        chunks,
+        &asked,
+        declarations,
+        typescript_server,
+        Grammar::TypeScript,
+    );
+    let rust_semantics =
+        semantics_for_language_of(chunks, &asked, declarations, rust_server, Grammar::Rust);
     let candidate_pairs = candidates
         .into_iter()
-        .map(|candidate| candidate_pair_of(chunks, &semantics, candidate, thresholds))
+        .map(|candidate| {
+            let semantics = if chunks[candidate.chunk_a].chunk.grammar() == Grammar::Rust {
+                &rust_semantics
+            } else {
+                &typescript_semantics
+            };
+            candidate_pair_of(chunks, semantics, candidate, thresholds)
+        })
+        .collect();
+    let semantics_errors = [typescript_semantics, rust_semantics]
+        .into_iter()
+        .filter_map(ScanSemantics::into_error)
         .collect();
 
     Scan {
@@ -1365,8 +1418,32 @@ fn scan_of_chunks(
         pruned_pair_count,
         skipped_files: inputs.skipped_files,
         unchunkable: inputs.unchunkable,
-        semantics_error: semantics.into_error(),
+        semantics_errors,
     }
+}
+
+fn semantics_for_language_of(
+    chunks: &[ScannedChunk],
+    asked: &BTreeSet<usize>,
+    declarations: &DomainDeclarations,
+    server: Option<&ServerCommand>,
+    language: Grammar,
+) -> ScanSemantics {
+    let language_asked: BTreeSet<usize> = asked
+        .iter()
+        .copied()
+        .filter(|index| chunks[*index].chunk.grammar().same_language_as(language))
+        .collect();
+    let Some(server) = server else {
+        let mut semantics = ScanSemantics::not_asked(chunks.len());
+        for index in language_asked {
+            semantics.per_chunk[index] = ChunkSemantics::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            };
+        }
+        return semantics;
+    };
+    scan_semantics_of(chunks, &language_asked, declarations, server)
 }
 
 /// 構造類似度だけで拾ったペアと、そこまでに測ったシグナル。
@@ -1611,7 +1688,7 @@ impl ScanSemantics {
 ///
 /// 落ちた理由そのものは持たない形（`Unavailable`）と、往復の失敗を持つ形（`Asked`）が
 /// 混ざるのは、**尋ねる前に止まる失敗は走査全体で 1 度しか起きない**ため。
-/// セッションは走査につき 1 本なので、起動や握手に失敗すれば候補ペアの全チャンクが同時に落ちる。
+/// セッションは言語につき 1 本なので、起動や握手に失敗すればその言語の候補チャンクが同時に落ちる。
 enum ChunkSemantics {
     /// 候補ペアに現れないので尋ねていない。
     NotACandidate,
@@ -1641,7 +1718,7 @@ struct AskedChunkSemantics {
 
 /// 候補ペアに現れるチャンクへ、Stage 2 のシグナルを尋ねる。
 ///
-/// **サーバは走査につき 1 度だけ起こす。** 候補ペアごとに起こすと、起動と握手と
+/// **サーバは言語につき 1 度だけ起こす。** 候補ペアごとに起こすと、起動と握手と
 /// プロジェクトの読み込みが候補ペアの数だけ走る（`tests/corpus/src` で 65 回）。
 ///
 /// 根は**候補ペアに現れるファイル**から決め、そこから上へプロジェクトの印を探す
@@ -1992,7 +2069,7 @@ pub struct Scan {
     pruned_pair_count: usize,
     skipped_files: Vec<SkippedFile>,
     unchunkable: Vec<Location>,
-    semantics_error: Option<SemanticsError>,
+    semantics_errors: Vec<SemanticsError>,
 }
 
 impl Scan {
@@ -2008,12 +2085,17 @@ impl Scan {
     /// 言えない分——**利用者が環境を直すのに要る、サーバが見つからないのか
     /// 握手に失敗したのか**——だけ（[`MeasuredPair::semantics_error`] と同じ）。
     ///
-    /// セッションは走査につき 1 本なので、理由も 1 つでよい。
+    /// 複数の言語を走査した場合は最初のエラーを返す。
     pub fn semantics_error(&self) -> Option<&SemanticsError> {
-        self.semantics_error.as_ref()
+        self.semantics_errors.first()
     }
 
-    /// 走査の対象になった TypeScript ファイルの数。
+    /// 言語ごとのサーバで起きたエラー。TypeScript、Rust の順。
+    pub fn semantics_errors(&self) -> &[SemanticsError] {
+        &self.semantics_errors
+    }
+
+    /// 走査の対象になった、指定言語のソースファイルの数。
     pub fn file_count(&self) -> usize {
         self.file_count
     }
@@ -2193,7 +2275,10 @@ impl fmt::Display for ChunkPairError {
                 )
             }
             Self::UnreadableExtension { location } => {
-                write!(formatter, "{location} は読める拡張子ではありません")
+                write!(
+                    formatter,
+                    "{location} の言語を拡張子から判定できません（対応: .ts / .tsx / .mts / .cts / .rs）。--lang を指定しても未対応の拡張子は読み取れません"
+                )
             }
             Self::SourceUnreadable { location, cause } => {
                 write!(formatter, "{location} のファイルを読めません: {cause}")
