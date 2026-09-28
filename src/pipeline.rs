@@ -25,16 +25,17 @@ use crate::codebase::{CodebaseError, SourceLanguage, source_of, source_paths_of}
 use crate::domain_declaration::{AmbiguousDomain, DomainDeclarations, DomainName};
 use crate::location::Location;
 use crate::lsp::{
-    Client, ClientError, DocumentError, HoverOutcome, ProjectMembershipOutcome, ProjectRoot,
-    ServerCommand, Session, SourceDocument, WorkspaceError, WorkspaceRoot,
+    Client, ClientError, DocumentError, ProjectMembershipOutcome, ProjectRoot, ServerCommand,
+    Session, SourceDocument, WorkspaceError, WorkspaceRoot,
 };
 use crate::semantics::callee_domain::{CalleeDomainsOutcome, callee_domains_outcome_of};
 use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outcome_of};
 use crate::semantics::resolved_type::{
-    TypeDeclaration, UnopenedReason, UnopenedTypeName, opened_type_names_of, traced_type_names_of,
+    TracedTypeNames, TypeDeclaration, UnopenedReason, UnopenedTypeName, opened_type_names_of,
+    traced_type_names_of,
 };
 use crate::semantics::type_signature::{
-    TypeSignatureOutcome, UntracedReason, type_signature_outcome_of,
+    TypeSignatureOutcome, UntracedReason, rust_type_signature_outcome_of, type_signature_outcome_of,
 };
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks};
@@ -699,15 +700,15 @@ fn resolved_type_signature_outcome_of(
     position: SourcePosition,
 ) -> Result<TypeSignatureOutcome, ClientError> {
     if chunk.grammar() == Grammar::Rust {
-        // Rust の境界を含む型シグネチャの比較は #40。TS の構文で Rust の綴りを
-        // 読み、誤って単一化可能と判定しない。hover の答え自体は受け取る。
-        return Ok(match session.hover(document, position)? {
-            HoverOutcome::Answered(_) => TypeSignatureOutcome::UnreadableSignature,
-            HoverOutcome::NoAnswer => TypeSignatureOutcome::NoTypeThere,
-            HoverOutcome::Unreadable => TypeSignatureOutcome::UnreadableHover,
-            HoverOutcome::ServerStillWorking => TypeSignatureOutcome::ServerStillWorking,
-            HoverOutcome::NotSupported => TypeSignatureOutcome::HoverNotProvided,
-        });
+        // **Rust の型名はまだ宣言まで辿らない。** 空の記録を渡すので、比較に残る型名・
+        // トレイト名は「尋ねていない」に倒れる。綴りのまま比べると、別々のモジュールの
+        // 同じ名前のトレイトを要求する 2 つが単一化可能に出る
+        return rust_type_signature_outcome_of(
+            session,
+            document,
+            position,
+            &TracedTypeNames::default(),
+        );
     }
 
     let traced = traced_type_names_of(session, document, chunk.type_references())?;

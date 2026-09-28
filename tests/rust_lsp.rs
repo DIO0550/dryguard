@@ -15,6 +15,10 @@ use dryguard::lsp::{
 };
 use dryguard::pipeline::scan_of_language;
 use dryguard::report::{Explanation, scan_text_of};
+use dryguard::semantics::resolved_type::TracedTypeNames;
+use dryguard::semantics::type_signature::{
+    TypeSignatureOutcome, UntracedReason, rust_type_signature_outcome_of,
+};
 use dryguard::source_position::SourcePosition;
 
 #[test]
@@ -134,11 +138,67 @@ fn test_rust_scan_asks_candidates_in_one_session() {
     );
     let text = scan_text_of(&scan, Explanation::AllSignals);
     assert!(
-        text.contains("返った綴りを読み解けない"),
-        "Rust の型比較は #40: {text}"
+        text.contains("型シグネチャ: 単一化可能"),
+        "引数名だけが違う i32 -> i32 の 2 つ: {text}"
     );
     assert!(
         text.contains("呼び出し元ドメインの重なり 1.00"),
         "references が返る: {text}"
+    );
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_analyzer_signatures_compare_through_where_clauses_and_lifetimes() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust-bounds/src/lib.rs");
+    let root = WorkspaceRoot::enclosing(std::slice::from_ref(&path)).expect("ワークスペースの根");
+    let source = source_of(&path).expect("フィクスチャを読める");
+    let document = SourceDocument::new(&path, source.clone()).expect("ドキュメントを作れる");
+
+    let client = Client::start(&ServerCommand::rust()).expect("rust-analyzer を起動できる");
+    let mut session = client.handshake(&root).expect("握手できる");
+    session.open_document(&document).expect("ファイルを開ける");
+
+    // pipeline と同じく、型名を辿った記録は渡さない
+    let traced = TracedTypeNames::default();
+    let mut outcome_of = |name: &str| {
+        let line = source
+            .lines()
+            .position(|line| line.starts_with(&format!("pub fn {name}")))
+            .expect("フィクスチャにその関数がある");
+        let position = SourcePosition::from_preceding_text(LineNumber::from_index(line), "pub fn ");
+        rust_type_signature_outcome_of(&mut session, &document, position, &traced)
+            .expect("hover を尋ねられる")
+    };
+
+    let normalized = |outcome: TypeSignatureOutcome| match outcome {
+        TypeSignatureOutcome::Normalized(signature) => signature,
+        other => panic!("読み解けて比べられる: {other:?}"),
+    };
+    let first = normalized(outcome_of("first_len"));
+    let second = normalized(outcome_of("second_len"));
+    // hover は inline の境界を `where` へ寄せ、ライフタイムを書かれたとおりに返す
+    let borrowed = normalized(outcome_of("borrowed_size"));
+    let elided = normalized(outcome_of("elided_size"));
+    let displayed = outcome_of("displayed_len");
+
+    session.shutdown().expect("正常終了できる");
+
+    assert!(
+        first.is_unifiable_with(&second),
+        "型変数名と引数名だけが違う"
+    );
+    assert!(
+        borrowed.is_unifiable_with(&elided),
+        "ライフタイムと境界の書き分けだけが違う"
+    );
+    assert!(!first.is_unifiable_with(&borrowed), "引数の型が違う");
+    assert_eq!(
+        displayed,
+        TypeSignatureOutcome::UntracedTypeName {
+            reason: UntracedReason::NoTracedRecord
+        },
+        "トレイトの名前はまだ辿らないので、綴りのまま比べない"
     );
 }

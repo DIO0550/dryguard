@@ -1,0 +1,6 @@
+[package]
+name = "dryguard-rust-bounds-fixture"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
