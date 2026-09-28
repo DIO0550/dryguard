@@ -19,7 +19,7 @@ use dryguard::config::configuration_of;
 use dryguard::domain_declaration::DomainDeclarations;
 use dryguard::location::Location;
 use dryguard::lsp::ServerCommand;
-use dryguard::pipeline::{chunk_pair_of, measured_pair_of, scan_of_language};
+use dryguard::pipeline::{chunk_pair_of, measured_pair_of, scan_with_language_servers};
 use dryguard::report::{Explanation, json_of, scan_json_of, scan_text_of, text_of};
 use dryguard::syntax::tree::Grammar;
 
@@ -99,20 +99,21 @@ fn report_compare(
         return ExitCode::FAILURE;
     }
 
+    let server = if is_rust {
+        ServerCommand::rust()
+    } else {
+        ServerCommand::typescript()
+    };
     // **宣言の食い違いは判定を出さずに止める。** 直す先は dryguard.toml で、
     // どちらかの宣言へ寄せた判定を出すと、並べ替えただけで答えが変わる
-    let measured = match measured_pair_of(
-        &pair,
-        settings.thresholds,
-        settings.declarations,
-        &ServerCommand::typescript(),
-    ) {
-        Ok(measured) => measured,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let measured =
+        match measured_pair_of(&pair, settings.thresholds, settings.declarations, &server) {
+            Ok(measured) => measured,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+        };
     if let Some(error) = measured.semantics_error() {
         // **どのシグナルが取れなかったかはここで言わない。** 片方だけ落ちることが
         // あるので数え上げると判定の根拠と食い違う。取れなかったシグナルは
@@ -146,12 +147,13 @@ fn report_scan(root: &Path, options: &CommonOptions, settings: &Settings<'_>) ->
         LanguageOption::Rust => SourceLanguage::Rust,
         LanguageOption::Auto => SourceLanguage::Auto,
     };
-    let scan = match scan_of_language(
+    let scan = match scan_with_language_servers(
         root,
         language,
         settings.thresholds,
         settings.declarations,
         &ServerCommand::typescript(),
+        &ServerCommand::rust(),
     ) {
         Ok(scan) => scan,
         Err(error) => {
@@ -159,7 +161,7 @@ fn report_scan(root: &Path, options: &CommonOptions, settings: &Settings<'_>) ->
             return ExitCode::FAILURE;
         }
     };
-    if let Some(error) = scan.semantics_error() {
+    for error in scan.semantics_errors() {
         // **どのシグナルが取れなかったかはここで言わない。** 候補ペアごとに
         // 効いたシグナルが違うので、数え上げると判定の根拠と食い違う。
         eprintln!("LSP への問い合わせが最後まで通りませんでした: {error}");
