@@ -24,11 +24,15 @@
 //! 同じ綴りを型の構造として読むのは `type_structure`。**書かれ方の違い（括弧・引数名・
 //! タプルのラベル・共用体の並び）を落とすのが目的**で、単一化の可否を比べるのは
 //! それを受け取る `semantics::type_signature` の側。
+//!
+//! Rust の関数の綴りは `rust_callable` が読む。**文法が別なので `type_structure` とは分ける**
+//! （境界・ライフタイムの書き分けを落とすのが目的なのは同じ）。
 
 pub mod chunk;
 pub mod import;
 pub mod line_range;
 pub mod module_distance;
+pub(crate) mod rust_callable;
 pub mod token;
 pub mod tree;
 pub mod type_reference;
