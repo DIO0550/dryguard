@@ -251,6 +251,17 @@ mod tests {
     }
 
     #[test]
+    fn test_fail_on_do_not_extract_is_met_by_a_do_not_extract_verdict() {
+        assert!(FailOn::DoNotExtract.is_met_by(Verdict::DoNotExtract));
+    }
+
+    #[test]
+    fn test_fail_on_do_not_extract_is_not_met_by_the_other_verdicts() {
+        assert!(!FailOn::DoNotExtract.is_met_by(Verdict::ExtractCandidate));
+        assert!(!FailOn::DoNotExtract.is_met_by(Verdict::Review));
+    }
+
+    #[test]
     fn test_compare_with_malformed_location_is_rejected() {
         let result = Cli::try_parse_from(["dryguard", "compare", "a.ts", "b.ts:20"]);
 
