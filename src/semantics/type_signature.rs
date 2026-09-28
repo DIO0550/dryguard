@@ -22,6 +22,7 @@ use crate::semantics::resolved_type::{
 };
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{AnnotatedPositions, OverloadDeclaration, TypeAnnotation};
+use crate::syntax::rust_callable::RustCallable;
 use crate::syntax::type_spelling::{names_only_types, substituted_spelling_of, type_name_spans_of};
 use crate::syntax::type_structure::{Callable, SignatureKind, TypeStructure};
 
@@ -324,6 +325,77 @@ fn overload_set_outcome_of(
     };
 
     Ok(TypeSignatureOutcome::Normalized(overloads))
+}
+
+/// Rust の関数の型シグネチャを尋ねて、正規化した形にする。
+///
+/// `document` は先に [`Session::open_document`] で開かせておく。`position` は
+/// `Chunk::name_position` が指す識別子の位置、`traced` は型名を宣言まで辿った結果。
+///
+/// **注釈の有無もオーバーロードも見ない。** Rust の関数は引数と戻り値の型を省けず
+/// （省いた戻り値は `()`）、同じ名前で複数のシグネチャを持てない。
+///
+/// # Errors
+///
+/// そのドキュメントを開かせていないとき、往復が失敗したとき。
+/// **答えが無い / 読めないは `Err` にしない**（[`type_signature_outcome_of`] と同じ）。
+pub fn rust_type_signature_outcome_of(
+    session: &mut Session,
+    document: &SourceDocument,
+    position: SourcePosition,
+    traced: &TracedTypeNames,
+) -> Result<TypeSignatureOutcome, ClientError> {
+    let signature_text = match asked_signature_text_of(session, document, position)? {
+        Ok(signature_text) => signature_text,
+        Err(outcome) => return Ok(outcome),
+    };
+
+    Ok(rust_normalized_outcome_of(&signature_text, traced))
+}
+
+/// rust-analyzer が返した関数の綴り 1 本を、1 本だけの集合へ正規化した結果。
+///
+/// **答えの並びは TypeScript と同じ**（`single_outcome_of`）。開けなかった型名 →
+/// 書かれた場所で決まる綴り → 辿った記録の無い型名の順に見て、どれにも当たらなければ
+/// 比べられる形にする。
+///
+/// **型エイリアスは差し込まない。** 型名の記録を渡すのは Rust の型名を宣言まで辿る側で、
+/// 開いた綴りをどう使うかもそこで決める。記録が渡っても、宣言の場所を一緒に比べるので
+/// **別々の宣言の同じ綴りは重ならない**（[`TypeSignature`] の `declarations`）。
+pub fn rust_normalized_outcome_of(
+    signature_text: &SignatureText,
+    traced: &TracedTypeNames,
+) -> TypeSignatureOutcome {
+    let Some(callable) = RustCallable::from_spelling(signature_text.as_str()) else {
+        return TypeSignatureOutcome::UnreadableSignature;
+    };
+
+    let type_names = callable.type_names();
+    if let Some(reason) = type_names
+        .iter()
+        .find_map(|name| traced.unopened_reason_of(name))
+    {
+        return TypeSignatureOutcome::UnopenedTypeName { reason };
+    }
+
+    // 別々の `impl` の `&self` は、綴りが同じでも別の型を受け取る
+    if callable.refers_to_self() {
+        return TypeSignatureOutcome::SiteDependentSpelling;
+    }
+
+    // **トレイトの名前も数える。** 別々のモジュールが同じ名前のトレイトを宣言していると、
+    // 綴りのまま比べた境界は要求の違う 2 つを単一化可能と答える
+    if type_names.iter().any(|name| !is_traced(name, traced)) {
+        return TypeSignatureOutcome::UntracedTypeName {
+            reason: UntracedReason::NoTracedRecord,
+        };
+    }
+
+    let declarations = declarations_named_in(type_names, traced.declared());
+    TypeSignatureOutcome::Normalized(OverloadSet::of_one(TypeSignature {
+        chunk_type: ComparedChunkType::Rust(callable),
+        declarations,
+    }))
 }
 
 /// その位置にある名前の型の綴り。答えが返らなければ、その理由の答え。
@@ -835,7 +907,7 @@ pub struct TypeSignature {
     /// **綴りではなく構造で持つ。** 同じ型に 2 通り以上の綴りがある
     /// （共用体の並び・冗長な括弧・タプルのラベル）ので、綴りの一致で比べると
     /// **書かれ方の違いが型の違いに見える**（`syntax::type_structure`）。
-    chunk_type: ChunkType,
+    chunk_type: ComparedChunkType,
     /// 綴りに残った型名が、それぞれどこで宣言されているか。**名前順**。
     ///
     /// **綴りは書いた人の位置に依存する。** 別々のモジュールが同じ局所名で構造の違う型を
@@ -845,6 +917,17 @@ pub struct TypeSignature {
     /// **並びを名前で固定する。** サーバが答えた順のままだと、同じ 2 つが尋ねた順で
     /// 等しくなったりならなかったりする。
     declarations: Vec<TypeDeclaration>,
+}
+
+/// 比べるチャンクの型。**読んだ言語ごとに、持つ形が違う。**
+///
+/// **Why not（[`ChunkType`] に Rust のバリアントを足す）**: あちらは注釈を省ける位置ごとの
+/// 型名を答える（TypeScript の推論を見分けるため）。Rust の関数は型を省けないので、
+/// 答えを持たない問いに空の集合で答える枝が生える。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ComparedChunkType {
+    TypeScript(ChunkType),
+    Rust(RustCallable),
 }
 
 /// 正規化した型シグネチャと、**比較に残る綴りに現れた型名**。
@@ -928,7 +1011,7 @@ impl NormalizedSignature {
         let names_only_types = read.names_only_types()?;
 
         let signature = TypeSignature {
-            chunk_type: read.normalized()?,
+            chunk_type: ComparedChunkType::TypeScript(read.normalized()?),
             declarations: declarations_named_in(&remaining_type_names, traced.declared()),
         };
 
@@ -3719,5 +3802,134 @@ mod tests {
         assert!(
             aliased.is_unifiable_with(&signature("function g(y: string | number | null): void"))
         );
+    }
+
+    /// Rust の綴りを、型名を渡した記録のとおりに正規化した集合。
+    fn rust_signature(text: &str, traced: &TracedTypeNames) -> OverloadSet {
+        let TypeSignatureOutcome::Normalized(signature) =
+            rust_normalized_outcome_of(&signature_text(text), traced)
+        else {
+            panic!("テストが渡す Rust の綴りは読み取れる: {text}");
+        };
+
+        signature
+    }
+
+    /// 型名をそれぞれ別の行で宣言したことにした記録。
+    fn declaring_rust(names: &[&str]) -> TracedTypeNames {
+        let declarations = names
+            .iter()
+            .enumerate()
+            .map(|(line, name)| declared(name, "/repo/src/traits.rs", line + 1))
+            .collect();
+
+        TracedTypeNames::new(declarations, Vec::new())
+    }
+
+    #[test]
+    fn test_rust_normalized_outcome_of_parameter_names_only_differing_is_unifiable() {
+        let traced = TracedTypeNames::default();
+        let first = rust_signature("pub fn first(value: i32) -> i32", &traced);
+        let second = rust_signature("pub fn second(amount: i32) -> i32", &traced);
+
+        assert!(first.is_unifiable_with(&second));
+    }
+
+    #[test]
+    fn test_rust_normalized_outcome_of_different_trait_bounds_is_not_unifiable() {
+        // Issue の例。境界を無視すると EXTRACT-CANDIDATE の偽陽性になる
+        let traced = declaring_rust(&["Display", "Serialize", "String"]);
+        let display = rust_signature(
+            "fn process<T>(items: &[T]) -> String\nwhere\n    T: Display,",
+            &traced,
+        );
+        let serialize = rust_signature(
+            "fn process<T>(items: &[T]) -> String\nwhere\n    T: Serialize,",
+            &traced,
+        );
+
+        assert!(!display.is_unifiable_with(&serialize));
+    }
+
+    #[test]
+    fn test_rust_normalized_outcome_of_inline_and_where_bounds_is_unifiable() {
+        let traced = declaring_rust(&["Clone", "Display", "String"]);
+        let inline = rust_signature("fn a<T: Display + Clone>(items: &[T]) -> String", &traced);
+        let where_clause = rust_signature(
+            "fn b<T>(items: &[T]) -> String\nwhere\n    T: Clone + Display,",
+            &traced,
+        );
+
+        assert!(inline.is_unifiable_with(&where_clause));
+    }
+
+    #[test]
+    fn test_rust_normalized_outcome_of_same_trait_name_declared_elsewhere_is_not_unifiable() {
+        // 別々のモジュールが同じ名前のトレイトを宣言している
+        let here = TracedTypeNames::new(
+            vec![declared("Render", "/repo/src/billing/render.rs", 1)],
+            Vec::new(),
+        );
+        let there = TracedTypeNames::new(
+            vec![declared("Render", "/repo/src/inventory/render.rs", 1)],
+            Vec::new(),
+        );
+        let text = "fn a<T>(item: T)\nwhere\n    T: Render,";
+
+        assert!(!rust_signature(text, &here).is_unifiable_with(&rust_signature(text, &there)));
+    }
+
+    #[test]
+    fn test_rust_normalized_outcome_of_untraced_trait_name_is_unmeasurable() {
+        let outcome = rust_normalized_outcome_of(
+            &signature_text("fn a<T>(item: T)\nwhere\n    T: Display,"),
+            &TracedTypeNames::default(),
+        );
+
+        assert_eq!(
+            outcome,
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord
+            }
+        );
+    }
+
+    #[test]
+    fn test_rust_normalized_outcome_of_receiver_is_site_dependent() {
+        let outcome = rust_normalized_outcome_of(
+            &signature_text("pub fn m(&self, v: u8) -> usize"),
+            &TracedTypeNames::default(),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::SiteDependentSpelling);
+    }
+
+    #[test]
+    fn test_rust_normalized_outcome_of_unopened_type_name_is_unopened() {
+        let traced = TracedTypeNames::new(
+            Vec::new(),
+            vec![unopened("Display", UnopenedReason::NoDeclarationSite)],
+        );
+        let outcome = rust_normalized_outcome_of(
+            &signature_text("fn a<T>(item: T)\nwhere\n    T: Display,"),
+            &traced,
+        );
+
+        assert_eq!(
+            outcome,
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::NoDeclarationSite
+            }
+        );
+    }
+
+    #[test]
+    fn test_rust_normalized_outcome_of_const_generics_is_unreadable() {
+        let outcome = rust_normalized_outcome_of(
+            &signature_text("pub fn h<const N: usize>(x: [u8; {const}]) -> (i32, u8)"),
+            &TracedTypeNames::default(),
+        );
+
+        assert_eq!(outcome, TypeSignatureOutcome::UnreadableSignature);
     }
 }
