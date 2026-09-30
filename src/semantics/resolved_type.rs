@@ -9,7 +9,7 @@
 //! 型名の位置 --typeDefinition--> 宣言の場所 --hover--> `type Amount = number`
 //! ```
 //!
-//! **Rust は宣言の場所までで止める**（[`rust_traced_type_names_of`]）。尋ねるのは
+//! **Rust は宣言の場所までで止める**（`rust_traced_type_names_of`）。尋ねるのは
 //! typeDefinition ではなく definition で、エイリアスも開かない。
 //!
 //! **綴りを読む部分は LSP を呼ばない**ので、サーバが無くても確かめられる
