@@ -53,9 +53,10 @@ const SELF_TYPE: &str = "Self";
 
 /// 型の綴りに現れない子の種別。
 ///
-/// **コメントは hover の綴りにも現れる。** `impl` の中のメソッドには、impl の境界が
-/// `// Bounds from impl:` の行と一緒に `where` 句へ足される（rust-analyzer 1.94.1 で実測）。
-/// 型の一部ではないので、どちらの綴りでも読み飛ばす。
+/// **ソースではどこにでも書ける**（引数の間・`where` 句の中）。型の一部ではないので読み飛ばす。
+/// hover の綴りにも `impl` の中のメソッドで現れる（impl の境界が `// Bounds from impl:` の行と
+/// 一緒に `where` 句へ足される。rust-analyzer 1.94.1 で実測）が、そのメソッドを比べられるように
+/// するのは別の話（impl の境界の型名がメソッドのノードに無い）で、ここでは読み飛ばすだけ。
 const COMMENT_KINDS: [&str; 2] = ["line_comment", "block_comment"];
 
 /// 引数に付く属性（`#[cfg(..)] a: A`）。hover の綴りには現れない。
@@ -149,7 +150,9 @@ impl RustCallable {
 ///
 /// **読めなければ空。** シグネチャに構文エラーがある・歩き方の一覧に無い形がある
 /// ときがこれで、比較に残る型名は記録が無いまま「尋ねていない」に倒れる（偽陰性）。
-/// 読めた部分だけを返すと、**hover の綴りに無い名前まで尋ねる**ことになる。
+/// 構文エラーから回復した木の名前を採ると、**綴りごとに最初の 1 つ**しか覚えないので、
+/// 回復が作った範囲の名前が同じ綴りの記録として先に入り、**別の宣言の場所で引かれうる**
+/// （偽陽性）。**本体の構文エラーは見ない** — 本体は歩かず、hover の綴りにも現れない。
 pub(crate) fn type_references_of(function: Node<'_>, source: &str) -> Vec<TypeReference> {
     let signature_has_error = named_children_of(function)
         .filter(|child| function.child_by_field_name("body") != Some(*child))
@@ -875,6 +878,18 @@ mod tests {
         let names = reference_names_of("fn f(a: User, b: Vec<Amount $>) {}\n");
 
         assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[test]
+    fn test_type_references_of_a_source_function_with_a_broken_body_are_still_collected() {
+        // 対照は上のテスト。本体は歩かないので、本体の構文エラーで捨てると
+        // 書きかけの関数の型名がまとめて「尋ねていない」へ倒れる
+        let names = reference_names_of("fn f(a: User) -> Total {\n    let x = ;\n}\n");
+
+        assert_eq!(
+            names,
+            BTreeSet::from(["Total".to_owned(), "User".to_owned()])
+        );
     }
 
     #[test]
