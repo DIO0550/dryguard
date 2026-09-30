@@ -99,8 +99,10 @@ pub enum DeclarationSiteOutcome {
 
 /// typeDefinition / definition の応答を、読み取れたかどうかが分かる形にする。
 ///
-/// **返った先頭の 1 件だけを採る。** 宣言が複数返るのは同じ名前が複数箇所で宣言されて
-/// いる場合（`declare` の重ね合わせ）で、そこから 1 つを選ぶ材料はこの層に無い。
+/// **返った先頭の 1 件だけを採る。** TypeScript で宣言が複数返るのは同じ名前が複数箇所で
+/// 宣言されている場合（`declare` の重ね合わせ）で、そこから 1 つを選ぶ材料はこの層に無い。
+/// rust-analyzer の definition は、測った型名・トレイト名・エイリアスのどれにも 1 件だけを
+/// 返した（1.94.1 と 2026-09-21 版で実測）。
 pub(super) fn outcome_of(answered: &GotoDefinitionResponse) -> DeclarationSiteOutcome {
     let site = match answered {
         GotoDefinitionResponse::Scalar(location) => Some(site_of(location)),

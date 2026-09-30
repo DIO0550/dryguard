@@ -686,8 +686,10 @@ fn asked_semantics_of(
 /// そのチャンクの型シグネチャを、**書かれた型名を解決してから**尋ねる。
 ///
 /// hover が返す綴りは書かれた型名のままで、型エイリアスは展開されない。
-/// 先に型名の宣言を辿って右辺を集め、綴りへ差し込んでから読む
-/// （`semantics::resolved_type`）。**Rust は宣言の場所を集めるまでで、右辺は差し込まない。**
+/// TypeScript は先に型名の宣言を辿って右辺を集め、綴りへ差し込んでから読む
+/// （`semantics::resolved_type`）。**Rust は hover の後に宣言の場所を集めるだけで、右辺は
+/// 差し込まない。** 順序は `semantics::type_signature::rust_type_signature_outcome_of` が
+/// 中に持つ（読み込み前の definition は空を返すので、hover が落ち着くのを先に待つ）。
 ///
 /// # Errors
 ///

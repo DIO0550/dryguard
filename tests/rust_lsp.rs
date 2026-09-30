@@ -356,8 +356,10 @@ fn test_compare_rust_alias_is_not_opened_into_its_right_hand_side() {
 #[test]
 #[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
 fn test_compare_rust_method_with_a_receiver_stays_site_dependent() {
-    // 型名を辿っても `&self` の指す先は囲む `impl` で決まる。対照は `charged`
-    // （同じ `Amount` を取るが、レシーバが無い）
+    // 辿った記録が渡るようになっても、`&self` を持つ側を比べられる答えにしない
+    // （指す先は囲む `impl` で決まる）。**辿れたかどうかは見ていない** — 相手の `charged` が
+    // 辿れず「尋ねていない」になっても、書かれた場所で決まる綴りのほうが先に出る
+    // （pipeline の `test_type_signature_match_of_a_site_dependent_spelling_outranks_*`）
     let total = traced_fixture("src/lib.rs", "total");
     let charged = traced_fixture("src/lib.rs", "charged");
 
