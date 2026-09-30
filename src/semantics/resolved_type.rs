@@ -112,9 +112,14 @@ pub enum UnopenedReason {
     ///
     /// **宣言が無いとは限らない。** そのファイルをプロジェクトとして見ていないときにも
     /// 空が返る（`lsp::DeclarationSiteOutcome::NoAnswer`）ので、サーバの答えとして読まない。
-    /// **rust-analyzer は rust-src が無いと std / core の名前にも空を返す**
-    /// （rust-analyzer 1.94.1 で実測）。応答からは原因を区別できないので分けない。
     NoDeclarationSite,
+    /// サーバが definition に宣言の場所を答えなかった。
+    ///
+    /// **[`UnopenedReason::NoDeclarationSite`] と分ける。** definition を尋ねるのは Rust で、
+    /// **rust-analyzer は rust-src が無いと std / core の名前にも空を返す**
+    /// （1.94.1 で実測）。利用者が次に試すこと（rust-src を入れる）が増えるので、
+    /// TypeScript の利用者にその案内を出さないよう問い合わせで分ける。
+    NoDefinitionSite,
     /// typeDefinition の宣言の場所は返ったが、パスとして読めない URI だった。
     UnreadableTypeDefinition,
     /// definition の宣言の場所は返ったが、パスとして読めない URI だった。
@@ -240,12 +245,7 @@ pub fn traced_type_names_of(
     document: &SourceDocument,
     type_references: &[TypeReference],
 ) -> Result<TracedTypeNames, ClientError> {
-    traced_type_names_by(
-        session,
-        document,
-        type_references,
-        DeclarationQuery::TypeDefinition,
-    )
+    DeclarationQuery::TypeDefinition.traced_type_names_of(session, document, type_references)
 }
 
 /// Rust のシグネチャに書かれた型名・トレイト名の宣言が、どこにあるかを尋ねる。
@@ -268,17 +268,12 @@ pub fn traced_type_names_of(
 /// # Errors
 ///
 /// そのドキュメントを開かせていないとき、往復が失敗したとき。
-pub fn rust_traced_type_names_of(
+pub(crate) fn rust_traced_type_names_of(
     session: &mut Session,
     document: &SourceDocument,
     type_references: &[TypeReference],
 ) -> Result<TracedTypeNames, ClientError> {
-    traced_type_names_by(
-        session,
-        document,
-        type_references,
-        DeclarationQuery::Definition,
-    )
+    DeclarationQuery::Definition.traced_type_names_of(session, document, type_references)
 }
 
 /// 宣言の場所を尋ねる問い合わせ。
@@ -311,6 +306,14 @@ impl DeclarationQuery {
         }
     }
 
+    /// サーバが宣言の場所を答えなかったときの理由。
+    fn no_answer(self) -> UnopenedReason {
+        match self {
+            Self::TypeDefinition => UnopenedReason::NoDeclarationSite,
+            Self::Definition => UnopenedReason::NoDefinitionSite,
+        }
+    }
+
     /// サーバがこの問い合わせを提供していなかったときの理由。
     fn not_provided(self) -> UnopenedReason {
         match self {
@@ -326,45 +329,42 @@ impl DeclarationQuery {
             Self::Definition => UnopenedReason::UnreadableDefinition,
         }
     }
-}
 
-/// 型名 1 つずつに `query` を尋ね、宣言の場所が取れたものと届かなかったものに分ける。
-///
-/// # Errors
-///
-/// そのドキュメントを開かせていないとき、往復が失敗したとき。
-fn traced_type_names_by(
-    session: &mut Session,
-    document: &SourceDocument,
-    type_references: &[TypeReference],
-    query: DeclarationQuery,
-) -> Result<TracedTypeNames, ClientError> {
-    let mut declared = Vec::new();
-    let mut unopened = Vec::new();
+    /// 型名 1 つずつにこの問い合わせを尋ね、宣言の場所が取れたものと届かなかったものに分ける。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、往復が失敗したとき。
+    fn traced_type_names_of(
+        self,
+        session: &mut Session,
+        document: &SourceDocument,
+        type_references: &[TypeReference],
+    ) -> Result<TracedTypeNames, ClientError> {
+        let mut declared = Vec::new();
+        let mut unopened = Vec::new();
 
-    for reference in type_references {
-        let name = reference.name().to_owned();
+        for reference in type_references {
+            let name = reference.name().to_owned();
 
-        match query.ask(session, document, reference.position())? {
-            DeclarationSiteOutcome::Answered(site) => {
-                declared.push(TypeDeclaration::new(name, site));
-            }
-            DeclarationSiteOutcome::NoAnswer => {
-                unopened.push(UnopenedTypeName::new(
-                    name,
-                    UnopenedReason::NoDeclarationSite,
-                ));
-            }
-            DeclarationSiteOutcome::Unreadable { .. } => {
-                unopened.push(UnopenedTypeName::new(name, query.unreadable()));
-            }
-            DeclarationSiteOutcome::NotSupported => {
-                unopened.push(UnopenedTypeName::new(name, query.not_provided()));
+            match self.ask(session, document, reference.position())? {
+                DeclarationSiteOutcome::Answered(site) => {
+                    declared.push(TypeDeclaration::new(name, site));
+                }
+                DeclarationSiteOutcome::NoAnswer => {
+                    unopened.push(UnopenedTypeName::new(name, self.no_answer()));
+                }
+                DeclarationSiteOutcome::Unreadable { .. } => {
+                    unopened.push(UnopenedTypeName::new(name, self.unreadable()));
+                }
+                DeclarationSiteOutcome::NotSupported => {
+                    unopened.push(UnopenedTypeName::new(name, self.not_provided()));
+                }
             }
         }
-    }
 
-    Ok(TracedTypeNames::new(declared, unopened))
+        Ok(TracedTypeNames::new(declared, unopened))
+    }
 }
 
 /// 宣言の位置へ hover を送り、型エイリアスの右辺を開く。

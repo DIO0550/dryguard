@@ -426,10 +426,13 @@ fn unopened_text_of(reason: UnopenedReason) -> &'static str {
         UnopenedReason::DefinitionNotProvided => {
             "測れない (比較に残る型名を開けない: サーバが definition を提供していない)"
         }
+        UnopenedReason::NoDeclarationSite => {
+            "測れない (比較に残る型名を開けない: サーバが宣言の場所を答えない)"
+        }
         // **原因を言い切らずに候補を出す。** 応答からは区別できないが、rust-analyzer は
         // rust-src が無いと std / core の名前にも空を返す（1.94.1 で実測）
-        UnopenedReason::NoDeclarationSite => {
-            "測れない (比較に残る型名を開けない: サーバが宣言の場所を答えない。Rust の std / core の型なら rust-src が要る)"
+        UnopenedReason::NoDefinitionSite => {
+            "測れない (比較に残る型名を開けない: サーバが definition に宣言の場所を答えない。std / core の型なら rust-src が要る)"
         }
         UnopenedReason::UnreadableTypeDefinition => {
             "測れない (比較に残る型名を開けない: typeDefinition の応答を読めない)"
@@ -1377,9 +1380,30 @@ mod tests {
     }
 
     #[test]
-    fn test_text_of_with_no_declaration_site_points_at_rust_src_as_a_candidate() {
+    fn test_text_of_with_no_definition_site_points_at_rust_src_as_a_candidate() {
         // rust-analyzer は rust-src が無いと std / core の名前に空を返す。応答からは
         // 区別できないので、言い切らずに候補として出す
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::UnopenedTypeName {
+                reason: UnopenedReason::NoDefinitionSite,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (比較に残る型名を開けない: サーバが definition に宣言の場所を答えない。std / core の型なら rust-src が要る) → どちらでもない"
+            ),
+            "rust-src が候補として出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_no_type_definition_site_does_not_mention_rust_src() {
+        // 対照は上のテスト。typeDefinition を尋ねるのは TypeScript なので、
+        // rust-src の案内を出すと利用者は関係の無いものを入れに行く
         let text = text_of_accidental_duplication_with_semantics(
             TypeSignatureMatch::UnopenedTypeName {
                 reason: UnopenedReason::NoDeclarationSite,
@@ -1391,9 +1415,9 @@ mod tests {
 
         assert!(
             text.contains(
-                "型シグネチャ: 測れない (比較に残る型名を開けない: サーバが宣言の場所を答えない。Rust の std / core の型なら rust-src が要る) → どちらでもない"
+                "型シグネチャ: 測れない (比較に残る型名を開けない: サーバが宣言の場所を答えない) → どちらでもない"
             ),
-            "rust-src が候補として出る: {text}"
+            "rust-src の案内が出ない: {text}"
         );
     }
 
