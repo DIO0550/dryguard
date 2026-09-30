@@ -1860,6 +1860,28 @@ mod tests {
     }
 
     #[test]
+    fn test_definition_asks_the_definition_of_the_name_not_its_type() {
+        // 対照は typeDefinition。rust-analyzer はエイリアスに typeDefinition だと空を返すので、
+        // 送る要求を取り違えると Rust の型名がすべて「宣言の場所を答えない」に倒れる
+        let server_output = frames_of(&[&no_type_definition_response(1)]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .definition(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, DeclarationSiteOutcome::NoAnswer),
+            "null は答えが無い: {outcome:?}"
+        );
+        assert_eq!(
+            sent_methods(&connection.writer).last().map(String::as_str),
+            Some("textDocument/definition")
+        );
+    }
+
+    #[test]
     fn test_references_answered_while_work_prepared_earlier_ran_asks_again() {
         // token を用意するのは前の問い合わせ（typeDefinition）の最中で、**始まりと終わりだけが
         // 参照元を尋ねている間に届く**。用意した時点しか数えていないと、この並びで
