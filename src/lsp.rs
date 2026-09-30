@@ -12,7 +12,7 @@
 //! | `workspace` | サーバに見せるワークスペースの根 |
 //! | `document` | サーバに開かせるソースファイル |
 //! | `hover` | hover の応答から型の綴りを取り出す |
-//! | `type_definition` | typeDefinition の応答から型の宣言の場所を取り出す |
+//! | `declaration_site` | typeDefinition / definition の応答から型の宣言の場所を取り出す |
 //! | `references` | references の応答から参照元のファイルを取り出す |
 //! | `call_hierarchy` | callHierarchy の応答から呼び出し先のファイルを取り出す |
 //! | `project_membership` | projectInfo の応答を読み、設定されたプロジェクトか見分ける |
@@ -25,13 +25,13 @@
 
 pub(crate) mod call_hierarchy;
 pub(crate) mod connection;
+pub(crate) mod declaration_site;
 pub(crate) mod document;
 pub(crate) mod framing;
 pub(crate) mod hover;
 pub(crate) mod message;
 pub(crate) mod project_membership;
 pub(crate) mod references;
-pub(crate) mod type_definition;
 pub(crate) mod uri;
 pub(crate) mod workspace;
 
@@ -57,7 +57,7 @@ pub use call_hierarchy::CalleesOutcome;
 pub use hover::{HoverOutcome, SignatureText};
 pub use references::ReferencesOutcome;
 // 型の宣言の場所は、開かせる相手を決める材料として `pipeline` が読む。
-pub use type_definition::{DeclarationSite, TypeDefinitionOutcome};
+pub use declaration_site::{DeclarationSite, DeclarationSiteOutcome};
 pub use workspace::{WorkspaceError, WorkspaceRoot};
 // 根の決め方と所属の確かめ方は `pipeline` だけが使う手順なので、クレートの外へは出さない
 // (rules/architecture.md「モジュールの公開 API」)。所属のほうは**サーバ固有の要求の形**
@@ -324,10 +324,10 @@ impl Session {
     /// 開かせたファイルの、指定位置に書かれた型が宣言されている場所を尋ねる。
     ///
     /// `position` は `TypeReference::position` が指す型名の位置。宣言が返ったのか、
-    /// 無かったのか、読めなかったのかは [`TypeDefinitionOutcome`] が分けて持つ。
+    /// 無かったのか、読めなかったのかは [`DeclarationSiteOutcome`] が分けて持つ。
     ///
     /// **typeDefinition を提供していないサーバには送らない**
-    /// （[`TypeDefinitionOutcome::NotSupported`]）。hover と同じ理由で、送ると
+    /// （[`DeclarationSiteOutcome::NotSupported`]）。hover と同じ理由で、送ると
     /// **シグナルが取れないだけの話が往復の失敗になる**。
     ///
     /// 先に [`Session::open_document`] で開かせておく。
@@ -340,14 +340,46 @@ impl Session {
         &mut self,
         document: &SourceDocument,
         position: SourcePosition,
-    ) -> Result<TypeDefinitionOutcome, ClientError> {
+    ) -> Result<DeclarationSiteOutcome, ClientError> {
         if !provides_type_definition(&self.capabilities) {
-            return Ok(TypeDefinitionOutcome::NotSupported);
+            return Ok(DeclarationSiteOutcome::NotSupported);
         }
 
         self.client
             .connection
             .type_definition(document, position)
+            .map_err(ClientError::Conversation)
+    }
+
+    /// 開かせたファイルの、指定位置に書かれた名前が宣言されている場所を尋ねる。
+    ///
+    /// `position` は `TypeReference::position` が指す型名の位置。
+    ///
+    /// **typeDefinition と違い、名前そのものの宣言を返す**（型エイリアスなら
+    /// エイリアスの宣言）。どちらを使うかは言語ごとに `semantics` が決める
+    /// （`Connection::definition`）。
+    ///
+    /// **definition を提供していないサーバには送らない**
+    /// （[`DeclarationSiteOutcome::NotSupported`]）。[`Session::type_definition`] と同じ理由。
+    ///
+    /// 先に [`Session::open_document`] で開かせておく。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、往復が失敗したとき、
+    /// 応答を definition の結果として読めないとき。
+    pub fn definition(
+        &mut self,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<DeclarationSiteOutcome, ClientError> {
+        if !provides_definition(&self.capabilities) {
+            return Ok(DeclarationSiteOutcome::NotSupported);
+        }
+
+        self.client
+            .connection
+            .definition(document, position)
             .map_err(ClientError::Conversation)
     }
 
@@ -547,6 +579,16 @@ fn provides_type_definition(capabilities: &ServerCapabilities) -> bool {
             TypeDefinitionProviderCapability::Simple(true)
                 | TypeDefinitionProviderCapability::Options(_)
         )
+    )
+}
+
+/// そのサーバが definition に答えるか。
+///
+/// references と同じく**有無ではなく中身を見る**。無効を表す `Left(false)` も「宣言はある」。
+fn provides_definition(capabilities: &ServerCapabilities) -> bool {
+    matches!(
+        capabilities.definition_provider,
+        Some(OneOf::Left(true) | OneOf::Right(_))
     )
 }
 
@@ -893,6 +935,39 @@ mod tests {
         let capabilities = capabilities_declaring_type_definition(None);
 
         assert!(!provides_type_definition(&capabilities));
+    }
+
+    /// そのサーバができることとして definition だけを宣言した capabilities。
+    fn capabilities_declaring_definition(
+        definition_provider: Option<OneOf<bool, lsp_types::DefinitionOptions>>,
+    ) -> ServerCapabilities {
+        ServerCapabilities {
+            definition_provider,
+            ..ServerCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn test_provides_definition_with_a_server_that_declares_it_is_true() {
+        let capabilities = capabilities_declaring_definition(Some(OneOf::Left(true)));
+
+        assert!(provides_definition(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_definition_with_a_server_that_turned_it_off_is_false() {
+        // 対照は上のテスト。**宣言はあるが無効**という形で、`is_some()` で見ていると
+        // definition を切ったサーバへ要求を送ってしまう
+        let capabilities = capabilities_declaring_definition(Some(OneOf::Left(false)));
+
+        assert!(!provides_definition(&capabilities));
+    }
+
+    #[test]
+    fn test_provides_definition_with_a_server_that_does_not_declare_it_is_false() {
+        let capabilities = capabilities_declaring_definition(None);
+
+        assert!(!provides_definition(&capabilities));
     }
 
     /// そのサーバができることとして references だけを宣言した capabilities。

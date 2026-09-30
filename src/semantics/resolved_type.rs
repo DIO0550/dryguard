@@ -9,14 +9,18 @@
 //! 型名の位置 --typeDefinition--> 宣言の場所 --hover--> `type Amount = number`
 //! ```
 //!
+//! **Rust は宣言の場所までで止める**（[`rust_traced_type_names_of`]）。尋ねるのは
+//! typeDefinition ではなく definition で、エイリアスも開かない。
+//!
 //! **綴りを読む部分は LSP を呼ばない**ので、サーバが無くても確かめられる
 //! (`rules/tdd.md`「`lsp` は『応答を受け取ってから先』を切り出す」)。
 
 use std::collections::HashMap;
 
 use crate::lsp::{
-    ClientError, DeclarationSite, HoverOutcome, Session, SourceDocument, TypeDefinitionOutcome,
+    ClientError, DeclarationSite, DeclarationSiteOutcome, HoverOutcome, Session, SourceDocument,
 };
+use crate::source_position::SourcePosition;
 use crate::syntax::type_reference::TypeReference;
 
 /// 型エイリアスの宣言を導く語。前後の空白ごと見て、`typeof` のような綴りと分ける。
@@ -99,13 +103,22 @@ impl ResolvedTypes {
 pub enum UnopenedReason {
     /// サーバが typeDefinition を提供していない。
     TypeDefinitionNotProvided,
+    /// サーバが definition を提供していない。
+    ///
+    /// **typeDefinition と分ける。** どちらを尋ねるかは言語で決まり、提供していない
+    /// 問い合わせの名前が違えば、利用者が確かめるサーバの設定も違う。
+    DefinitionNotProvided,
     /// サーバが宣言の場所を答えなかった。
     ///
     /// **宣言が無いとは限らない。** そのファイルをプロジェクトとして見ていないときにも
-    /// 空が返る（`lsp::TypeDefinitionOutcome::NoAnswer`）ので、サーバの答えとして読まない。
+    /// 空が返る（`lsp::DeclarationSiteOutcome::NoAnswer`）ので、サーバの答えとして読まない。
+    /// **rust-analyzer は rust-src が無いと std / core の名前にも空を返す**
+    /// （rust-analyzer 1.94.1 で実測）。応答からは原因を区別できないので分けない。
     NoDeclarationSite,
-    /// 宣言の場所は返ったが、パスとして読めない URI だった。
+    /// typeDefinition の宣言の場所は返ったが、パスとして読めない URI だった。
     UnreadableTypeDefinition,
+    /// definition の宣言の場所は返ったが、パスとして読めない URI だった。
+    UnreadableDefinition,
     /// 宣言のファイルを読めず、サーバに開かせられなかった。
     UnreadableDeclaringDocument,
     /// サーバが宣言の位置に綴りを持たなかった。
@@ -227,33 +240,126 @@ pub fn traced_type_names_of(
     document: &SourceDocument,
     type_references: &[TypeReference],
 ) -> Result<TracedTypeNames, ClientError> {
+    traced_type_names_by(
+        session,
+        document,
+        type_references,
+        DeclarationQuery::TypeDefinition,
+    )
+}
+
+/// Rust のシグネチャに書かれた型名・トレイト名の宣言が、どこにあるかを尋ねる。
+///
+/// 引数と、宣言まで届かなかった型名を落とさないのは [`traced_type_names_of`] と同じ。
+///
+/// **typeDefinition ではなく definition を尋ねる。** rust-analyzer の typeDefinition は
+/// 名前ではなく**その名前が指す型**の宣言を返すので、型エイリアス（`type Amount = u64`）には
+/// 空を返し、ジェネリックな型（`Option<User>`）には型引数の宣言まで並べる。definition は
+/// 書かれた名前の宣言を 1 件返す（rust-analyzer 1.94.1 と 2026-09-21 版で実測）。
+///
+/// **エイリアスは開かない。** 宣言の場所で比べるので、同じエイリアスを使う 2 つは重なり、
+/// 別々の宣言の同じ綴りは重ならない。**エイリアスと右辺の型（`Amount` と `u64`）は
+/// 重ならない**（偽陰性）。
+///
+/// **Why not（TypeScript と同じく右辺を差し込む）**: 差し込みは `syntax::type_spelling` が
+/// TypeScript の文法で綴りを割っている。Rust の綴りへの差し込みと、`type Pair<T>` の
+/// 型引数の当てはめが別に要る。
+///
+/// # Errors
+///
+/// そのドキュメントを開かせていないとき、往復が失敗したとき。
+pub fn rust_traced_type_names_of(
+    session: &mut Session,
+    document: &SourceDocument,
+    type_references: &[TypeReference],
+) -> Result<TracedTypeNames, ClientError> {
+    traced_type_names_by(
+        session,
+        document,
+        type_references,
+        DeclarationQuery::Definition,
+    )
+}
+
+/// 宣言の場所を尋ねる問い合わせ。
+///
+/// **届かなかった理由の語彙を問い合わせと一緒に持つ。** 尋ねた問い合わせと
+/// 別の名前で「提供していない」と出すと、利用者が確かめる相手を取り違える。
+#[derive(Debug, Clone, Copy)]
+enum DeclarationQuery {
+    /// `textDocument/typeDefinition`。TypeScript で使う。
+    TypeDefinition,
+    /// `textDocument/definition`。Rust で使う。
+    Definition,
+}
+
+impl DeclarationQuery {
+    /// その位置の宣言の場所を尋ねる。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、往復が失敗したとき。
+    fn ask(
+        self,
+        session: &mut Session,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<DeclarationSiteOutcome, ClientError> {
+        match self {
+            Self::TypeDefinition => session.type_definition(document, position),
+            Self::Definition => session.definition(document, position),
+        }
+    }
+
+    /// サーバがこの問い合わせを提供していなかったときの理由。
+    fn not_provided(self) -> UnopenedReason {
+        match self {
+            Self::TypeDefinition => UnopenedReason::TypeDefinitionNotProvided,
+            Self::Definition => UnopenedReason::DefinitionNotProvided,
+        }
+    }
+
+    /// 返った場所をパスとして読めなかったときの理由。
+    fn unreadable(self) -> UnopenedReason {
+        match self {
+            Self::TypeDefinition => UnopenedReason::UnreadableTypeDefinition,
+            Self::Definition => UnopenedReason::UnreadableDefinition,
+        }
+    }
+}
+
+/// 型名 1 つずつに `query` を尋ね、宣言の場所が取れたものと届かなかったものに分ける。
+///
+/// # Errors
+///
+/// そのドキュメントを開かせていないとき、往復が失敗したとき。
+fn traced_type_names_by(
+    session: &mut Session,
+    document: &SourceDocument,
+    type_references: &[TypeReference],
+    query: DeclarationQuery,
+) -> Result<TracedTypeNames, ClientError> {
     let mut declared = Vec::new();
     let mut unopened = Vec::new();
 
     for reference in type_references {
         let name = reference.name().to_owned();
 
-        match session.type_definition(document, reference.position())? {
-            TypeDefinitionOutcome::Answered(site) => {
+        match query.ask(session, document, reference.position())? {
+            DeclarationSiteOutcome::Answered(site) => {
                 declared.push(TypeDeclaration::new(name, site));
             }
-            TypeDefinitionOutcome::NoAnswer => {
+            DeclarationSiteOutcome::NoAnswer => {
                 unopened.push(UnopenedTypeName::new(
                     name,
                     UnopenedReason::NoDeclarationSite,
                 ));
             }
-            TypeDefinitionOutcome::Unreadable { .. } => {
-                unopened.push(UnopenedTypeName::new(
-                    name,
-                    UnopenedReason::UnreadableTypeDefinition,
-                ));
+            DeclarationSiteOutcome::Unreadable { .. } => {
+                unopened.push(UnopenedTypeName::new(name, query.unreadable()));
             }
-            TypeDefinitionOutcome::NotSupported => {
-                unopened.push(UnopenedTypeName::new(
-                    name,
-                    UnopenedReason::TypeDefinitionNotProvided,
-                ));
+            DeclarationSiteOutcome::NotSupported => {
+                unopened.push(UnopenedTypeName::new(name, query.not_provided()));
             }
         }
     }

@@ -1,4 +1,8 @@
-//! typeDefinition の応答から、型が宣言されている場所を取り出す。
+//! typeDefinition / definition の応答から、型が宣言されている場所を取り出す。
+//!
+//! **2 つの問い合わせで同じ形を使う。** どちらも応答は `GotoDefinitionResponse` で、
+//! 読み取った結果の分かれ方（返った / 空 / 読めない / 提供していない）も同じ。
+//! 違うのは**どちらを尋ねるか**で、それは言語ごとに `semantics` が決める。
 //!
 //! **サーバとの往復そのものは `connection` が持つ。** ここにあるのは受け取った応答を
 //! こちらが読める形へ直す変換だけなので、サーバを起動せずに確かめられる
@@ -70,13 +74,13 @@ impl DeclarationSite {
     }
 }
 
-/// typeDefinition に尋ねた結果。
+/// typeDefinition / definition に尋ねた結果。
 ///
 /// **「取れなかった」を 1 つにまとめない。** どれなのかで**利用者が次に試すことが違う**
 /// （サーバを替える / そのコードベースの見せ方を直す / dryguard 側の穴）
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
 #[derive(Debug)]
-pub enum TypeDefinitionOutcome {
+pub enum DeclarationSiteOutcome {
     /// 宣言の場所が返った。
     Answered(DeclarationSite),
     /// サーバはこの位置の宣言を返さなかった。
@@ -89,15 +93,15 @@ pub enum TypeDefinitionOutcome {
         /// 読めなかった理由。どの URI で落ちたかを持つ。
         cause: UriPathError,
     },
-    /// サーバが typeDefinition を提供していない。要求は送っていない。
+    /// サーバがその問い合わせを提供していない。要求は送っていない。
     NotSupported,
 }
 
-/// typeDefinition の応答を、読み取れたかどうかが分かる形にする。
+/// typeDefinition / definition の応答を、読み取れたかどうかが分かる形にする。
 ///
 /// **返った先頭の 1 件だけを採る。** 宣言が複数返るのは同じ名前が複数箇所で宣言されて
 /// いる場合（`declare` の重ね合わせ）で、そこから 1 つを選ぶ材料はこの層に無い。
-pub(super) fn outcome_of(answered: &GotoDefinitionResponse) -> TypeDefinitionOutcome {
+pub(super) fn outcome_of(answered: &GotoDefinitionResponse) -> DeclarationSiteOutcome {
     let site = match answered {
         GotoDefinitionResponse::Scalar(location) => Some(site_of(location)),
         GotoDefinitionResponse::Array(locations) => locations.first().map(site_of),
@@ -105,9 +109,9 @@ pub(super) fn outcome_of(answered: &GotoDefinitionResponse) -> TypeDefinitionOut
     };
 
     match site {
-        Some(Ok(site)) => TypeDefinitionOutcome::Answered(site),
-        Some(Err(cause)) => TypeDefinitionOutcome::Unreadable { cause },
-        None => TypeDefinitionOutcome::NoAnswer,
+        Some(Ok(site)) => DeclarationSiteOutcome::Answered(site),
+        Some(Err(cause)) => DeclarationSiteOutcome::Unreadable { cause },
+        None => DeclarationSiteOutcome::NoAnswer,
     }
 }
 
@@ -161,13 +165,13 @@ mod tests {
     /// 読み取れた宣言の場所。読み取れていなければテストを落とす。
     fn site_of_response(answered: &GotoDefinitionResponse) -> DeclarationSite {
         match outcome_of(answered) {
-            TypeDefinitionOutcome::Answered(site) => site,
+            DeclarationSiteOutcome::Answered(site) => site,
             other => panic!("宣言の場所を読み取れる: {other:?}"),
         }
     }
 
     #[test]
-    fn test_type_definition_outcome_of_a_single_location_is_the_file_it_names() {
+    fn test_declaration_site_outcome_of_a_single_location_is_the_file_it_names() {
         let answered =
             GotoDefinitionResponse::Scalar(location("file:///repo/src/billing/money.ts", 0, 12));
 
@@ -178,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn test_type_definition_outcome_of_a_location_keeps_the_position_the_server_named() {
+    fn test_declaration_site_outcome_of_a_location_keeps_the_position_the_server_named() {
         // 宣言の位置は、そこを指して尋ね直すために持つ。落とすとエイリアスの右辺が取れない
         let answered =
             GotoDefinitionResponse::Scalar(location("file:///repo/src/billing/money.ts", 4, 12));
@@ -190,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_type_definition_outcome_of_several_locations_is_the_first_of_them() {
+    fn test_declaration_site_outcome_of_several_locations_is_the_first_of_them() {
         // 対照として 2 件目を別のファイルにする。畳む先を決めていないと、
         // 同じ入力で別のファイルが返りうる
         let answered = GotoDefinitionResponse::Array(vec![
@@ -205,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn test_type_definition_outcome_of_a_link_points_at_the_name_not_the_whole_declaration() {
+    fn test_declaration_site_outcome_of_a_link_points_at_the_name_not_the_whole_declaration() {
         // `target_range` は `export type Amount = number;` の行頭から始まる。
         // そこを指して尋ね直すと、`export` の綴りの上を指すことになる
         let link = LocationLink {
@@ -221,23 +225,23 @@ mod tests {
     }
 
     #[test]
-    fn test_type_definition_outcome_of_no_locations_is_not_an_empty_answer() {
+    fn test_declaration_site_outcome_of_no_locations_is_not_an_empty_answer() {
         // 空配列は「宣言が無い」と「プロジェクトとして見ていない」の両方で返る。
         // 材料が取れたことにすると、後段は「解決した結果その綴りだった」と読む
         assert!(matches!(
             outcome_of(&GotoDefinitionResponse::Array(Vec::new())),
-            TypeDefinitionOutcome::NoAnswer
+            DeclarationSiteOutcome::NoAnswer
         ));
     }
 
     #[test]
-    fn test_type_definition_outcome_of_an_unreadable_uri_is_not_an_absent_answer() {
+    fn test_declaration_site_outcome_of_an_unreadable_uri_is_not_an_absent_answer() {
         // 対照は上のテスト。どちらも「宣言に届かない」だが、直す先が違う
         let answered = GotoDefinitionResponse::Scalar(location("untitled:Untitled-1", 0, 0));
 
         assert!(matches!(
             outcome_of(&answered),
-            TypeDefinitionOutcome::Unreadable { .. }
+            DeclarationSiteOutcome::Unreadable { .. }
         ));
     }
 }
