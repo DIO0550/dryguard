@@ -32,6 +32,10 @@ bash harness/records/count.sh
 - 対策済: `naming-mismatch` 層=rules at pr-42
 ```
 
+集計から介入の PR を出すまでの手順は `harness-growth` スキル
+（[`.claude/skills/harness-growth/SKILL.md`](../../.claude/skills/harness-growth/SKILL.md)）。
+この行は介入の PR の本文で宣言され、`harness-record` がその PR の記録へ写す。
+
 ## 書き方
 
 形式・層の語彙・分類の語彙は [`TEMPLATE.md`](TEMPLATE.md)。
