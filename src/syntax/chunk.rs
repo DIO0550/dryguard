@@ -19,6 +19,7 @@ use crate::location::Location;
 use crate::source_position::SourcePosition;
 use crate::syntax::import::{ImportSet, ImportsUnavailable};
 use crate::syntax::line_range::LineRange;
+use crate::syntax::rust_callable;
 use crate::syntax::token::TokenSequence;
 use crate::syntax::tree::{
     Grammar, SyntaxTree, source_position_of, transparent_wrappers_of, unwrapped_parent_of,
@@ -190,7 +191,7 @@ impl Chunk {
                 overload_declarations_of(node, source)
             },
             type_references: if grammar == Grammar::Rust {
-                Vec::new()
+                rust_callable::type_references_of(node, source)
             } else {
                 chunk_type_references_of(node, source)
             },
@@ -261,6 +262,10 @@ impl Chunk {
     ///
     /// 空を `None` にしないのは、**集められなかったという状態が無い**ため。
     /// キーワードの型だけで書かれたシグネチャでは、書かれていないことが空で表される。
+    ///
+    /// **Rust ではシグネチャを読めなかったときも空**（`rust_callable::type_references_of`）。
+    /// 比較に残る型名は記録が無いまま「尋ねていない」に倒れるので、空を「書かれていない」と
+    /// 読んで綴りのまま比べる経路は無い。
     pub fn type_references(&self) -> &[TypeReference] {
         &self.type_references
     }
@@ -1931,6 +1936,23 @@ export function overloaded(a: unknown): unknown {
         let chunk = chunk_at(annotated, "a.ts:1").expect("切り出せる");
 
         assert_eq!(type_names_of(&chunk), vec!["Amount", "Rate", "Total"]);
+    }
+
+    #[test]
+    fn test_chunk_type_references_of_a_rust_function_cover_its_parameters_bounds_and_return_type() {
+        // Rust のチャンクも尋ねる位置を持つ。空のままだと、比較に残る型名・トレイト名が
+        // すべて「尋ねていない」に倒れる
+        let source =
+            "fn scale<T: Display>(amount: billing::Amount, item: T) -> Total {\n    todo!()\n}\n";
+        let location: Location = "a.rs:1".parse().expect("テストが渡す位置は解釈できる");
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).expect("木にできる");
+
+        let chunk = Chunk::find_enclosing(&location, &tree).expect("切り出せる");
+
+        // 尋ねる順は答えに効かないので、並びは見ない
+        let mut names = type_names_of(&chunk);
+        names.sort_unstable();
+        assert_eq!(names, vec!["Display", "Total", "billing::Amount"]);
     }
 
     #[test]

@@ -15,7 +15,8 @@ use std::collections::BTreeSet;
 
 use tree_sitter::Node;
 
-use crate::syntax::tree::{Grammar, SyntaxTree};
+use crate::syntax::tree::{Grammar, SyntaxTree, source_position_of};
+use crate::syntax::type_reference::TypeReference;
 
 /// 付け替えた型変数の綴りの前置き。
 ///
@@ -49,6 +50,16 @@ const UNIT_TYPE: &str = "()";
 
 /// `impl` の対象を指す型の名前。
 const SELF_TYPE: &str = "Self";
+
+/// 型の綴りに現れない子の種別。
+///
+/// **コメントは hover の綴りにも現れる。** `impl` の中のメソッドには、impl の境界が
+/// `// Bounds from impl:` の行と一緒に `where` 句へ足される（rust-analyzer 1.94.1 で実測）。
+/// 型の一部ではないので、どちらの綴りでも読み飛ばす。
+const COMMENT_KINDS: [&str; 2] = ["line_comment", "block_comment"];
+
+/// 引数に付く属性（`#[cfg(..)] a: A`）。hover の綴りには現れない。
+const ATTRIBUTE_KIND: &str = "attribute_item";
 
 /// Rust の関数 1 つ分の、単一化の可否を比べられる形。
 ///
@@ -125,6 +136,36 @@ impl RustCallable {
     }
 }
 
+/// ソースに書かれた関数の宣言から、比較に残る型名とその尋ねる位置を集める。
+/// 1 つも書かれていなければ空。
+///
+/// `function` は本体のある関数の宣言（`function_item`）、`source` はそれを含む
+/// ファイル全体のソース。
+///
+/// **hover の綴りを読むのと同じ歩き方で読む。** rust-analyzer の hover は境界を `where` へ
+/// 寄せるが、**パスは書かれたとおりに綴る**（rust-analyzer 1.94.1 で実測）。同じ歩き方で
+/// ソースを読めば、[`RustCallable::type_names`] と同じ綴りの名前が位置つきで取れる。
+/// 歩き方を 2 つ持つと、片方だけが新しい形に追随したときに綴りが食い違う。
+///
+/// **読めなければ空。** シグネチャに構文エラーがある・歩き方の一覧に無い形がある
+/// ときがこれで、比較に残る型名は記録が無いまま「尋ねていない」に倒れる（偽陰性）。
+/// 読めた部分だけを返すと、**hover の綴りに無い名前まで尋ねる**ことになる。
+pub(crate) fn type_references_of(function: Node<'_>, source: &str) -> Vec<TypeReference> {
+    let signature_has_error = named_children_of(function)
+        .filter(|child| function.child_by_field_name("body") != Some(*child))
+        .any(|child| child.has_error());
+    if signature_has_error {
+        return Vec::new();
+    }
+
+    let mut spelling = Spelling::new(source);
+    if spelling.callable_of(function).is_none() {
+        return Vec::new();
+    }
+
+    spelling.references
+}
+
 /// 1 つの関数の綴りを読み進める途中の状態。
 ///
 /// **付け替えの番号は読んだ順に振る**ので、引数 → 戻り値 → 境界の順に歩く。
@@ -135,6 +176,11 @@ struct Spelling<'source> {
     /// 付け替えた型変数の名前。**番号の順**。
     numbered: Vec<String>,
     type_names: BTreeSet<String>,
+    /// 型名が書かれた位置。[`Spelling::type_names`] と同じ綴りで、**綴りごとに最初の 1 つ**。
+    ///
+    /// **綴りの書き手がソースのときだけ意味を持つ。** hover の綴りを読むときにも数えるが、
+    /// それは hover の中の位置で、尋ねる先にはならない。
+    references: Vec<TypeReference>,
     refers_to_self: bool,
 }
 
@@ -145,12 +191,16 @@ impl<'source> Spelling<'source> {
             declared: Vec::new(),
             numbered: Vec::new(),
             type_names: BTreeSet::new(),
+            references: Vec::new(),
             refers_to_self: false,
         }
     }
 
     /// 関数の宣言のノードから組み立てる。読めない形があれば `None`。
-    fn callable_of(mut self, function: Node<'_>) -> Option<RustCallable> {
+    ///
+    /// **本体の無い宣言（hover の綴り）と本体のある宣言（ソース）のどちらも読める。**
+    /// 見るのは名前付きのフィールドと `where` 句だけで、本体には触れない。
+    fn callable_of(&mut self, function: Node<'_>) -> Option<RustCallable> {
         let modifiers = self.modifiers_of(function)?;
 
         // 境界は型変数をすべて宣言し終えてから読む（`T: Into<U>` の `U` が後ろで宣言されうる）
@@ -161,7 +211,9 @@ impl<'source> Spelling<'source> {
 
         let parameter_list = function.child_by_field_name("parameters")?;
         let mut parameters = Vec::new();
-        for parameter in named_children_of(parameter_list) {
+        for parameter in
+            named_children_of(parameter_list).filter(|node| node.kind() != ATTRIBUTE_KIND)
+        {
             parameters.push(self.parameter_spelling_of(parameter)?);
         }
 
@@ -191,7 +243,7 @@ impl<'source> Spelling<'source> {
             value_type,
             type_parameter_count: self.declared.len(),
             trait_bounds,
-            type_names: self.type_names,
+            type_names: self.type_names.clone(),
             refers_to_self: self.refers_to_self,
         })
     }
@@ -409,7 +461,7 @@ impl<'source> Spelling<'source> {
         if name == SELF_TYPE {
             self.refers_to_self = true;
         } else {
-            self.type_names.insert(name.to_owned());
+            self.insert_type_name(name.to_owned(), node);
         }
 
         Some(name.to_owned())
@@ -446,11 +498,31 @@ impl<'source> Spelling<'source> {
     }
 
     /// パスごと 1 つの型名として数えた綴り。
+    ///
+    /// **尋ねる位置は末尾の名前。** 先頭（`billing::User` の `billing`）を指すと、
+    /// 型ではなくモジュールの宣言が返る。
     fn whole_path_of(&mut self, node: Node<'_>) -> Option<String> {
         let path = collapsed(self.text_of(node)?);
-        self.type_names.insert(path.clone());
+        self.insert_type_name(path.clone(), node.child_by_field_name("name")?);
 
         Some(path)
+    }
+
+    /// 比較に残る型名を 1 つ数え、`asked` をその綴りの尋ねる位置として覚える。
+    ///
+    /// **同じ綴りは最初の 1 つだけ覚える。** 1 つの関数の宣言の中では、同じ綴りは
+    /// 同じスコープで解決されるので同じ宣言を指す（`Self` は数えない）。
+    fn insert_type_name(&mut self, name: String, asked: Node<'_>) {
+        let first = self.type_names.insert(name.clone());
+        if !first {
+            return;
+        }
+
+        // 位置が文字の境界に乗らない綴りは尋ねられない。数えた名前は記録が無いまま残り、
+        // 「尋ねていない」に倒れる
+        if let Some(position) = source_position_of(asked, self.source) {
+            self.references.push(TypeReference::new(name, position));
+        }
     }
 
     /// 関数が束縛した型変数なら、その番号。初めて現れたなら次の番号を振る。
@@ -482,10 +554,13 @@ struct BoundedMembers {
     spelled: Vec<String>,
 }
 
-/// 名前付きの子。書かれた順。
+/// 名前付きの子。書かれた順。コメント（[`COMMENT_KINDS`]）は除く。
 fn named_children_of(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
     let mut cursor = node.walk();
-    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+    let children: Vec<Node<'_>> = node
+        .named_children(&mut cursor)
+        .filter(|child| !COMMENT_KINDS.contains(&child.kind()))
+        .collect();
     children.into_iter()
 }
 
@@ -711,5 +786,103 @@ mod tests {
     #[test]
     fn test_from_spelling_non_function_is_unreadable() {
         assert_eq!(RustCallable::from_spelling("pub struct S"), None);
+    }
+
+    /// ソースに書かれた関数 1 つから集めた型名の、綴りと位置（行, 列）の組。
+    fn references_of(source: &str) -> Vec<(String, usize, usize)> {
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).expect("Rust として読める");
+        let function = tree
+            .named_descendants()
+            .into_iter()
+            .find(|node| node.kind() == "function_item")
+            .expect("関数の宣言がある");
+
+        type_references_of(function, source)
+            .iter()
+            .map(|reference| {
+                let position = reference.position();
+                (
+                    reference.name().to_owned(),
+                    position.line().get(),
+                    position.character(),
+                )
+            })
+            .collect()
+    }
+
+    /// 集めた型名の綴りだけ。名前順。
+    fn reference_names_of(source: &str) -> BTreeSet<String> {
+        references_of(source)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect()
+    }
+
+    #[test]
+    fn test_type_references_of_a_source_function_are_the_type_names_of_its_hover_spelling() {
+        // hover は inline の境界を `where` へ寄せ、パスを書かれたとおりに綴る
+        // （rust-analyzer 1.94.1 で実測）。比較に残る型名と同じ綴りで集めないと、
+        // 集めた記録を綴りで引けない
+        let source = "pub fn shown<T: Display>(user: billing::User, items: &[T]) -> Option<Vec<String>>\nwhere\n    T: Clone,\n{\n    None\n}\n";
+        let hover = "pub fn shown<T>(user: billing::User, items: &[T]) -> Option<Vec<String>>\nwhere\n    T: Display + Clone,";
+
+        assert_eq!(reference_names_of(source), read(hover).type_names().clone());
+    }
+
+    #[test]
+    fn test_type_references_of_a_path_point_at_its_last_segment() {
+        // 綴りはパスごと、尋ねる位置は末尾の名前。先頭の `billing` を指すと
+        // モジュールの宣言が返る
+        let references = references_of("fn scoped(user: billing::User) {}\n");
+
+        assert_eq!(references, vec![("billing::User".to_owned(), 1, 25)]);
+    }
+
+    #[test]
+    fn test_type_references_of_a_source_function_leave_out_what_has_no_declaration_to_trace() {
+        // 対照に `Iterator` を置く。型変数・プリミティブ・関連型の名前（`Item`）は
+        // 辿る相手が居ない
+        let names = reference_names_of(
+            "fn f<T: Iterator<Item = u8>>(t: T, n: usize) -> T::Item { todo!() }\n",
+        );
+
+        assert_eq!(names, BTreeSet::from(["Iterator".to_owned()]));
+    }
+
+    #[test]
+    fn test_type_references_of_a_source_function_name_the_same_type_only_once() {
+        let references = references_of("fn f(a: User, b: User) -> User { a }\n");
+
+        assert_eq!(references, vec![("User".to_owned(), 1, 8)]);
+    }
+
+    #[test]
+    fn test_type_references_of_a_source_function_skip_comments_and_attributes_in_parameters() {
+        // hover の綴りには現れないので、読めないとして落とすと
+        // 注釈を書いてある関数が「尋ねていない」側へ倒れる
+        let names = reference_names_of("fn f(/* 金額 */ a: User, #[allow(unused)] b: Amount) {}\n");
+
+        assert_eq!(
+            names,
+            BTreeSet::from(["Amount".to_owned(), "User".to_owned()])
+        );
+    }
+
+    #[test]
+    fn test_type_references_of_a_source_function_with_a_broken_signature_are_empty() {
+        // 読めない形から名前を拾うと、hover の綴りに無い名前まで尋ねることになる。
+        // 空なら比較に残る型名は「尋ねていない」に倒れる（偽陰性）
+        let names = reference_names_of("fn f(a: User, b: Vec<Amount $>) {}\n");
+
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[test]
+    fn test_type_references_of_a_source_function_leave_out_self() {
+        // `Self` の指す先は囲む `impl` で決まり、名前で辿る相手ではない。
+        // 対照に `User` を置く
+        let names = reference_names_of("impl A { fn f(&self, user: User) -> Self { todo!() } }\n");
+
+        assert_eq!(names, BTreeSet::from(["User".to_owned()]));
     }
 }

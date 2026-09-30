@@ -82,6 +82,14 @@ pub struct TypeReference {
 }
 
 impl TypeReference {
+    /// 綴りと、その綴りを尋ねる位置から作る。
+    ///
+    /// **`syntax` の外からは作らせない。** 位置は構文木から採ったものに限る
+    /// （`rules/architecture.md`「`pub` は最小限にする」）。
+    pub(super) fn new(name: String, position: SourcePosition) -> Self {
+        Self { name, position }
+    }
+
     /// ソースに書かれた綴り。
     pub fn name(&self) -> &str {
         &self.name
