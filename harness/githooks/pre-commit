@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+#
+# commit 前の整形検査（git ネイティブのフック）。
+#
+# pre-push だけだと、整形の差分は積んだコミットの後ろに「整形だけのコミット」として
+# 足すことになる（pr-169 は 15 回、pr-254 は CI で 2 回）。commit の時点で止めれば、
+# 直した中身が元のコミットに入る。
+#
+# 配線: git config core.hooksPath harness/githooks
+set -e
+
+cd "$(git rev-parse --show-toplevel)"
+
+# cargo が無い環境では黙って通す（pre-push と同じ。無条件のゲートは CI）。
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "pre-commit: cargo が無いため検査を飛ばします"
+  exit 0
+fi
+
+# fmt だけを走らせる。clippy / test は重く、commit のたびに走らせると
+# 小さく刻む commit が避けられる。そちらは pre-push が持つ。
+echo "pre-commit: fmt"
+if ! cargo fmt --check; then
+  echo "pre-commit: 整形の差分があります。'cargo fmt' をかけて、直した分を stage し直してください" >&2
+  exit 1
+fi
