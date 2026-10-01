@@ -326,6 +326,11 @@ impl FileChunks {
     ///
     /// 構文エラーのある関数はチャンクにせず、始まりの行だけを残す
     /// ([`Chunk::find_enclosing`] が [`ChunkingError::UnparsableFunction`] で断るのと同じ扱い)。
+    ///
+    /// `test_functions` は `test function` をチャンクにするか。[`TestFunctions::Excluded`] で
+    /// 外した関数は、構文エラーがあっても始まりの行には入れず、**数だけを残す**
+    /// （比べるつもりの無い関数を「切り出せなかった」と出さない）。外すのはその関数だけで、
+    /// 本体の中に書いた関数は印が付いていないので残る（入れ子の扱いと同じ）。
     pub fn from_tree(tree: &SyntaxTree<'_>, path: &Path, test_functions: TestFunctions) -> Self {
         let imports = ImportSet::from_tree(tree, path);
         let mut chunks = Vec::new();
@@ -463,6 +468,8 @@ const COMMENT_KINDS: [&str; 2] = ["line_comment", "block_comment"];
 /// `#[test]` / `#[tokio::test]` / `#[async_std::test]` がこれに当たる。**一覧から漏れた属性
 /// （`#[rstest]` など）の関数はチャンクとして残る**ので、漏れても外す前と同じ振る舞いに
 /// 倒れるだけ（`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」）。
+/// 逆に末尾だけを見るので、テストでない `#[foo::test]` の関数も外す。外した数は
+/// 走査の出力に出るので、黙って消えはしない。
 const TEST_ATTRIBUTE_NAME: &str = "test";
 
 /// そのノードが `test function`（テストの印の属性が付いた Rust の関数）か。

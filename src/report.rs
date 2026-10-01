@@ -212,24 +212,25 @@ fn listed_block_of(heading: &str, items: impl Iterator<Item = String>) -> Option
 /// 同じ理由で、チャンクにしなかった `test function` の数も出す。
 fn walked_text_of(scan: &Scan) -> String {
     format!(
-        "対象 {} ファイル / {}/ 比較 {} ペア（うち長さで確定 {} ペア）/ 候補 {} ペア",
+        "対象 {} ファイル / チャンク {} 件{} / 比較 {} ペア（うち長さで確定 {} ペア）/ 候補 {} ペア",
         scan.file_count(),
-        chunks_text_of(scan.chunk_count(), scan.excluded_test_function_count()),
+        scan.chunk_count(),
+        excluded_test_functions_text_of(scan.excluded_test_function_count()),
         scan.compared_pair_count(),
         scan.pruned_pair_count(),
         scan.candidate_pairs().len()
     )
 }
 
-/// チャンクの数と、外した `test function` の数。外していなければ後者を添えない。
+/// チャンクの数に添える、外した `test function` の数。外していなければ何も添えない。
 ///
 /// 0 件でも出すと、テストの印を持たない TypeScript の走査にまで「テスト関数 0 件」が並び、
 /// **テストを見分けたうえで 0 件だった**ように読める。
-fn chunks_text_of(chunk_count: usize, excluded_test_function_count: usize) -> String {
-    if excluded_test_function_count == 0 {
-        return format!("チャンク {chunk_count} 件 ");
+fn excluded_test_functions_text_of(count: usize) -> String {
+    if count == 0 {
+        return String::new();
     }
-    format!("チャンク {chunk_count} 件（テスト関数 {excluded_test_function_count} 件を除外）")
+    format!("（テスト関数 {count} 件を除外）")
 }
 
 /// 根拠の行。見出し `理由:` は最初の 1 件にだけ付け、続きは同じ桁から始める。
@@ -1232,7 +1233,7 @@ mod tests {
         );
 
         assert!(
-            text.contains("チャンク 2 件（テスト関数 2 件を除外）/ "),
+            text.contains("チャンク 2 件（テスト関数 2 件を除外） / "),
             "外したテスト関数の数が、切り出したチャンクの数と並んで読める: {text}"
         );
     }

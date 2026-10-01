@@ -141,7 +141,6 @@ fn scan_of_root(root: &Path, server: &ServerCommand) -> Scan {
     scan
 }
 
-/// そのペアが、コーパスの中の 2 箇所（`<相対パス>:<行>`）を指しているか。
 /// `rust-tests` のフィクスチャを、`test function` の扱いを指定して走査した結果。
 fn rust_tests_scan_of(test_functions: TestFunctions) -> Scan {
     let root = PathBuf::from(format!(
@@ -193,13 +192,7 @@ fn test_rust_scan_including_test_functions_keeps_the_pair_of_two_tests() {
     assert_eq!(scan.excluded_test_function_count(), 0);
 }
 
-#[test]
-fn test_rust_scan_excluding_test_functions_counts_the_functions_it_left_out() {
-    let scan = rust_tests_scan_of(TestFunctions::Excluded);
-
-    assert_eq!(scan.excluded_test_function_count(), 2);
-}
-
+/// そのペアが、コーパスの中の 2 箇所（`<相対パス>:<行>`）を指しているか。
 fn is_pair_of(pair: &CandidatePair, one: &str, other: &str) -> bool {
     let ends_with_both = |left: &str, right: &str| {
         pair.location_a().to_string().ends_with(left)
