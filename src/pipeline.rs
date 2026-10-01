@@ -38,7 +38,7 @@ use crate::semantics::type_signature::{
     TypeSignatureOutcome, UntracedReason, rust_type_signature_outcome_of, type_signature_outcome_of,
 };
 use crate::source_position::SourcePosition;
-use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks};
+use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks, TestFunctions};
 use crate::syntax::import::ImportsUnavailable;
 use crate::syntax::module_distance::ModuleDistance;
 use crate::syntax::tree::{Grammar, ParseError, SyntaxTree};
@@ -1143,6 +1143,7 @@ impl Error for SemanticsError {
 /// 走査対象のファイルが名前の違う 2 つの宣言に当たったとき（[`ScanError`]）。
 pub fn scan_of(
     root: &Path,
+    test_functions: TestFunctions,
     thresholds: ConfiguredThresholds,
     declarations: &DomainDeclarations,
     server: &ServerCommand,
@@ -1150,6 +1151,7 @@ pub fn scan_of(
     scan_of_language(
         root,
         SourceLanguage::TypeScript,
+        test_functions,
         thresholds,
         declarations,
         server,
@@ -1165,11 +1167,20 @@ pub fn scan_of(
 pub fn scan_of_language(
     root: &Path,
     language: SourceLanguage,
+    test_functions: TestFunctions,
     thresholds: ConfiguredThresholds,
     declarations: &DomainDeclarations,
     server: &ServerCommand,
 ) -> Result<Scan, ScanError> {
-    scan_with_servers(root, language, thresholds, declarations, server, None)
+    scan_with_servers(
+        root,
+        language,
+        test_functions,
+        thresholds,
+        declarations,
+        server,
+        None,
+    )
 }
 
 /// 混在したコードベースを、言語ごとに対応する LSP サーバで走査する。
@@ -1180,6 +1191,7 @@ pub fn scan_of_language(
 pub fn scan_with_language_servers(
     root: &Path,
     language: SourceLanguage,
+    test_functions: TestFunctions,
     thresholds: ConfiguredThresholds,
     declarations: &DomainDeclarations,
     typescript_server: &ServerCommand,
@@ -1188,6 +1200,7 @@ pub fn scan_with_language_servers(
     scan_with_servers(
         root,
         language,
+        test_functions,
         thresholds,
         declarations,
         typescript_server,
@@ -1198,6 +1211,7 @@ pub fn scan_with_language_servers(
 fn scan_with_servers(
     root: &Path,
     language: SourceLanguage,
+    test_functions: TestFunctions,
     thresholds: ConfiguredThresholds,
     declarations: &DomainDeclarations,
     server: &ServerCommand,
@@ -1216,12 +1230,15 @@ fn scan_with_servers(
     // ファイルごとの読み込み・パース・切り出しは互いに独立なので並列に回す。
     // 結果は `paths` と同じ並びで返るので、まとめ直しを順に行えば出力の並びは
     // 逐次で回したときと変わらない
-    let chunked_files: Vec<Result<ChunkedFile, SkippedFile>> =
-        paths.par_iter().map(|path| file_chunks_of(path)).collect();
+    let chunked_files: Vec<Result<ChunkedFile, SkippedFile>> = paths
+        .par_iter()
+        .map(|path| file_chunks_of(path, test_functions))
+        .collect();
 
     let mut chunks: Vec<ScannedChunk> = Vec::new();
     let mut skipped_files = Vec::new();
     let mut unchunkable = Vec::new();
+    let mut excluded_test_function_count = 0;
 
     for ((path, chunked_file), declared) in paths.iter().zip(chunked_files).zip(declared) {
         let chunked_file = match chunked_file {
@@ -1232,6 +1249,7 @@ fn scan_with_servers(
             }
         };
 
+        excluded_test_function_count += chunked_file.chunks.excluded_test_function_count();
         unchunkable.extend(
             chunked_file
                 .chunks
@@ -1263,6 +1281,7 @@ fn scan_with_servers(
             file_count,
             skipped_files,
             unchunkable,
+            excluded_test_function_count,
         },
     ))
 }
@@ -1303,7 +1322,7 @@ struct ScannedChunk {
 ///
 /// 拡張子から grammar を選べない / ファイルを読めない / 構文木にできないとき。
 /// **飛ばす理由をそのまま返す**ので、呼び出し側は 1 ファイルのために走査を止めずに済む。
-fn file_chunks_of(path: &Path) -> Result<ChunkedFile, SkippedFile> {
+fn file_chunks_of(path: &Path, test_functions: TestFunctions) -> Result<ChunkedFile, SkippedFile> {
     let grammar = Grammar::of_path(path).ok_or_else(|| SkippedFile::UnreadableExtension {
         path: path.to_path_buf(),
     })?;
@@ -1321,7 +1340,7 @@ fn file_chunks_of(path: &Path) -> Result<ChunkedFile, SkippedFile> {
             }
         })?;
 
-        FileChunks::from_tree(&tree, path)
+        FileChunks::from_tree(&tree, path, test_functions)
     };
 
     Ok(ChunkedFile {
@@ -1337,6 +1356,7 @@ struct ScanInputs {
     file_count: usize,
     skipped_files: Vec<SkippedFile>,
     unchunkable: Vec<Location>,
+    excluded_test_function_count: usize,
 }
 
 /// 集めたチャンクを総当たりで比べ、候補ペアだけを判定する。
@@ -1415,6 +1435,7 @@ fn scan_of_chunks(
         candidate_pairs,
         file_count: inputs.file_count,
         chunk_count: chunks.len(),
+        excluded_test_function_count: inputs.excluded_test_function_count,
         compared_pair_count,
         pruned_pair_count,
         skipped_files: inputs.skipped_files,
@@ -2066,6 +2087,7 @@ pub struct Scan {
     candidate_pairs: Vec<CandidatePair>,
     file_count: usize,
     chunk_count: usize,
+    excluded_test_function_count: usize,
     compared_pair_count: usize,
     pruned_pair_count: usize,
     skipped_files: Vec<SkippedFile>,
@@ -2104,6 +2126,14 @@ impl Scan {
     /// 切り出せたチャンクの数。
     pub fn chunk_count(&self) -> usize {
         self.chunk_count
+    }
+
+    /// チャンクにしなかった `test function` の数（[`TestFunctions::Excluded`]）。
+    ///
+    /// **黙って落とさない**のは [`Scan::pruned_pair_count`] と同じ理由で、外した数が
+    /// 読めないと「比べて似ていなかった」と「そもそも比べていない」を区別できない。
+    pub fn excluded_test_function_count(&self) -> usize {
+        self.excluded_test_function_count
     }
 
     /// 実際に比べたペアの数。入れ子の組は含まない。
@@ -3069,6 +3099,7 @@ mod tests {
     ) -> Scan {
         scan_of(
             &fixture(relative_path),
+            TestFunctions::Excluded,
             thresholds,
             &DomainDeclarations::default(),
             &missing_server(),
@@ -3196,6 +3227,7 @@ mod tests {
 
         let result = scan_of(
             &root,
+            TestFunctions::Excluded,
             ConfiguredThresholds::default(),
             &DomainDeclarations::default(),
             &missing_server(),
@@ -3214,6 +3246,7 @@ mod tests {
 
         scan_of(
             &root,
+            TestFunctions::Excluded,
             ConfiguredThresholds::default(),
             &declarations_at(&root, declared),
             &missing_server(),

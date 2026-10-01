@@ -42,6 +42,13 @@ pub enum Command {
         /// 走査を始めるディレクトリ
         #[arg(default_value = DEFAULT_SCAN_ROOT)]
         path: PathBuf,
+        /// `#[test]` の付いた Rust の関数も比較の対象に入れる
+        ///
+        /// 既定で外すのは、テスト関数どうしが `fn()` の型シグネチャと呼び出し元の無さで
+        /// 空の一致を作り、本番コードの候補ペアを埋もれさせるため。`compare` は位置を
+        /// 名指しするので、このオプションを持たない（global にしない）。
+        #[arg(long)]
+        include_tests: bool,
     },
 }
 
@@ -153,7 +160,7 @@ mod tests {
         // 既定は "." なので、既定と違う値を渡さないと指定が効いたか分からない
         let cli = parse(&["dryguard", "scan", "src/billing"]);
 
-        let Command::Scan { path } = &cli.command else {
+        let Command::Scan { path, .. } = &cli.command else {
             panic!("scan を渡したので Scan になる");
         };
         assert_eq!(path, Path::new("src/billing"));
@@ -163,10 +170,40 @@ mod tests {
     fn test_scan_without_a_path_walks_the_current_directory() {
         let cli = parse(&["dryguard", "scan"]);
 
-        let Command::Scan { path } = &cli.command else {
+        let Command::Scan { path, .. } = &cli.command else {
             panic!("scan を渡したので Scan になる");
         };
         assert_eq!(path, Path::new("."));
+    }
+
+    #[test]
+    fn test_scan_without_include_tests_leaves_test_functions_out() {
+        let cli = parse(&["dryguard", "scan", "src"]);
+
+        let Command::Scan { include_tests, .. } = &cli.command else {
+            panic!("scan を渡したので Scan になる");
+        };
+        assert!(!include_tests);
+    }
+
+    #[test]
+    fn test_scan_with_include_tests_takes_test_functions_in() {
+        // 既定は外す側なので、指定が効いたかは入れる側で確かめる
+        let cli = parse(&["dryguard", "scan", "src", "--include-tests"]);
+
+        let Command::Scan { include_tests, .. } = &cli.command else {
+            panic!("scan を渡したので Scan になる");
+        };
+        assert!(include_tests);
+    }
+
+    #[test]
+    fn test_compare_with_include_tests_is_rejected() {
+        // `compare` は位置を名指しするので外すものが無い。受けて何もしない指定を作らない
+        let parsed =
+            Cli::try_parse_from(["dryguard", "compare", "a.rs:1", "b.rs:2", "--include-tests"]);
+
+        assert!(parsed.is_err());
     }
 
     #[test]

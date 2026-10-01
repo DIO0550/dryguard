@@ -154,6 +154,7 @@ fn walked_value_of(scan: &Scan) -> Value {
     json!({
         "files": scan.file_count(),
         "chunks": scan.chunk_count(),
+        "excluded_test_functions": scan.excluded_test_function_count(),
         "compared_pairs": scan.compared_pair_count(),
         "pruned_pairs": scan.pruned_pair_count(),
     })
@@ -711,7 +712,9 @@ mod tests {
     use crate::semantics::caller_domain::CallerDomains;
     use crate::similarity::Similarity;
     use crate::syntax::module_distance::ModuleDistance;
-    use crate::test_support::{declarations_of, line, location, overload_count, scan_of_fixture};
+    use crate::test_support::{
+        declarations_of, line, location, overload_count, rust_scan_of_fixture, scan_of_fixture,
+    };
 
     /// テストが渡す 0.0-1.0 の値。
     fn measured(value: f64) -> Similarity {
@@ -1158,6 +1161,26 @@ mod tests {
         assert_eq!(walked["chunks"], 6);
         assert_eq!(walked["compared_pairs"], 14);
         assert_eq!(walked["pruned_pairs"], 5);
+    }
+
+    #[test]
+    fn test_scan_json_of_reports_the_test_functions_it_left_out() {
+        let text = scan_json_of(
+            &rust_scan_of_fixture("rust-tests"),
+            Explanation::AskedSignals,
+        );
+        let json: Value =
+            serde_json::from_str(&text).expect("組み立てた綴りは JSON として読み直せる");
+
+        assert_eq!(json["walked"]["excluded_test_functions"], 2);
+    }
+
+    #[test]
+    fn test_scan_json_of_a_walk_without_test_functions_reports_zero_left_out() {
+        // text と違い、キーは常に置く。読む側がキーの有無で分岐せずに済む
+        let json = scan_json_of_fixture("scan");
+
+        assert_eq!(json["walked"]["excluded_test_functions"], 0);
     }
 
     #[test]

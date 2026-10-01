@@ -20,6 +20,7 @@ use dryguard::semantics::type_signature::{
     TypeSignatureOutcome, UntracedReason, rust_type_signature_outcome_of,
 };
 use dryguard::source_position::SourcePosition;
+use dryguard::syntax::chunk::TestFunctions;
 
 #[test]
 #[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
@@ -124,6 +125,7 @@ fn test_rust_scan_asks_candidates_in_one_session() {
     let scan = scan_of_language(
         &root,
         SourceLanguage::Rust,
+        TestFunctions::Excluded,
         ConfiguredThresholds::default(),
         &DomainDeclarations::default(),
         &ServerCommand::rust(),

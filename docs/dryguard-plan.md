@@ -159,6 +159,7 @@ dryguard check --diff            # git diff範囲のみ (フック用)      [Pha
   --threshold <0-1>
   --fail-on do-not-extract        # 非推奨ペアがあればexit 1
   --explain                      # 判定根拠のシグナル値を全表示
+  --include-tests                # scan のみ。#[test] 関数も比較する (既定は外す。Issue #270)
 ```
 
 出力イメージ:

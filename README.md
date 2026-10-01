@@ -71,6 +71,7 @@ cargo run -- scan [path]             # コードベース全体をスキャン (
   --threshold <0-1>
   --explain                          # 判定根拠のシグナル値を全表示
   --fail-on do-not-extract           # 非推奨ペアがあれば exit 1
+  --include-tests                    # scan のみ。#[test] の付いた Rust の関数も比較する (既定は外す)
 ```
 
 終了コードは 3 つ。**判定で落ちたのか、判定を出せなかったのかを CI が区別できる**ように分けてある。
