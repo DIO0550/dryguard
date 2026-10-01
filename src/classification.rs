@@ -1686,8 +1686,11 @@ mod tests {
         signals.extend(
             [
                 UnopenedReason::TypeDefinitionNotProvided,
+                UnopenedReason::DefinitionNotProvided,
                 UnopenedReason::NoDeclarationSite,
+                UnopenedReason::NoDefinitionSite,
                 UnopenedReason::UnreadableTypeDefinition,
+                UnopenedReason::UnreadableDefinition,
                 UnopenedReason::UnreadableDeclaringDocument,
                 UnopenedReason::NoSpellingAtDeclaration,
                 UnopenedReason::UnreadableDeclarationHover,
