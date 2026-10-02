@@ -89,8 +89,9 @@ if structurally_similar && domains_differ { ... }
 | `document` | サーバに開かせるソースファイル 1 つ分。URI・`language id`・中身の組 |
 | `language id` | LSP がサーバに伝える言語の名前（`typescript` / `typescriptreact`） |
 | `hover` | ソースの 1 点を指して、そこにある名前の型を尋ねる問い合わせ |
-| `type definition` | ソースの 1 点を指して、そこに書かれた型がどこで宣言されているかを尋ねる問い合わせ |
-| `declaration site` | `type definition` が返す宣言の場所。ファイルと、その中の 1 点 |
+| `type definition` | ソースの 1 点を指して、そこに書かれた型がどこで宣言されているかを尋ねる問い合わせ。**名前ではなく、その名前が指す型の宣言**を返す（Rust のエイリアスには空を返す） |
+| `definition` | ソースの 1 点を指して、**そこに書かれた名前**がどこで宣言されているかを尋ねる問い合わせ。Rust の型名はこちらで辿る（TypeScript では輸入した名前が import 文へ戻るので使わない） |
+| `declaration site` | `type definition` / `definition` が返す宣言の場所。ファイルと、その中の 1 点 |
 | `references` | ソースの 1 点を指して、そこにある名前を使っているところを尋ねる問い合わせ |
 | `reference` | `references` が返す 1 件。**その名前を使っている側**のファイルの位置 |
 | `caller domain` | 参照元が属する `domain`。ドメインごとの件数を持つ |

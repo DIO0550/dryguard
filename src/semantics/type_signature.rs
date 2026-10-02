@@ -18,11 +18,12 @@ use std::num::NonZeroUsize;
 
 use crate::lsp::{ClientError, HoverOutcome, Session, SignatureText, SourceDocument};
 use crate::semantics::resolved_type::{
-    ResolvedTypes, TracedTypeNames, TypeDeclaration, UnopenedReason,
+    ResolvedTypes, TracedTypeNames, TypeDeclaration, UnopenedReason, rust_traced_type_names_of,
 };
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{AnnotatedPositions, OverloadDeclaration, TypeAnnotation};
 use crate::syntax::rust_callable::RustCallable;
+use crate::syntax::type_reference::TypeReference;
 use crate::syntax::type_spelling::{names_only_types, substituted_spelling_of, type_name_spans_of};
 use crate::syntax::type_structure::{Callable, SignatureKind, TypeStructure};
 
@@ -141,7 +142,8 @@ pub enum TypeSignatureOutcome {
     },
     /// **比較に残る綴りに現れる**型名を、そもそも尋ねていない。
     ///
-    /// `typeDefinition` は**ソースの 1 点を指して**尋ねる問い合わせなので、
+    /// 宣言の場所を尋ねる問い合わせ（TypeScript は `typeDefinition`、Rust は `definition`）は
+    /// **ソースの 1 点を指して**尋ねるので、
     /// 尋ねる位置を作れなかった型名は綴りのまま残る。綴りのまま比べると、
     /// **別々のファイルが同じ綴りで宣言した構造の違う型が単一化可能に出る**（偽陽性）。
     ///
@@ -327,13 +329,22 @@ fn overload_set_outcome_of(
     Ok(TypeSignatureOutcome::Normalized(overloads))
 }
 
-/// Rust の関数の型シグネチャを尋ねて、正規化した形にする。
+/// Rust の関数の型シグネチャを尋ね、書かれた型名を宣言まで辿って、正規化した形にする。
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
-/// `Chunk::name_position` が指す識別子の位置、`traced` は型名を宣言まで辿った結果。
+/// `Chunk::name_position` が指す識別子の位置、`type_references` は
+/// `Chunk::type_references` が集めた型名。
 ///
 /// **注釈の有無もオーバーロードも見ない。** Rust の関数は引数と戻り値の型を省けず
 /// （省いた戻り値は `()`）、同じ名前で複数のシグネチャを持てない。
+///
+/// **hover を先に尋ねる。** hover は rust-analyzer の読み込みが落ち着くまで尋ね直すが
+/// （`lsp::Connection::hover`）、definition は待たない。読み込み前の definition は
+/// **自前の型にも空を返す**ので、先に送るとすべての型名が「宣言の場所を答えない」に
+/// 倒れる（rust-analyzer 1.94.1 で実測）。hover が落ちたら definition は送らない。
+///
+/// **Why not（definition も尋ね直す）**: 落ち着かなかったことを表す答えと、その理由を
+/// 開けなかった理由の語彙へ足すことになる。hover の後に送れば同じ落ち着いた状態を尋ねる。
 ///
 /// # Errors
 ///
@@ -343,14 +354,15 @@ pub fn rust_type_signature_outcome_of(
     session: &mut Session,
     document: &SourceDocument,
     position: SourcePosition,
-    traced: &TracedTypeNames,
+    type_references: &[TypeReference],
 ) -> Result<TypeSignatureOutcome, ClientError> {
     let signature_text = match asked_signature_text_of(session, document, position)? {
         Ok(signature_text) => signature_text,
         Err(outcome) => return Ok(outcome),
     };
 
-    Ok(rust_normalized_outcome_of(&signature_text, traced))
+    let traced = rust_traced_type_names_of(session, document, type_references)?;
+    Ok(rust_normalized_outcome_of(&signature_text, &traced))
 }
 
 /// rust-analyzer が返した関数の綴り 1 本を、1 本だけの集合へ正規化した結果。
@@ -359,9 +371,9 @@ pub fn rust_type_signature_outcome_of(
 /// 書かれた場所で決まる綴り → 辿った記録の無い型名の順に見て、どれにも当たらなければ
 /// 比べられる形にする。
 ///
-/// **型エイリアスは差し込まない。** 型名の記録を渡すのは Rust の型名を宣言まで辿る側で、
-/// 開いた綴りをどう使うかもそこで決める。記録が渡っても、宣言の場所を一緒に比べるので
-/// **別々の宣言の同じ綴りは重ならない**（[`TypeSignature`] の `declarations`）。
+/// **型エイリアスは差し込まない。** Rust の型名を辿る側（`semantics::resolved_type` の
+/// `rust_traced_type_names_of`）はエイリアスを開かず、宣言の場所だけを渡す。宣言の場所を
+/// 一緒に比べるので、**別々の宣言の同じ綴りは重ならない**（[`TypeSignature`] の `declarations`）。
 pub fn rust_normalized_outcome_of(
     signature_text: &SignatureText,
     traced: &TracedTypeNames,

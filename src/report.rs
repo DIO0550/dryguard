@@ -423,11 +423,22 @@ fn unopened_text_of(reason: UnopenedReason) -> &'static str {
         UnopenedReason::TypeDefinitionNotProvided => {
             "測れない (比較に残る型名を開けない: サーバが typeDefinition を提供していない)"
         }
+        UnopenedReason::DefinitionNotProvided => {
+            "測れない (比較に残る型名を開けない: サーバが definition を提供していない)"
+        }
         UnopenedReason::NoDeclarationSite => {
             "測れない (比較に残る型名を開けない: サーバが宣言の場所を答えない)"
         }
+        // **原因を言い切らずに候補を出す。** 応答からは区別できないが、rust-analyzer は
+        // rust-src が無いと std / core の名前にも空を返す（1.94.1 で実測）
+        UnopenedReason::NoDefinitionSite => {
+            "測れない (比較に残る型名を開けない: サーバが definition に宣言の場所を答えない。std / core の型なら rust-src が要る)"
+        }
         UnopenedReason::UnreadableTypeDefinition => {
             "測れない (比較に残る型名を開けない: typeDefinition の応答を読めない)"
+        }
+        UnopenedReason::UnreadableDefinition => {
+            "測れない (比較に残る型名を開けない: definition の応答を読めない)"
         }
         UnopenedReason::UnreadableDeclaringDocument => {
             "測れない (比較に残る型名を開けない: 宣言のファイルを読めない)"
@@ -1344,6 +1355,89 @@ mod tests {
                 "型シグネチャ: 測れない (比較に残る型名を開けない: サーバが typeDefinition を提供していない) → どちらでもない"
             ),
             "開けなかったことが理由として出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_names_definition_when_the_server_did_not_provide_it() {
+        // 対照は 1 つ上のテスト（typeDefinition）。Rust は definition を尋ねるので、
+        // 同じ文で出すと利用者は違う問い合わせを確かめに行く
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::UnopenedTypeName {
+                reason: UnopenedReason::DefinitionNotProvided,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (比較に残る型名を開けない: サーバが definition を提供していない) → どちらでもない"
+            ),
+            "尋ねた問い合わせの名前が出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_no_definition_site_points_at_rust_src_as_a_candidate() {
+        // rust-analyzer は rust-src が無いと std / core の名前に空を返す。応答からは
+        // 区別できないので、言い切らずに候補として出す
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::UnopenedTypeName {
+                reason: UnopenedReason::NoDefinitionSite,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (比較に残る型名を開けない: サーバが definition に宣言の場所を答えない。std / core の型なら rust-src が要る) → どちらでもない"
+            ),
+            "rust-src が候補として出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_no_type_definition_site_does_not_mention_rust_src() {
+        // 対照は上のテスト。typeDefinition を尋ねるのは TypeScript なので、
+        // rust-src の案内を出すと利用者は関係の無いものを入れに行く
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::UnopenedTypeName {
+                reason: UnopenedReason::NoDeclarationSite,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (比較に残る型名を開けない: サーバが宣言の場所を答えない) → どちらでもない"
+            ),
+            "rust-src の案内が出ない: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_with_an_unreadable_definition_names_the_request() {
+        // 対照は typeDefinition の応答を読めない場合。尋ねた問い合わせが違う
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::UnopenedTypeName {
+                reason: UnopenedReason::UnreadableDefinition,
+            },
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (比較に残る型名を開けない: definition の応答を読めない) → どちらでもない"
+            ),
+            "読めなかった応答の問い合わせが出る: {text}"
         );
     }
 

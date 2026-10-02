@@ -677,8 +677,11 @@ fn lean_name_of(lean: Lean) -> &'static str {
 fn unopened_name_of(reason: UnopenedReason) -> &'static str {
     match reason {
         UnopenedReason::TypeDefinitionNotProvided => "type-definition-not-provided",
+        UnopenedReason::DefinitionNotProvided => "definition-not-provided",
         UnopenedReason::NoDeclarationSite => "no-declaration-site",
+        UnopenedReason::NoDefinitionSite => "no-definition-site",
         UnopenedReason::UnreadableTypeDefinition => "unreadable-type-definition",
+        UnopenedReason::UnreadableDefinition => "unreadable-definition",
         UnopenedReason::UnreadableDeclaringDocument => "unreadable-declaring-document",
         UnopenedReason::NoSpellingAtDeclaration => "no-spelling-at-declaration",
         UnopenedReason::UnreadableDeclarationHover => "unreadable-declaration-hover",
@@ -1042,6 +1045,37 @@ mod tests {
         let reason = reason_of(&json, "type-signature-match");
         assert_eq!(reason["value"]["status"], "measured");
         assert_eq!(reason["value"]["unifiable"], true);
+    }
+
+    #[test]
+    fn test_json_of_names_the_request_the_server_did_not_provide() {
+        // 対照は typeDefinition。Rust は definition を尋ねるので、同じ綴りで出すと
+        // 利用者は提供されている問い合わせを確かめに行くことになる
+        let json_for = |reason| {
+            let signals = accidental_duplication().with_semantics(
+                TypeSignatureMatch::UnopenedTypeName { reason },
+                CallerDomainOverlap::NoReferences,
+            );
+            let json = json_of_signals(&signals, Explanation::AskedSignals);
+            reason_of(&json, "type-signature-match")["value"]["unopened"].clone()
+        };
+
+        assert_eq!(
+            json_for(UnopenedReason::DefinitionNotProvided),
+            "definition-not-provided"
+        );
+        assert_eq!(
+            json_for(UnopenedReason::TypeDefinitionNotProvided),
+            "type-definition-not-provided"
+        );
+        assert_eq!(
+            json_for(UnopenedReason::UnreadableDefinition),
+            "unreadable-definition"
+        );
+        assert_eq!(
+            json_for(UnopenedReason::NoDefinitionSite),
+            "no-definition-site"
+        );
     }
 
     #[test]

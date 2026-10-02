@@ -31,8 +31,7 @@ use crate::lsp::{
 use crate::semantics::callee_domain::{CalleeDomainsOutcome, callee_domains_outcome_of};
 use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outcome_of};
 use crate::semantics::resolved_type::{
-    TracedTypeNames, TypeDeclaration, UnopenedReason, UnopenedTypeName, opened_type_names_of,
-    traced_type_names_of,
+    TypeDeclaration, UnopenedReason, UnopenedTypeName, opened_type_names_of, traced_type_names_of,
 };
 use crate::semantics::type_signature::{
     TypeSignatureOutcome, UntracedReason, rust_type_signature_outcome_of, type_signature_outcome_of,
@@ -687,8 +686,10 @@ fn asked_semantics_of(
 /// そのチャンクの型シグネチャを、**書かれた型名を解決してから**尋ねる。
 ///
 /// hover が返す綴りは書かれた型名のままで、型エイリアスは展開されない。
-/// 先に型名の宣言を辿って右辺を集め、綴りへ差し込んでから読む
-/// （`semantics::resolved_type`）。
+/// TypeScript は先に型名の宣言を辿って右辺を集め、綴りへ差し込んでから読む
+/// （`semantics::resolved_type`）。**Rust は hover の後に宣言の場所を集めるだけで、右辺は
+/// 差し込まない。** 順序は `semantics::type_signature::rust_type_signature_outcome_of` が
+/// 中に持つ（読み込み前の definition は空を返すので、hover が落ち着くのを先に待つ）。
 ///
 /// # Errors
 ///
@@ -700,14 +701,13 @@ fn resolved_type_signature_outcome_of(
     position: SourcePosition,
 ) -> Result<TypeSignatureOutcome, ClientError> {
     if chunk.grammar() == Grammar::Rust {
-        // **Rust の型名はまだ宣言まで辿らない。** 空の記録を渡すので、比較に残る型名・
-        // トレイト名は「尋ねていない」に倒れる。綴りのまま比べると、別々のモジュールの
-        // 同じ名前のトレイトを要求する 2 つが単一化可能に出る
+        // **宣言の場所までで止める。** エイリアスを開かないので、宣言のファイルを開かせて
+        // 尋ね直す段が要らない（`semantics::resolved_type::rust_traced_type_names_of`）
         return rust_type_signature_outcome_of(
             session,
             document,
             position,
-            &TracedTypeNames::default(),
+            chunk.type_references(),
         );
     }
 
