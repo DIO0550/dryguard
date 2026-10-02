@@ -13,22 +13,23 @@ use lsp_types::notification::{
     DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized, Notification as _, Progress,
 };
 use lsp_types::request::{
-    CallHierarchyOutgoingCalls, CallHierarchyPrepare, ExecuteCommand, GotoTypeDefinition,
-    GotoTypeDefinitionParams, GotoTypeDefinitionResponse, HoverRequest, Initialize, References,
-    Request as _, Shutdown, WorkDoneProgressCreate,
+    CallHierarchyOutgoingCalls, CallHierarchyPrepare, ExecuteCommand, GotoDefinition,
+    GotoTypeDefinition, HoverRequest, Initialize, References, Request as _, Shutdown,
+    WorkDoneProgressCreate,
 };
 use lsp_types::{
     CallHierarchyItem, CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
-    CallHierarchyPrepareParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover,
-    HoverParams, InitializeResult, Location, PartialResultParams, ProgressParams,
-    ProgressParamsValue, ProgressToken, ReferenceContext, ReferenceParams, ServerCapabilities,
-    TextDocumentIdentifier, TextDocumentPositionParams, Uri, WorkDoneProgress,
-    WorkDoneProgressCreateParams, WorkDoneProgressParams,
+    CallHierarchyPrepareParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeResult, Location,
+    PartialResultParams, ProgressParams, ProgressParamsValue, ProgressToken, ReferenceContext,
+    ReferenceParams, ServerCapabilities, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
+    WorkDoneProgress, WorkDoneProgressCreateParams, WorkDoneProgressParams,
 };
 use serde_json::{Value, json};
 
 use super::ServerLanguage;
 use super::call_hierarchy::{self, CallHierarchyStart, CalleesOutcome};
+use super::declaration_site::{self, DeclarationSite, DeclarationSiteOutcome};
 use super::document::SourceDocument;
 use super::framing::{self, FramingError};
 use super::hover::{self, HoverOutcome};
@@ -40,7 +41,6 @@ use super::project_membership::{
     self, PROJECT_INFO_COMMAND, ProjectMembershipOutcome, TSSERVER_REQUEST_COMMAND,
 };
 use super::references::{self, ReferencesOutcome};
-use super::type_definition::{self, DeclarationSite, TypeDefinitionOutcome};
 use super::workspace::WorkspaceRoot;
 use crate::source_position::SourcePosition;
 
@@ -355,9 +355,9 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     /// 開かせたファイルの、指定位置に書かれた型が宣言されている場所を尋ねる。
     ///
     /// `position` は `TypeReference::position` が指す型名の位置。宣言が無かったのか
-    /// 読めなかったのかは [`TypeDefinitionOutcome`] が分けて持つ。
+    /// 読めなかったのかは [`DeclarationSiteOutcome`] が分けて持つ。
     ///
-    /// **`textDocument/definition` では届かない。** 輸入した型名に送ると
+    /// **TypeScript では `textDocument/definition` では届かない。** 輸入した型名に送ると
     /// `import Amount` を宣言している import 文の綴りが返り、そこからもう一度尋ねても
     /// 同じ場所へ戻る（typescript-language-server 6.0.0 で実測）。
     ///
@@ -369,7 +369,45 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         &mut self,
         document: &SourceDocument,
         position: SourcePosition,
-    ) -> Result<TypeDefinitionOutcome, ConnectionError> {
+    ) -> Result<DeclarationSiteOutcome, ConnectionError> {
+        self.declaration_site_of(GotoTypeDefinition::METHOD, document, position)
+    }
+
+    /// 開かせたファイルの、指定位置に書かれた名前が宣言されている場所を尋ねる。
+    ///
+    /// `position` は `TypeReference::position` が指す型名の位置。
+    ///
+    /// **rust-analyzer では typeDefinition ではなくこちらを使う。** typeDefinition は
+    /// 名前ではなく**その名前が指す型**の宣言を返すので、型エイリアス（`type Amount = u64`）
+    /// には空を、ジェネリックな型（`Option<User>`）には型引数の宣言まで並べて返す。
+    /// definition は書かれた名前の宣言を 1 件返す（rust-analyzer 1.94.1 で実測）。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、パラメータを JSON にできないとき、
+    /// 送受信が失敗したとき、応答を definition の結果として読めないとき。
+    pub fn definition(
+        &mut self,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<DeclarationSiteOutcome, ConnectionError> {
+        self.declaration_site_of(GotoDefinition::METHOD, document, position)
+    }
+
+    /// 宣言の場所を返す問い合わせ（typeDefinition / definition）を 1 往復尋ねる。
+    ///
+    /// **2 つは要求も応答も同じ形**で、違うのはメソッドの名前だけ。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、パラメータを JSON にできないとき、
+    /// 送受信が失敗したとき、応答をその問い合わせの結果として読めないとき。
+    fn declaration_site_of(
+        &mut self,
+        method: &'static str,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<DeclarationSiteOutcome, ConnectionError> {
         // 開かせていないドキュメントへ送ると、サーバは中身を知らないまま null を返す。
         // 「宣言が無い」と「開かせ忘れ」が同じ答えになるので、送る前に断る。
         if !self.open_documents.contains(document.uri()) {
@@ -378,7 +416,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             });
         }
 
-        let params = GotoTypeDefinitionParams {
+        let params = GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
                     uri: document.uri().clone(),
@@ -388,21 +426,20 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
-        let params = serde_json::to_value(params)
-            .map_err(not_serializable_error_of(GotoTypeDefinition::METHOD))?;
+        let params = serde_json::to_value(params).map_err(not_serializable_error_of(method))?;
 
-        let result = self.request(GotoTypeDefinition::METHOD, Some(params))?;
+        let result = self.request(method, Some(params))?;
         // 宣言が無いときサーバは null を返す。`Option` で受けて、応答が読めなかった
         // 場合と分ける。
-        let answered: Option<GotoTypeDefinitionResponse> =
+        let answered: Option<GotoDefinitionResponse> =
             serde_json::from_value(result).map_err(|cause| ConnectionError::MalformedResult {
-                method: GotoTypeDefinition::METHOD.to_owned(),
+                method: method.to_owned(),
                 cause,
             })?;
 
         Ok(match answered.as_ref() {
-            Some(answered) => type_definition::outcome_of(answered),
-            None => TypeDefinitionOutcome::NoAnswer,
+            Some(answered) => declaration_site::outcome_of(answered),
+            None => DeclarationSiteOutcome::NoAnswer,
         })
     }
 
@@ -1819,6 +1856,28 @@ mod tests {
         assert!(
             matches!(outcome, ReferencesOutcome::ServerStillWorking),
             "落ち着かなかったことを名前で返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_definition_asks_the_definition_of_the_name_not_its_type() {
+        // 対照は typeDefinition。rust-analyzer はエイリアスに typeDefinition だと空を返すので、
+        // 送る要求を取り違えると Rust の型名がすべて「宣言の場所を答えない」に倒れる
+        let server_output = frames_of(&[&no_type_definition_response(1)]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .definition(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, DeclarationSiteOutcome::NoAnswer),
+            "null は答えが無い: {outcome:?}"
+        );
+        assert_eq!(
+            sent_methods(&connection.writer).last().map(String::as_str),
+            Some("textDocument/definition")
         );
     }
 

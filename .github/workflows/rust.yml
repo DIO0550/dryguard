@@ -36,7 +36,9 @@ jobs:
         run: |
           rustup update --no-self-update stable
           rustup default stable
-          rustup component add rustfmt clippy
+          # rust-src: rust-analyzer はこれが無いと std / core の型名・トレイト名に
+          # definition の答えを返さない。型シグネチャが「測れない」に倒れ、実サーバテストが落ちる
+          rustup component add rustfmt clippy rust-src
           cargo --version
           cargo fmt --version
           cargo clippy --version
