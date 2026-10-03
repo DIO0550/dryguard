@@ -5,7 +5,7 @@
 //! シグナルの値だけを並べても、読む側はそれが判定にどう効いたのかを再現できない。
 
 use crate::classification::signal::{
-    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, ModuleSeparation,
+    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, LeafDivergence, ModuleSeparation,
     StructuralSimilarity, TypeSignatureMatch,
 };
 use crate::threshold::Threshold;
@@ -42,6 +42,11 @@ pub enum Reason {
         threshold: Threshold,
         lean: Lean,
     },
+    /// 位置が揃う 2 つのチャンクの、葉の綴りの違いが傾けた。
+    ///
+    /// **閾値を持たない。** 違いが 1 つでもあれば傾けるので、当てる境目が無い
+    /// （違いの割合で測ると、定数 1 つだけが違う本物の複製と区別できない。Issue #272）。
+    LeafDivergence { signal: LeafDivergence, lean: Lean },
     /// 依存先の重なりが傾けた。
     ImportOverlap {
         signal: ImportOverlap,

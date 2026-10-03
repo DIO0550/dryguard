@@ -14,7 +14,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::classification::signal::{
-    CalleeDomainOverlap, CallerDomainOverlap, DeclaredDomains, ImportOverlap,
+    CalleeDomainOverlap, CallerDomainOverlap, DeclaredDomains, ImportOverlap, LeafDivergence,
     MeasuredCalleeDomains, MeasuredCallerDomains, SemanticsUnavailable, Signals,
     StructuralSimilarity, TypeSignatureMatch,
 };
@@ -39,6 +39,7 @@ use crate::semantics::type_signature::{
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks, TestFunctions};
 use crate::syntax::import::ImportsUnavailable;
+use crate::syntax::leaf_divergence::LeafComparison;
 use crate::syntax::module_distance::ModuleDistance;
 use crate::syntax::tree::{Grammar, ParseError, SyntaxTree};
 use crate::threshold::Threshold;
@@ -203,6 +204,7 @@ fn enclosing_chunk_at(location: &Location, tree: &SyntaxTree<'_>) -> Result<Chun
 pub fn signals_of(chunk_a: &Chunk, chunk_b: &Chunk) -> Signals {
     Signals::new(
         structural_similarity_of(chunk_a, chunk_b),
+        leaf_divergence_of(chunk_a, chunk_b),
         import_overlap_of(chunk_a, chunk_b),
         ModuleDistance::between(chunk_a.path(), chunk_b.path()),
     )
@@ -246,6 +248,20 @@ fn structural_similarity_of(chunk_a: &Chunk, chunk_b: &Chunk) -> StructuralSimil
     };
 
     StructuralSimilarity::Measured(tokens_a.similarity_with(tokens_b))
+}
+
+/// 位置が揃う 2 つのチャンクの、同じ位置の葉の綴りの違い。
+/// どちらかにトークンが無ければ比べない（[`structural_similarity_of`] と同じ扱い）。
+fn leaf_divergence_of(chunk_a: &Chunk, chunk_b: &Chunk) -> LeafDivergence {
+    if chunk_a.tokens().is_none() || chunk_b.tokens().is_none() {
+        return LeafDivergence::NoTokens;
+    }
+
+    match chunk_a.leaves().compared_with(chunk_b.leaves()) {
+        LeafComparison::NoDivergence => LeafDivergence::NoDivergence,
+        LeafComparison::Diverged(divergent) => LeafDivergence::Diverged(divergent),
+        LeafComparison::UnalignedTokens => LeafDivergence::UnalignedTokens,
+    }
 }
 
 /// 依存先集合の Jaccard 係数。どちらかのファイルで集合を作れなければ測れない。

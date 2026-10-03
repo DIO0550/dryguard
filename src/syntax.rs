@@ -12,7 +12,8 @@
 //! 木を歩く手順だけを `tree` に置く。
 //!
 //! 構造類似度は構文木を正規化したトークン列の重なりで出す（`token`）。
-//! 正規化の粒度もそこが持つ。
+//! 正規化の粒度もそこが持つ。正規化で捨てた葉の綴りを、列が揃う 2 つのチャンクの
+//! 同じ位置どうしで突き合わせるのは `leaf_divergence`。
 //!
 //! シグネチャに書かれた型名とその位置は `type_reference` が集める。**その名前が何を
 //! 指しているかは尋ねない**（尋ねるのは `semantics`）。ここが決めるのは、どこを指して
@@ -30,6 +31,7 @@
 
 pub mod chunk;
 pub mod import;
+pub mod leaf_divergence;
 pub mod line_range;
 pub mod module_distance;
 pub(crate) mod rust_callable;

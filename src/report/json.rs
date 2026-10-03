@@ -18,7 +18,7 @@ use serde_json::{Map, Value, json};
 use crate::classification::Classification;
 use crate::classification::reason::{Lean, Reason};
 use crate::classification::signal::{
-    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, MeasuredCalleeDomains,
+    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, LeafDivergence, MeasuredCalleeDomains,
     MeasuredCallerDomains, ModuleSeparation, SemanticsUnavailable, StructuralSimilarity,
     TypeSignatureMatch,
 };
@@ -215,6 +215,12 @@ fn reason_value_of(reason: &Reason, explanation: Explanation) -> Option<Value> {
                 applied,
             ))
         }
+        Reason::LeafDivergence { signal, lean } => Some(signal_value_of(
+            "leaf-divergence",
+            leaf_divergence_value_of(signal, explanation)?,
+            *lean,
+            None,
+        )),
         Reason::ImportOverlap {
             signal,
             threshold,
@@ -596,6 +602,45 @@ fn callers_value_of(callers: &CallerDomains) -> Value {
     Value::Array(per_domain)
 }
 
+/// 葉の綴りの違い。比べていなければ既定で `None`。
+///
+/// **違いが無いときも空の配列で出す。** 比べた結果が「無い」なのか比べていないのかを、
+/// `status` とキーの有無の両方で読めるようにする。
+///
+/// **揃わないペアは `not-asked`。** 位置の対応が無いので比べる前提が成り立たず、
+/// 候補ペアでないから Stage 2 に尋ねない（`not-a-candidate`）のと同じ形で降りている。
+/// `--explain` のときだけ出すのも同じで、既定で出すと構造類似度 1.0 未満のペアすべてに
+/// 行が増える。**トークンが無いのは `unmeasurable`** で既定でも出す（構造類似度の
+/// `no-tokens` と同じ扱い。比べようとして材料が無かった）。
+fn leaf_divergence_value_of(signal: &LeafDivergence, explanation: Explanation) -> Option<Value> {
+    let not_asked_reason = match signal {
+        LeafDivergence::NoDivergence => {
+            return Some(measured_value_of(vec![(
+                "divergent_leaves",
+                Value::Array(Vec::new()),
+            )]));
+        }
+        LeafDivergence::Diverged(divergent) => {
+            let leaves: Vec<Value> = divergent
+                .as_slice()
+                .iter()
+                .map(|leaf| json!({ "a": leaf.spelling_a(), "b": leaf.spelling_b() }))
+                .collect();
+            return Some(measured_value_of(vec![(
+                "divergent_leaves",
+                Value::Array(leaves),
+            )]));
+        }
+        LeafDivergence::UnalignedTokens => "unaligned-tokens",
+        LeafDivergence::NoTokens => return Some(unmeasurable_value_of("no-tokens")),
+    };
+
+    match explanation {
+        Explanation::AskedSignals => None,
+        Explanation::AllSignals => Some(not_asked_value_of(not_asked_reason)),
+    }
+}
+
 /// Stage 2 へ届かなかったこと。尋ねていないだけなら既定で `None`。
 ///
 /// **尋ねていないのと測れないを `status` で分ける。** 前者はこちらが降りた話、
@@ -715,6 +760,7 @@ mod tests {
     use crate::domain_declaration::DomainDeclarations;
     use crate::semantics::caller_domain::CallerDomains;
     use crate::similarity::Similarity;
+    use crate::syntax::leaf_divergence::{DivergentLeaf, DivergentLeaves};
     use crate::syntax::module_distance::ModuleDistance;
     use crate::test_support::{
         declarations_of, line, location, overload_count, rust_scan_of_fixture, scan_of_fixture,
@@ -737,6 +783,7 @@ mod tests {
     fn accidental_duplication() -> Signals {
         Signals::new(
             StructuralSimilarity::Measured(measured(0.91)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         )
@@ -858,6 +905,7 @@ mod tests {
         // 対照は上のテスト。測れているペアでは同じキーが出る
         let signals = Signals::new(
             StructuralSimilarity::NoTokens,
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         );
@@ -1086,6 +1134,7 @@ mod tests {
     fn test_json_of_keeps_the_line_of_an_import_declaration_it_could_not_read() {
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.91)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Unavailable(ImportsUnavailable::UnreadableDeclaration {
                 line: line(12),
             }),
@@ -1361,6 +1410,90 @@ mod tests {
         assert!(
             reason.get("separate_directory_steps").is_none(),
             "当てていない段数を出さない: {reason:#}"
+        );
+    }
+
+    /// 葉の綴りの違いだけを差し替えた、構造が似ていて依存先が食い違う組の JSON。
+    fn json_of_leaf_divergence(leaf_divergence: LeafDivergence, explanation: Explanation) -> Value {
+        let signals = Signals::new(
+            StructuralSimilarity::Measured(measured(1.0)),
+            leaf_divergence,
+            ImportOverlap::Measured(measured(0.0)),
+            separate_directories(),
+        );
+
+        json_of_signals(&signals, explanation)
+    }
+
+    #[test]
+    fn test_json_of_divergent_leaves_carries_every_pair() {
+        let divergent = DivergentLeaves::new(vec![
+            DivergentLeaf::new("hover_provider", "references_provider"),
+            DivergentLeaf::new("Hover", "References"),
+        ])
+        .expect("2 組あるので作れる");
+
+        let json = json_of_leaf_divergence(
+            LeafDivergence::Diverged(divergent),
+            Explanation::AskedSignals,
+        );
+
+        assert_eq!(
+            reason_of(&json, "leaf-divergence"),
+            json!({
+                "signal": "leaf-divergence",
+                "value": {
+                    "status": "measured",
+                    "divergent_leaves": [
+                        { "a": "hover_provider", "b": "references_provider" },
+                        { "a": "Hover", "b": "References" },
+                    ],
+                },
+                "lean": "toward-do-not-extract",
+            })
+        );
+    }
+
+    #[test]
+    fn test_json_of_leaves_without_divergence_carries_an_empty_list() {
+        let json = json_of_leaf_divergence(LeafDivergence::NoDivergence, Explanation::AskedSignals);
+
+        assert_eq!(
+            reason_of(&json, "leaf-divergence")["value"],
+            json!({ "status": "measured", "divergent_leaves": [] })
+        );
+    }
+
+    #[test]
+    fn test_json_of_unaligned_leaves_is_left_out_by_default() {
+        // 対照は下のテスト。同じ入力で `--explain` なら出る
+        let json =
+            json_of_leaf_divergence(LeafDivergence::UnalignedTokens, Explanation::AskedSignals);
+
+        assert!(
+            !signal_names_of(&json).contains(&"leaf-divergence"),
+            "{json:#}"
+        );
+    }
+
+    #[test]
+    fn test_json_of_unaligned_leaves_is_explained_as_not_asked() {
+        let json =
+            json_of_leaf_divergence(LeafDivergence::UnalignedTokens, Explanation::AllSignals);
+
+        assert_eq!(
+            reason_of(&json, "leaf-divergence")["value"],
+            json!({ "status": "not-asked", "reason": "unaligned-tokens" })
+        );
+    }
+
+    #[test]
+    fn test_json_of_leaves_without_tokens_is_unmeasurable_by_default() {
+        let json = json_of_leaf_divergence(LeafDivergence::NoTokens, Explanation::AskedSignals);
+
+        assert_eq!(
+            reason_of(&json, "leaf-divergence")["value"],
+            json!({ "status": "unmeasurable", "reason": "no-tokens" })
         );
     }
 }

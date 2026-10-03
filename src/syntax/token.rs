@@ -158,15 +158,27 @@ fn normalization_of(kind: &'static str) -> Normalization {
 /// リテラルの中へは降りない。`/ab-[0-9]+/` の中身は値であって構造ではないので、
 /// 降りると正規表現を書き換えただけで構造が違って見える。
 pub fn tokens_of(node: Node<'_>) -> Vec<Token> {
+    token_nodes_of(node)
+        .into_iter()
+        .map(|(token, _)| token)
+        .collect()
+}
+
+/// [`tokens_of`] と同じ列を、**それぞれのトークンを出したノード**と組にして返す。
+///
+/// 正規化で捨てた綴りを、同じ位置どうしで突き合わせる側（`syntax::leaf_divergence`）が
+/// 使う。**木の歩き方をここ 1 箇所に置く** — 2 箇所で歩くと、片方だけ正規化の表を
+/// 変えたときに、綴りの並びとトークン列の位置がずれる。
+pub(crate) fn token_nodes_of(node: Node<'_>) -> Vec<(Token, Node<'_>)> {
     let mut tokens = Vec::new();
     let mut pending = vec![node];
 
     while let Some(current) = pending.pop() {
         match normalization_of(current.kind()) {
             Normalization::Dropped => continue,
-            Normalization::Collapsed(token) => tokens.push(token),
+            Normalization::Collapsed(token) => tokens.push((token, current)),
             Normalization::Expanded(token) => {
-                tokens.push(token);
+                tokens.push((token, current));
 
                 let mut cursor = current.walk();
                 let children: Vec<Node<'_>> = current.children(&mut cursor).collect();
