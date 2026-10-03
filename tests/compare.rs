@@ -122,6 +122,87 @@ fn test_compare_of_similar_functions_sharing_a_utility_is_extract_candidate() {
     assert_eq!(verdict, Verdict::ExtractCandidate);
 }
 
+/// 同じ形のまま別の相手へ委譲する関数（Issue #289）の、Rust のフィクスチャ。
+fn delegates_rs(line: usize) -> Location {
+    fixture("leaf-divergence/delegates.rs", line)
+}
+
+/// 同じ形のまま別の相手へ委譲する関数（Issue #289）の、TypeScript のフィクスチャ。
+fn delegates_ts(line: usize) -> Location {
+    fixture("leaf-divergence/delegates.ts", line)
+}
+
+#[test]
+fn test_compare_of_functions_matching_different_capabilities_is_review() {
+    // 構造類似度 1.0・同じファイル（依存先を共有）で、葉の綴りを比べる前は
+    // EXTRACT-CANDIDATE だった。対照は下の `directory_of` / `domain_of`
+    let verdict = verdict(&delegates_rs(3), &delegates_rs(13));
+
+    assert_eq!(verdict, Verdict::Review);
+}
+
+#[test]
+fn test_compare_of_functions_returning_different_texts_is_review() {
+    let verdict = verdict(&delegates_rs(22), &delegates_rs(33));
+
+    assert_eq!(verdict, Verdict::Review);
+}
+
+#[test]
+fn test_compare_of_methods_delegating_to_different_methods_is_review() {
+    let verdict = verdict(&delegates_rs(45), &delegates_rs(54));
+
+    assert_eq!(verdict, Verdict::Review);
+}
+
+#[test]
+fn test_compare_of_functions_that_only_rename_bindings_stays_extract_candidate() {
+    // 対照。違いは束縛した名前（引数・`let`・関数自身の名前）の付け替えだけ
+    let verdict = verdict(&delegates_rs(64), &delegates_rs(69));
+
+    assert_eq!(verdict, Verdict::ExtractCandidate);
+}
+
+#[test]
+fn test_compare_of_typescript_functions_reading_different_members_is_review() {
+    let verdict = verdict(&delegates_ts(3), &delegates_ts(7));
+
+    assert_eq!(verdict, Verdict::Review);
+}
+
+#[test]
+fn test_compare_of_typescript_functions_that_only_rename_bindings_stays_extract_candidate() {
+    // 対照は上のテスト。同じファイルの、付け替えただけの 2 つ
+    let verdict = verdict(&delegates_ts(11), &delegates_ts(16));
+
+    assert_eq!(verdict, Verdict::ExtractCandidate);
+}
+
+#[test]
+fn test_compare_reports_the_leaves_that_diverge() {
+    let location_a = delegates_rs(3);
+    let location_b = delegates_rs(13);
+    let classification = classification_of(
+        &signals(&location_a, &location_b),
+        ConfiguredThresholds::default(),
+    );
+
+    let text = text_of(
+        &location_a,
+        &location_b,
+        &classification,
+        Explanation::AskedSignals,
+    );
+
+    assert!(
+        text.contains(
+            "綴りの違い: type_definition_provider ↔ call_hierarchy_provider, \
+             TypeDefinitionProviderCapability ↔ CallHierarchyServerCapability → 共通化しない側"
+        ),
+        "差し替わった綴りの組が出る: {text}"
+    );
+}
+
 #[test]
 fn test_compare_of_functions_with_different_shapes_is_review() {
     // 依存先もディレクトリも上の DO-NOT-EXTRACT の組と同じ条件で、構造だけが

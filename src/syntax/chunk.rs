@@ -18,6 +18,7 @@ use crate::line_number::LineNumber;
 use crate::location::Location;
 use crate::source_position::SourcePosition;
 use crate::syntax::import::{ImportSet, ImportsUnavailable};
+use crate::syntax::leaf_divergence::ChunkLeaves;
 use crate::syntax::line_range::LineRange;
 use crate::syntax::rust_callable;
 use crate::syntax::token::TokenSequence;
@@ -47,6 +48,7 @@ pub struct Chunk {
     type_references: Vec<TypeReference>,
     source: String,
     tokens: Option<TokenSequence>,
+    leaves: ChunkLeaves,
     imports: Result<ImportSet, ImportsUnavailable>,
 }
 
@@ -197,6 +199,7 @@ impl Chunk {
             },
             source: source_of_lines(source, lines),
             tokens: TokenSequence::from_node(node),
+            leaves: ChunkLeaves::from_node(node, name_node_of(node), source, grammar),
             imports,
         }
     }
@@ -282,6 +285,14 @@ impl Chunk {
     /// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
     pub fn tokens(&self) -> Option<&TokenSequence> {
         self.tokens.as_ref()
+    }
+
+    /// このチャンクの正規化トークンと、正規化で捨てた葉の綴り。
+    ///
+    /// 位置が揃う 2 つのチャンクで、同じ位置の名前・リテラルが違うかを突き合わせるのに使う
+    /// (`syntax::leaf_divergence`)。
+    pub fn leaves(&self) -> &ChunkLeaves {
+        &self.leaves
     }
 
     /// このチャンクがあるファイルの、依存先の集合。

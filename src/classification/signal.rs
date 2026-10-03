@@ -13,15 +13,17 @@ use crate::semantics::resolved_type::UnopenedReason;
 use crate::semantics::type_signature::UntracedReason;
 use crate::similarity::Similarity;
 use crate::syntax::import::ImportsUnavailable;
+use crate::syntax::leaf_divergence::DivergentLeaves;
 use crate::syntax::module_distance::ModuleDistance;
 
 /// 1 つのペアについて測ったシグナル一式。
 ///
-/// Stage 1（`syntax`）が採る 3 つと、Stage 2（`semantics`）が採る 3 つ
+/// Stage 1（`syntax`）が採る 4 つと、Stage 2（`semantics`）が採る 3 つ
 /// （`docs/dryguard-plan.md`「Stage 3: 分類」）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Signals {
     structural_similarity: StructuralSimilarity,
+    leaf_divergence: LeafDivergence,
     import_overlap: ImportOverlap,
     module_separation: ModuleSeparation,
     type_signature_match: TypeSignatureMatch,
@@ -30,7 +32,7 @@ pub struct Signals {
 }
 
 impl Signals {
-    /// Stage 1 で測った 3 つのシグナルをまとめる。
+    /// Stage 1 で測った 4 つのシグナルをまとめる。
     ///
     /// `module_distance` はディレクトリの段数で、**宣言を見ない**。どちらかのファイルが
     /// `dryguard.toml` の宣言に当たったときは [`Self::with_declared_domains`] で重ねる。
@@ -41,11 +43,13 @@ impl Signals {
     /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
     pub fn new(
         structural_similarity: StructuralSimilarity,
+        leaf_divergence: LeafDivergence,
         import_overlap: ImportOverlap,
         module_distance: ModuleDistance,
     ) -> Self {
         Self {
             structural_similarity,
+            leaf_divergence,
             import_overlap,
             module_separation: ModuleSeparation::Directories(module_distance),
             type_signature_match: TypeSignatureMatch::Unavailable {
@@ -95,7 +99,7 @@ impl Signals {
     /// **[`Self::with_semantics`] と分けてある。** 呼び出し先は hover / references と
     /// 別の問い合わせ（callHierarchy）で、サーバによって答えが不安定なことがある
     /// （`docs/dryguard-plan.md`「リスクと対処」）。重ねなければ「尋ねていない」のまま残り、
-    /// 残りの 5 つだけで判定できる。
+    /// 残りの 6 つだけで判定できる。
     pub fn with_callee_domain_overlap(self, callee_domain_overlap: CalleeDomainOverlap) -> Self {
         Self {
             callee_domain_overlap,
@@ -106,6 +110,11 @@ impl Signals {
     /// 正規化トークン列の gram の重なりで測った構造の似かた。
     pub fn structural_similarity(&self) -> StructuralSimilarity {
         self.structural_similarity
+    }
+
+    /// 位置が揃う 2 つのチャンクの、同じ位置の葉の綴りの違い。
+    pub fn leaf_divergence(&self) -> &LeafDivergence {
+        &self.leaf_divergence
     }
 
     /// 2 つのチャンクが属するファイルの、依存先の重なり。
@@ -140,6 +149,25 @@ pub enum StructuralSimilarity {
     /// 測れた類似度。
     Measured(Similarity),
     /// どちらかのチャンクからトークンが 1 つも取れず、測れなかった。
+    NoTokens,
+}
+
+/// 位置が揃う 2 つのチャンクの、同じ位置の葉の綴りの違いのシグナル
+/// （`rules/naming.md` の `leaf divergence`）。
+///
+/// **違いが無いことと、比べていないことを分ける。** 正規化トークン列が揃わないペアは
+/// 位置の対応が無く、比べていない。「違いが無い」で埋めると、構造類似度 1.0 未満の
+/// ペアまで付け替えただけの複製として読める
+/// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeafDivergence {
+    /// 位置が揃い、違いは束縛した名前の一貫した付け替えだけ。
+    NoDivergence,
+    /// 位置が揃い、綴りの違う葉がある。
+    Diverged(DivergentLeaves),
+    /// 正規化トークン列が一致せず、比べなかった。
+    UnalignedTokens,
+    /// どちらかのチャンクからトークンが 1 つも取れず、比べなかった。
     NoTokens,
 }
 

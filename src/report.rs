@@ -14,7 +14,7 @@ pub use json::{json_of, scan_json_of};
 use crate::classification::Classification;
 use crate::classification::reason::{Lean, Reason};
 use crate::classification::signal::{
-    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, MeasuredCalleeDomains,
+    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, LeafDivergence, MeasuredCalleeDomains,
     MeasuredCallerDomains, ModuleSeparation, SemanticsUnavailable, StructuralSimilarity,
     TypeSignatureMatch,
 };
@@ -32,6 +32,15 @@ use crate::threshold::Threshold;
 
 /// 見出しの行に付ける字下げ。
 const INDENT: &str = "  ";
+
+/// 綴りの違いの行に並べる組の上限。超えた分は数だけ出す。
+///
+/// テストのフィクスチャを組む関数は、リテラルが何十組も違うことがある。全部並べても
+/// 判定は 1 組目で決まっており、行が読めなくなるだけ（全部は `--format json` が出す）。
+const LISTED_DIVERGENT_LEAVES: usize = 3;
+
+/// 綴りの違いの行に出す綴り 1 つの、文字数の上限。超えた分は `…` で切る。
+const DIVERGENT_SPELLING_CHARS: usize = 40;
 
 /// `理由:` の 2 行目以降に付ける字下げ。
 ///
@@ -94,6 +103,16 @@ pub fn text_of(
                 structural_similarity_text_of(*signal, *threshold),
                 lean_text_of(*lean)
             )),
+            Reason::LeafDivergence { signal, lean } => {
+                lines.extend(
+                    leaf_divergence_text_of(signal, explanation).map(|signal_text| {
+                        format!(
+                            "{INDENT}綴りの違い: {signal_text} → {}",
+                            lean_text_of(*lean)
+                        )
+                    }),
+                );
+            }
             Reason::ImportOverlap {
                 signal,
                 threshold,
@@ -257,6 +276,57 @@ fn structural_similarity_text_of(signal: StructuralSimilarity, threshold: Thresh
         StructuralSimilarity::Measured(similarity) => format!("{similarity} (閾値 {threshold})"),
         StructuralSimilarity::NoTokens => "測れない (トークンが 1 つも無い)".to_owned(),
     }
+}
+
+/// 葉の綴りの違い。比べていなければ既定で `None`（行ごと出さない）。
+///
+/// **比べていないのは、正規化トークン列が揃わないペア。** 構造類似度 1.0 未満のペアは
+/// 全部ここに入るので、既定で出すと候補ペアのほとんどに行が増える。`--explain` は
+/// 比べなかったことも理由付きで出す（[`semantics_unavailable_text_of`] と同じ扱い）。
+fn leaf_divergence_text_of(signal: &LeafDivergence, explanation: Explanation) -> Option<String> {
+    let skipped_reason = match signal {
+        LeafDivergence::NoDivergence => {
+            return Some("無い (束縛した名前の付け替えだけ)".to_owned());
+        }
+        LeafDivergence::Diverged(divergent) => {
+            let leaves = divergent.as_slice();
+            let mut listed: Vec<String> = leaves
+                .iter()
+                .take(LISTED_DIVERGENT_LEAVES)
+                .map(|leaf| {
+                    format!(
+                        "{} ↔ {}",
+                        shortened_spelling_of(leaf.spelling_a()),
+                        shortened_spelling_of(leaf.spelling_b())
+                    )
+                })
+                .collect();
+            let unlisted = leaves.len().saturating_sub(LISTED_DIVERGENT_LEAVES);
+            if unlisted > 0 {
+                listed.push(format!("ほか {unlisted} 組"));
+            }
+            return Some(listed.join(", "));
+        }
+        LeafDivergence::UnalignedTokens => "正規化トークン列が揃わない",
+        LeafDivergence::NoTokens => "トークンが 1 つも無い",
+    };
+
+    match explanation {
+        Explanation::AskedSignals => None,
+        Explanation::AllSignals => Some(format!("比べていない ({skipped_reason})")),
+    }
+}
+
+/// 綴り 1 つを、1 行に収まる形にする。空白の並び（改行を含む）は 1 つの空白に畳み、
+/// [`DIVERGENT_SPELLING_CHARS`] 文字を超えた分は `…` で切る。
+fn shortened_spelling_of(spelling: &str) -> String {
+    let folded = spelling.split_whitespace().collect::<Vec<_>>().join(" ");
+    if folded.chars().count() <= DIVERGENT_SPELLING_CHARS {
+        return folded;
+    }
+
+    let kept: String = folded.chars().take(DIVERGENT_SPELLING_CHARS).collect();
+    format!("{kept}…")
 }
 
 /// 依存モジュールの重なりの値。測れていなければ、その理由。
@@ -764,6 +834,7 @@ mod tests {
     };
     use crate::similarity::Similarity;
     use crate::syntax::import::ImportsUnavailable;
+    use crate::syntax::leaf_divergence::{DivergentLeaf, DivergentLeaves};
     use crate::syntax::module_distance::ModuleDistance;
     use crate::test_support::{
         declarations_of, location, overload_count, rust_scan_of_fixture, scan_of_fixture,
@@ -807,6 +878,7 @@ mod tests {
     ) -> String {
         let signals = Signals::new(
             structural_similarity,
+            LeafDivergence::UnalignedTokens,
             import_overlap,
             separate_directories(),
         );
@@ -849,6 +921,7 @@ mod tests {
         let threshold = DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.94)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             nested_directories(),
         );
@@ -966,6 +1039,7 @@ mod tests {
             .with_shared_caller_domains(Threshold::from_literal(0.6));
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.94)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         )
@@ -1343,6 +1417,7 @@ mod tests {
         let threshold = DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD;
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.94)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         )
@@ -1885,6 +1960,7 @@ mod tests {
     ) -> String {
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.94)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         )
@@ -2084,6 +2160,7 @@ mod tests {
     fn explained_text_of_declared(declared: DeclaredDomains, explanation: Explanation) -> String {
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.94)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         )
@@ -2116,6 +2193,112 @@ mod tests {
         assert!(
             !text.contains("モジュール距離") && !text.contains("段)"),
             "宣言で比べたときは段数も、当てていない段数の閾値も出さない: {text}"
+        );
+    }
+
+    /// 葉の綴りの違いだけを差し替えた、構造が似ていて依存先が食い違う組の text。
+    fn text_of_leaf_divergence(
+        leaf_divergence: LeafDivergence,
+        explanation: Explanation,
+    ) -> String {
+        let signals = Signals::new(
+            StructuralSimilarity::Measured(measured(1.0)),
+            leaf_divergence,
+            ImportOverlap::Measured(measured(0.0)),
+            separate_directories(),
+        );
+
+        text_of(
+            &location("src/billing/discount.ts", 42),
+            &location("src/inventory/reorder.ts", 18),
+            &classification_of(&signals, ConfiguredThresholds::default()),
+            explanation,
+        )
+    }
+
+    /// 綴りの組から、違いがあるシグナルを作る。
+    fn diverged(pairs: &[(&str, &str)]) -> LeafDivergence {
+        let leaves = pairs
+            .iter()
+            .map(|(spelling_a, spelling_b)| DivergentLeaf::new(*spelling_a, *spelling_b))
+            .collect();
+
+        LeafDivergence::Diverged(DivergentLeaves::new(leaves).expect("テストが渡す組は 1 組以上"))
+    }
+
+    #[test]
+    fn test_text_of_divergent_leaves_lists_each_pair_with_its_lean() {
+        let text = text_of_leaf_divergence(
+            diverged(&[
+                ("hover_provider", "references_provider"),
+                ("Hover", "References"),
+            ]),
+            Explanation::AskedSignals,
+        );
+
+        assert!(
+            text.contains(
+                "  綴りの違い: hover_provider ↔ references_provider, Hover ↔ References → 共通化しない側"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_many_divergent_leaves_lists_the_first_few_and_counts_the_rest() {
+        let text = text_of_leaf_divergence(
+            diverged(&[("a", "b"), ("c", "d"), ("e", "f"), ("g", "h"), ("i", "j")]),
+            Explanation::AskedSignals,
+        );
+
+        assert!(
+            text.contains("綴りの違い: a ↔ b, c ↔ d, e ↔ f, ほか 2 組 →"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_a_long_divergent_spelling_folds_its_lines_and_cuts_it_short() {
+        let long = format!("\"first line\n    {}\"", "x".repeat(60));
+
+        let text = text_of_leaf_divergence(
+            diverged(&[(long.as_str(), "\"short\"")]),
+            Explanation::AskedSignals,
+        );
+
+        let expected_head = format!("綴りの違い: \"first line {}… ↔ \"short\"", "x".repeat(28));
+        assert!(text.contains(&expected_head), "{text}");
+    }
+
+    #[test]
+    fn test_text_of_leaves_without_divergence_says_only_bindings_were_renamed() {
+        let text = text_of_leaf_divergence(LeafDivergence::NoDivergence, Explanation::AskedSignals);
+
+        assert!(
+            text.contains("  綴りの違い: 無い (束縛した名前の付け替えだけ) → どちらでもない"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_unaligned_leaves_is_left_out_by_default() {
+        // 対照は下のテスト。同じ入力で `--explain` なら出る
+        let text =
+            text_of_leaf_divergence(LeafDivergence::UnalignedTokens, Explanation::AskedSignals);
+
+        assert!(!text.contains("綴りの違い"), "{text}");
+    }
+
+    #[test]
+    fn test_text_of_unaligned_leaves_is_explained_as_not_compared() {
+        let text =
+            text_of_leaf_divergence(LeafDivergence::UnalignedTokens, Explanation::AllSignals);
+
+        assert!(
+            text.contains(
+                "  綴りの違い: 比べていない (正規化トークン列が揃わない) → どちらでもない"
+            ),
+            "{text}"
         );
     }
 }

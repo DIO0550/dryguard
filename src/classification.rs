@@ -15,6 +15,7 @@
 //! | シグナル | 共通化する側へ傾く | 共通化しない側へ傾く |
 //! |---|---|---|
 //! | 構造類似度 | 閾値に届いた | （傾けない。下の表の 1 行目） |
+//! | 葉の綴りの違い | （傾けない） | 位置が揃い、綴りの違う葉がある |
 //! | 依存先の重なり | 閾値に届いた | 届かなかった |
 //! | ディレクトリの隔たり | [`SEPARATE_DIRECTORY_STEPS`] 段未満 / 同じ宣言 | 段以上 / 別の宣言 |
 //! | 型シグネチャ | 単一化可能 | 単一化不能 |
@@ -23,6 +24,11 @@
 //!
 //! 当てる閾値のうち 3 つは外から動く（[`ConfiguredThresholds`]）。段数と呼び出し先の
 //! 閾値は定数で、**どのシグナルにどれを当てるかを決めているのは [`AppliedThresholds::of`] だけ。**
+//!
+//! **葉の綴りの違いはドメインの一致に使わない。** 置き場所でも使われ方でもなく、
+//! 同じドメインの中で「1 つにまとめられるか」を言う材料なので、型シグネチャと同じく
+//! 候補側の拒否権として効く（`shared_domain_verdict_of`）。違いが無いことは
+//! 共通化してよい証拠ではない（構造類似度 1.0 と同じことしか言っていない）ので傾けない。
 //!
 //! 傾きからラベルまでは 2 段。まず**ドメインが同じか**を、置き場所（依存先の重なり →
 //! ディレクトリの隔たり）で決めてから**呼び出し元・呼び出し先の観測を重ねて**出す
@@ -37,6 +43,7 @@
 //! | いいえ | — | — | `REVIEW` |
 //! | はい | 別 | — | `DO-NOT-EXTRACT` |
 //! | はい | どちらとも言えない | — | `REVIEW` |
+//! | はい | 同じ | 葉の綴りが違う（型シグネチャを見ない） | `REVIEW` |
 //! | はい | 同じ | 単一化不能 | `REVIEW` |
 //! | はい | 同じ | 単一化可能 | `EXTRACT-CANDIDATE` |
 //! | はい | 同じ | 傾かない | 置き場所だけで同じドメインなら `EXTRACT-CANDIDATE`、でなければ `REVIEW` |
@@ -67,8 +74,8 @@ pub mod verdict;
 
 use crate::classification::reason::{Lean, Reason};
 use crate::classification::signal::{
-    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, ModuleSeparation, Signals,
-    StructuralSimilarity, TypeSignatureMatch,
+    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, LeafDivergence, ModuleSeparation,
+    Signals, StructuralSimilarity, TypeSignatureMatch,
 };
 use crate::classification::verdict::Verdict;
 use crate::similarity::Similarity;
@@ -230,12 +237,7 @@ pub fn classification_of(signals: &Signals, configured: ConfiguredThresholds) ->
     let domain_match = domain_match_of(placement, &leans);
 
     Classification {
-        verdict: verdict_of(
-            structurally_similar,
-            leans.type_signature,
-            placement,
-            domain_match,
-        ),
+        verdict: verdict_of(structurally_similar, &leans, placement, domain_match),
         reasons: reasons_of(signals, &leans, thresholds),
     }
 }
@@ -282,6 +284,7 @@ impl AppliedThresholds {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Leans {
     structural_similarity: Lean,
+    leaf_divergence: Lean,
     import_overlap: Lean,
     module_distance: Lean,
     type_signature: Lean,
@@ -297,6 +300,7 @@ impl Leans {
                 signals.structural_similarity(),
                 thresholds.structural_similarity,
             ),
+            leaf_divergence: leaf_divergence_lean_of(signals.leaf_divergence()),
             import_overlap: import_overlap_lean_of(
                 signals.import_overlap(),
                 thresholds.shared_imports,
@@ -324,7 +328,7 @@ impl Leans {
 /// **偶発的な重複と呼べるのは、そもそも共通化したくなるほど似ている場合だけ。**
 fn verdict_of(
     structurally_similar: bool,
-    type_signature_lean: Lean,
+    leans: &Leans,
     placement: DomainMatch,
     domain_match: DomainMatch,
 ) -> Verdict {
@@ -333,13 +337,18 @@ fn verdict_of(
     }
 
     match domain_match {
-        DomainMatch::Same => shared_domain_verdict_of(type_signature_lean, placement),
+        DomainMatch::Same => shared_domain_verdict_of(leans, placement),
         DomainMatch::Separate => Verdict::DoNotExtract,
         DomainMatch::Undecidable => Verdict::Review,
     }
 }
 
-/// ドメインが一致しているペアのラベル。型シグネチャが候補側の拒否権を持つ。
+/// ドメインが一致しているペアのラベル。葉の綴りの違いと型シグネチャが候補側の拒否権を持つ。
+///
+/// **葉の綴りが違えば、型シグネチャを見ずに `REVIEW`。** 同じ形のまま別の相手へ委譲する
+/// 2 つ（`hover_provider` を見る関数と `references_provider` を見る関数）は、型も同じで
+/// 単一化できる。違う相手を引数に取り出せばまとめられることもあるので、
+/// `DO-NOT-EXTRACT` ではなく人へ回す（単一化不能と同じ扱い）。
 ///
 /// `placement` は Stage 1 だけで出したドメインの一致（[`placement_domain_match_of`]）。
 ///
@@ -354,8 +363,12 @@ fn verdict_of(
 /// **Why not（単一化できることを候補側の決め手にする）**: `(Date) => string` のような
 /// 汎用の型は別ドメインでもよく重なる。**重なることは必要条件であって、
 /// 同じドメインである証拠ではない。**
-fn shared_domain_verdict_of(type_signature_lean: Lean, placement: DomainMatch) -> Verdict {
-    match type_signature_lean {
+fn shared_domain_verdict_of(leans: &Leans, placement: DomainMatch) -> Verdict {
+    if leans.leaf_divergence == Lean::TowardDoNotExtract {
+        return Verdict::Review;
+    }
+
+    match leans.type_signature {
         Lean::TowardDoNotExtract => Verdict::Review,
         Lean::TowardExtract => Verdict::ExtractCandidate,
         Lean::Neither => stage1_shared_domain_verdict_of(placement),
@@ -496,6 +509,10 @@ fn reasons_of(signals: &Signals, leans: &Leans, thresholds: AppliedThresholds) -
             threshold: thresholds.structural_similarity,
             lean: leans.structural_similarity,
         },
+        Reason::LeafDivergence {
+            signal: signals.leaf_divergence().clone(),
+            lean: leans.leaf_divergence,
+        },
         Reason::ImportOverlap {
             signal: signals.import_overlap(),
             threshold: thresholds.shared_imports,
@@ -521,6 +538,19 @@ fn reasons_of(signals: &Signals, leans: &Leans, thresholds: AppliedThresholds) -
             lean: leans.callee_domain,
         },
     ]
+}
+
+/// 葉の綴りの違いが傾けた向き。違いがあれば共通化しない側、それ以外は傾けない。
+///
+/// **違いが無くても共通化する側へ傾けない。** 正規化トークン列が一致したことは
+/// 構造類似度がすでに言っており、同じ証拠を 2 度数えることになる。
+fn leaf_divergence_lean_of(signal: &LeafDivergence) -> Lean {
+    match signal {
+        LeafDivergence::Diverged(_) => Lean::TowardDoNotExtract,
+        LeafDivergence::NoDivergence
+        | LeafDivergence::UnalignedTokens
+        | LeafDivergence::NoTokens => Lean::Neither,
+    }
 }
 
 /// 型シグネチャの単一化の可否が傾けた向き。尋ねていない / 測れなければ傾けない。
@@ -686,6 +716,7 @@ mod tests {
     use crate::semantics::type_signature::UntracedReason;
     use crate::similarity::Similarity;
     use crate::syntax::import::ImportsUnavailable;
+    use crate::syntax::leaf_divergence::{DivergentLeaf, DivergentLeaves};
     use crate::syntax::module_distance::ModuleDistance;
     use crate::threshold::Threshold;
 
@@ -781,6 +812,7 @@ mod tests {
     ) -> Classification {
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             distance,
         )
@@ -797,6 +829,7 @@ mod tests {
     fn test_classification_of_similar_chunks_sharing_dependencies_is_extract_candidate() {
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(1.0)),
             separate_directories(),
         );
@@ -811,6 +844,7 @@ mod tests {
      {
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         );
@@ -827,6 +861,7 @@ mod tests {
         // 上のテストとの違いはディレクトリだけで、そちらは DO-NOT-EXTRACT になる
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             same_directory(),
         );
@@ -893,6 +928,7 @@ mod tests {
         // 倒れないことを見る（似ていないペアは、そもそも共通化の候補ではない）
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.2)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         );
@@ -909,6 +945,7 @@ mod tests {
             StructuralSimilarity::Measured(measured(
                 DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD.value(),
             )),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(1.0)),
             separate_directories(),
         );
@@ -924,6 +961,7 @@ mod tests {
         // 渡した閾値が使われたのか既定が使われたのかが分からない
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.3)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         );
@@ -942,6 +980,7 @@ mod tests {
         // ドメインは不一致。構造類似度が取れないことだけで REVIEW になる
         let signals = Signals::new(
             StructuralSimilarity::NoTokens,
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         );
@@ -957,6 +996,7 @@ mod tests {
         // ドメインの一致 / 不一致を決めない
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Unavailable(ImportsUnavailable::NoDeclarations),
             separate_directories(),
         );
@@ -970,19 +1010,135 @@ mod tests {
     fn test_classification_reports_one_reason_for_every_signal() {
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(1.0)),
             separate_directories(),
         );
 
         let classification = classification_of(&signals, ConfiguredThresholds::default());
 
-        assert_eq!(classification.reasons().len(), 6);
+        assert_eq!(classification.reasons().len(), 7);
+    }
+
+    /// 同じ位置の葉が 1 組だけ違う（`hover_provider ↔ references_provider`）。
+    fn diverged_leaves() -> LeafDivergence {
+        let divergent = DivergentLeaves::new(vec![DivergentLeaf::new(
+            "hover_provider",
+            "references_provider",
+        )])
+        .expect("1 組あるので作れる");
+
+        LeafDivergence::Diverged(divergent)
+    }
+
+    /// 構造が似ていて依存先も共有し、型シグネチャも単一化できる組に、葉の綴りの違いを重ねる。
+    fn classification_of_unifiable_shared_domain(
+        leaf_divergence: LeafDivergence,
+    ) -> Classification {
+        let signals = Signals::new(
+            StructuralSimilarity::Measured(measured(1.0)),
+            leaf_divergence,
+            ImportOverlap::Measured(measured(1.0)),
+            same_directory(),
+        )
+        .with_semantics(
+            TypeSignatureMatch::Unifiable,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        classification_of(&signals, ConfiguredThresholds::default())
+    }
+
+    #[test]
+    fn test_classification_of_a_shared_domain_pair_with_divergent_leaves_is_review() {
+        // 型も同じで単一化できるが、同じ形のまま別の相手へ委譲している
+        let classification = classification_of_unifiable_shared_domain(diverged_leaves());
+
+        assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    #[test]
+    fn test_classification_of_a_shared_domain_pair_that_only_renames_bindings_is_extract_candidate()
+    {
+        // 対照。付け替えただけなら、違いが無いことは傾けない
+        let classification =
+            classification_of_unifiable_shared_domain(LeafDivergence::NoDivergence);
+
+        assert_eq!(classification.verdict(), Verdict::ExtractCandidate);
+    }
+
+    #[test]
+    fn test_classification_of_a_shared_domain_pair_with_unaligned_tokens_is_left_as_it_was() {
+        // 揃わないペアは比べていないので、今の判定を動かさない
+        let classification =
+            classification_of_unifiable_shared_domain(LeafDivergence::UnalignedTokens);
+
+        assert_eq!(classification.verdict(), Verdict::ExtractCandidate);
+    }
+
+    #[test]
+    fn test_classification_of_a_separate_domain_pair_with_divergent_leaves_stays_do_not_extract() {
+        let signals = Signals::new(
+            StructuralSimilarity::Measured(measured(1.0)),
+            diverged_leaves(),
+            ImportOverlap::Measured(measured(0.0)),
+            separate_directories(),
+        );
+
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
+
+        assert_eq!(classification.verdict(), Verdict::DoNotExtract);
+    }
+
+    #[test]
+    fn test_classification_of_divergent_leaves_without_a_type_signature_is_review() {
+        // Stage 1 だけで同じドメインと言えていても、候補に出さない
+        let signals = Signals::new(
+            StructuralSimilarity::Measured(measured(1.0)),
+            diverged_leaves(),
+            ImportOverlap::Measured(measured(1.0)),
+            same_directory(),
+        );
+
+        let classification = classification_of(&signals, ConfiguredThresholds::default());
+
+        assert_eq!(classification.verdict(), Verdict::Review);
+    }
+
+    #[test]
+    fn test_classification_leans_divergent_leaves_toward_do_not_extract() {
+        let classification = classification_of_unifiable_shared_domain(diverged_leaves());
+
+        assert!(leans(
+            &classification,
+            &Reason::LeafDivergence {
+                signal: diverged_leaves(),
+                lean: Lean::TowardDoNotExtract,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classification_does_not_lean_leaves_without_divergence() {
+        let classification =
+            classification_of_unifiable_shared_domain(LeafDivergence::NoDivergence);
+
+        assert!(leans(
+            &classification,
+            &Reason::LeafDivergence {
+                signal: LeafDivergence::NoDivergence,
+                lean: Lean::Neither,
+            }
+        ));
     }
 
     /// 構造が似ていて依存先も共有している組（Stage 1 だけなら `EXTRACT-CANDIDATE`）。
     fn signals_of_a_shared_domain() -> Signals {
         Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(1.0)),
             separate_directories(),
         )
@@ -993,6 +1149,7 @@ mod tests {
     fn signals_of_separate_domains() -> Signals {
         Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         )
@@ -1053,6 +1210,7 @@ mod tests {
         // 取れて初めて別ドメインと言える
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Unavailable(ImportsUnavailable::NoDeclarations),
             separate_directories(),
         )
@@ -1106,6 +1264,7 @@ mod tests {
     fn signals_of_a_caller_only_domain_match() -> Signals {
         Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Unavailable(ImportsUnavailable::NoDeclarations),
             separate_directories(),
         )
@@ -1508,6 +1667,7 @@ mod tests {
     fn test_classification_of_disjoint_imports_leans_the_import_reason_toward_do_not_extract() {
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         );
@@ -1532,6 +1692,7 @@ mod tests {
     fn test_classification_of_shared_imports_leans_the_import_reason_toward_extract() {
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(1.0)),
             separate_directories(),
         );
@@ -1558,6 +1719,7 @@ mod tests {
         // --explain が「偶発的重複だから共通化しない」と読める根拠を出してしまう
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.2)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         );
@@ -1582,6 +1744,7 @@ mod tests {
     fn test_classification_of_far_modules_leans_the_distance_reason_toward_do_not_extract() {
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             separate_directories(),
         );
@@ -1607,6 +1770,7 @@ mod tests {
      {
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Measured(measured(0.0)),
             same_directory(),
         );
@@ -1631,6 +1795,7 @@ mod tests {
     fn test_classification_without_imports_leans_the_import_reason_neither_way() {
         let signals = Signals::new(
             StructuralSimilarity::Measured(measured(0.9)),
+            LeafDivergence::UnalignedTokens,
             ImportOverlap::Unavailable(ImportsUnavailable::NoDeclarations),
             separate_directories(),
         );
@@ -1745,6 +1910,7 @@ mod tests {
         for signal in unmeasured_type_signature_matches() {
             let signals = Signals::new(
                 StructuralSimilarity::Measured(measured(0.9)),
+                LeafDivergence::UnalignedTokens,
                 ImportOverlap::Measured(measured(1.0)),
                 same_directory(),
             )
@@ -1771,6 +1937,7 @@ mod tests {
         for signal in unmeasured_caller_domain_overlaps() {
             let signals = Signals::new(
                 StructuralSimilarity::Measured(measured(0.9)),
+                LeafDivergence::UnalignedTokens,
                 ImportOverlap::Measured(measured(1.0)),
                 same_directory(),
             )

@@ -176,12 +176,13 @@ jq -r \
       (if $placement == "same" then "undecidable" else "separate" end)
     end;
 
-  def verdict($similar; $import; $distance; $signature; $caller; $callee):
+  def verdict($similar; $divergence; $import; $distance; $signature; $caller; $callee):
     placement($import; $distance) as $placement
     | domain_match($placement; observed($caller; $callee)) as $match
     | if ($similar | not) then "REVIEW"
       elif $match == "separate" then "DO-NOT-EXTRACT"
       elif $match == "undecidable" then "REVIEW"
+      elif $divergence == "toward-do-not-extract" then "REVIEW"
       elif $signature == "toward-do-not-extract" then "REVIEW"
       elif $signature == "toward-extract" then "EXTRACT-CANDIDATE"
       elif $placement == "same" then "EXTRACT-CANDIDATE"
@@ -203,6 +204,7 @@ jq -r \
      | domain_of($table; $pair.location_b) as $domain_b
      | reason($pair; "structural-similarity") as $structure
      | ($structure.value.similarity >= $structure.threshold) as $similar
+     | reason($pair; "leaf-divergence").lean as $divergence
      | reason($pair; "import-overlap").lean as $import
      | reason($pair; "module-distance") as $distance
      | reason($pair; "type-signature-match").lean as $signature
@@ -234,8 +236,9 @@ jq -r \
          remappable: ($declared_caller.remapped != "mixed-directory"
                       and $declared_callee.remapped != "mixed-directory"),
          verdict: $pair.verdict,
-         replayed: verdict($similar; $import; $distance.lean; $signature; $caller.lean; $callee.lean),
-         declared: verdict($similar; $import; $declared_distance; $signature;
+         replayed: verdict($similar; $divergence; $import; $distance.lean; $signature;
+                           $caller.lean; $callee.lean),
+         declared: verdict($similar; $divergence; $import; $declared_distance; $signature;
                            $declared_caller.lean; $declared_callee.lean),
          declared_scan: (if $declared_verdicts == null then null
                          else ($declared_verdicts[$key] // "missing") end)
