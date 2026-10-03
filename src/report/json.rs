@@ -155,6 +155,7 @@ fn walked_value_of(scan: &Scan) -> Value {
         "files": scan.file_count(),
         "chunks": scan.chunk_count(),
         "excluded_test_functions": scan.excluded_test_function_count(),
+        "undersized_chunks": scan.undersized_chunk_count(),
         "compared_pairs": scan.compared_pair_count(),
         "pruned_pairs": scan.pruned_pair_count(),
     })
@@ -1243,7 +1244,7 @@ mod tests {
         assert_eq!(walked["files"], 8);
         assert_eq!(walked["chunks"], 6);
         assert_eq!(walked["compared_pairs"], 14);
-        assert_eq!(walked["pruned_pairs"], 5);
+        assert_eq!(walked["pruned_pairs"], 3);
     }
 
     #[test]
@@ -1264,6 +1265,19 @@ mod tests {
         let json = scan_json_of_fixture("scan");
 
         assert_eq!(json["walked"]["excluded_test_functions"], 0);
+    }
+
+    #[test]
+    fn test_scan_json_of_reports_the_undersized_chunks_it_left_out() {
+        let text = scan_json_of(
+            &rust_scan_of_fixture("rust-undersized"),
+            Explanation::AskedSignals,
+        );
+        let json: Value =
+            serde_json::from_str(&text).expect("組み立てた綴りは JSON として読み直せる");
+
+        assert_eq!(json["walked"]["undersized_chunks"], 2);
+        assert_eq!(json["walked"]["chunks"], 2);
     }
 
     #[test]

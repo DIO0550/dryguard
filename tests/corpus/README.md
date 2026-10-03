@@ -26,10 +26,14 @@ TypeScript で、5 ドメイン（`billing` / `inventory` / `shipping` / `notifi
 
 | テスト | 固定している数 | 何を守っているか |
 |---|---|---|
-| `test_scan_of_the_corpus_compares_every_pair_of_chunks_it_found` | 関数 47・総ペア 1081 | 既定の閾値を決めたときの母数がまだ成り立っていること |
-| `test_scan_of_the_corpus_keeps_every_candidate_pair_it_can_reach` | 候補ペア 65 | 枝刈りが候補を 1 組も落としていないこと |
+| `test_scan_of_the_corpus_compares_every_pair_of_chunks_it_found` | 関数 47（比べたチャンク 46 + 小さいチャンク 1）・総ペア 1035 | 既定の閾値を決めたときの母数がまだ成り立っていること |
+| `test_scan_of_the_corpus_keeps_every_candidate_pair_it_can_reach` | 候補ペア 64 | 枝刈りが候補を 1 組も落としていないこと |
 
-**したがって関数を 1 つ足しただけでも CI は落ちる**（47 と 1081 が動く）。名指しの 4 つ以外の
+`scan` は正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない関数（`notification/queue.ts` の `shouldRetry`）を比べないので、
+総当たりは 46 関数の 1035 ペアになる（Issue #271）。閾値を決めたときに測った 1081 ペアは、
+47 関数すべてを比べた数。
+
+**したがって関数を 1 つ足しただけでも CI は落ちる**（47 と 1035 が動く）。名指しの 4 つ以外の
 本体を変えた場合も、候補の数が動けば同じテストが落ちる。**足すこと自体は歓迎で、落ちた数を
 直すところまでが 1 セット**（数が変わったこと自体は、閾値を決めた母数が変わったという情報なので
 黙って通さない）。
@@ -65,7 +69,12 @@ Issue #17 のゲートのうち、このコーパスで答えられるのは**�
 短さが有利に働かない。[Issue #86](https://github.com/DIO0550/dryguard/issues/86) で全 1081 ペアを
 測り直した結果、**既定の閾値 0.50 で**短い側が 3 行のペアの候補率は 1.8%、10 行のペアは 56.9% で、
 **短いほうが候補になりにくい**（傾きが逆）。候補かどうかは閾値で決まるので、閾値を測り直したら
-この 2 つの数値も出し直すことになる。`import` の希釈は未解決（[Issue #87](https://github.com/DIO0550/dryguard/issues/87)）。
+この 2 つの数値も出し直すことになる。
+
+**ただし形が 1 つしかない短さは残っていた。** `fn x(&self) -> T { self.x }` の形のアクセサどうしは、
+3-gram でも構造類似度 1.0 で並ぶ（dryguard 自身の `src` で、片側が 3 行以下のペアが候補の 8 割）。
+こちらは閾値ではなく、**`scan` が正規化トークンの下限に届かない関数を比べない**ことで落とした
+（[Issue #271](https://github.com/DIO0550/dryguard/issues/271)。`compare` は名指しされれば比べる）。`import` の希釈は未解決（[Issue #87](https://github.com/DIO0550/dryguard/issues/87)）。
 
 ## 書くときの約束
 

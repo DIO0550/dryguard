@@ -1255,6 +1255,7 @@ fn scan_with_servers(
     let mut skipped_files = Vec::new();
     let mut unchunkable = Vec::new();
     let mut excluded_test_function_count = 0;
+    let mut undersized_chunk_count = 0;
 
     for ((path, chunked_file), declared) in paths.iter().zip(chunked_files).zip(declared) {
         let chunked_file = match chunked_file {
@@ -1273,18 +1274,19 @@ fn scan_with_servers(
                 .iter()
                 .map(|start| Location::new(path.clone(), *start)),
         );
-        chunks.extend(
-            chunked_file
-                .chunks
-                .chunks()
-                .iter()
-                .cloned()
-                .map(|chunk| ScannedChunk {
-                    chunk,
-                    source: Arc::clone(&chunked_file.source),
-                    declared: declared.clone(),
-                }),
-        );
+        // 小さすぎるチャンクはチャンクではあるが、候補列挙に入れない。`compare` は
+        // 位置を名指しするのでここを通らず、小さくても比べる
+        let (undersized, comparable): (Vec<&Chunk>, Vec<&Chunk>) = chunked_file
+            .chunks
+            .chunks()
+            .iter()
+            .partition(|chunk| chunk.is_undersized());
+        undersized_chunk_count += undersized.len();
+        chunks.extend(comparable.into_iter().cloned().map(|chunk| ScannedChunk {
+            chunk,
+            source: Arc::clone(&chunked_file.source),
+            declared: declared.clone(),
+        }));
     }
 
     Ok(scan_of_chunks(
@@ -1298,6 +1300,7 @@ fn scan_with_servers(
             skipped_files,
             unchunkable,
             excluded_test_function_count,
+            undersized_chunk_count,
         },
     ))
 }
@@ -1373,6 +1376,7 @@ struct ScanInputs {
     skipped_files: Vec<SkippedFile>,
     unchunkable: Vec<Location>,
     excluded_test_function_count: usize,
+    undersized_chunk_count: usize,
 }
 
 /// 集めたチャンクを総当たりで比べ、候補ペアだけを判定する。
@@ -1452,6 +1456,7 @@ fn scan_of_chunks(
         file_count: inputs.file_count,
         chunk_count: chunks.len(),
         excluded_test_function_count: inputs.excluded_test_function_count,
+        undersized_chunk_count: inputs.undersized_chunk_count,
         compared_pair_count,
         pruned_pair_count,
         skipped_files: inputs.skipped_files,
@@ -2104,6 +2109,7 @@ pub struct Scan {
     file_count: usize,
     chunk_count: usize,
     excluded_test_function_count: usize,
+    undersized_chunk_count: usize,
     compared_pair_count: usize,
     pruned_pair_count: usize,
     skipped_files: Vec<SkippedFile>,
@@ -2139,7 +2145,7 @@ impl Scan {
         self.file_count
     }
 
-    /// 切り出せたチャンクの数。
+    /// 比べたチャンクの数。[`Scan::undersized_chunk_count`] の分は含まない。
     pub fn chunk_count(&self) -> usize {
         self.chunk_count
     }
@@ -2150,6 +2156,17 @@ impl Scan {
     /// 読めないと「比べて似ていなかった」と「そもそも比べていない」を区別できない。
     pub fn excluded_test_function_count(&self) -> usize {
         self.excluded_test_function_count
+    }
+
+    /// 比べるには小さすぎるとして候補列挙に入れなかったチャンクの数（[`Chunk::is_undersized`]）。
+    ///
+    /// 黙って落とさない理由は [`Scan::excluded_test_function_count`] と同じ。
+    ///
+    /// 長さの上限で突き合わせを省くのとは違い、**これは候補ペアを変える**。それでも判定の
+    /// 先取りではなく比べる相手の線引きで、どれとも構造類似度 1.0 で並ぶ短さを、
+    /// 判定に渡す前に母集団から外している（`compare` は名指しされれば比べる）。
+    pub fn undersized_chunk_count(&self) -> usize {
+        self.undersized_chunk_count
     }
 
     /// 実際に比べたペアの数。入れ子の組は含まない。
@@ -3165,7 +3182,7 @@ mod tests {
         // ここに現れない
         let scan = scan_of_fixture("scan");
 
-        assert_eq!(scan.chunk_count(), 6, "切り出せたチャンクの数");
+        assert_eq!(scan.chunk_count(), 6, "比べたチャンクの数");
         assert_eq!(
             scan.compared_pair_count(),
             14,
@@ -3216,7 +3233,7 @@ mod tests {
         assert_eq!(
             scan.chunk_count(),
             1,
-            "読めたファイルの関数は切り出せている"
+            "読めたファイルの関数は比べるチャンクに入っている"
         );
     }
 

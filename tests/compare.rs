@@ -405,6 +405,17 @@ fn test_compare_of_similar_functions_in_separate_domains_reports_the_verdict_and
     );
 }
 
+#[test]
+fn test_compare_of_two_accessors_still_measures_their_structure() {
+    // `scan` は小さすぎるチャンクを候補列挙に入れないが、名指しされた 2 箇所は比べる
+    let similarity = structural_similarity(
+        &fixture("rust-undersized/src/lib.rs", 7),
+        &fixture("rust-undersized/src/lib.rs", 11),
+    );
+
+    assert_eq!(similarity.value(), 1.0);
+}
+
 /// 2 箇所を実ファイルから切り出して、起動できないサーバで Stage 2 を尋ねるところまで。
 fn measured_without_an_lsp(location_a: &Location, location_b: &Location) -> MeasuredPair {
     let Ok(pair) = chunk_pair_of(location_a, location_b) else {
