@@ -330,12 +330,12 @@ pub struct FileChunks {
     excluded_test_function_count: usize,
 }
 
-/// `test function`（`#[test]` の付いた Rust の関数）をチャンクにするか。
+/// `test function`（Rust のテスト属性付き関数・TypeScript のテストコールバック）をチャンクにするか。
 ///
 /// **外す既定を持たない。** 既定は入口（`scan` の `--include-tests`）が決め、
 /// `compare` は位置を名指ししているので外さない（[`Chunk::find_enclosing`] は見ない）。
 ///
-/// TypeScript は構文にテストの印が無いので、どちらでも同じチャンクになる。
+/// TypeScript は呼び出しの綴りで見分ける（[`is_typescript_test_callback`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestFunctions {
     /// `test function` をチャンクにしない。数だけを残す。
@@ -369,8 +369,8 @@ impl FileChunks {
                 continue;
             }
 
-            let excluded_test_function =
-                test_functions == TestFunctions::Excluded && is_test_function(node, tree.source());
+            let excluded_test_function = test_functions == TestFunctions::Excluded
+                && is_test_function(node, tree.source(), tree.grammar());
             if excluded_test_function {
                 excluded_test_function_count += 1;
                 continue;
@@ -499,11 +499,19 @@ const COMMENT_KINDS: [&str; 2] = ["line_comment", "block_comment"];
 /// 走査の出力に出るので、黙って消えはしない。
 const TEST_ATTRIBUTE_NAME: &str = "test";
 
-/// そのノードが `test function`（テストの印の属性が付いた Rust の関数）か。
+/// そのノードが言語ごとの印を持つ `test function` か。
 ///
-/// `#[cfg(test)]` のモジュールの中にあることは見ない。**印の付かないヘルパーは、別の
+/// Rust の `#[cfg(test)]` や TypeScript のファイル名は見ない。**印の付かないヘルパーは、別の
 /// テストモジュールの同じヘルパーと比べたい**（`rules/testing.md`「テスト用ヘルパーの置き場所」）。
-fn is_test_function(node: Node<'_>, source: &str) -> bool {
+fn is_test_function(node: Node<'_>, source: &str, grammar: Grammar) -> bool {
+    match grammar {
+        Grammar::Rust => has_test_attribute(node, source),
+        Grammar::TypeScript | Grammar::Tsx => is_typescript_test_callback(node, source),
+    }
+}
+
+/// Rust の関数にテストの印の属性が付いているか。
+fn has_test_attribute(node: Node<'_>, source: &str) -> bool {
     let mut sibling = node.prev_named_sibling();
     while let Some(previous) = sibling {
         if previous.kind() == ATTRIBUTE_ITEM_KIND && is_test_attribute(previous, source) {
@@ -518,6 +526,67 @@ fn is_test_function(node: Node<'_>, source: &str) -> bool {
         sibling = previous.prev_named_sibling();
     }
     false
+}
+
+/// `describe` / `it` / `test`（`.only` / `.skip` を含む）の第2引数の関数か。
+///
+/// 呼び出し名だけのヒューリスティックで、同名の業務 API も対象になる。
+/// 別名・namespace・未知の修飾は残す。ファイル丸ごとの除外はヘルパーまで失うので行わない。
+fn is_typescript_test_callback(node: Node<'_>, source: &str) -> bool {
+    if !matches!(node.kind(), "arrow_function" | "function_expression") {
+        return false;
+    }
+    let argument = transparent_wrappers_of(node)
+        .last()
+        .copied()
+        .unwrap_or(node);
+    let Some(arguments) = argument
+        .parent()
+        .filter(|parent| parent.kind() == "arguments")
+    else {
+        return false;
+    };
+    let mut cursor = arguments.walk();
+    let mut values = arguments
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment");
+    let Some(first) = values.next() else {
+        return false;
+    };
+    // spread の後ろは実際の第2引数と確定できないので、通常のチャンクとして残す。
+    let is_second_argument = first.kind() != "spread_element" && values.next() == Some(argument);
+    if !is_second_argument {
+        return false;
+    }
+    let Some(call) = arguments
+        .parent()
+        .filter(|parent| parent.kind() == "call_expression")
+    else {
+        return false;
+    };
+    call.child_by_field_name("function")
+        .is_some_and(|callee| is_typescript_test_callee(callee, source))
+}
+
+/// 既知のテスト登録関数の綴りか。修飾は `.only` / `.skip` の1段だけを認める。
+fn is_typescript_test_callee(callee: Node<'_>, source: &str) -> bool {
+    if callee.kind() == IDENTIFIER_KIND {
+        return matches!(
+            source.get(callee.byte_range()),
+            Some("describe" | "it" | "test")
+        );
+    }
+    if callee.kind() != "member_expression" {
+        return false;
+    }
+    let Some(object) = callee.child_by_field_name("object") else {
+        return false;
+    };
+    let Some(property) = callee.child_by_field_name("property") else {
+        return false;
+    };
+    let known_modifier = matches!(source.get(property.byte_range()), Some("only" | "skip"));
+    object.kind() == IDENTIFIER_KIND && known_modifier && is_typescript_test_callee(object, source)
 }
 
 /// その属性（`attribute_item`）のパスの末尾が [`TEST_ATTRIBUTE_NAME`] か。
@@ -1355,6 +1424,144 @@ export function sound(value: number): number {
             .expect("テストが渡すソースは木にできる");
 
         FileChunks::from_tree(&tree, Path::new(path), TestFunctions::Excluded)
+    }
+
+    #[test]
+    fn test_file_chunks_excluding_typescript_tests_keep_nested_helpers() {
+        let source = "function production() {}\n\
+describe('suite', () => {\n\
+  function helper() {}\n\
+  it('case', function () {\n\
+    const nested = () => 1;\n\
+  });\n\
+});\n\
+test('case', async () => {});\n";
+
+        let chunks = chunks_at(source, "a.test.ts");
+
+        assert_eq!(start_lines_of(&chunks), vec![1, 3, 5]);
+        assert_eq!(chunks.excluded_test_function_count(), 3);
+    }
+
+    #[test]
+    fn test_file_chunks_including_typescript_tests_restore_callbacks() {
+        let source = "function helper() {}\nit('case', () => {});";
+        let tree = SyntaxTree::from_source(source, Grammar::TypeScript).unwrap();
+        let chunks = FileChunks::from_tree(&tree, Path::new("a.spec.ts"), TestFunctions::Included);
+
+        assert_eq!(start_lines_of(&chunks), vec![1, 2]);
+        assert_eq!(chunks.excluded_test_function_count(), 0);
+    }
+
+    #[test]
+    fn test_file_chunks_excluding_typescript_tests_recognize_modifiers() {
+        for callee in [
+            "describe.only",
+            "describe.skip",
+            "it.only",
+            "it.skip",
+            "test.only",
+            "test.skip",
+        ] {
+            let source = format!("function helper() {{}}\n{callee}('case', () => {{}});");
+            let chunks = chunks_at(&source, "ordinary.ts");
+
+            assert_eq!(start_lines_of(&chunks), vec![1], "{callee}");
+            assert_eq!(chunks.excluded_test_function_count(), 1, "{callee}");
+        }
+    }
+
+    #[test]
+    fn test_file_chunks_excluding_typescript_tests_recognize_wrapped_callbacks() {
+        for callback in [
+            "(() => {})",
+            "(() => {}) as Handler",
+            "(() => {}) satisfies Handler",
+            "<Handler>(() => {})",
+            "(() => {})!",
+        ] {
+            let source = format!("function helper() {{}}\nit('case', /* callback */ {callback});");
+            let chunks = chunks_at(&source, "a.ts");
+
+            assert_eq!(start_lines_of(&chunks), vec![1], "{callback}");
+            assert_eq!(chunks.excluded_test_function_count(), 1, "{callback}");
+        }
+    }
+
+    #[test]
+    fn test_file_chunks_excluding_typescript_tests_keep_unrecognized_calls() {
+        for call in [
+            "run('case', () => {})",
+            "api.test('case', () => {})",
+            "test.each([])('case', () => {})",
+            "it.only.skip('case', () => {})",
+            "it.concurrent('case', () => {})",
+            "(it)('case', () => {})",
+            "it(() => {}, handler)",
+            "it('case', handler, () => {})",
+            "it(...args, () => {})",
+            "it('case', wrap(() => {}))",
+            "it('case', function* () {})",
+            "new test('case', () => {})",
+        ] {
+            let source = format!("function helper() {{}}\n{call};\nit('known', () => {{}});");
+            let chunks = chunks_at(&source, "a.test.ts");
+
+            assert_eq!(start_lines_of(&chunks), vec![1, 2], "{call}");
+            assert_eq!(chunks.excluded_test_function_count(), 1, "{call}");
+        }
+    }
+
+    #[test]
+    fn test_file_chunks_excluding_typescript_tests_do_not_filter_by_file_name() {
+        for path in [
+            "a.test.ts",
+            "a.spec.ts",
+            "a-spec.ts",
+            "__tests__/a.ts",
+            "a.test.mts",
+            "a.spec.cts",
+        ] {
+            let chunks = chunks_at("function helper() {}\nit('case', () => {});", path);
+
+            assert_eq!(start_lines_of(&chunks), vec![1], "{path}");
+            assert_eq!(chunks.excluded_test_function_count(), 1, "{path}");
+        }
+    }
+
+    #[test]
+    fn test_file_chunks_excluding_tsx_tests_keep_components() {
+        let source =
+            "const Component = () => <div />;\nit('case', () => { render(<Component />); });";
+        let tree = SyntaxTree::from_source(source, Grammar::Tsx).unwrap();
+        let chunks = FileChunks::from_tree(&tree, Path::new("a.test.tsx"), TestFunctions::Excluded);
+
+        assert_eq!(start_lines_of(&chunks), vec![1]);
+        assert_eq!(chunks.excluded_test_function_count(), 1);
+        assert!(chunks.unparsable_starts().is_empty());
+    }
+
+    #[test]
+    fn test_file_chunks_excluding_typescript_tests_count_broken_callbacks_as_excluded() {
+        let source = "function helper() {}\nit('case', () => { const value = ; });";
+        let tree = SyntaxTree::from_source(source, Grammar::TypeScript).unwrap();
+        let path = Path::new("a.test.ts");
+        let excluded = FileChunks::from_tree(&tree, path, TestFunctions::Excluded);
+        let included = FileChunks::from_tree(&tree, path, TestFunctions::Included);
+
+        assert_eq!(start_lines_of(&excluded), vec![1]);
+        assert_eq!(excluded.excluded_test_function_count(), 1);
+        assert!(excluded.unparsable_starts().is_empty());
+        assert_eq!(included.unparsable_starts(), &[LineNumber::from_index(1)]);
+    }
+
+    #[test]
+    fn test_chunk_at_typescript_test_callback_is_still_available_for_compare() {
+        let source = "it('case', () => {\n  assert(true);\n});";
+        let chunk = chunk_at(source, "a.test.ts:2").unwrap();
+
+        assert_eq!(chunk.lines(), range(1, 3));
+        assert_eq!(chunk.source(), source);
     }
 
     fn rust_chunks_of(source: &str, test_functions: TestFunctions) -> FileChunks {
