@@ -61,7 +61,8 @@ if structurally_similar && domains_differ { ... }
 | `accessor` | プロパティのように読み書きされるメンバーを実装する関数（`get` / `set`）。**チャンクとしては関数**だが、`hover` が返すのは**メンバーとしての型** |
 | `test function` | テストの印の属性（パスの末尾が `test`。`#[test]` / `#[tokio::test]`）が付いた Rust の関数。**`scan` は既定でチャンクにしない**（`--include-tests` で入れる）。`#[cfg(test)]` の中にあっても**印の付かないヘルパーは含まない**。テスト関数の本体の中に書いた関数も、印が付いていないので含まない |
 | `pair` | 比較する 2 つの chunk |
-| `candidate pair` | 構造類似度が閾値に届いた pair。`scan` が判定して出すのはこれだけ |
+| `undersized chunk` | 正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない chunk。**chunk ではある**が、`scan` は候補列挙に入れない（`compare` は名指しされれば比べる）。`test function` は**chunk にしない**ので別物 |
+| `candidate pair` | 構造類似度が閾値に届いた pair。**両側とも `undersized chunk` でない**。`scan` が判定して出すのはこれだけ |
 | `gram` | 構造類似度を測るときに突き合わせる、正規化トークンの並び 1 つ分 |
 | `signal` | 判定の材料。構造類似度・型シグネチャ・呼び出し先 / 呼び出し元・モジュール距離 |
 | `verdict` | 判定の結果（`EXTRACT-CANDIDATE` / `DO-NOT-EXTRACT` / `REVIEW`） |
@@ -129,6 +130,10 @@ if structurally_similar && domains_differ { ... }
 
 `snippet` / `fragment` / `candidate`（chunk の意味で）/ `label`（verdict の意味で）は使わない。
 **`candidate` が指すのはペアであって chunk ではない。**
+
+**`undersized chunk` の下限を `configured threshold` に入れない。** 判定に当てる閾値ではなく、
+**比べる相手を決める線引き**で、`--explain` が出す「当てた閾値」にも現れない。外から動かせると、
+`scan` と `compare` で同じ 2 つの扱いが変わる理由が設定ファイルにまで散る。
 
 **`configured threshold` を、判定に当てる閾値の全部と混ぜない。** 当てる閾値には
 ディレクトリの段数（`SEPARATE_DIRECTORY_STEPS`）と呼び出し先ドメインの重なりの下限
