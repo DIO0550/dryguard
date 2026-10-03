@@ -22,6 +22,7 @@ use dryguard::domain_declaration::DomainDeclarations;
 use dryguard::lsp::ServerCommand;
 use dryguard::pipeline::{CandidatePair, Scan, scan_of, scan_of_language};
 use dryguard::report::{Explanation, scan_text_of};
+use dryguard::syntax::chunk::TestFunctions;
 
 mod common;
 
@@ -36,6 +37,7 @@ fn test_rust_scan_lists_free_functions_and_impl_methods_without_asking_typescrip
     let scan = scan_of_language(
         &root,
         SourceLanguage::Rust,
+        TestFunctions::Excluded,
         ConfiguredThresholds::default(),
         &DomainDeclarations::default(),
         &missing_server(),
@@ -88,6 +90,7 @@ fn test_auto_scan_does_not_compare_rust_with_typescript() {
     let scan = scan_of_language(
         &root,
         SourceLanguage::Auto,
+        TestFunctions::Excluded,
         ConfiguredThresholds::default(),
         &DomainDeclarations::default(),
         &missing_server(),
@@ -128,6 +131,7 @@ fn corpus_root() -> PathBuf {
 fn scan_of_root(root: &Path, server: &ServerCommand) -> Scan {
     let Ok(scan) = scan_of(
         root,
+        TestFunctions::Excluded,
         ConfiguredThresholds::default(),
         &DomainDeclarations::default(),
         server,
@@ -135,6 +139,57 @@ fn scan_of_root(root: &Path, server: &ServerCommand) -> Scan {
         panic!("テストが渡す根は走査できる: {}", root.display());
     };
     scan
+}
+
+/// `rust-tests` のフィクスチャを、`test function` の扱いを指定して走査した結果。
+fn rust_tests_scan_of(test_functions: TestFunctions) -> Scan {
+    let root = PathBuf::from(format!(
+        "{}/tests/fixtures/rust-tests",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    let Ok(scan) = scan_of_language(
+        &root,
+        SourceLanguage::Rust,
+        test_functions,
+        ConfiguredThresholds::default(),
+        &DomainDeclarations::default(),
+        &missing_server(),
+    ) else {
+        panic!("Rust のフィクスチャを走査できる");
+    };
+    scan
+}
+
+#[test]
+fn test_rust_scan_excluding_test_functions_leaves_out_the_pair_of_two_tests() {
+    // 対照として本番の関数どうしのペアを同じフィクスチャに置く。消えるのは
+    // `#[test]` 関数どうしのペアだけ
+    let scan = rust_tests_scan_of(TestFunctions::Excluded);
+
+    let pairs: Vec<(String, String)> = scan
+        .candidate_pairs()
+        .iter()
+        .map(|pair| (pair.location_a().to_string(), pair.location_b().to_string()))
+        .collect();
+    assert_eq!(scan.candidate_pairs().len(), 1, "{pairs:?}");
+    assert!(is_pair_of(
+        &scan.candidate_pairs()[0],
+        "lib.rs:1",
+        "lib.rs:5"
+    ));
+}
+
+#[test]
+fn test_rust_scan_including_test_functions_keeps_the_pair_of_two_tests() {
+    let scan = rust_tests_scan_of(TestFunctions::Included);
+
+    assert!(
+        scan.candidate_pairs()
+            .iter()
+            .any(|pair| is_pair_of(pair, "lib.rs:14", "lib.rs:19")),
+        "`--include-tests` を付けると、テスト関数どうしのペアも比べる"
+    );
+    assert_eq!(scan.excluded_test_function_count(), 0);
 }
 
 /// そのペアが、コーパスの中の 2 箇所（`<相対パス>:<行>`）を指しているか。

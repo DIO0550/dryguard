@@ -59,6 +59,7 @@ if structurally_similar && domains_differ { ... }
 | `grammar` | ソースを読むのに使う tree-sitter の文法。拡張子で決まる（`.ts` / `.tsx` / `.mts` / `.cts`） |
 | `chunk` | 比較の単位。関数・メソッド・impl ブロック |
 | `accessor` | プロパティのように読み書きされるメンバーを実装する関数（`get` / `set`）。**チャンクとしては関数**だが、`hover` が返すのは**メンバーとしての型** |
+| `test function` | テストの印の属性（パスの末尾が `test`。`#[test]` / `#[tokio::test]`）が付いた Rust の関数。**`scan` は既定でチャンクにしない**（`--include-tests` で入れる）。`#[cfg(test)]` の中にあっても**印の付かないヘルパーは含まない**。テスト関数の本体の中に書いた関数も、印が付いていないので含まない |
 | `pair` | 比較する 2 つの chunk |
 | `candidate pair` | 構造類似度が閾値に届いた pair。`scan` が判定して出すのはこれだけ |
 | `gram` | 構造類似度を測るときに突き合わせる、正規化トークンの並び 1 つ分 |

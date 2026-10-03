@@ -24,6 +24,7 @@ use dryguard::location::Location;
 use dryguard::lsp::ServerCommand;
 use dryguard::pipeline::{chunk_pair_of, measured_pair_of, scan_with_language_servers};
 use dryguard::report::{Explanation, json_of, scan_json_of, scan_text_of, text_of};
+use dryguard::syntax::chunk::TestFunctions;
 use dryguard::syntax::tree::Grammar;
 
 fn main() -> ExitCode {
@@ -48,7 +49,17 @@ fn main() -> ExitCode {
             location_a,
             location_b,
         } => report_compare(location_a, location_b, &cli.options, &settings),
-        Command::Scan { path } => report_scan(path, &cli.options, &settings),
+        Command::Scan {
+            path,
+            include_tests,
+        } => {
+            let test_functions = if *include_tests {
+                TestFunctions::Included
+            } else {
+                TestFunctions::Excluded
+            };
+            report_scan(path, test_functions, &cli.options, &settings)
+        }
     }
 }
 
@@ -155,7 +166,12 @@ fn report_compare(
 ///
 /// **LSP サーバを使えなくても失敗にしない。** 理由を stderr へ回す分担は
 /// [`report_compare`] と同じ（stdout は判定の出力に保つ）。
-fn report_scan(root: &Path, options: &CommonOptions, settings: &Settings<'_>) -> ExitCode {
+fn report_scan(
+    root: &Path,
+    test_functions: TestFunctions,
+    options: &CommonOptions,
+    settings: &Settings<'_>,
+) -> ExitCode {
     let language = match options.lang {
         LanguageOption::Ts => SourceLanguage::TypeScript,
         LanguageOption::Rust => SourceLanguage::Rust,
@@ -164,6 +180,7 @@ fn report_scan(root: &Path, options: &CommonOptions, settings: &Settings<'_>) ->
     let scan = match scan_with_language_servers(
         root,
         language,
+        test_functions,
         settings.thresholds,
         settings.declarations,
         &ServerCommand::typescript(),

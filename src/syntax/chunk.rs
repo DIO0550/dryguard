@@ -305,6 +305,21 @@ impl Chunk {
 pub struct FileChunks {
     chunks: Vec<Chunk>,
     unparsable_starts: Vec<LineNumber>,
+    excluded_test_function_count: usize,
+}
+
+/// `test function`（`#[test]` の付いた Rust の関数）をチャンクにするか。
+///
+/// **外す既定を持たない。** 既定は入口（`scan` の `--include-tests`）が決め、
+/// `compare` は位置を名指ししているので外さない（[`Chunk::find_enclosing`] は見ない）。
+///
+/// TypeScript は構文にテストの印が無いので、どちらでも同じチャンクになる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestFunctions {
+    /// `test function` をチャンクにしない。数だけを残す。
+    Excluded,
+    /// `test function` もほかの関数と同じくチャンクにする。
+    Included,
 }
 
 impl FileChunks {
@@ -316,13 +331,26 @@ impl FileChunks {
     ///
     /// 構文エラーのある関数はチャンクにせず、始まりの行だけを残す
     /// ([`Chunk::find_enclosing`] が [`ChunkingError::UnparsableFunction`] で断るのと同じ扱い)。
-    pub fn from_tree(tree: &SyntaxTree<'_>, path: &Path) -> Self {
+    ///
+    /// `test_functions` は `test function` をチャンクにするか。[`TestFunctions::Excluded`] で
+    /// 外した関数は、構文エラーがあっても始まりの行には入れず、**数だけを残す**
+    /// （比べるつもりの無い関数を「切り出せなかった」と出さない）。外すのはその関数だけで、
+    /// 本体の中に書いた関数は印が付いていないので残る（入れ子の扱いと同じ）。
+    pub fn from_tree(tree: &SyntaxTree<'_>, path: &Path, test_functions: TestFunctions) -> Self {
         let imports = ImportSet::from_tree(tree, path);
         let mut chunks = Vec::new();
         let mut unparsable_starts = Vec::new();
+        let mut excluded_test_function_count = 0;
 
         for node in tree.named_descendants() {
             if !is_chunk_node(node, tree.grammar()) {
+                continue;
+            }
+
+            let excluded_test_function =
+                test_functions == TestFunctions::Excluded && is_test_function(node, tree.source());
+            if excluded_test_function {
+                excluded_test_function_count += 1;
                 continue;
             }
 
@@ -344,6 +372,7 @@ impl FileChunks {
         Self {
             chunks,
             unparsable_starts,
+            excluded_test_function_count,
         }
     }
 
@@ -355,6 +384,11 @@ impl FileChunks {
     /// 構文エラーで切り出せなかった関数の、始まりの行。
     pub fn unparsable_starts(&self) -> &[LineNumber] {
         &self.unparsable_starts
+    }
+
+    /// [`TestFunctions::Excluded`] で外した `test function` の数。`Included` なら 0。
+    pub fn excluded_test_function_count(&self) -> usize {
+        self.excluded_test_function_count
     }
 }
 
@@ -426,6 +460,58 @@ fn is_chunk_node(node: Node<'_>, grammar: Grammar) -> bool {
         return node.kind() == "function_item" && node.child_by_field_name("body").is_some();
     }
     CHUNK_KINDS.contains(&node.kind())
+}
+
+/// 属性を表すノードの種別。Rust の文法では、付けた相手の**直前の兄弟**として並ぶ。
+const ATTRIBUTE_ITEM_KIND: &str = "attribute_item";
+
+/// 属性と付けた相手の間に挟まってよいノードの種別（`///` の doc も行コメント）。
+const COMMENT_KINDS: [&str; 2] = ["line_comment", "block_comment"];
+
+/// テストの印とみなす属性のパスの、末尾の区切り。
+///
+/// `#[test]` / `#[tokio::test]` / `#[async_std::test]` がこれに当たる。**一覧から漏れた属性
+/// （`#[rstest]` など）の関数はチャンクとして残る**ので、漏れても外す前と同じ振る舞いに
+/// 倒れるだけ（`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」）。
+/// 逆に末尾だけを見るので、テストでない `#[foo::test]` の関数も外す。外した数は
+/// 走査の出力に出るので、黙って消えはしない。
+const TEST_ATTRIBUTE_NAME: &str = "test";
+
+/// そのノードが `test function`（テストの印の属性が付いた Rust の関数）か。
+///
+/// `#[cfg(test)]` のモジュールの中にあることは見ない。**印の付かないヘルパーは、別の
+/// テストモジュールの同じヘルパーと比べたい**（`rules/testing.md`「テスト用ヘルパーの置き場所」）。
+fn is_test_function(node: Node<'_>, source: &str) -> bool {
+    let mut sibling = node.prev_named_sibling();
+    while let Some(previous) = sibling {
+        if previous.kind() == ATTRIBUTE_ITEM_KIND && is_test_attribute(previous, source) {
+            return true;
+        }
+
+        let still_attached =
+            previous.kind() == ATTRIBUTE_ITEM_KIND || COMMENT_KINDS.contains(&previous.kind());
+        if !still_attached {
+            return false;
+        }
+        sibling = previous.prev_named_sibling();
+    }
+    false
+}
+
+/// その属性（`attribute_item`）のパスの末尾が [`TEST_ATTRIBUTE_NAME`] か。
+///
+/// 引数付きの属性（`#[cfg(test)]`）はパスが `cfg` なので当たらない。
+fn is_test_attribute(attribute_item: Node<'_>, source: &str) -> bool {
+    let Some(path) = attribute_item
+        .named_child(0)
+        .and_then(|attribute| attribute.named_child(0))
+    else {
+        return false;
+    };
+    let Some(path_text) = source.get(path.byte_range()) else {
+        return false;
+    };
+    path_text.rsplit("::").next() == Some(TEST_ATTRIBUTE_NAME)
 }
 
 /// オーバーロード宣言を表すノードの種別。
@@ -1246,7 +1332,157 @@ export function sound(value: number): number {
         let tree = SyntaxTree::from_source(source, Grammar::TypeScript)
             .expect("テストが渡すソースは木にできる");
 
-        FileChunks::from_tree(&tree, Path::new(path))
+        FileChunks::from_tree(&tree, Path::new(path), TestFunctions::Excluded)
+    }
+
+    fn rust_chunks_of(source: &str, test_functions: TestFunctions) -> FileChunks {
+        let tree =
+            SyntaxTree::from_source(source, Grammar::Rust).expect("テストが渡すソースは木にできる");
+
+        FileChunks::from_tree(&tree, Path::new("src/a.rs"), test_functions)
+    }
+
+    fn start_lines_of(file_chunks: &FileChunks) -> Vec<usize> {
+        file_chunks
+            .chunks()
+            .iter()
+            .map(|chunk| chunk.lines().start().get())
+            .collect()
+    }
+
+    /// 本番の関数 1 つと、テストモジュールの中のヘルパー 1 つと `#[test]` 関数 1 つ。
+    const PRODUCTION_HELPER_AND_TEST: &str = r#"pub fn total(values: &[u32]) -> u32 {
+    values.iter().sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn values_of() -> Vec<u32> {
+        vec![1, 2]
+    }
+
+    #[test]
+    fn test_total_of_two_values_is_their_sum() {
+        assert_eq!(total(&values_of()), 3);
+    }
+}
+"#;
+
+    #[test]
+    fn test_file_chunks_excluding_test_functions_leave_out_a_function_marked_test() {
+        // 対照として本番の関数を同じソースに置く。外れるのは `#[test]` の付いた側だけ
+        let file_chunks = rust_chunks_of(PRODUCTION_HELPER_AND_TEST, TestFunctions::Excluded);
+
+        assert!(
+            !start_lines_of(&file_chunks).contains(&14),
+            "`#[test]` 関数はチャンクにしない"
+        );
+        assert!(start_lines_of(&file_chunks).contains(&1));
+    }
+
+    #[test]
+    fn test_file_chunks_excluding_test_functions_keep_a_helper_inside_the_test_module() {
+        // テストモジュールの中でも `#[test]` の付かない関数は、別のテストモジュールの
+        // 同じヘルパーと比べたいので残す
+        let file_chunks = rust_chunks_of(PRODUCTION_HELPER_AND_TEST, TestFunctions::Excluded);
+
+        assert_eq!(start_lines_of(&file_chunks), vec![1, 9]);
+    }
+
+    #[test]
+    fn test_file_chunks_including_test_functions_keep_a_function_marked_test() {
+        let file_chunks = rust_chunks_of(PRODUCTION_HELPER_AND_TEST, TestFunctions::Included);
+
+        assert_eq!(start_lines_of(&file_chunks), vec![1, 9, 14]);
+    }
+
+    #[test]
+    fn test_file_chunks_excluding_test_functions_count_the_functions_they_left_out() {
+        let file_chunks = rust_chunks_of(PRODUCTION_HELPER_AND_TEST, TestFunctions::Excluded);
+
+        assert_eq!(file_chunks.excluded_test_function_count(), 1);
+    }
+
+    #[test]
+    fn test_file_chunks_including_test_functions_count_nothing_as_left_out() {
+        let file_chunks = rust_chunks_of(PRODUCTION_HELPER_AND_TEST, TestFunctions::Included);
+
+        assert_eq!(file_chunks.excluded_test_function_count(), 0);
+    }
+
+    #[test]
+    fn test_file_chunks_excluding_test_functions_leave_out_a_function_marked_with_a_scoped_test_attribute()
+     {
+        let async_test = r#"fn plain() -> u32 {
+    1
+}
+
+#[tokio::test]
+async fn test_async() {
+    assert_eq!(plain(), 1);
+}
+"#;
+
+        let file_chunks = rust_chunks_of(async_test, TestFunctions::Excluded);
+
+        assert_eq!(start_lines_of(&file_chunks), vec![1]);
+    }
+
+    #[test]
+    fn test_file_chunks_excluding_test_functions_leave_out_a_test_whose_test_attribute_is_not_the_nearest()
+     {
+        // `#[test]` の後ろに別の属性とコメントが挟まっても、同じ関数に付いた属性
+        let with_other_attributes = r#"fn plain() -> u32 {
+    1
+}
+
+#[test]
+#[should_panic]
+// 落ちることを確かめる
+fn test_panics() {
+    panic!("boom");
+}
+"#;
+
+        let file_chunks = rust_chunks_of(with_other_attributes, TestFunctions::Excluded);
+
+        assert_eq!(start_lines_of(&file_chunks), vec![1]);
+    }
+
+    #[test]
+    fn test_file_chunks_excluding_test_functions_keep_a_function_whose_attribute_only_mentions_test()
+     {
+        // `#[cfg(test)]` はテストのときだけ入る関数で、テストそのものではない
+        let test_only_helper = r#"#[cfg(test)]
+fn fixture() -> u32 {
+    1
+}
+"#;
+
+        let file_chunks = rust_chunks_of(test_only_helper, TestFunctions::Excluded);
+
+        assert_eq!(start_lines_of(&file_chunks), vec![2]);
+    }
+
+    #[test]
+    fn test_file_chunks_excluding_test_functions_keep_a_function_after_a_test_function() {
+        // 属性は直前の兄弟として並ぶので、前の関数に付いた `#[test]` を後ろの関数の
+        // ものと取り違えない
+        let test_then_plain = r#"#[test]
+fn test_first() {
+    assert!(true);
+}
+
+fn plain() -> u32 {
+    1
+}
+"#;
+
+        let file_chunks = rust_chunks_of(test_then_plain, TestFunctions::Excluded);
+
+        assert_eq!(start_lines_of(&file_chunks), vec![6]);
     }
 
     #[test]

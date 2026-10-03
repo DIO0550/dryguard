@@ -21,7 +21,7 @@ use dryguard::semantics::type_signature::{
     TypeSignatureOutcome, UntracedReason, rust_type_signature_outcome_of,
 };
 use dryguard::source_position::SourcePosition;
-use dryguard::syntax::chunk::Chunk;
+use dryguard::syntax::chunk::{Chunk, TestFunctions};
 use dryguard::syntax::tree::{Grammar, SyntaxTree};
 use dryguard::threshold::Threshold;
 
@@ -128,6 +128,7 @@ fn test_rust_scan_asks_candidates_in_one_session() {
     let scan = scan_of_language(
         &root,
         SourceLanguage::Rust,
+        TestFunctions::Excluded,
         ConfiguredThresholds::default(),
         &DomainDeclarations::default(),
         &ServerCommand::rust(),

@@ -10,12 +10,14 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use crate::classification::ConfiguredThresholds;
+use crate::codebase::SourceLanguage;
 use crate::domain_declaration::{DomainDeclaration, DomainDeclarations, DomainName};
 use crate::line_number::LineNumber;
 use crate::location::Location;
 use crate::lsp::{DeclarationSite, ServerCommand, SignatureText};
-use crate::pipeline::{Scan, scan_of};
+use crate::pipeline::{Scan, scan_of, scan_of_language};
 use crate::source_position::SourcePosition;
+use crate::syntax::chunk::TestFunctions;
 
 /// このリポジトリの中のパス。
 ///
@@ -143,7 +145,29 @@ pub(crate) fn scan_of_fixture(relative_path: &str, thresholds: ConfiguredThresho
 
     scan_of(
         &root,
+        TestFunctions::Excluded,
         thresholds,
+        &DomainDeclarations::default(),
+        &missing_server(),
+    )
+    .expect("フィクスチャのディレクトリは走査できる")
+}
+
+/// `tests/fixtures/` の下の Rust のディレクトリを、`test function` を外して走査した結果。
+///
+/// サーバの扱いは [`scan_of_fixture`] と同じ。
+///
+/// # Panics
+///
+/// [`scan_of_fixture`] と同じ。
+pub(crate) fn rust_scan_of_fixture(relative_path: &str) -> Scan {
+    let root = repository_path(&format!("tests/fixtures/{relative_path}"));
+
+    scan_of_language(
+        &root,
+        SourceLanguage::Rust,
+        TestFunctions::Excluded,
+        ConfiguredThresholds::default(),
         &DomainDeclarations::default(),
         &missing_server(),
     )

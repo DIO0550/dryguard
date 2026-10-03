@@ -209,15 +209,28 @@ fn listed_block_of(heading: &str, items: impl Iterator<Item = String>) -> Option
 ///
 /// 比べたペアの内訳（長さの上限だけで確定した数）も出す。省いた数が読めないと、
 /// 同じ「比較 N ペア」がどれだけの突き合わせを指すのかが回ごとに変わって見える。
+/// 同じ理由で、チャンクにしなかった `test function` の数も出す。
 fn walked_text_of(scan: &Scan) -> String {
     format!(
-        "対象 {} ファイル / チャンク {} 件 / 比較 {} ペア（うち長さで確定 {} ペア）/ 候補 {} ペア",
+        "対象 {} ファイル / チャンク {} 件{} / 比較 {} ペア（うち長さで確定 {} ペア）/ 候補 {} ペア",
         scan.file_count(),
         scan.chunk_count(),
+        excluded_test_functions_text_of(scan.excluded_test_function_count()),
         scan.compared_pair_count(),
         scan.pruned_pair_count(),
         scan.candidate_pairs().len()
     )
+}
+
+/// チャンクの数に添える、外した `test function` の数。外していなければ何も添えない。
+///
+/// 0 件でも出すと、テストの印を持たない TypeScript の走査にまで「テスト関数 0 件」が並び、
+/// **テストを見分けたうえで 0 件だった**ように読める。
+fn excluded_test_functions_text_of(count: usize) -> String {
+    if count == 0 {
+        return String::new();
+    }
+    format!("（テスト関数 {count} 件を除外）")
 }
 
 /// 根拠の行。見出し `理由:` は最初の 1 件にだけ付け、続きは同じ桁から始める。
@@ -752,7 +765,9 @@ mod tests {
     use crate::similarity::Similarity;
     use crate::syntax::import::ImportsUnavailable;
     use crate::syntax::module_distance::ModuleDistance;
-    use crate::test_support::{declarations_of, location, overload_count, scan_of_fixture};
+    use crate::test_support::{
+        declarations_of, location, overload_count, rust_scan_of_fixture, scan_of_fixture,
+    };
     use crate::threshold::Threshold;
 
     fn measured(value: f64) -> Similarity {
@@ -1219,6 +1234,28 @@ mod tests {
             ),
             "走査した量と、突き合わせを省いた内訳が読める: {text}"
         );
+    }
+
+    #[test]
+    fn test_scan_text_of_reports_the_test_functions_it_left_out() {
+        let text = scan_text_of(
+            &rust_scan_of_fixture("rust-tests"),
+            Explanation::AskedSignals,
+        );
+
+        assert!(
+            text.contains("チャンク 2 件（テスト関数 2 件を除外） / "),
+            "外したテスト関数の数が、切り出したチャンクの数と並んで読める: {text}"
+        );
+    }
+
+    #[test]
+    fn test_scan_text_of_a_walk_without_test_functions_leaves_the_count_out() {
+        // 対照は上のテスト。外したものが無ければ、TypeScript の走査に
+        // 「テスト関数 0 件」を並べない
+        let text = scan_text_of_fixture();
+
+        assert!(!text.contains("テスト関数"), "{text}");
     }
 
     #[test]
