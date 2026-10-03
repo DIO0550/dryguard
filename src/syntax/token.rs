@@ -117,10 +117,20 @@ const COMMENT_KIND: &str = "comment";
 ///
 /// 1 にすると並びを見ないのと同じで、長くすると少しの違いで共通する並びが無くなる。
 /// クローン検出で使われる 3-5 の下限を採る。
-///
-/// **Why not（短いチャンクに最小トークン数の下限を置く）**: 下限を偽陽性（Issue #86 の
-/// `allocate` は 49 トークン）に届く高さにすると、真陽性（`taxFor` 37 / `netOf` 43）が先に消える。
 const GRAM_LENGTH: usize = 3;
+
+/// 比べるのに要るトークン列の長さの下限。`scan` はこれに届かないチャンクを比べない。
+///
+/// 1〜3 行のアクセサ・委譲（`fn x(&self) -> T { self.x }` で 20、`&self.root` を返す
+/// `pub(crate)` の getter で 27）は形が 1 つしかなく、どれとも構造類似度 1.0 で並ぶ。
+/// 共通化してよいと言えば偽陽性で、するなと言っても誰も共通化しようとしないので情報が無い。
+/// 値は、同じく 3 行の真陽性（`taxFor` 37 / `netOf` 43）を残せる高さに置く。
+///
+/// **Why not（行数で測る）**: 真陽性の `taxFor` / `netOf` も 3 行で、アクセサと行数では分けられない。
+///
+/// **Why not（下限を偽陽性に届く高さにする）**: `allocate`（49 トークン）まで外すと、
+/// 真陽性（37 / 43）が先に消える。下限が外すのは、形が 1 つしかない短さだけ。
+const MINIMUM_TOKEN_COUNT: usize = 30;
 
 /// ノードの種別から、正規化の仕方を決める。
 ///
@@ -187,6 +197,11 @@ impl TokenSequence {
             return None;
         }
         Some(Self(tokens))
+    }
+
+    /// 比べるのに要る長さ（[`MINIMUM_TOKEN_COUNT`]）に届いているか。
+    pub fn is_long_enough_to_compare(&self) -> bool {
+        self.0.len() >= MINIMUM_TOKEN_COUNT
     }
 
     /// 2 つのトークン列の似かた。1.0 が完全一致。
@@ -574,5 +589,19 @@ mod tests {
             ceiling < 0.5,
             "長さが 2 倍以上離れた組の上限は 0.5 を切る: {ceiling}"
         );
+    }
+
+    #[test]
+    fn test_a_sequence_as_long_as_the_minimum_is_long_enough_to_compare() {
+        let at_the_minimum = TokenSequence(vec![syntax("identifier"); MINIMUM_TOKEN_COUNT]);
+
+        assert!(at_the_minimum.is_long_enough_to_compare());
+    }
+
+    #[test]
+    fn test_a_sequence_one_token_short_of_the_minimum_is_not_long_enough_to_compare() {
+        let one_short = TokenSequence(vec![syntax("identifier"); MINIMUM_TOKEN_COUNT - 1]);
+
+        assert!(!one_short.is_long_enough_to_compare());
     }
 }

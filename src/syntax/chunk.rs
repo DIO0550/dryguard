@@ -284,6 +284,17 @@ impl Chunk {
         self.tokens.as_ref()
     }
 
+    /// 比べるには小さすぎるか（`undersized chunk`）。`scan` はこれを候補列挙に入れない。
+    ///
+    /// トークン列が無いチャンクは `false`。**長さを測る材料が無い**ので小さいとは言えず、
+    /// 候補列挙へ回して構造類似度の「測れない」に任せる。関数のノードは少なくとも
+    /// キーワードのトークンを持つので、切り出したチャンクでこの枝に入ることは今は無い。
+    pub fn is_undersized(&self) -> bool {
+        self.tokens
+            .as_ref()
+            .is_some_and(|tokens| !tokens.is_long_enough_to_compare())
+    }
+
     /// このチャンクがあるファイルの、依存先の集合。
     ///
     /// # Errors
@@ -2558,5 +2569,39 @@ export function scale(a: unknown, rate?: unknown): unknown {
         let chunk = chunk_at(plain, "a.ts:1").expect("切り出せる");
 
         assert!(chunk.type_references().is_empty());
+    }
+
+    #[test]
+    fn test_chunk_of_an_accessor_returning_a_field_is_undersized() {
+        // 1〜3 行のアクセサは形が 1 つしかなく、どれとも構造類似度 1.0 で並ぶ（Issue #271）
+        let accessor = r#"impl Signals {
+    pub fn structural_similarity(&self) -> StructuralSimilarity {
+        self.structural_similarity
+    }
+}
+"#;
+        let file_chunks = rust_chunks_of(accessor, TestFunctions::Excluded);
+        let chunk = file_chunks
+            .chunks()
+            .iter()
+            .find(|chunk| chunk.lines().start().to_index() == 1)
+            .expect("2 行目のメソッドがチャンクになる");
+
+        assert!(chunk.is_undersized());
+    }
+
+    #[test]
+    fn test_chunk_of_a_three_line_function_that_does_its_own_work_is_not_undersized() {
+        // 行数ではアクセサと同じ 3 行。下限をここまで上げると、構造の重複の真陽性が消える
+        let tax_for = r#"export function taxFor(amount: number, rate: number = DEFAULT_RATE): number {
+  return roundToCents(amount * rate);
+}
+"#;
+        let file_chunks = chunks_at(tax_for, "src/billing/tax.ts");
+        let [chunk] = file_chunks.chunks() else {
+            panic!("関数 1 つがチャンクになる");
+        };
+
+        assert!(!chunk.is_undersized());
     }
 }

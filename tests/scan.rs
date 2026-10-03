@@ -192,6 +192,38 @@ fn test_rust_scan_including_test_functions_keeps_the_pair_of_two_tests() {
     assert_eq!(scan.excluded_test_function_count(), 0);
 }
 
+#[test]
+fn test_rust_scan_leaves_out_the_pair_of_two_accessors_and_counts_them() {
+    // 対照として、下限に届く大きさの似た 2 つを同じフィクスチャに置く。
+    // 消えるのはアクセサどうしのペアだけ
+    let root = PathBuf::from(format!(
+        "{}/tests/fixtures/rust-undersized",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    let scan = scan_of_language(
+        &root,
+        SourceLanguage::Rust,
+        TestFunctions::Excluded,
+        ConfiguredThresholds::default(),
+        &DomainDeclarations::default(),
+        &missing_server(),
+    )
+    .expect("Rust のフィクスチャを走査できる");
+
+    let pairs: Vec<(String, String)> = scan
+        .candidate_pairs()
+        .iter()
+        .map(|pair| (pair.location_a().to_string(), pair.location_b().to_string()))
+        .collect();
+    assert_eq!(scan.candidate_pairs().len(), 1, "{pairs:?}");
+    assert!(is_pair_of(
+        &scan.candidate_pairs()[0],
+        "lib.rs:15",
+        "lib.rs:20"
+    ));
+    assert_eq!(scan.undersized_chunk_count(), 2);
+}
+
 /// そのペアが、コーパスの中の 2 箇所（`<相対パス>:<行>`）を指しているか。
 fn is_pair_of(pair: &CandidatePair, one: &str, other: &str) -> bool {
     let ends_with_both = |left: &str, right: &str| {
@@ -256,13 +288,18 @@ fn test_scan_of_the_corpus_leaves_out_a_pair_that_is_not_structurally_similar() 
 
 #[test]
 fn test_scan_of_the_corpus_compares_every_pair_of_chunks_it_found() {
-    // 47 関数 / 1081 ペアは `docs/dryguard-plan.md`「Stage 1」と
-    // `classification` の既定閾値が拠っているコーパスの大きさ。ここがずれたら、
-    // 閾値を決めたときの母数がもう成り立っていない
+    // 47 関数は `docs/dryguard-plan.md`「Stage 1」と `classification` の既定閾値が
+    // 拠っているコーパスの大きさ。ここがずれたら、閾値を決めたときの母数がもう成り立っていない。
+    // 比べるのは小さすぎる 1 関数（`shouldRetry`）を除いた 46 関数の総当たり
     let scan = scan_of_corpus();
 
-    assert_eq!(scan.chunk_count(), 47, "コーパスの関数の数");
-    assert_eq!(scan.compared_pair_count(), 1081, "総当たりのペアの数");
+    assert_eq!(
+        scan.chunk_count() + scan.undersized_chunk_count(),
+        47,
+        "コーパスの関数の数"
+    );
+    assert_eq!(scan.undersized_chunk_count(), 1, "比べない小さい関数の数");
+    assert_eq!(scan.compared_pair_count(), 1035, "総当たりのペアの数");
 }
 
 #[test]
@@ -271,7 +308,7 @@ fn test_scan_of_the_corpus_keeps_every_candidate_pair_it_can_reach() {
     // 落としてはならない。落ちればこの数が減る
     let scan = scan_of_corpus();
 
-    assert_eq!(scan.candidate_pairs().len(), 65, "閾値に届いたペアの数");
+    assert_eq!(scan.candidate_pairs().len(), 64, "閾値に届いたペアの数");
 }
 
 #[test]
@@ -493,7 +530,7 @@ fn pair_text_of(scan: &Scan, one: &str, other: &str) -> Option<String> {
 #[test]
 fn test_scan_of_the_corpus_rules_out_pairs_whose_lengths_are_too_far_apart() {
     // 上限だけで確定できるペアが 1 組も無いなら、枝刈りは何も飛ばしていない。
-    // 対照は上のテスト（候補 65 組）。飛ばしすぎればあちらが落ちる
+    // 対照は上のテスト（候補 64 組）。飛ばしすぎればあちらが落ちる
     let scan = scan_of_corpus();
 
     assert!(
