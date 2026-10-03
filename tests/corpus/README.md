@@ -29,7 +29,7 @@ TypeScript で、5 ドメイン（`billing` / `inventory` / `shipping` / `notifi
 | `test_scan_of_the_corpus_compares_every_pair_of_chunks_it_found` | 関数 47（比べたチャンク 46 + 小さいチャンク 1）・総ペア 1035 | 既定の閾値を決めたときの母数がまだ成り立っていること |
 | `test_scan_of_the_corpus_keeps_every_candidate_pair_it_can_reach` | 候補ペア 64 | 枝刈りが候補を 1 組も落としていないこと |
 
-`scan` は正規化トークンが 30 に届かない関数（`notification/queue.ts` の `shouldRetry`）を比べないので、
+`scan` は正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない関数（`notification/queue.ts` の `shouldRetry`）を比べないので、
 総当たりは 46 関数の 1035 ペアになる（Issue #271）。閾値を決めたときに測った 1081 ペアは、
 47 関数すべてを比べた数。
 
@@ -73,7 +73,7 @@ Issue #17 のゲートのうち、このコーパスで答えられるのは**�
 
 **ただし形が 1 つしかない短さは残っていた。** `fn x(&self) -> T { self.x }` の形のアクセサどうしは、
 3-gram でも構造類似度 1.0 で並ぶ（dryguard 自身の `src` で、片側が 3 行以下のペアが候補の 8 割）。
-こちらは閾値ではなく、**`scan` が正規化トークン 30 未満の関数を比べない**ことで落とした
+こちらは閾値ではなく、**`scan` が正規化トークンの下限に届かない関数を比べない**ことで落とした
 （[Issue #271](https://github.com/DIO0550/dryguard/issues/271)。`compare` は名指しされれば比べる）。`import` の希釈は未解決（[Issue #87](https://github.com/DIO0550/dryguard/issues/87)）。
 
 ## 書くときの約束

@@ -92,7 +92,7 @@ LSP が使えなかったことを終了コードで区別するかは、まだ�
 `scan` は `.ts` / `.tsx` / `.mts` / `.cts` / `.rs` を見る。`--lang ts` / `--lang rust` で
 対象を絞り、`auto` では両方を走査する（異なる言語の関数同士は比較しない）。Rust の
 自由関数・`impl` 内のメソッド・トレイト実装のメソッドをそれぞれ 1 チャンクにする。
-正規化トークンが 30 に届かない関数（1〜3 行のアクセサ・委譲）は `scan` では比べず、
+正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない関数（1〜3 行のアクセサ・委譲）は `scan` では比べず、
 外した数を走査量の行に出す（`compare` は名指しされれば比べる）。
 CLI は拡張子から TypeScript と Rust の LSP サーバを選ぶ。`scan --lang auto` では
 言語ごとに候補を揃え、TypeScript は typescript-language-server、Rust は rust-analyzer の

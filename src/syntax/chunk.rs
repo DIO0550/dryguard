@@ -287,7 +287,8 @@ impl Chunk {
     /// 比べるには小さすぎるか（`undersized chunk`）。`scan` はこれを候補列挙に入れない。
     ///
     /// トークン列が無いチャンクは `false`。**長さを測る材料が無い**ので小さいとは言えず、
-    /// 候補列挙へ回して構造類似度の「測れない」に任せる。
+    /// 候補列挙へ回して構造類似度の「測れない」に任せる。関数のノードは少なくとも
+    /// キーワードのトークンを持つので、切り出したチャンクでこの枝に入ることは今は無い。
     pub fn is_undersized(&self) -> bool {
         self.tokens
             .as_ref()
@@ -2591,7 +2592,7 @@ export function scale(a: unknown, rate?: unknown): unknown {
 
     #[test]
     fn test_chunk_of_a_three_line_function_that_does_its_own_work_is_not_undersized() {
-        // 行数ではアクセサと同じ 3 行。下限がこれまで外すと、構造の重複の真陽性が消える
+        // 行数ではアクセサと同じ 3 行。下限をここまで上げると、構造の重複の真陽性が消える
         let tax_for = r#"export function taxFor(amount: number, rate: number = DEFAULT_RATE): number {
   return roundToCents(amount * rate);
 }
