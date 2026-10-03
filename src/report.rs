@@ -209,28 +209,37 @@ fn listed_block_of(heading: &str, items: impl Iterator<Item = String>) -> Option
 ///
 /// 比べたペアの内訳（長さの上限だけで確定した数）も出す。省いた数が読めないと、
 /// 同じ「比較 N ペア」がどれだけの突き合わせを指すのかが回ごとに変わって見える。
-/// 同じ理由で、チャンクにしなかった `test function` の数も出す。
+/// 同じ理由で、比べなかった関数（`test function` と `undersized chunk`）の数も出す。
 fn walked_text_of(scan: &Scan) -> String {
     format!(
         "対象 {} ファイル / チャンク {} 件{} / 比較 {} ペア（うち長さで確定 {} ペア）/ 候補 {} ペア",
         scan.file_count(),
         scan.chunk_count(),
-        excluded_test_functions_text_of(scan.excluded_test_function_count()),
+        left_out_text_of(scan),
         scan.compared_pair_count(),
         scan.pruned_pair_count(),
         scan.candidate_pairs().len()
     )
 }
 
-/// チャンクの数に添える、外した `test function` の数。外していなければ何も添えない。
+/// チャンクの数に添える、比べなかった関数の内訳。1 件も無ければ何も添えない。
 ///
-/// 0 件でも出すと、テストの印を持たない TypeScript の走査にまで「テスト関数 0 件」が並び、
+/// 0 件の内訳は並べない。テストの印を持たない TypeScript の走査にまで「テスト関数 0 件」が並ぶと、
 /// **テストを見分けたうえで 0 件だった**ように読める。
-fn excluded_test_functions_text_of(count: usize) -> String {
-    if count == 0 {
+fn left_out_text_of(scan: &Scan) -> String {
+    let counts = [
+        ("テスト関数", scan.excluded_test_function_count()),
+        ("小さいチャンク", scan.undersized_chunk_count()),
+    ];
+    let parts: Vec<String> = counts
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(name, count)| format!("{name} {count} 件"))
+        .collect();
+    if parts.is_empty() {
         return String::new();
     }
-    format!("（テスト関数 {count} 件を除外）")
+    format!("（{}を除外）", parts.join("・"))
 }
 
 /// 根拠の行。見出し `理由:` は最初の 1 件にだけ付け、続きは同じ桁から始める。
@@ -1230,7 +1239,7 @@ mod tests {
 
         assert!(
             text.contains(
-                "対象 8 ファイル / チャンク 6 件 / 比較 14 ペア（うち長さで確定 5 ペア）/ 候補 1 ペア"
+                "対象 8 ファイル / チャンク 6 件 / 比較 14 ペア（うち長さで確定 3 ペア）/ 候補 1 ペア"
             ),
             "走査した量と、突き合わせを省いた内訳が読める: {text}"
         );
@@ -1256,6 +1265,32 @@ mod tests {
         let text = scan_text_of_fixture();
 
         assert!(!text.contains("テスト関数"), "{text}");
+    }
+
+    #[test]
+    fn test_scan_text_of_reports_the_undersized_chunks_it_left_out() {
+        let text = scan_text_of(
+            &rust_scan_of_fixture("rust-undersized"),
+            Explanation::AskedSignals,
+        );
+
+        assert!(
+            text.contains("チャンク 2 件（小さいチャンク 2 件を除外） / "),
+            "比べなかった小さいチャンクの数が、比べたチャンクの数と並んで読める: {text}"
+        );
+    }
+
+    #[test]
+    fn test_scan_text_of_a_walk_with_both_left_out_lists_them_in_one_parenthesis() {
+        let text = scan_text_of(
+            &rust_scan_of_fixture("rust-tests"),
+            Explanation::AskedSignals,
+        );
+
+        assert!(
+            !text.contains("）（"),
+            "除外の内訳を 1 つの括弧にまとめる: {text}"
+        );
     }
 
     #[test]
