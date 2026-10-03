@@ -3166,7 +3166,7 @@ mod tests {
         // ここに現れない
         let scan = scan_of_fixture("scan");
 
-        assert_eq!(scan.chunk_count(), 6, "切り出せたチャンクの数");
+        assert_eq!(scan.chunk_count(), 6, "比べたチャンクの数");
         assert_eq!(
             scan.compared_pair_count(),
             14,
@@ -3217,7 +3217,7 @@ mod tests {
         assert_eq!(
             scan.chunk_count(),
             1,
-            "読めたファイルの関数は切り出せている"
+            "読めたファイルの関数は比べるチャンクに入っている"
         );
     }
 

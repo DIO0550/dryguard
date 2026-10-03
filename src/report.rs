@@ -1254,7 +1254,7 @@ mod tests {
 
         assert!(
             text.contains("チャンク 2 件（テスト関数 2 件を除外） / "),
-            "外したテスト関数の数が、切り出したチャンクの数と並んで読める: {text}"
+            "外したテスト関数の数が、比べたチャンクの数と並んで読める: {text}"
         );
     }
 
@@ -1268,28 +1268,15 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_text_of_reports_the_undersized_chunks_it_left_out() {
+    fn test_scan_text_of_lists_the_test_functions_and_undersized_chunks_in_one_parenthesis() {
         let text = scan_text_of(
             &rust_scan_of_fixture("rust-undersized"),
             Explanation::AskedSignals,
         );
 
         assert!(
-            text.contains("チャンク 2 件（小さいチャンク 2 件を除外） / "),
-            "比べなかった小さいチャンクの数が、比べたチャンクの数と並んで読める: {text}"
-        );
-    }
-
-    #[test]
-    fn test_scan_text_of_a_walk_with_both_left_out_lists_them_in_one_parenthesis() {
-        let text = scan_text_of(
-            &rust_scan_of_fixture("rust-tests"),
-            Explanation::AskedSignals,
-        );
-
-        assert!(
-            !text.contains("）（"),
-            "除外の内訳を 1 つの括弧にまとめる: {text}"
+            text.contains("チャンク 2 件（テスト関数 1 件・小さいチャンク 2 件を除外） / "),
+            "比べなかった関数の内訳が 1 つの括弧にまとまり、比べたチャンクの数と並んで読める: {text}"
         );
     }
 

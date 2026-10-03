@@ -22,3 +22,14 @@ impl Invoice {
         charged + self.tax
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_total_with_no_discount_adds_the_tax() {
+        let invoice = Invoice { amount: 100, tax: 10 };
+        assert_eq!(invoice.total_with_discount(0), 110);
+    }
+}

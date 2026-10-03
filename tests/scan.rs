@@ -530,7 +530,7 @@ fn pair_text_of(scan: &Scan, one: &str, other: &str) -> Option<String> {
 #[test]
 fn test_scan_of_the_corpus_rules_out_pairs_whose_lengths_are_too_far_apart() {
     // 上限だけで確定できるペアが 1 組も無いなら、枝刈りは何も飛ばしていない。
-    // 対照は上のテスト（候補 65 組）。飛ばしすぎればあちらが落ちる
+    // 対照は上のテスト（候補 64 組）。飛ばしすぎればあちらが落ちる
     let scan = scan_of_corpus();
 
     assert!(
