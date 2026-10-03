@@ -55,7 +55,7 @@ pub use document::{DocumentError, SourceDocument};
 // 外から読める形で出す。
 pub use call_hierarchy::CalleesOutcome;
 pub use hover::{HoverOutcome, SignatureText};
-pub use references::ReferencesOutcome;
+pub use references::{Reference, ReferencesOutcome};
 // 型の宣言の場所は、開かせる相手を決める材料として `pipeline` が読む。
 pub use declaration_site::{DeclarationSite, DeclarationSiteOutcome};
 pub use workspace::{WorkspaceError, WorkspaceRoot};
@@ -1251,7 +1251,7 @@ mod tests {
         };
         let names: BTreeSet<String> = paths
             .iter()
-            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .filter_map(|path| path.path().file_name()?.to_str().map(str::to_owned))
             .collect();
         assert_eq!(
             names,

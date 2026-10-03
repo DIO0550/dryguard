@@ -29,7 +29,9 @@ use crate::lsp::{
     Session, SourceDocument, WorkspaceError, WorkspaceRoot,
 };
 use crate::semantics::callee_domain::{CalleeDomainsOutcome, callee_domains_outcome_of};
-use crate::semantics::caller_domain::{CallerDomainsOutcome, caller_domains_outcome_of};
+use crate::semantics::caller_domain::{
+    CallerDomainsOutcome, ReferenceSources, caller_domains_outcome_of,
+};
 use crate::semantics::resolved_type::{
     TypeDeclaration, UnopenedReason, UnopenedTypeName, opened_type_names_of, traced_type_names_of,
 };
@@ -490,6 +492,7 @@ impl AskedCallerDomains {
         document: &SourceDocument,
         position: SourcePosition,
         declarations: &DomainDeclarations,
+        sources: &mut ReferenceSources,
     ) -> Self {
         match membership {
             AskedMembership::Unrooted { markers } => Self::Unrooted {
@@ -509,6 +512,7 @@ impl AskedCallerDomains {
                 document,
                 position,
                 declarations,
+                sources,
             )),
         }
     }
@@ -672,12 +676,14 @@ fn asked_semantics_of(
     let mut membership_a = AskedMembership::ask(session, root, document_a);
     let mut membership_b = AskedMembership::ask(session, root, document_b);
 
+    let mut reference_sources = ReferenceSources::default();
     let callers_a = AskedCallerDomains::ask(
         session,
         &mut membership_a,
         document_a,
         position_a,
         declarations,
+        &mut reference_sources,
     );
     let callers_b = AskedCallerDomains::ask(
         session,
@@ -685,6 +691,7 @@ fn asked_semantics_of(
         document_b,
         position_b,
         declarations,
+        &mut reference_sources,
     );
 
     // **呼び出し先は所属で絞らない。** outgoingCalls はそのファイル自身の import を辿るので、
@@ -1039,6 +1046,10 @@ fn caller_domain_overlap_of(
         (CallerDomainsOutcome::AmbiguousDomain(ambiguous), _)
         | (_, CallerDomainsOutcome::AmbiguousDomain(ambiguous)) => {
             CallerDomainOverlap::AmbiguousDomain(ambiguous.clone())
+        }
+        (CallerDomainsOutcome::UnclassifiedReference(cause), _)
+        | (_, CallerDomainsOutcome::UnclassifiedReference(cause)) => {
+            CallerDomainOverlap::UnclassifiedReference(cause.clone())
         }
         (CallerDomainsOutcome::NoReferences, _) | (_, CallerDomainsOutcome::NoReferences) => {
             CallerDomainOverlap::NoReferences
@@ -1939,6 +1950,7 @@ fn asked_scan_semantics_of(
     // にも往復が 1 回走る。そちらの答えは `NoName` にしかならない。
     let mut memberships: Vec<Option<AskedMembership>> =
         documents.documents.iter().map(|_| None).collect();
+    let mut reference_sources = ReferenceSources::default();
     let mut callers = Vec::with_capacity(askable.len());
     for askable in &askable {
         let membership = memberships[askable.document_index]
@@ -1950,6 +1962,7 @@ fn asked_scan_semantics_of(
             askable.document,
             askable.position,
             declarations,
+            &mut reference_sources,
         ));
     }
     let callees: Vec<Result<CalleeDomainsOutcome, ClientError>> = askable
@@ -2388,6 +2401,23 @@ mod tests {
 
     fn measured(value: f64) -> Similarity {
         Similarity::new(value).expect("テストが渡す値は 0.0-1.0")
+    }
+
+    #[test]
+    fn test_caller_domain_overlap_keeps_reference_source_failures_on_either_side() {
+        let cause = crate::semantics::caller_domain::ReferenceSourceError::Unreadable {
+            path: PathBuf::from("/repo/caller.rs"),
+        };
+        let failed = CallerDomainsOutcome::UnclassifiedReference(cause.clone());
+        for (left, right) in [
+            (&failed, &CallerDomainsOutcome::NoReferences),
+            (&CallerDomainsOutcome::NoReferences, &failed),
+        ] {
+            assert_eq!(
+                caller_domain_overlap_of(left, right),
+                CallerDomainOverlap::UnclassifiedReference(cause.clone())
+            );
+        }
     }
 
     /// 尋ねる前に止まった理由が、シグナルの側でも別々のままかを見る。

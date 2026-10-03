@@ -98,7 +98,7 @@ if structurally_similar && domains_differ { ... }
 | `declaration site` | `type definition` / `definition` が返す宣言の場所。ファイルと、その中の 1 点 |
 | `references` | ソースの 1 点を指して、そこにある名前を使っているところを尋ねる問い合わせ |
 | `reference` | `references` が返す 1 件。**その名前を使っている側**のファイルの位置 |
-| `caller domain` | 参照元が属する `domain`。ドメインごとの件数を持つ |
+| `caller domain` | 参照元が属する `domain`。Rust のテスト範囲内の参照を除き、ドメインごとの件数を持つ |
 | `call hierarchy` | ソースの 1 点を指して、そこにある名前の呼び出し関係を尋ねる問い合わせ。**起点を取る要求と、向きを指定する要求の 2 往復で 1 つ** |
 | `call hierarchy item` | `call hierarchy` の起点。`prepareCallHierarchy` が返し、**1 点につき 2 つ以上返ることがある** |
 | `callee` | `outgoingCalls` が返す 1 件。**そのチャンクが呼んでいる側**のファイルの位置 |
@@ -420,6 +420,13 @@ setter がまとめて「注釈が無い」側へ落ちる**（コンストラ�
 **向きが逆**（呼んでいる側と呼ばれている側）。1 語で呼ぶと、呼び出し元の分布と呼び出し先の
 分布が同じ集合に混ざり、**誰が使っているか**と**何に依存しているか**を取り違える
 （`docs/dryguard-plan.md`「Stage 3: 分類」のシグナル表は 2 行に分けている）。
+
+**`reference` はファイルパスだけでなく開始位置まで持つ。** 同じファイルの本番参照と
+テスト参照を分けるため。Rust は `#[test]`（末尾が `test` の scoped 属性も含む）関数、
+単純な `#[cfg(test)]` を付けた項目、および `#![cfg(test)]` のあるファイル・本体の範囲を除く。
+ネストしたヘルパーも範囲に入る。候補列挙の `test function` 除外とは別で、
+`--include-tests` でも参照の数え方は変わらない。複合 cfg・cfg_attr・他ファイルの mod 宣言からの
+cfg 伝播・マクロ展開・TypeScript のテスト参照の判別は行わない。
 
 **`caller domain` と `callee domain` を 1 つの型で持たない。** どちらも
 `domain counts`（ドメインごとの件数）を中身に持つが、**向きが逆**なので、1 つの型にすると

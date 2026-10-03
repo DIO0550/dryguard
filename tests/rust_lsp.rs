@@ -58,7 +58,10 @@ fn test_rust_analyzer_answers_both_candidates_in_one_session() {
         let ReferencesOutcome::Answered(paths) = references else {
             panic!("{name} の参照元が返る: {references:?}");
         };
-        assert!(paths.contains(&path), "{name} の呼び出し元: {paths:?}");
+        assert!(
+            paths.iter().any(|reference| reference.path() == path),
+            "{name} の呼び出し元: {paths:?}"
+        );
     }
 
     let queried = started.elapsed();
@@ -107,7 +110,7 @@ fn test_rust_analyzer_indexes_dryguard_and_answers_its_own_source() {
             .references(&document, position)
             .expect("references を尋ねられる");
         assert!(
-            matches!(references, ReferencesOutcome::Answered(ref paths) if !paths.is_empty() && paths.iter().all(|path| path.starts_with(&repository))),
+            matches!(references, ReferencesOutcome::Answered(ref paths) if !paths.is_empty() && paths.iter().all(|path| path.path().starts_with(&repository))),
             "{name} の参照元: {references:?}"
         );
     }
@@ -409,4 +412,108 @@ fn test_rust_type_references_of_a_chunk_are_the_type_names_of_its_hover() {
             "{function}: 比較に残る型名にすべて記録がある: {outcome:?}"
         );
     }
+}
+
+/// 実サーバが返した参照から、本番の件数だけが残ることを検証する。
+fn assert_production_callers(
+    signal: &dryguard::classification::signal::CallerDomainOverlap,
+    source: &std::path::Path,
+) {
+    use dryguard::classification::signal::CallerDomainOverlap;
+    use dryguard::semantics::domain::Domain;
+    let CallerDomainOverlap::Measured(measured) = signal else {
+        panic!("参照元を測れる: {signal:?}");
+    };
+    let Ok(domain) = Domain::of_path(source, &DomainDeclarations::default()) else {
+        panic!("宣言がなければ曖昧にならない");
+    };
+    assert_eq!(
+        measured.callers_a().references_per_domain(),
+        vec![(&domain, 2)]
+    );
+    assert_eq!(
+        measured.callers_b().references_per_domain(),
+        vec![(&domain, 1)]
+    );
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_references_exclude_tests_in_compare_and_scan() {
+    let root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust-test-references");
+    let path = root.join("src/lib.rs");
+    let document = SourceDocument::new(&path, source_of(&path).expect("ソースを読める"))
+        .expect("ドキュメントを作れる");
+    let workspace =
+        WorkspaceRoot::enclosing(std::slice::from_ref(&path)).expect("Cargo プロジェクト");
+    let mut session = Client::start(&ServerCommand::rust())
+        .expect("サーバを起動できる")
+        .handshake(&workspace)
+        .expect("握手できる");
+    session
+        .open_document(&document)
+        .expect("ファイルを開かせる");
+    let position =
+        SourcePosition::from_preceding_text(LineNumber::new(3).expect("正の行"), "pub fn ");
+    let raw = session
+        .references(&document, position)
+        .expect("参照を尋ねられる");
+    let ReferencesOutcome::Answered(references) = raw else {
+        panic!("参照が返る: {raw:?}");
+    };
+    assert!(
+        references
+            .iter()
+            .any(|reference| reference.path() == path.with_file_name("report.rs")),
+        "テスト専用ファイルからの参照もサーバは返す: {references:?}"
+    );
+    assert!(
+        references
+            .iter()
+            .any(|reference| reference.path() == path && reference.position().line().get() == 17),
+        "同一ファイルのテストからの参照も返す: {references:?}"
+    );
+    session.shutdown().expect("終了できる");
+
+    let first = Location::new(path.clone(), LineNumber::new(3).expect("正の行"));
+    let second = Location::new(path.clone(), LineNumber::new(7).expect("正の行"));
+    let pair = chunk_pair_of(&first, &second).expect("本番関数のペア");
+    let measured = measured_pair_of(
+        &pair,
+        ConfiguredThresholds::default(),
+        &DomainDeclarations::default(),
+        &ServerCommand::rust(),
+    )
+    .expect("宣言がない");
+    assert_production_callers(measured.signals().caller_domain_overlap(), &path);
+
+    let scan = scan_of_language(
+        &root,
+        SourceLanguage::Rust,
+        TestFunctions::Included,
+        ConfiguredThresholds::default(),
+        &DomainDeclarations::default(),
+        &ServerCommand::rust(),
+    )
+    .expect("走査できる");
+    let pair = scan
+        .candidate_pairs()
+        .iter()
+        .find(|pair| pair.location_a() == &first && pair.location_b() == &second)
+        .expect("本番関数のペアが残る");
+    let signal = pair
+        .classification()
+        .reasons()
+        .iter()
+        .find_map(|reason| {
+            let dryguard::classification::reason::Reason::CallerDomainOverlap { signal, .. } =
+                reason
+            else {
+                return None;
+            };
+            Some(signal)
+        })
+        .expect("呼び出し元の根拠がある");
+    assert_production_callers(signal, &path);
 }
