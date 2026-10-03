@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+#
+# コミットメッセージに、レビューコメント・Issue コメントへの URL（`#discussion_r<番号>` /
+# `#issuecomment-<番号>` / `#pullrequestreview-<番号>`）を書かせない（git ネイティブのフック）。
+#
+# Why: この URL の番号は、コメントが投稿されたあとにしか分からない。コミットは投稿より前に
+# 作られるので、書けるのは推測した番号だけになる（pr-166 / pr-203 / pr-207 が繰り返した形）。
+# 経緯は PR / Issue の担当なので、メッセージには PR か Issue の番号だけを書く。
+#
+# Why not（API で URL の実在を確かめる）: オフラインやリモート環境の権限で確かめられない
+# ことがあり、確かめられなかったときに通すと、このフックが推測を通す穴になる。
+#
+# 引数: $1 = コミットメッセージのファイル（git が渡す）
+# 配線: git config core.hooksPath harness/githooks
+set -e
+
+message_file="${1:?commit-msg: メッセージのファイルが渡されていません}"
+
+# `#` で始まる行は git のコメントなので見ない。
+offending="$(grep -v '^#' "$message_file" | grep -nE '#(discussion_r|issuecomment-|pullrequestreview-)[0-9]+' || true)"
+
+if [ -n "$offending" ]; then
+  echo "commit-msg: コメントへの URL（#discussion_r / #issuecomment- / #pullrequestreview-）は書けません:" >&2
+  echo "$offending" >&2
+  echo "commit-msg: コミットの時点では実在を確かめられません。PR / Issue の番号だけにしてください" >&2
+  exit 1
+fi
