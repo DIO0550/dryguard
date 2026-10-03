@@ -1748,7 +1748,13 @@ mod tests {
         let ReferencesOutcome::Answered(paths) = outcome else {
             panic!("参照元が返る: {outcome:?}");
         };
-        assert_eq!(paths, vec![PathBuf::from("/repo/src/billing/invoice.ts")]);
+        assert_eq!(
+            paths
+                .iter()
+                .map(|reference| reference.path().to_path_buf())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("/repo/src/billing/invoice.ts")]
+        );
     }
 
     #[test]

@@ -511,10 +511,19 @@ fn is_test_function(node: Node<'_>, source: &str, grammar: Grammar) -> bool {
 }
 
 /// Rust の関数にテストの印の属性が付いているか。
-fn has_test_attribute(node: Node<'_>, source: &str) -> bool {
+pub(super) fn has_test_attribute(node: Node<'_>, source: &str) -> bool {
+    has_attribute(node, source, is_test_attribute)
+}
+
+/// コメントを挟んで直前に並ぶ Rust 外部属性のどれかが条件を満たすか。
+pub(super) fn has_attribute(
+    node: Node<'_>,
+    source: &str,
+    matches_attribute: fn(Node<'_>, &str) -> bool,
+) -> bool {
     let mut sibling = node.prev_named_sibling();
     while let Some(previous) = sibling {
-        if previous.kind() == ATTRIBUTE_ITEM_KIND && is_test_attribute(previous, source) {
+        if previous.kind() == ATTRIBUTE_ITEM_KIND && matches_attribute(previous, source) {
             return true;
         }
 

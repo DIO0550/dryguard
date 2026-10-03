@@ -477,6 +477,20 @@ fn caller_domain_value_of(signal: &CallerDomainOverlap, explanation: Explanation
             unmeasurable_value_of("project-membership-not-provided")
         }
         CallerDomainOverlap::NoReferences => unmeasurable_value_of("no-references"),
+        CallerDomainOverlap::UnclassifiedReference(cause) => {
+            use crate::semantics::caller_domain::ReferenceSourceError;
+            let reason = match cause {
+                ReferenceSourceError::Unreadable { .. } => "unreadable-reference-source",
+                ReferenceSourceError::Unparsable { .. } => "unparsable-reference-source",
+                ReferenceSourceError::InvalidPosition { .. } => "invalid-reference-position",
+            };
+            let mut details = vec![("path", json!(cause.path().display().to_string()))];
+            if let ReferenceSourceError::InvalidPosition { position, .. } = cause {
+                details.push(("line", json!(position.line().get())));
+                details.push(("character", json!(position.character())));
+            }
+            detailed_unmeasurable_value_of(reason, details)
+        }
         CallerDomainOverlap::UnreadableReferences => unmeasurable_value_of("unreadable-references"),
         CallerDomainOverlap::ServerStillWorking => unmeasurable_value_of("server-still-working"),
         CallerDomainOverlap::ReferencesNotProvided => {
@@ -849,6 +863,46 @@ mod tests {
                     .expect("根拠のシグナル名は文字列で出る")
             })
             .collect()
+    }
+
+    #[test]
+    fn test_json_of_reference_source_failures_preserves_the_reason_and_path() {
+        use crate::semantics::caller_domain::ReferenceSourceError;
+        let path = PathBuf::from("/repo/src/caller.rs");
+        let position = crate::source_position::SourcePosition::from_lsp_position(
+            lsp_types::Position::new(3, 7),
+        );
+        for (cause, expected) in [
+            (
+                ReferenceSourceError::Unreadable { path: path.clone() },
+                "unreadable-reference-source",
+            ),
+            (
+                ReferenceSourceError::Unparsable { path: path.clone() },
+                "unparsable-reference-source",
+            ),
+            (
+                ReferenceSourceError::InvalidPosition {
+                    path: path.clone(),
+                    position,
+                },
+                "invalid-reference-position",
+            ),
+        ] {
+            let signals = accidental_duplication().with_semantics(
+                TypeSignatureMatch::NoName,
+                CallerDomainOverlap::UnclassifiedReference(cause),
+            );
+            let json = json_of_signals(&signals, Explanation::AskedSignals);
+            let value = &reason_of(&json, "caller-domain-overlap")["value"];
+            assert_eq!(value["status"], "unmeasurable");
+            assert_eq!(value["reason"], expected);
+            assert_eq!(value["path"], "/repo/src/caller.rs");
+            if expected == "invalid-reference-position" {
+                assert_eq!(value["line"], 4);
+                assert_eq!(value["character"], 7);
+            }
+        }
     }
 
     #[test]

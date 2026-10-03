@@ -274,6 +274,9 @@ fn reference_paths_of(session: &mut Session, chunk: &Chunk) -> Vec<PathBuf> {
         );
     };
     reference_paths
+        .iter()
+        .map(|reference| reference.path().to_path_buf())
+        .collect()
 }
 
 /// そのチャンクの呼び出し元が属するドメイン。サーバに尋ねて数える。

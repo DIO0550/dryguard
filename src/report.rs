@@ -596,7 +596,10 @@ fn caller_domain_overlap_text_of(
         CallerDomainOverlap::ProjectMembershipNotProvided => {
             "サーバがプロジェクトの所属を答えられない"
         }
-        CallerDomainOverlap::NoReferences => "参照元が 1 件も返らない",
+        CallerDomainOverlap::NoReferences => "数える参照元がない (Rust のテスト内の参照は除外)",
+        CallerDomainOverlap::UnclassifiedReference(cause) => {
+            return Some(format!("呼び出し元ドメインの重なりを測れない ({cause})"));
+        }
         CallerDomainOverlap::UnreadableReferences => "読めない URI が混じっている",
         CallerDomainOverlap::ServerStillWorking => "サーバが作業中で答えが落ち着かない",
         CallerDomainOverlap::ReferencesNotProvided => "サーバが references を提供していない",
@@ -955,6 +958,40 @@ mod tests {
             ImportOverlap::Measured(measured(0.0)),
             DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD,
         )
+    }
+
+    #[test]
+    fn test_reference_source_failure_text_reports_the_file_and_distinct_cause() {
+        use crate::semantics::caller_domain::ReferenceSourceError;
+        let path = std::path::PathBuf::from("/repo/src/caller.rs");
+        for (cause, expected) in [
+            (
+                ReferenceSourceError::Unreadable { path: path.clone() },
+                "ファイルを読めない",
+            ),
+            (
+                ReferenceSourceError::Unparsable { path: path.clone() },
+                "Rust 構文を読めない",
+            ),
+            (
+                ReferenceSourceError::InvalidPosition {
+                    path: path.clone(),
+                    position: crate::source_position::SourcePosition::from_lsp_position(
+                        lsp_types::Position::new(3, 7),
+                    ),
+                },
+                "位置がソースの文字を指していない",
+            ),
+        ] {
+            let text = caller_domain_overlap_text_of(
+                &CallerDomainOverlap::UnclassifiedReference(cause),
+                Threshold::from_literal(0.5),
+                Explanation::AskedSignals,
+            )
+            .expect("理由を出す");
+            assert!(text.contains(expected), "{text}");
+            assert!(text.contains("/repo/src/caller.rs"), "{text}");
+        }
     }
 
     #[test]

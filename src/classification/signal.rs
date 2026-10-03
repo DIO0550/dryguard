@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 
 use crate::domain_declaration::{AmbiguousDomain, DomainName};
 use crate::semantics::callee_domain::CalleeDomains;
-use crate::semantics::caller_domain::CallerDomains;
+use crate::semantics::caller_domain::{CallerDomains, ReferenceSourceError};
 use crate::semantics::resolved_type::UnopenedReason;
 use crate::semantics::type_signature::UntracedReason;
 use crate::similarity::Similarity;
@@ -404,10 +404,12 @@ pub enum CallerDomainOverlap {
     /// **`OutsideProject` と分ける。** あちらは**範囲外だと確かめた**答えで、こちらは
     /// **確かめる術が無い**。利用者が直す先も違う（印の範囲 / 使うサーバ）。
     ProjectMembershipNotProvided,
-    /// どちらかのチャンクに参照元が 1 件も返らなかった。
+    /// どちらかのチャンクに数える参照元がない（Rust テスト内の参照は除く）。
     NoReferences,
     /// 参照元は返ったが、パスとして読めない URI が混じっていた。
     UnreadableReferences,
+    /// Rust の参照元をテスト範囲と照合できない。
+    UnclassifiedReference(ReferenceSourceError),
     /// サーバが作業中で、落ち着いた答えを受け取れなかった。
     ServerStillWorking,
     /// サーバが references を提供していない。
