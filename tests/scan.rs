@@ -544,3 +544,41 @@ fn test_scan_of_the_corpus_rules_out_pairs_whose_lengths_are_too_far_apart() {
         scan.compared_pair_count()
     );
 }
+
+#[test]
+fn test_typescript_scan_excludes_test_pairs_unless_included() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typescript-tests");
+    for language in [SourceLanguage::TypeScript, SourceLanguage::Auto] {
+        for test_functions in [TestFunctions::Excluded, TestFunctions::Included] {
+            let scan = scan_of_language(
+                &root,
+                language,
+                test_functions,
+                ConfiguredThresholds::default(),
+                &DomainDeclarations::default(),
+                &missing_server(),
+            )
+            .expect("TypeScript のフィクスチャを走査できる");
+            let includes_tests = test_functions == TestFunctions::Included;
+            assert!(scan.candidate_pairs().iter().any(|pair| is_pair_of(
+                pair,
+                "example.test.ts:1",
+                "example.test.ts:9"
+            )));
+            assert_eq!(
+                scan.candidate_pairs().iter().any(|pair| is_pair_of(
+                    pair,
+                    "example.test.ts:17",
+                    "example.test.ts:23"
+                )),
+                includes_tests
+            );
+            let (chunks, excluded) = match test_functions {
+                TestFunctions::Excluded => (2, 2),
+                TestFunctions::Included => (4, 0),
+            };
+            assert_eq!(scan.chunk_count(), chunks);
+            assert_eq!(scan.excluded_test_function_count(), excluded);
+        }
+    }
+}

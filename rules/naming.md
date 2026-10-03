@@ -59,7 +59,7 @@ if structurally_similar && domains_differ { ... }
 | `grammar` | ソースを読むのに使う tree-sitter の文法。拡張子で決まる（`.ts` / `.tsx` / `.mts` / `.cts`） |
 | `chunk` | 比較の単位。関数・メソッド・impl ブロック |
 | `accessor` | プロパティのように読み書きされるメンバーを実装する関数（`get` / `set`）。**チャンクとしては関数**だが、`hover` が返すのは**メンバーとしての型** |
-| `test function` | テストの印の属性（パスの末尾が `test`。`#[test]` / `#[tokio::test]`）が付いた Rust の関数。**`scan` は既定でチャンクにしない**（`--include-tests` で入れる）。`#[cfg(test)]` の中にあっても**印の付かないヘルパーは含まない**。テスト関数の本体の中に書いた関数も、印が付いていないので含まない |
+| `test function` | Rust のテスト属性（パス末尾が `test`）付き関数、または TypeScript / TSX の `describe` / `it` / `test`（`.only` / `.skip` を含む）の第2引数に直接書いたアロー関数・関数式。callback 側の透過ラッパーは辿るが、spread で位置が確定しない形・別名・namespace・未知の修飾は残す。TS は呼び出し名のヒューリスティックで、同名の業務 API も対象。**`scan` は既定でチャンクにしない**（`--include-tests` で入れる）。ファイル名や囲むテストでは判定せず、印の付かないヘルパー・内部の関数は残す |
 | `pair` | 比較する 2 つの chunk |
 | `undersized chunk` | 正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない chunk。**chunk ではある**が、`scan` は候補列挙に入れない（`compare` は名指しされれば比べる）。`test function` は**chunk にしない**ので別物 |
 | `candidate pair` | 構造類似度が閾値に届いた pair。**両側とも `undersized chunk` でない**。`scan` が判定して出すのはこれだけ |

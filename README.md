@@ -71,8 +71,18 @@ cargo run -- scan [path]             # コードベース全体をスキャン (
   --threshold <0-1>
   --explain                          # 判定根拠のシグナル値を全表示
   --fail-on do-not-extract           # 非推奨ペアがあれば exit 1
-  --include-tests                    # scan のみ。#[test] の付いた Rust の関数も比較する (既定は外す)
+  --include-tests                    # scan のみ。Rust / TypeScript のテスト関数も比較する (既定は外す)
 ```
+
+`scan` は Rust のテスト属性（`#[test]` / `#[tokio::test]` など）付き関数と、
+TypeScript / TSX の `describe` / `it` / `test`（`.only` / `.skip` も対応）の第2引数に
+直接書いたアロー関数・関数式を除外する。コールバック側の括弧・型アサーション等は辿る。
+ファイル名では除外せず、ヘルパーやテスト本体内の通常の関数は残す。除外数は走査結果に出る。
+`--include-tests` で再び比較対象にでき、`compare` での直接指定には影響しない。
+
+TypeScript 側は呼び出し名によるヒューリスティックなので、同名の業務 API も対象になる。
+import 別名・namespace・`each`・`beforeEach` 等のフック・修飾の連鎖・callee 側の括弧は認識しない。
+spread 引数の後ろも引数位置が確定しないため残す。テスト全体を取り除く機能ではない。
 
 終了コードは 3 つ。**判定で落ちたのか、判定を出せなかったのかを CI が区別できる**ように分けてある。
 
