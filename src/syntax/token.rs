@@ -156,7 +156,7 @@ pub fn tokens_of(node: Node<'_>) -> Vec<Token> {
 
 /// [`tokens_of`] と同じ列を、**それぞれのトークンを出したノード**と組にして返す。
 ///
-/// 正規化で捨てた綴りを、同じ位置どうしで突き合わせる側（`syntax::spelling_substitution`）が
+/// 正規化で捨てた綴りを、同じ位置どうしで突き合わせる側（`syntax::leaf_divergence`）が
 /// 使う。**木の歩き方をここ 1 箇所に置く** — 2 箇所で歩くと、片方だけ正規化の表を
 /// 変えたときに、綴りの並びとトークン列の位置がずれる。
 pub(crate) fn token_nodes_of(node: Node<'_>) -> Vec<(Token, Node<'_>)> {

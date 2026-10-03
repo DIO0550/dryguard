@@ -7,7 +7,7 @@
 //! ここは捨てた綴りを位置ごとに残しておき、**列が揃うペアに限って**同じ位置どうしを比べる。
 //!
 //! **比べるのは正規化トークン列が完全に一致するペアだけ。** 揃わなければ位置の対応が無く、
-//! 「違いが無い」とも「違う」とも言えない（[`LeafComparison::Unaligned`]）。構造類似度は
+//! 「違いが無い」とも「違う」とも言えない（[`LeafComparison::UnalignedTokens`]）。構造類似度は
 //! gram の多重集合で測るので、1.0 でも列が一致しないことがある。
 //!
 //! **チャンクが束縛した名前は、一貫した付け替えなら違いに数えない。** 引数や `let` の名前は
@@ -16,12 +16,16 @@
 //! 付け替えただけのペアが「違う」側（共通化しない側）へ倒れ、偽の `EXTRACT-CANDIDATE` は
 //! 出ない（`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」）。
 //!
-//! **型の位置の型名は比べない。** 型の違いは型シグネチャ（Stage 2）が見る（`syntax::token` の
-//! `NAME_KINDS` と同じ分担）。綴りで比べると、エイリアスと右辺のように**同じ型を指す
-//! 別の綴り**が違いに見え、型シグネチャが単一化可能と答えたペアを綴りで覆す
-//! （`rules/naming.md`「`type reference` と `resolved type` を混ぜない」）。
+//! **チャンク自身のシグネチャに書かれた型は比べない。** そこは型シグネチャ（Stage 2）が見る。
+//! 綴りで比べると、エイリアスと右辺のように**同じ型を指す別の綴り**が違いに見え、
+//! 型シグネチャが単一化可能と答えたペアを綴りで覆す（`rules/naming.md`
+//! 「`type reference` と `resolved type` を混ぜない」）。**本体の中の型名は比べる** —
+//! `Vec::<u8>::new()` と `VecDeque::<u8>::new()` は Stage 2 が見ない位置で違う相手を使っている。
+//! 外す範囲はシグネチャの構文の位置で決め、型名のノードの種別では決めない
+//! （種別の一覧で外すと、一覧から漏れた式の位置の型名が比べない側＝偽の
+//! `EXTRACT-CANDIDATE` の側へ倒れる）。
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 
 use tree_sitter::Node;
@@ -47,24 +51,11 @@ const OUTSIDE_NAME_PARENT_KINDS: [&str; 3] = [
     "shorthand_field_initializer",
 ];
 
-/// 型名の葉の種別。**式の中のパスに置かれたとき以外は比べない**（module doc）。
-const TYPE_NAME_KINDS: [&str; 3] = ["type_identifier", "predefined_type", "primitive_type"];
-
-/// 型名の葉を、式として比べる位置に置く親と、そのフィールド（Rust）。
-///
-/// 構造体式・構造体パターンの名前（`Reason::Import { .. }`）は**どの値を作る / 照らすか**で、
-/// 型の位置ではない。**一覧から漏れた式の位置の型名は比べない側へ倒れる**が、Rust の文法で
-/// 型名のノードが式に現れるのはこの 3 つと `u32::MAX` のようなパスだけ。
-const VALUE_POSITION_TYPE_NAME_FIELDS: [(&str, &str); 3] = [
-    ("struct_expression", "name"),
-    ("struct_pattern", "type"),
-    ("tuple_struct_pattern", "type"),
-];
-
 /// 正規化トークン 1 つ分の綴りと、それをどう突き合わせるか。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Spelling {
-    /// 綴りを比べないトークン。子を持つ構文ノード（綴りは子の側にある）と、型の位置の型名。
+    /// 綴りを比べないトークン。子を持つ構文ノード（綴りは子の側にある）と、
+    /// チャンク自身のシグネチャに書かれた型の中の葉。
     Unspelled,
     /// チャンクが束縛した名前。**一貫した付け替えは違いに数えない。**
     Bound(String),
@@ -99,12 +90,19 @@ impl ChunkLeaves {
         grammar: Grammar,
     ) -> Self {
         let bound = bound_names_of(node, own_name, source, grammar);
+        let signature_types = signature_type_nodes_of(node, grammar);
+        let context = SpellingContext {
+            own_name,
+            source,
+            bound: &bound,
+            signature_types: &signature_types,
+        };
 
         let spelled = token_nodes_of(node)
             .into_iter()
             .map(|(token, token_node)| SpelledToken {
                 token,
-                spelling: spelling_of(token, token_node, own_name, source, &bound),
+                spelling: context.spelling_of(token, token_node),
             })
             .collect();
 
@@ -113,7 +111,7 @@ impl ChunkLeaves {
 
     /// 2 つのチャンクの葉の綴りを、同じ位置どうしで突き合わせる。
     ///
-    /// 正規化トークン列が一致しなければ [`LeafComparison::Unaligned`]。
+    /// 正規化トークン列が一致しなければ [`LeafComparison::UnalignedTokens`]。
     pub fn compared_with(&self, other: &Self) -> LeafComparison {
         let aligned = self.0.len() == other.0.len()
             && self
@@ -122,7 +120,7 @@ impl ChunkLeaves {
                 .zip(&other.0)
                 .all(|(mine, theirs)| mine.token == theirs.token);
         if !aligned {
-            return LeafComparison::Unaligned;
+            return LeafComparison::UnalignedTokens;
         }
 
         let mut renames = Renames::default();
@@ -142,6 +140,8 @@ impl ChunkLeaves {
                 {
                     None
                 }
+                // 束縛と外の名前が向き合った組は、綴りが同じでも違いに数える
+                // （片方では局所の名前、もう片方では外の名前を指している）
                 (
                     Spelling::Bound(spelling_a) | Spelling::Fixed(spelling_a),
                     Spelling::Bound(spelling_b) | Spelling::Fixed(spelling_b),
@@ -149,7 +149,7 @@ impl ChunkLeaves {
                 // 同じ種別のトークンを、片方でだけ比べる。位置の対応が崩れている
                 (Spelling::Unspelled, Spelling::Bound(_) | Spelling::Fixed(_))
                 | (Spelling::Bound(_) | Spelling::Fixed(_), Spelling::Unspelled) => {
-                    return LeafComparison::Unaligned;
+                    return LeafComparison::UnalignedTokens;
                 }
             };
 
@@ -164,7 +164,7 @@ impl ChunkLeaves {
 
         match DivergentLeaves::new(divergent) {
             Some(divergent) => LeafComparison::Diverged(divergent),
-            None => LeafComparison::Identical,
+            None => LeafComparison::NoDivergence,
         }
     }
 }
@@ -173,11 +173,11 @@ impl ChunkLeaves {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeafComparison {
     /// 位置が揃い、違いは束縛した名前の一貫した付け替えだけ。
-    Identical,
+    NoDivergence,
     /// 位置が揃い、綴りの違う葉がある。
     Diverged(DivergentLeaves),
     /// 正規化トークン列が一致せず、位置の対応が無い。
-    Unaligned,
+    UnalignedTokens,
 }
 
 /// 同じ位置で綴りが違った葉の組 1 つ。
@@ -247,97 +247,143 @@ struct Renames<'a> {
 
 impl<'a> Renames<'a> {
     /// `spelling_a` を `spelling_b` へ付け替えたと見て、それまでの対応と両立するか。
-    /// 両立すれば対応に加える。
+    /// **両立したときだけ**対応に加える。
+    ///
+    /// 両立しなかった組を登録すると、後から来る正しい付け替えまで違いとして並ぶ。
     fn is_consistent(&mut self, spelling_a: &'a str, spelling_b: &'a str) -> bool {
-        let forward = *self.forward.entry(spelling_a).or_insert(spelling_b);
-        let backward = *self.backward.entry(spelling_b).or_insert(spelling_a);
+        let forward_fits = self
+            .forward
+            .get(spelling_a)
+            .is_none_or(|known| *known == spelling_b);
+        let backward_fits = self
+            .backward
+            .get(spelling_b)
+            .is_none_or(|known| *known == spelling_a);
+        if !(forward_fits && backward_fits) {
+            return false;
+        }
 
-        forward == spelling_b && backward == spelling_a
+        self.forward.insert(spelling_a, spelling_b);
+        self.backward.insert(spelling_b, spelling_a);
+        true
     }
 }
 
-/// トークン 1 つの綴り。
-///
-/// **チャンク自身の名前は、位置で束縛に数える**（`own_name` のノードそのもの）。比べる 2 つの
-/// チャンクは名前が違って当たり前で、数えるとどのペアにも違いが出る。種別では決めない —
-/// メソッドの名前は `property_identifier` で、**同じ綴りで委譲する `this.inner.traceable()` の
-/// `traceable`** と種別が同じになる。
-fn spelling_of(
-    token: Token,
-    node: Node<'_>,
-    own_name: Option<Node<'_>>,
-    source: &str,
-    bound: &BTreeSet<String>,
-) -> Spelling {
-    let is_leaf = match token {
-        Token::Identifier | Token::Literal(_) => true,
-        Token::Syntax(_) => node.child_count() == 0,
-    };
-    if !is_leaf || is_type_position_name(node) {
-        return Spelling::Unspelled;
-    }
-
-    let text = text_of(node, source).to_owned();
-    if own_name == Some(node) {
-        return Spelling::Bound(text);
-    }
-
-    let bindable = BINDABLE_LEAF_KINDS.contains(&node.kind())
-        && !node
-            .parent()
-            .is_some_and(|parent| OUTSIDE_NAME_PARENT_KINDS.contains(&parent.kind()));
-    if bindable && bound.contains(&text) {
-        return Spelling::Bound(text);
-    }
-    Spelling::Fixed(text)
+/// 綴りを決めるのに要る、チャンク 1 つ分の材料。
+struct SpellingContext<'tree, 'context> {
+    /// チャンク自身の名前のノード。無名なら `None`。
+    own_name: Option<Node<'tree>>,
+    /// チャンクを含むファイル全体のソース。
+    source: &'context str,
+    /// チャンクが束縛した名前と、その最初の束縛の始まり（[`bound_names_of`]）。
+    bound: &'context HashMap<String, usize>,
+    /// チャンク自身のシグネチャに書かれた型のノード（[`signature_type_nodes_of`]）。
+    signature_types: &'context [Node<'tree>],
 }
 
-/// 型の位置に置かれた型名の葉か。
-///
-/// 式の中のパス（`u32::MAX` の `u32`）と、構造体式・構造体パターンの名前は型の位置ではない
-/// （[`VALUE_POSITION_TYPE_NAME_FIELDS`]）。
-fn is_type_position_name(node: Node<'_>) -> bool {
-    if !TYPE_NAME_KINDS.contains(&node.kind()) {
-        return false;
-    }
-    let Some(parent) = node.parent() else {
-        return true;
-    };
-    if parent.kind() == "scoped_identifier" {
-        return false;
+impl<'tree> SpellingContext<'tree, '_> {
+    /// トークン 1 つの綴り。
+    ///
+    /// **チャンク自身の名前は、位置で束縛に数える**（`own_name` のノードそのもの）。比べる 2 つの
+    /// チャンクは名前が違って当たり前で、数えるとどのペアにも違いが出る。種別では決めない —
+    /// メソッドの名前は `property_identifier` で、**同じ綴りで委譲する `this.inner.traceable()` の
+    /// `traceable`** と種別が同じになる。
+    ///
+    /// **束縛より前に現れた同じ綴りは、束縛にしない。** `use(x); const g = (x) => x` の 1 つ目の
+    /// `x` は外の名前で、内側の引数の付け替えに乗せると外の名前の差し替えが付け替えに見える。
+    fn spelling_of(&self, token: Token, node: Node<'tree>) -> Spelling {
+        let is_leaf = match token {
+            Token::Identifier | Token::Literal(_) => true,
+            Token::Syntax(_) => node.child_count() == 0,
+        };
+        if !is_leaf || self.is_in_signature_type(node) {
+            return Spelling::Unspelled;
+        }
+
+        let text = text_of(node, self.source).to_owned();
+        if self.own_name == Some(node) {
+            return Spelling::Bound(text);
+        }
+
+        let bindable = BINDABLE_LEAF_KINDS.contains(&node.kind())
+            && !node
+                .parent()
+                .is_some_and(|parent| OUTSIDE_NAME_PARENT_KINDS.contains(&parent.kind()));
+        let bound_by_then = self
+            .bound
+            .get(&text)
+            .is_some_and(|first_binder| node.start_byte() >= *first_binder);
+        if bindable && bound_by_then {
+            return Spelling::Bound(text);
+        }
+        Spelling::Fixed(text)
     }
 
-    // `Reason::Import { .. }` は名前が `scoped_type_identifier` に包まれる
-    let named = if parent.kind() == "scoped_type_identifier" {
-        parent
-    } else {
-        node
-    };
-    let in_value_position = named.parent().is_some_and(|holder| {
-        VALUE_POSITION_TYPE_NAME_FIELDS.iter().any(|(kind, field)| {
-            holder.kind() == *kind && holder.child_by_field_name(field) == Some(named)
+    /// そのノードが、チャンク自身のシグネチャに書かれた型の中にあるか。
+    fn is_in_signature_type(&self, node: Node<'_>) -> bool {
+        let range = node.byte_range();
+        self.signature_types.iter().any(|signature_type| {
+            let covering = signature_type.byte_range();
+            covering.start <= range.start && range.end <= covering.end
         })
-    });
-    !in_value_position
+    }
+}
+
+/// チャンク自身のシグネチャに書かれた型のノード。引数の型・戻り値の型・型引数・`where` 節。
+///
+/// **型シグネチャ（Stage 2）が見ている範囲だけを外す。** 引数の既定値はシグネチャに書かれるが
+/// 型ではない（式）ので外さない。一覧から漏れたシグネチャの形は比べる側へ倒れ、
+/// 型の違いが綴りの違いとしても出るだけ（REVIEW 側）。
+fn signature_type_nodes_of(node: Node<'_>, grammar: Grammar) -> Vec<Node<'_>> {
+    let mut types: Vec<Node<'_>> = ["return_type", "type_parameters"]
+        .into_iter()
+        .filter_map(|field| node.child_by_field_name(field))
+        .collect();
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "where_clause" {
+            types.push(child);
+        }
+    }
+
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return types;
+    };
+    let parameter_kinds: &[&str] = match grammar {
+        Grammar::Rust => &["parameter"],
+        Grammar::TypeScript | Grammar::Tsx => &["required_parameter", "optional_parameter"],
+    };
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter_kinds.contains(&parameter.kind()) {
+            types.extend(parameter.child_by_field_name("type"));
+        }
+    }
+
+    types
 }
 
 /// そのチャンクが束縛した名前の綴り。
 ///
-/// `own_name` はチャンク自身の名前のノード。**これは入れない**（位置で数える。[`spelling_of`]）。
+/// `own_name` はチャンク自身の名前のノード。**これは入れない**（位置で数える。
+/// [`SpellingContext::spelling_of`]）。
 /// 入れると、チャンクと同じ綴りの外の関数へ委譲する形（`fn hover(x) { hover(x) }` が
 /// 別の場所の `hover` を呼ぶ形）を付け替えと読む。代わりに再帰する 2 つは違いに数えられる
 /// （倒れる向きは「違う」側）。
 ///
-/// **綴りで持ち、位置では持たない。** スコープを辿らないので、束縛と同じ綴りの外の名前も
-/// 束縛として扱う（引数名と同じ綴りの外の関数を呼ぶ形）。そこを閉じるにはスコープ解析を
-/// TypeScript と Rust の両方に書くことになる。パスとフィールドは種別で外してあるので、
-/// 穴は**同じ綴りの素の名前**に限られる（[`spelling_of`]）。
+/// 綴りごとに、**最初の束縛の始まり**（バイト位置）を返す。
+///
+/// **スコープは辿らない。** 束縛より後に現れた同じ綴りは、束縛の外（兄弟のブロック）でも
+/// 束縛として扱う。そこを閉じるにはスコープ解析を TypeScript と Rust の両方に書くことになる。
+/// パスとフィールドは種別で外し、束縛より前の出現は位置で外してあるので、穴は
+/// **束縛より後に現れた同じ綴りの、外の素の名前**に限られる（[`SpellingContext::spelling_of`]）。
 fn bound_names_of(
     node: Node<'_>,
     own_name: Option<Node<'_>>,
     source: &str,
     grammar: Grammar,
-) -> BTreeSet<String> {
+) -> HashMap<String, usize> {
     let mut binders = Vec::new();
 
     let mut pending = vec![node];
@@ -351,11 +397,17 @@ fn bound_names_of(
         pending.extend(current.named_children(&mut cursor));
     }
 
-    binders
-        .into_iter()
-        .filter(|binder| Some(*binder) != own_name)
-        .map(|binder| text_of(binder, source).to_owned())
-        .collect()
+    let mut first_binders: HashMap<String, usize> = HashMap::new();
+    for binder in binders {
+        if Some(binder) == own_name {
+            continue;
+        }
+        let first = first_binders
+            .entry(text_of(binder, source).to_owned())
+            .or_insert(binder.start_byte());
+        *first = (*first).min(binder.start_byte());
+    }
+    first_binders
 }
 
 /// TypeScript のノード 1 つが束縛する名前のノード。束縛しなければ何も足さない。
@@ -540,8 +592,8 @@ mod tests {
     /// 違った葉の組を `a ↔ b` の綴りで並べる。違いが無い / 揃わないときは、その旨の 1 語。
     fn divergence_of(comparison: LeafComparison) -> Vec<String> {
         match comparison {
-            LeafComparison::Identical => vec!["identical".to_owned()],
-            LeafComparison::Unaligned => vec!["unaligned".to_owned()],
+            LeafComparison::NoDivergence => vec!["identical".to_owned()],
+            LeafComparison::UnalignedTokens => vec!["unaligned".to_owned()],
             LeafComparison::Diverged(divergent) => divergent
                 .as_slice()
                 .iter()
@@ -725,5 +777,93 @@ mod tests {
         );
 
         assert_eq!(divergence, vec!["LOW ↔ HIGH"]);
+    }
+
+    #[test]
+    fn test_leaves_of_rust_functions_using_different_types_in_their_bodies_diverge() {
+        // 本体の中の型は型シグネチャが見ない。同じ形のまま違う型へ委譲している
+        let divergence = rust_divergence(
+            "fn ordered() -> usize { let items = Vec::<u8>::new(); items.len() }",
+            "fn queued() -> usize { let items = VecDeque::<u8>::new(); items.len() }",
+        );
+
+        assert_eq!(divergence, vec!["Vec ↔ VecDeque"]);
+    }
+
+    #[test]
+    fn test_leaves_of_rust_functions_casting_to_different_types_diverge() {
+        let divergence = rust_divergence(
+            "fn narrow(x: u32) -> u32 { (x as u8) as u32 }",
+            "fn wide(x: u32) -> u32 { (x as u16) as u32 }",
+        );
+
+        assert_eq!(divergence, vec!["u8 ↔ u16"]);
+    }
+
+    #[test]
+    fn test_leaves_of_typescript_functions_building_different_generic_types_diverge() {
+        let divergence = typescript_divergence(
+            "function counts() { return new Map<string, number>(); }",
+            "function labels() { return new Map<string, string>(); }",
+        );
+
+        assert_eq!(divergence, vec!["number ↔ string"]);
+    }
+
+    #[test]
+    fn test_leaves_of_rust_functions_naming_signature_types_by_different_paths_do_not_diverge() {
+        // シグネチャの型は型シグネチャ（Stage 2）が見る。パスの要素も綴りで覆さない
+        let divergence = rust_divergence(
+            "fn billed(amount: crate::billing::Amount) -> u32 { amount.cents() }",
+            "fn stocked(amount: crate::stock::Amount) -> u32 { amount.cents() }",
+        );
+
+        assert_eq!(divergence, vec!["identical"]);
+    }
+
+    #[test]
+    fn test_leaves_of_functions_renaming_an_outer_name_before_a_binder_of_the_same_spelling_diverge()
+     {
+        // 1 つ目の `x` / `z` は外の名前。後の引数の付け替えに乗せない
+        let divergence = typescript_divergence(
+            "function run() { use(x); const g = (x) => x; return g; }",
+            "function walk() { use(z); const g = (z) => z; return g; }",
+        );
+
+        assert_eq!(divergence, vec!["x ↔ z"]);
+    }
+
+    #[test]
+    fn test_leaves_of_functions_do_not_count_a_later_consistent_rename_after_a_mismatch() {
+        // `b ↔ x` は両立しない（`x` の相手は `a`）。それを対応に登録すると、後の
+        // `b ↔ y`（どちらもまだ相手が無い）まで違いに並ぶ
+        let divergence = typescript_divergence(
+            "function f() { const a = 1; const b = 2; const b = 3; }",
+            "function g() { const x = 1; const x = 2; const y = 3; }",
+        );
+
+        assert_eq!(divergence, vec!["b ↔ x"]);
+    }
+
+    #[test]
+    fn test_leaves_of_typescript_functions_renaming_every_kind_of_binder_do_not_diverge() {
+        // for-in・catch・単一引数のアロー・分割代入（キー付き・既定値・残り）
+        let divergence = typescript_divergence(
+            "function f(o: object) { for (const k in o) { use(k); } try { use(o); } catch (e) { use(e); } const h = v => v; const { key: a, b = 1, ...rest } = o; return [h, a, b, rest]; }",
+            "function g(p: object) { for (const n in p) { use(n); } try { use(p); } catch (err) { use(err); } const m = w => w; const { key: x, b = 1, ...others } = p; return [m, x, b, others]; }",
+        );
+
+        assert_eq!(divergence, vec!["identical"]);
+    }
+
+    #[test]
+    fn test_leaves_of_rust_functions_renaming_every_kind_of_binder_do_not_diverge() {
+        // クロージャ引数（注釈あり・なし）・for・if let
+        let divergence = rust_divergence(
+            "fn f(items: &[Point]) -> u32 { let add = |a: u32, b| a + b; let mut total = 0; for item in items { if let Some(head) = item.first() { total = add(total, head.x); } } total }",
+            "fn g(values: &[Point]) -> u32 { let sum = |c: u32, d| c + d; let mut acc = 0; for value in values { if let Some(lead) = value.first() { acc = sum(acc, lead.x); } } acc }",
+        );
+
+        assert_eq!(divergence, vec!["identical"]);
     }
 }

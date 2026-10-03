@@ -609,7 +609,8 @@ fn callers_value_of(callers: &CallerDomains) -> Value {
 /// **揃わないペアは `not-asked`。** 位置の対応が無いので比べる前提が成り立たず、
 /// 候補ペアでないから Stage 2 に尋ねない（`not-a-candidate`）のと同じ形で降りている。
 /// `--explain` のときだけ出すのも同じで、既定で出すと構造類似度 1.0 未満のペアすべてに
-/// 行が増える。
+/// 行が増える。**トークンが無いのは `unmeasurable`** で既定でも出す（構造類似度の
+/// `no-tokens` と同じ扱い。比べようとして材料が無かった）。
 fn leaf_divergence_value_of(signal: &LeafDivergence, explanation: Explanation) -> Option<Value> {
     let not_asked_reason = match signal {
         LeafDivergence::NoDivergence => {
@@ -630,7 +631,7 @@ fn leaf_divergence_value_of(signal: &LeafDivergence, explanation: Explanation) -
             )]));
         }
         LeafDivergence::UnalignedTokens => "unaligned-tokens",
-        LeafDivergence::NoTokens => "no-tokens",
+        LeafDivergence::NoTokens => return Some(unmeasurable_value_of("no-tokens")),
     };
 
     match explanation {
@@ -1469,6 +1470,16 @@ mod tests {
         assert_eq!(
             reason_of(&json, "leaf-divergence")["value"],
             json!({ "status": "not-asked", "reason": "unaligned-tokens" })
+        );
+    }
+
+    #[test]
+    fn test_json_of_leaves_without_tokens_is_unmeasurable_by_default() {
+        let json = json_of_leaf_divergence(LeafDivergence::NoTokens, Explanation::AskedSignals);
+
+        assert_eq!(
+            reason_of(&json, "leaf-divergence")["value"],
+            json!({ "status": "unmeasurable", "reason": "no-tokens" })
         );
     }
 }

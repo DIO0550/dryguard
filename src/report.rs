@@ -283,6 +283,8 @@ fn structural_similarity_text_of(signal: StructuralSimilarity, threshold: Thresh
 /// **比べていないのは、正規化トークン列が揃わないペア。** 構造類似度 1.0 未満のペアは
 /// 全部ここに入るので、既定で出すと候補ペアのほとんどに行が増える。`--explain` は
 /// 比べなかったことも理由付きで出す（[`semantics_unavailable_text_of`] と同じ扱い）。
+/// トークンが無いのは比べようとして材料が無かったので、既定でも出す
+/// （[`structural_similarity_text_of`] と同じ扱い）。
 fn leaf_divergence_text_of(signal: &LeafDivergence, explanation: Explanation) -> Option<String> {
     let skipped_reason = match signal {
         LeafDivergence::NoDivergence => {
@@ -308,7 +310,7 @@ fn leaf_divergence_text_of(signal: &LeafDivergence, explanation: Explanation) ->
             return Some(listed.join(", "));
         }
         LeafDivergence::UnalignedTokens => "正規化トークン列が揃わない",
-        LeafDivergence::NoTokens => "トークンが 1 つも無い",
+        LeafDivergence::NoTokens => return Some("測れない (トークンが 1 つも無い)".to_owned()),
     };
 
     match explanation {
@@ -2298,6 +2300,16 @@ mod tests {
             text.contains(
                 "  綴りの違い: 比べていない (正規化トークン列が揃わない) → どちらでもない"
             ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_leaves_without_tokens_is_reported_as_unmeasurable_by_default() {
+        let text = text_of_leaf_divergence(LeafDivergence::NoTokens, Explanation::AskedSignals);
+
+        assert!(
+            text.contains("  綴りの違い: 測れない (トークンが 1 つも無い) → どちらでもない"),
             "{text}"
         );
     }

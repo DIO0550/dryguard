@@ -258,9 +258,9 @@ fn leaf_divergence_of(chunk_a: &Chunk, chunk_b: &Chunk) -> LeafDivergence {
     }
 
     match chunk_a.leaves().compared_with(chunk_b.leaves()) {
-        LeafComparison::Identical => LeafDivergence::NoDivergence,
+        LeafComparison::NoDivergence => LeafDivergence::NoDivergence,
         LeafComparison::Diverged(divergent) => LeafDivergence::Diverged(divergent),
-        LeafComparison::Unaligned => LeafDivergence::UnalignedTokens,
+        LeafComparison::UnalignedTokens => LeafDivergence::UnalignedTokens,
     }
 }
 
