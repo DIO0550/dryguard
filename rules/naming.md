@@ -58,6 +58,7 @@ if structurally_similar && domains_differ { ... }
 | `codebase` | スキャンの対象になるディレクトリツリー。`scan` が受け取る根の下 |
 | `grammar` | ソースを読むのに使う tree-sitter の文法。拡張子で決まる（`.ts` / `.tsx` / `.mts` / `.cts`） |
 | `chunk` | 比較の単位。関数・メソッド・impl ブロック |
+| `generic alias` | Rust の型パラメータ・既定値・右辺を持ち、使用側の型引数を当てはめて展開する型エイリアス |
 | `impl header` | Rust メソッドが直接所属する impl の本体より前のソース。対象型・型変数・境界・実装トレイトを、そのスコープのまま運ぶ |
 | `accessor` | プロパティのように読み書きされるメンバーを実装する関数（`get` / `set`）。**チャンクとしては関数**だが、`hover` が返すのは**メンバーとしての型** |
 | `test function` | Rust のテスト属性（パス末尾が `test`）付き関数、または TypeScript / TSX の `describe` / `it` / `test`（`.only` / `.skip` を含む）の第2引数に直接書いたアロー関数・関数式。callback 側の透過ラッパーは辿るが、spread で位置が確定しない形・別名・namespace・未知の修飾は残す。TS は呼び出し名のヒューリスティックで、同名の業務 API も対象。**`scan` は既定でチャンクにしない**（`--include-tests` で入れる）。ファイル名や囲むテストでは判定せず、印の付かないヘルパー・内部の関数は残す |

@@ -379,8 +379,8 @@ fn test_compare_rust_aliases_with_different_right_hand_sides_are_not_unifiable()
 
 #[test]
 #[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
-fn test_rust_aliases_requiring_declaration_scope_or_arguments_are_unavailable() {
-    for name in ["generic_alias", "named_alias", "counted_alias"] {
+fn test_rust_aliases_requiring_declaration_scope_are_unavailable() {
+    for name in ["named_alias", "counted_alias"] {
         let alias = traced_fixture("src/lib.rs", name);
         let outcome = traced_type_signature_match_of(&alias, &alias);
         assert!(
@@ -704,5 +704,73 @@ fn test_rust_compound_aliases_are_unifiable_with_their_right_hand_sides() {
     assert_eq!(
         traced_type_signature_match_of(&alias, &raw),
         TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_generic_aliases_are_unifiable_with_their_instantiated_types() {
+    for (alias, raw) in [
+        ("pair", "tuple"),
+        ("nested", "nested_tuple"),
+        ("defaulted", "tuple"),
+        ("partial", "large"),
+        ("bounded", "tuple"),
+        ("flipped", "flipped_tuple"),
+        ("primitive_parameter", "tuple"),
+        ("nested_default", "default_tuple"),
+        ("qualified", "tuple"),
+        ("named", "named_tuple"),
+    ] {
+        let a = traced_fixture("src/generic.rs", alias);
+        let b = traced_fixture("src/generic.rs", raw);
+        assert_eq!(
+            traced_type_signature_match_of(&a, &b),
+            TypeSignatureMatch::Unifiable,
+            "{alias} / {raw}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_generic_alias_different_arguments_are_not_unifiable() {
+    let a = traced_fixture("src/generic.rs", "pair");
+    let b = traced_fixture("src/generic.rs", "large");
+    assert_eq!(
+        traced_type_signature_match_of(&a, &b),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_generic_alias_unsupported_parameters_and_shadowed_defaults_are_unavailable() {
+    for name in ["lifetime", "default_shadow"] {
+        let alias = traced_fixture("src/generic.rs", name);
+        assert_eq!(
+            traced_type_signature_match_of(&alias, &alias),
+            TypeSignatureMatch::UnopenedTypeName {
+                reason: dryguard::semantics::resolved_type::UnopenedReason::UnopenableAlias,
+            },
+            "{name}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_generic_alias_const_arguments_remain_unmeasurable() {
+    let alias = traced_fixture("src/generic.rs", "constant");
+    let outcome = traced_type_signature_match_of(&alias, &alias);
+    assert!(
+        matches!(
+            outcome,
+            TypeSignatureMatch::UnreadableSignature
+                | TypeSignatureMatch::UnopenedTypeName {
+                    reason: dryguard::semantics::resolved_type::UnopenedReason::UnopenableAlias,
+                }
+        ),
+        "const の値を失った hover を綴りで比較しない: {outcome:?}"
     );
 }

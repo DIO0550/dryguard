@@ -10,7 +10,7 @@
 //! ```
 //!
 //! **Rust は definition で宣言を辿り、宣言 hover の右辺を Rust の構文で読む。**
-//! 型引数や宣言側スコープが要る右辺は、開けない理由を残す。
+//! 型引数の当てはめを支え、宣言側の自由な名前の解決が要る右辺は開けない理由を残す。
 //!
 //! **綴りを読む部分は LSP を呼ばない**ので、サーバが無くても確かめられる
 //! (`rules/tdd.md`「`lsp` は『応答を受け取ってから先』を切り出す」)。
@@ -23,7 +23,9 @@ use crate::lsp::{
     SourceDocument,
 };
 use crate::source_position::SourcePosition;
-use crate::syntax::rust_callable::{RustTypeAlias, primitive_references_of_alias};
+use crate::syntax::rust_callable::{
+    RustGenericAlias, RustTypeAlias, primitive_references_of_alias,
+};
 use crate::syntax::type_reference::TypeReference;
 
 /// 型エイリアスの宣言を導く語。前後の空白ごと見て、`typeof` のような綴りと分ける。
@@ -73,6 +75,7 @@ impl TypeDeclaration {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedTypes {
     by_name: HashMap<String, String>,
+    rust_generics: HashMap<String, RustGenericAlias>,
 }
 
 impl ResolvedTypes {
@@ -80,7 +83,17 @@ impl ResolvedTypes {
     pub fn new(resolutions: impl IntoIterator<Item = (String, String)>) -> Self {
         Self {
             by_name: resolutions.into_iter().collect(),
+            rust_generics: HashMap::new(),
         }
+    }
+
+    /// Rust の展開候補。型引数付きなら使用側で当てはめるテンプレートを返す。
+    pub(crate) fn rust_alias_of(&self, name: &str) -> Option<RustTypeAlias> {
+        if let Some(alias) = self.rust_generics.get(name) {
+            return Some(RustTypeAlias::Generic(alias.clone()));
+        }
+        self.resolved_of(name)
+            .map(|right| RustTypeAlias::Opened(right.to_owned()))
     }
 
     /// その型名の解決後の綴り。開けていなければ `None`。
@@ -260,8 +273,8 @@ pub fn traced_type_names_of(
 /// 空を返し、ジェネリックな型（`Option<User>`）には型引数の宣言まで並べる。definition は
 /// 書かれた名前の宣言を 1 件返す（rust-analyzer 1.94.1 と 2026-09-21 版で実測）。
 ///
-/// **宣言 hover の右辺を Rust の構文で読む。** 型引数を持つエイリアスや、右辺が
-/// 別の型名・定数名を参照するものは、使用側のスコープで解決せず `UnopenableAlias` にする。
+/// **宣言 hover の右辺を Rust の構文で読む。** 型引数は使用側で当てはめる。
+/// 右辺・既定値の自由な型名や定数名は、使用側で解決せず `UnopenableAlias` にする。
 /// Rust の宣言 hover は、宣言ファイルを didOpen していなくても返る。展開候補だけは
 /// 右辺のソース位置へ hover も尋ね、プリミティブ表記が別の型を指す場合は開かない。
 ///
@@ -275,38 +288,56 @@ pub(crate) fn rust_traced_type_names_of(
 ) -> Result<TracedTypeNames, ClientError> {
     let traced =
         DeclarationQuery::Definition.traced_type_names_of(session, document, type_references)?;
-    let mut traced =
-        opened_type_names_with(
-            session,
-            traced,
-            |spelling| match RustTypeAlias::from_spelling(spelling) {
-                RustTypeAlias::Opened(resolved) => DeclaredAlias::Opened(resolved),
-                RustTypeAlias::NotAnAlias => DeclaredAlias::NotAnAlias,
-                RustTypeAlias::Unopenable => DeclaredAlias::Unopenable,
-            },
-        )?;
-
+    let mut resolutions = ResolvedTypes::default();
     let mut sources = HashMap::new();
     let mut unopened = Vec::new();
     for declaration in traced.declared() {
-        let Some(right) = traced.resolved().resolved_of(declaration.name()) else {
-            continue;
+        let declared = match declared_spelling_of(session.hover_at_declaration(declaration.site())?)
+        {
+            Ok(declared) => declared,
+            Err(reason) => {
+                unopened.push(UnopenedTypeName::new(declaration.name().to_owned(), reason));
+                continue;
+            }
         };
+        let alias = RustTypeAlias::from_spelling(declared.as_str());
+        match &alias {
+            RustTypeAlias::NotAnAlias => continue,
+            RustTypeAlias::Unopenable => {
+                unopened.push(UnopenedTypeName::new(
+                    declaration.name().to_owned(),
+                    UnopenedReason::UnopenableAlias,
+                ));
+                continue;
+            }
+            RustTypeAlias::Opened(_) | RustTypeAlias::Generic(_) => {}
+        }
         let source = sources
             .entry(declaration.site().path().to_path_buf())
             .or_insert_with(|| source_of(declaration.site().path()));
         let reason = match source {
-            Ok(source) => rust_alias_unopened_reason(session, declaration, source, right)?,
+            Ok(source) => rust_alias_unopened_reason(session, declaration, source, &alias)?,
             Err(_) => Some(UnopenedReason::UnreadableDeclaringDocument),
         };
         if let Some(reason) = reason {
             unopened.push(UnopenedTypeName::new(declaration.name().to_owned(), reason));
+            continue;
+        }
+        match alias {
+            RustTypeAlias::Opened(right) => {
+                resolutions
+                    .by_name
+                    .insert(declaration.name().to_owned(), right);
+            }
+            RustTypeAlias::Generic(alias) => {
+                resolutions
+                    .rust_generics
+                    .insert(declaration.name().to_owned(), alias);
+            }
+            RustTypeAlias::NotAnAlias | RustTypeAlias::Unopenable => {}
         }
     }
-    for name in &unopened {
-        traced.resolved.by_name.remove(name.name());
-    }
-    Ok(traced.with_unopened(unopened))
+    Ok(traced.with_resolved(resolutions).with_unopened(unopened))
 }
 
 /// 右辺のプリミティブ表記が、その宣言側で同じプリミティブを指すか確認する。
@@ -319,10 +350,10 @@ fn rust_alias_unopened_reason(
     session: &mut Session,
     declaration: &TypeDeclaration,
     source: &str,
-    right: &str,
+    alias: &RustTypeAlias,
 ) -> Result<Option<UnopenedReason>, ClientError> {
     let Some(primitives) =
-        primitive_references_of_alias(source, declaration.site().position(), right)
+        primitive_references_of_alias(source, declaration.site().position(), alias)
     else {
         return Ok(Some(UnopenedReason::UnopenableAlias));
     };

@@ -102,6 +102,7 @@ pub(crate) struct RustCallable {
     type_names: BTreeSet<String>,
     /// impl の対象に置き換えられない Self、または Self を含む関連型が残るか。
     refers_to_self: bool,
+    unopenable_alias: bool,
 }
 
 impl RustCallable {
@@ -113,7 +114,7 @@ impl RustCallable {
     /// 束縛された型変数には差し込まない。`impl_header` は実ソースの直接の親 impl。
     pub(crate) fn from_spelling(
         spelling: &str,
-        alias_of: &dyn Fn(&str) -> Option<String>,
+        alias_of: &dyn Fn(&str) -> Option<RustTypeAlias>,
         impl_header: Option<&str>,
     ) -> Option<Self> {
         let function_spelling = match spelling
@@ -149,12 +150,80 @@ impl RustCallable {
         let mut spelling = Spelling::new(&declaration);
         spelling.alias_of = alias_of;
         spelling.from_hover = true;
-        spelling.callable_of(function)
+        let mut callable = spelling.callable_of(function)?;
+        callable.renumber_variables();
+        Some(callable)
+    }
+
+    /// エイリアスが引数の順序を変えても、展開後の初出順で比べる。
+    fn renumber_variables(&mut self) {
+        let mut method = Vec::new();
+        let mut implementation = Vec::new();
+        let mut renumber = |spelling: &str| -> String {
+            let mut output = String::new();
+            let mut rest = spelling;
+            while let Some(position) = rest.find(['%', '"', '\'']) {
+                if rest.as_bytes()[position] == b'\'' {
+                    let end = character_literal_end(rest, position).unwrap_or(position + 1);
+                    output.push_str(&rest[..end]);
+                    rest = &rest[end..];
+                    continue;
+                }
+                if rest.as_bytes()[position] == b'"' {
+                    let end = string_literal_end(rest, position);
+                    output.push_str(&rest[..end]);
+                    rest = &rest[end..];
+                    continue;
+                }
+                output.push_str(&rest[..position]);
+                rest = &rest[position + 1..];
+                let (numbers, prefix) = match rest.strip_prefix("impl") {
+                    Some(suffix) => {
+                        rest = suffix;
+                        (&mut implementation, "%impl")
+                    }
+                    None => (&mut method, PLACEHOLDER_PREFIX),
+                };
+                let length = rest.bytes().take_while(u8::is_ascii_digit).count();
+                if length == 0 {
+                    output.push_str(prefix);
+                    continue;
+                }
+                let original = &rest[..length];
+                let index = match numbers.iter().position(|number| number == original) {
+                    Some(index) => index,
+                    None => {
+                        numbers.push(original.to_owned());
+                        numbers.len() - 1
+                    }
+                };
+                output.push_str(&format!("{prefix}{index}"));
+                rest = &rest[length..];
+            }
+            output.push_str(rest);
+            output
+        };
+        self.parameters = self
+            .parameters
+            .iter()
+            .map(|parameter| renumber(parameter))
+            .collect();
+        self.value_type = renumber(&self.value_type);
+        self.trait_bounds = self
+            .trait_bounds
+            .iter()
+            .map(|(left, bound)| (renumber(left), renumber(bound)))
+            .collect();
     }
 
     /// 比較に残る綴りに現れた型名。名前順。
     pub(crate) fn type_names(&self) -> &BTreeSet<String> {
         &self.type_names
+    }
+
+    /// エイリアスの型引数を当てはめられなかったか。
+    pub(crate) fn has_unopenable_alias(&self) -> bool {
+        self.unopenable_alias
     }
 
     /// impl の文脈を使っても、Self の指す型を確定できない綴りが残るか。
@@ -163,10 +232,55 @@ impl RustCallable {
     }
 }
 
+/// 文字リテラルの終端。閉じる引用符を持たないライフタイムは `None`。
+fn character_literal_end(source: &str, quote: usize) -> Option<usize> {
+    let rest = source.get(quote + 1..)?;
+    let first = rest.chars().next()?;
+    let length = match first {
+        '\\' => match rest.as_bytes().get(1)? {
+            b'u' => rest.find('}')? + 1,
+            b'x' => 4,
+            _ => 2,
+        },
+        _ => first.len_utf8(),
+    };
+    (rest.as_bytes().get(length) == Some(&b'\'')).then_some(quote + 1 + length + 1)
+}
+
+/// 引用符から始まる文字列の終端。raw string の hash と通常の escape を区別する。
+fn string_literal_end(source: &str, quote: usize) -> usize {
+    let prefix = &source[..quote];
+    let hashes = prefix
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'#')
+        .count();
+    let raw = prefix[..prefix.len() - hashes].ends_with('r');
+    let bytes = source.as_bytes();
+    let mut index = quote + 1;
+    while index < bytes.len() {
+        if !raw && bytes[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        let closes = bytes[index] == b'"'
+            && (!raw
+                || bytes
+                    .get(index + 1..index + 1 + hashes)
+                    .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#')));
+        if closes {
+            return index + 1 + if raw { hashes } else { 0 };
+        }
+        index += 1;
+    }
+    source.len()
+}
+
 /// Rust の宣言 hover を、開ける右辺・型エイリアスでない宣言・開けない宣言に分ける。
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RustTypeAlias {
     Opened(String),
+    Generic(RustGenericAlias),
     NotAnAlias,
     Unopenable,
 }
@@ -174,7 +288,7 @@ pub(crate) enum RustTypeAlias {
 impl RustTypeAlias {
     /// 可視性を含む宣言から、展開候補の右辺を正規化する。
     /// プリミティブの綴りが指す実際の型の確認は、呼び出し側が意味情報から行う。
-    /// 型・ライフタイム・const 引数、および未知の型構文は開かない。
+    /// ライフタイム・const 引数、および未知の型構文は開かない。
     pub(crate) fn from_spelling(spelling: &str) -> Self {
         let declaration = format!("{}{DECLARATION_TERMINATOR}", spelling.trim_end_matches(';'));
         let Ok(tree) = SyntaxTree::from_source(&declaration, Grammar::Rust) else {
@@ -205,13 +319,19 @@ impl RustTypeAlias {
             }
             return Self::NotAnAlias;
         };
-        if tree.has_error() || alias.child_by_field_name("type_parameters").is_some() {
+        if tree.has_error() {
             return Self::Unopenable;
         }
         let Some(right) = alias.child_by_field_name("type") else {
             return Self::Unopenable;
         };
-        if !is_openable_type_syntax(right, &declaration) {
+        if let Some(parameters) = alias.child_by_field_name("type_parameters") {
+            return match RustGenericAlias::from_nodes(parameters, right, &declaration) {
+                Some(alias) => Self::Generic(alias),
+                None => Self::Unopenable,
+            };
+        }
+        if !is_openable_type_syntax(right, &declaration, &[]) {
             return Self::Unopenable;
         }
         let mut spelling = Spelling::new(&declaration);
@@ -222,12 +342,93 @@ impl RustTypeAlias {
     }
 }
 
+/// 宣言側で意味を確定できた、型引数付きエイリアスのテンプレート。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RustGenericAlias {
+    parameters: Vec<AliasParameter>,
+    right: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AliasParameter {
+    name: String,
+    default: Option<String>,
+}
+
+impl RustGenericAlias {
+    /// 型パラメータだけを持ち、右辺・既定値の名前が束縛内に閉じる宣言を読む。
+    fn from_nodes(parameters: Node<'_>, right: Node<'_>, source: &str) -> Option<Self> {
+        let mut names = Vec::new();
+        let mut parsed = Vec::new();
+        for parameter in named_children_of(parameters) {
+            if parameter.kind() != "type_parameter" {
+                return None;
+            }
+            let name = source
+                .get(parameter.child_by_field_name("name")?.byte_range())?
+                .to_owned();
+            if names.contains(&name) {
+                return None;
+            }
+            let default = match parameter.child_by_field_name("default_type") {
+                Some(default) => {
+                    if !is_openable_type_syntax(default, source, &names) {
+                        return None;
+                    }
+                    Some(Spelling::new(source).spelling_of(default)??)
+                }
+                None => None,
+            };
+            names.push(name.clone());
+            parsed.push(AliasParameter { name, default });
+        }
+        if !is_openable_type_syntax(right, source, &names) {
+            return None;
+        }
+        Some(Self {
+            parameters: parsed,
+            right: Spelling::new(source).spelling_of(right)??,
+        })
+    }
+
+    /// 使用側で正規化した型引数を当てはめる。個数が合わず既定値も無ければ `None`。
+    fn instantiated(&self, arguments: &[String]) -> Option<String> {
+        if arguments.len() > self.parameters.len() {
+            return None;
+        }
+        let mut substitutions = Vec::new();
+        for (index, parameter) in self.parameters.iter().enumerate() {
+            let argument = match arguments.get(index) {
+                Some(argument) => argument.clone(),
+                None => substituted(parameter.default.as_deref()?, &substitutions),
+            };
+            substitutions.push((parameter.name.as_str(), argument));
+        }
+        Some(substituted(&self.right, &substitutions))
+    }
+}
+
+/// AST で検証・分離した型識別子のトークンだけを置換する。
+/// 導入した引数は再走査しないので、宣言側の別の型変数に捕捉されない。
+fn substituted(template: &str, substitutions: &[(&str, String)]) -> String {
+    template
+        .split_whitespace()
+        .map(|token| {
+            substitutions
+                .iter()
+                .find(|(name, _)| *name == token)
+                .map_or(token, |(_, argument)| argument.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// 宣言の名前の位置から、右辺のプリミティブ表記と問い合わせ位置を返す。
 /// ソースの宣言を読めない、または正規化した右辺が hover と一致しなければ `None`。
 pub(crate) fn primitive_references_of_alias(
     source: &str,
     position: crate::source_position::SourcePosition,
-    expected_right: &str,
+    expected: &RustTypeAlias,
 ) -> Option<Vec<TypeReference>> {
     let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
     let alias = tree.named_descendants().into_iter().find(|node| {
@@ -237,21 +438,27 @@ pub(crate) fn primitive_references_of_alias(
                 .and_then(|name| source_position_of(name, source))
                 == Some(position)
     })?;
-    if alias.has_error() || alias.child_by_field_name("type_parameters").is_some() {
+    if alias.has_error() {
+        return None;
+    }
+    let actual = RustTypeAlias::from_spelling(source.get(alias.byte_range())?);
+    if &actual != expected {
         return None;
     }
     let right = alias.child_by_field_name("type")?;
-    if !is_openable_type_syntax(right, source) {
-        return None;
-    }
-    let resolved = Spelling::new(source).spelling_of(right)??;
-    if resolved != expected_right {
-        return None;
-    }
+    let defaults: Vec<_> = alias
+        .child_by_field_name("type_parameters")
+        .into_iter()
+        .flat_map(named_children_of)
+        .filter_map(|parameter| parameter.child_by_field_name("default_type"))
+        .collect();
     tree.named_descendants()
         .into_iter()
         .filter(|node| {
-            node.kind() == "primitive_type" && right.byte_range().contains(&node.start_byte())
+            node.kind() == "primitive_type"
+                && !matches!(expected, RustTypeAlias::Generic(alias) if alias.parameters.iter().any(|parameter| source.get(node.byte_range()) == Some(parameter.name.as_str())))
+                && (right.byte_range().contains(&node.start_byte())
+                    || defaults.iter().any(|default| default.byte_range().contains(&node.start_byte())))
         })
         .map(|node| {
             Some(TypeReference::new(
@@ -264,15 +471,18 @@ pub(crate) fn primitive_references_of_alias(
 
 /// 展開候補にできる型構文か。未知の構文は許可しない。
 /// プリミティブ名の shadow は構文だけでは分からず、意味情報を取る側で確認する。
-fn is_openable_type_syntax(node: Node<'_>, source: &str) -> bool {
+fn is_openable_type_syntax(node: Node<'_>, source: &str, parameters: &[String]) -> bool {
     match node.kind() {
+        "type_identifier" => source
+            .get(node.byte_range())
+            .is_some_and(|name| parameters.iter().any(|parameter| parameter == name)),
         "primitive_type" | "unit_type" | "never_type" | "integer_literal" | "mutable_specifier" => {
             true
         }
         "lifetime" => source.get(node.byte_range()) == Some(STATIC_LIFETIME),
         "reference_type" | "pointer_type" | "tuple_type" | "array_type" | "function_type"
         | "parameters" | "function_modifiers" => {
-            named_children_of(node).all(|child| is_openable_type_syntax(child, source))
+            named_children_of(node).all(|child| is_openable_type_syntax(child, source, parameters))
         }
         _ => false,
     }
@@ -337,7 +547,7 @@ pub(crate) fn type_references_of(function: Node<'_>, source: &str) -> Vec<TypeRe
 /// **付け替えの番号は読んだ順に振る**ので、引数 → 戻り値 → 境界の順に歩く。
 struct Spelling<'source, 'tree> {
     source: &'source str,
-    alias_of: &'source dyn Fn(&str) -> Option<String>,
+    alias_of: &'source dyn Fn(&str) -> Option<RustTypeAlias>,
     /// 関数が束縛した型変数の名前。宣言された順。
     declared: Vec<String>,
     impl_declared: Vec<String>,
@@ -353,6 +563,7 @@ struct Spelling<'source, 'tree> {
     /// それは hover の中の位置で、尋ねる先にはならない。
     references: Vec<TypeReference>,
     refers_to_self: bool,
+    unopenable_alias: bool,
 }
 
 impl<'source, 'tree> Spelling<'source, 'tree> {
@@ -369,6 +580,7 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
             type_names: BTreeSet::new(),
             references: Vec::new(),
             refers_to_self: false,
+            unopenable_alias: false,
         }
     }
 
@@ -465,6 +677,7 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
             trait_bounds,
             type_names: self.type_names.clone(),
             refers_to_self: self.refers_to_self,
+            unopenable_alias: self.unopenable_alias,
         })
     }
 
@@ -604,17 +817,7 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
                 let bound = node.child_by_field_name("type")?;
                 format!("{name} = {}", self.spelling_of(bound)?.unwrap_or_default())
             }
-            "generic_type" => {
-                let generic = self.spelling_of(node.child_by_field_name("type")?)?;
-                let arguments =
-                    self.listed_spellings_of(node.child_by_field_name("type_arguments")?)?;
-                let generic = generic.unwrap_or_default();
-                if arguments.is_empty() {
-                    generic
-                } else {
-                    format!("{generic}<{}>", arguments.join(", "))
-                }
-            }
+            "generic_type" => self.generic_spelling_of(node)?,
             // `+` で並ぶ要求は並びを問わない
             "bounded_type" | "trait_bounds" => {
                 let mut members = BoundedMembers::default();
@@ -630,6 +833,68 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
         };
 
         Some(Some(spelled))
+    }
+
+    /// 型引数を使用側で正規化してから、エイリアス全体へ当てはめる。
+    fn generic_spelling_of(&mut self, node: Node<'_>) -> Option<String> {
+        let head = node.child_by_field_name("type")?;
+        let argument_nodes = node.child_by_field_name("type_arguments")?;
+        let name = collapsed(self.text_of(head)?);
+        let bound_head = name.split("::").next().is_some_and(|head| {
+            head == SELF_TYPE || self.declared.iter().any(|declared| declared == head)
+        });
+        if !bound_head {
+            if let Some(alias) = (self.alias_of)(&name) {
+                // ライフタイム・const・関連型束縛を型引数として数えてはいけない。
+                let type_arguments_only = named_children_of(argument_nodes).all(|argument| {
+                    matches!(
+                        argument.kind(),
+                        "primitive_type"
+                            | "type_identifier"
+                            | "scoped_type_identifier"
+                            | "generic_type"
+                            | "reference_type"
+                            | "pointer_type"
+                            | "tuple_type"
+                            | "unit_type"
+                            | "never_type"
+                            | "array_type"
+                            | "function_type"
+                            | "dynamic_type"
+                            | "abstract_type"
+                            | "bounded_type"
+                    )
+                });
+                if !type_arguments_only {
+                    self.unopenable_alias = true;
+                    return Some(name);
+                }
+                let arguments = self.listed_spellings_of(argument_nodes)?;
+                return Some(self.alias_spelling(alias, &arguments));
+            }
+        }
+        let generic = self.spelling_of(head)?.unwrap_or_default();
+        let arguments = self.listed_spellings_of(argument_nodes)?;
+        if arguments.is_empty() {
+            return Some(generic);
+        }
+        Some(format!("{generic}<{}>", arguments.join(", ")))
+    }
+
+    /// 開けない当てはめは印を残し、呼び出し側が理由付きで測定不能にする。
+    fn alias_spelling(&mut self, alias: RustTypeAlias, arguments: &[String]) -> String {
+        let resolved = match alias {
+            RustTypeAlias::Opened(right) => arguments.is_empty().then_some(right),
+            RustTypeAlias::Generic(alias) => alias.instantiated(arguments),
+            RustTypeAlias::NotAnAlias | RustTypeAlias::Unopenable => None,
+        };
+        match resolved {
+            Some(right) => right,
+            None => {
+                self.unopenable_alias = true;
+                String::new()
+            }
+        }
     }
 
     /// 名前付きの子を 1 つずつ綴り、落ちたものを除いて返す。読めなければ `None`。
@@ -700,7 +965,7 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
         }
 
         if let Some(resolved) = (self.alias_of)(name) {
-            return Some(resolved);
+            return Some(self.alias_spelling(resolved, &[]));
         }
 
         self.insert_type_name(name.to_owned(), node);
@@ -748,7 +1013,7 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
     fn whole_path_of(&mut self, node: Node<'_>) -> Option<String> {
         let path = collapsed(self.text_of(node)?);
         if let Some(resolved) = (self.alias_of)(&path) {
-            return Some(resolved);
+            return Some(self.alias_spelling(resolved, &[]));
         }
         self.insert_type_name(path.clone(), node.child_by_field_name("name")?);
 
@@ -1023,8 +1288,12 @@ mod tests {
             line,
             "mod b { /*🦀*/ type ",
         );
-        let references = super::primitive_references_of_alias(source, position, "u64")
-            .expect("宣言の右辺が一致する");
+        let references = super::primitive_references_of_alias(
+            source,
+            position,
+            &super::RustTypeAlias::Opened("u64".to_owned()),
+        )
+        .expect("宣言の右辺が一致する");
         assert_eq!(references.len(), 1);
         assert_eq!(references[0].name(), "u64");
         assert_eq!(
@@ -1035,9 +1304,156 @@ mod tests {
             )
         );
         assert_eq!(
-            super::primitive_references_of_alias(source, position, "u8"),
+            super::primitive_references_of_alias(
+                source,
+                position,
+                &super::RustTypeAlias::Opened("u8".to_owned())
+            ),
             None
         );
+    }
+
+    #[test]
+    fn test_rust_generic_alias_arguments_are_instantiated() {
+        let alias = super::RustTypeAlias::from_spelling("type Pair<T> = (T, T)");
+        let actual = RustCallable::from_spelling(
+            "fn f(value: Pair<u8>)",
+            &|name| (name == "Pair").then(|| alias.clone()),
+            None,
+        )
+        .expect("型引数付き関数を読める");
+        assert_eq!(actual, read("fn f(value: (u8, u8))"));
+    }
+
+    #[test]
+    fn test_rust_generic_alias_defaults_nesting_and_capture_avoidance() {
+        for (declaration, actual, expected) in [
+            (
+                "type Pair<T> = (T, T)",
+                "fn f(x: Pair<Pair<u8>>)",
+                "fn f(x: ((u8,u8),(u8,u8)))",
+            ),
+            (
+                "type Pair<T = u8, U = T> = (T, U)",
+                "fn f(x: Pair)",
+                "fn f(x: (u8,u8))",
+            ),
+            (
+                "type Pair<T = u8, U = T> = (T, U)",
+                "fn f(x: Pair<u64>)",
+                "fn f(x: (u64,u64))",
+            ),
+            (
+                "type Pair<T = u8, U = [T; 2]> = (T, U)",
+                "fn f(x: Pair<u64>)",
+                "fn f(x: (u64,[u64;2]))",
+            ),
+            (
+                "type Pair<T, U> = (T, U)",
+                "fn f<U>(x: Pair<U,u8>, y: U)",
+                "fn f<V>(x: (V,u8), y: V)",
+            ),
+            (
+                "type Pair<T, U> = (U, T)",
+                "fn f<T,U>(x: Pair<T,U>, y: T)",
+                "fn f<A,B>(x: (B,A), y: A)",
+            ),
+            (
+                "type Pair<T> = (T, TT)",
+                "fn f<T>(x: Pair<T>)",
+                "fn f<T>(x: Pair<T>)",
+            ),
+            (
+                "type Pair<T> = (T, T)\nwhere T: Copy,",
+                "fn f(x: Pair<u8>)",
+                "fn f(x: (u8,u8))",
+            ),
+            (
+                "type Pair<u8> = (u8, u8)",
+                "fn f(x: Pair<u64>)",
+                "fn f(x: (u64,u64))",
+            ),
+        ] {
+            let alias = super::RustTypeAlias::from_spelling(declaration);
+            if declaration.contains("TT") {
+                assert_eq!(alias, super::RustTypeAlias::Unopenable);
+                continue;
+            }
+            let actual = RustCallable::from_spelling(
+                actual,
+                &|name| (name == "Pair").then(|| alias.clone()),
+                None,
+            )
+            .unwrap();
+            assert_eq!(actual, read(expected), "{declaration}");
+        }
+    }
+
+    #[test]
+    fn test_rust_generic_alias_invalid_arguments_are_unopenable() {
+        let alias = super::RustTypeAlias::from_spelling("type Pair<T> = (T, T)");
+        for signature in [
+            "fn f(x: Pair)",
+            "fn f(x: Pair<u8,u64>)",
+            "fn f(x: Pair<'static>)",
+            "fn f(x: Pair<3>)",
+            "fn f(x: Pair<true>)",
+            "fn f(x: Pair<'x'>)",
+        ] {
+            let actual = RustCallable::from_spelling(
+                signature,
+                &|name| (name == "Pair").then(|| alias.clone()),
+                None,
+            )
+            .unwrap_or_else(|| panic!("型として読める: {signature}"));
+            assert!(actual.has_unopenable_alias(), "{signature}");
+        }
+    }
+
+    #[test]
+    fn test_rust_variable_numbering_preserves_percent_in_literals_and_remainders() {
+        for (first, second) in [
+            (
+                r#"fn f(x: [u8; b"%1"[1] as usize])"#,
+                r#"fn f(x: [u8; b"%2"[1] as usize])"#,
+            ),
+            (
+                r##"fn f(x: [u8; br#"\"%1"#[2] as usize])"##,
+                r##"fn f(x: [u8; br#"\"%2"#[2] as usize])"##,
+            ),
+            ("fn f(x: [u8; 4 % 3])", "fn f(x: [u8; 4 % 2])"),
+        ] {
+            assert_ne!(read(first), read(second));
+        }
+    }
+
+    #[test]
+    fn test_rust_alias_variable_order_after_a_quoted_byte_is_preserved() {
+        let alias = super::RustTypeAlias::from_spelling("type Flip<A,B> = (B,A)");
+        let actual = RustCallable::from_spelling(
+            r#"fn f<T,U>(x: ([u8; b'"' as usize], Flip<T,U>), y:T)"#,
+            &|name| (name == "Flip").then(|| alias.clone()),
+            None,
+        )
+        .unwrap();
+        let expected = read(r#"fn g<A,B>(x: ([u8; b'"' as usize], (B,A)), y:A)"#);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_rust_generic_alias_external_defaults_cannot_capture_use_site_names() {
+        for declaration in [
+            "type Pair<T = Customer> = (T,T)",
+            "type Pair<T = U, U = u8> = (T,U)",
+            "type Pair<T> = (T, T::Item)",
+            "type Pair<T> = (T, [u8; COUNT])",
+        ] {
+            assert_eq!(
+                super::RustTypeAlias::from_spelling(declaration),
+                super::RustTypeAlias::Unopenable,
+                "{declaration}"
+            );
+        }
     }
 
     #[test]
@@ -1083,10 +1499,8 @@ mod tests {
     #[test]
     fn test_rust_alias_generic_parameters_cannot_be_opened() {
         for declaration in [
-            "type Pair<T> = (T, T)",
             "type Bytes<'a> = &'a [u8]",
             "type Bytes<const N: usize> = [u8; N]",
-            "type Value<T = u8> = T",
         ] {
             assert_eq!(
                 super::RustTypeAlias::from_spelling(declaration),
