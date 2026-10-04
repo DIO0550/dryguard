@@ -371,14 +371,15 @@ pub fn rust_type_signature_outcome_of(
 /// 書かれた場所で決まる綴り → 辿った記録の無い型名の順に見て、どれにも当たらなければ
 /// 比べられる形にする。
 ///
-/// **型エイリアスは差し込まない。** Rust の型名を辿る側（`semantics::resolved_type` の
-/// `rust_traced_type_names_of`）はエイリアスを開かず、宣言の場所だけを渡す。宣言の場所を
-/// 一緒に比べるので、**別々の宣言の同じ綴りは重ならない**（[`TypeSignature`] の `declarations`）。
+/// **右辺は型名の位置だけに差し込む。** 宣言側スコープに依存しない形に限って
+/// `syntax::rust_callable` が開いているので、使用側の型変数や宣言記録を流用しない。
 pub fn rust_normalized_outcome_of(
     signature_text: &SignatureText,
     traced: &TracedTypeNames,
 ) -> TypeSignatureOutcome {
-    let Some(callable) = RustCallable::from_spelling(signature_text.as_str()) else {
+    let Some(callable) = RustCallable::from_spelling(signature_text.as_str(), &|name| {
+        traced.resolved().resolved_of(name).map(str::to_owned)
+    }) else {
         return TypeSignatureOutcome::UnreadableSignature;
     };
 
@@ -3813,6 +3814,75 @@ mod tests {
 
         assert!(
             aliased.is_unifiable_with(&signature("function g(y: string | number | null): void"))
+        );
+    }
+
+    #[test]
+    fn test_rust_alias_is_unifiable_with_its_right_hand_side() {
+        let alias = rust_signature(
+            "fn charged(value: Amount) -> Amount",
+            &TracedTypeNames::default().with_resolved(resolving("Amount", "u64")),
+        );
+        let raw = rust_signature("fn raw(value: u64) -> u64", &TracedTypeNames::default());
+        assert!(alias.is_unifiable_with(&raw));
+    }
+
+    #[test]
+    fn test_rust_alias_nested_type_positions_are_expanded() {
+        let traced = TracedTypeNames::default().with_resolved(resolving("model::Amount", "u64"));
+        let alias = rust_signature(
+            "fn f(value: &[(model::Amount, u8)]) -> *const model::Amount",
+            &traced,
+        );
+        let raw = rust_signature(
+            "fn g(value: &[(u64, u8)]) -> *const u64",
+            &TracedTypeNames::default(),
+        );
+        assert!(alias.is_unifiable_with(&raw));
+    }
+
+    #[test]
+    fn test_rust_bound_type_parameters_are_not_replaced_by_aliases() {
+        let traced = TracedTypeNames::default().with_resolved(resolving("Amount", "u64"));
+        let bound = rust_signature("fn f<Amount>(value: Amount) -> Amount", &traced);
+        let renamed = rust_signature("fn g<T>(value: T) -> T", &TracedTypeNames::default());
+        assert!(bound.is_unifiable_with(&renamed));
+    }
+
+    #[test]
+    fn test_rust_alias_substrings_and_associated_names_are_not_replaced() {
+        let traced =
+            declaring_rust(&["Amounts", "Iterator"]).with_resolved(resolving("Amount", "u64"));
+        let original = "fn f<T: Iterator<Amount = u8>>(Amount: Amounts) -> Amounts";
+        let aliased = rust_signature(original, &traced);
+        let raw = rust_signature(original, &declaring_rust(&["Amounts", "Iterator"]));
+        assert!(aliased.is_unifiable_with(&raw));
+    }
+
+    #[test]
+    fn test_rust_different_alias_right_hand_sides_are_not_unifiable() {
+        let small = rust_signature(
+            "fn f(value: Amount)",
+            &TracedTypeNames::default().with_resolved(resolving("Amount", "u8")),
+        );
+        let large = rust_signature(
+            "fn f(value: Amount)",
+            &TracedTypeNames::default().with_resolved(resolving("Amount", "u64")),
+        );
+        assert!(!small.is_unifiable_with(&large));
+    }
+
+    #[test]
+    fn test_rust_unopenable_alias_is_not_compared_as_a_nominal_type() {
+        let traced = declaring_rust(&["Pair"]).with_unopened(vec![UnopenedTypeName::new(
+            "Pair".to_owned(),
+            UnopenedReason::UnopenableAlias,
+        )]);
+        assert_eq!(
+            rust_normalized_outcome_of(&signature_text("fn f(value: Pair<u8>)"), &traced),
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::UnopenableAlias
+            }
         );
     }
 

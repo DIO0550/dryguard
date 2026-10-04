@@ -111,7 +111,12 @@ impl RustCallable {
     ///
     /// **const generics を持つ関数も `None`。** hover は使用箇所を `[u8; {const}]` と
     /// 綴るので型として読めず、読めた部分だけで比べると長さの違う配列が重なる。
-    pub(crate) fn from_spelling(spelling: &str) -> Option<Self> {
+    /// 型名の位置だけに、宣言側で正規化した右辺を差し込む。
+    /// 束縛された型変数には差し込まない。
+    pub(crate) fn from_spelling(
+        spelling: &str,
+        alias_of: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<Self> {
         let declaration = format!("{spelling}{DECLARATION_TERMINATOR}");
         let tree = SyntaxTree::from_source(&declaration, Grammar::Rust).ok()?;
         if tree.has_error() {
@@ -123,7 +128,9 @@ impl RustCallable {
             .into_iter()
             .find(|node| node.kind() == FUNCTION_SIGNATURE_KIND)?;
 
-        Spelling::new(&declaration).callable_of(function)
+        let mut spelling = Spelling::new(&declaration);
+        spelling.alias_of = alias_of;
+        spelling.callable_of(function)
     }
 
     /// 比較に残る綴りに現れた型名。名前順。
@@ -134,6 +141,121 @@ impl RustCallable {
     /// `Self` かレシーバを持ち、指す先が書かれた場所で決まるか。
     pub(crate) fn refers_to_self(&self) -> bool {
         self.refers_to_self
+    }
+}
+
+/// Rust の宣言 hover を、開ける右辺・型エイリアスでない宣言・開けない宣言に分ける。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RustTypeAlias {
+    Opened(String),
+    NotAnAlias,
+    Unopenable,
+}
+
+impl RustTypeAlias {
+    /// 可視性を含む宣言から、展開候補の右辺を正規化する。
+    /// プリミティブの綴りが指す実際の型の確認は、呼び出し側が意味情報から行う。
+    /// 型・ライフタイム・const 引数、および未知の型構文は開かない。
+    pub(crate) fn from_spelling(spelling: &str) -> Self {
+        let declaration = format!("{}{DECLARATION_TERMINATOR}", spelling.trim_end_matches(';'));
+        let Ok(tree) = SyntaxTree::from_source(&declaration, Grammar::Rust) else {
+            return Self::Unopenable;
+        };
+        let nodes = tree.named_descendants();
+        let Some(alias) = nodes.iter().find(|node| {
+            matches!(node.kind(), "type_item" | "associated_type")
+                && node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "source_file")
+        }) else {
+            // 欠けた右辺でも type 宣言と分かるものは、通常の型の宣言にしない。
+            let has_alias_keyword = nodes.iter().any(|node| {
+                if node.kind() != "ERROR"
+                    || node
+                        .parent()
+                        .is_none_or(|parent| parent.kind() != "source_file")
+                {
+                    return false;
+                }
+                let mut cursor = node.walk();
+                node.children(&mut cursor)
+                    .any(|child| child.kind() == "type")
+            });
+            if has_alias_keyword {
+                return Self::Unopenable;
+            }
+            return Self::NotAnAlias;
+        };
+        if tree.has_error() || alias.child_by_field_name("type_parameters").is_some() {
+            return Self::Unopenable;
+        }
+        let Some(right) = alias.child_by_field_name("type") else {
+            return Self::Unopenable;
+        };
+        if !is_openable_type_syntax(right, &declaration) {
+            return Self::Unopenable;
+        }
+        let mut spelling = Spelling::new(&declaration);
+        match spelling.spelling_of(right) {
+            Some(Some(resolved)) => Self::Opened(resolved),
+            Some(None) | None => Self::Unopenable,
+        }
+    }
+}
+
+/// 宣言の名前の位置から、右辺のプリミティブ表記と問い合わせ位置を返す。
+/// ソースの宣言を読めない、または正規化した右辺が hover と一致しなければ `None`。
+pub(crate) fn primitive_references_of_alias(
+    source: &str,
+    position: crate::source_position::SourcePosition,
+    expected_right: &str,
+) -> Option<Vec<TypeReference>> {
+    let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
+    let alias = tree.named_descendants().into_iter().find(|node| {
+        node.kind() == "type_item"
+            && node
+                .child_by_field_name("name")
+                .and_then(|name| source_position_of(name, source))
+                == Some(position)
+    })?;
+    if alias.has_error() || alias.child_by_field_name("type_parameters").is_some() {
+        return None;
+    }
+    let right = alias.child_by_field_name("type")?;
+    if !is_openable_type_syntax(right, source) {
+        return None;
+    }
+    let resolved = Spelling::new(source).spelling_of(right)??;
+    if resolved != expected_right {
+        return None;
+    }
+    tree.named_descendants()
+        .into_iter()
+        .filter(|node| {
+            node.kind() == "primitive_type" && right.byte_range().contains(&node.start_byte())
+        })
+        .map(|node| {
+            Some(TypeReference::new(
+                source.get(node.byte_range())?.to_owned(),
+                source_position_of(node, source)?,
+            ))
+        })
+        .collect()
+}
+
+/// 展開候補にできる型構文か。未知の構文は許可しない。
+/// プリミティブ名の shadow は構文だけでは分からず、意味情報を取る側で確認する。
+fn is_openable_type_syntax(node: Node<'_>, source: &str) -> bool {
+    match node.kind() {
+        "primitive_type" | "unit_type" | "never_type" | "integer_literal" | "mutable_specifier" => {
+            true
+        }
+        "lifetime" => source.get(node.byte_range()) == Some(STATIC_LIFETIME),
+        "reference_type" | "pointer_type" | "tuple_type" | "array_type" | "function_type"
+        | "parameters" | "function_modifiers" => {
+            named_children_of(node).all(|child| is_openable_type_syntax(child, source))
+        }
+        _ => false,
     }
 }
 
@@ -174,6 +296,7 @@ pub(crate) fn type_references_of(function: Node<'_>, source: &str) -> Vec<TypeRe
 /// **付け替えの番号は読んだ順に振る**ので、引数 → 戻り値 → 境界の順に歩く。
 struct Spelling<'source> {
     source: &'source str,
+    alias_of: &'source dyn Fn(&str) -> Option<String>,
     /// 関数が束縛した型変数の名前。宣言された順。
     declared: Vec<String>,
     /// 付け替えた型変数の名前。**番号の順**。
@@ -191,6 +314,7 @@ impl<'source> Spelling<'source> {
     fn new(source: &'source str) -> Self {
         Self {
             source,
+            alias_of: &|_| None,
             declared: Vec::new(),
             numbered: Vec::new(),
             type_names: BTreeSet::new(),
@@ -461,6 +585,10 @@ impl<'source> Spelling<'source> {
             return Some(format!("{PLACEHOLDER_PREFIX}{number}"));
         }
 
+        if let Some(resolved) = (self.alias_of)(name) {
+            return Some(resolved);
+        }
+
         if name == SELF_TYPE {
             self.refers_to_self = true;
         } else {
@@ -506,6 +634,9 @@ impl<'source> Spelling<'source> {
     /// 型ではなくモジュールの宣言が返る。
     fn whole_path_of(&mut self, node: Node<'_>) -> Option<String> {
         let path = collapsed(self.text_of(node)?);
+        if let Some(resolved) = (self.alias_of)(&path) {
+            return Some(resolved);
+        }
         self.insert_type_name(path.clone(), node.child_by_field_name("name")?);
 
         Some(path)
@@ -574,10 +705,147 @@ fn collapsed(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_rust_alias_primitive_positions_follow_the_selected_declaration_in_utf16() {
+        let source = "mod a { type Value = u8; }\nmod b { /*🦀*/ type Value = u64; }";
+        let line = crate::line_number::LineNumber::from_index(1);
+        let position = crate::source_position::SourcePosition::from_preceding_text(
+            line,
+            "mod b { /*🦀*/ type ",
+        );
+        let references = super::primitive_references_of_alias(source, position, "u64")
+            .expect("宣言の右辺が一致する");
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].name(), "u64");
+        assert_eq!(
+            references[0].position(),
+            crate::source_position::SourcePosition::from_preceding_text(
+                line,
+                "mod b { /*🦀*/ type Value = "
+            )
+        );
+        assert_eq!(
+            super::primitive_references_of_alias(source, position, "u8"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rust_alias_visibility_does_not_change_its_right_hand_side() {
+        for declaration in [
+            "type Amount = u64",
+            "pub type Amount = u64;",
+            "pub(crate) type Amount = u64",
+            "pub(in crate::billing) type Amount = u64",
+        ] {
+            assert_eq!(
+                super::RustTypeAlias::from_spelling(declaration),
+                super::RustTypeAlias::Opened("u64".to_owned()),
+                "{declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rust_alias_nested_scope_independent_types_are_opened() {
+        for right in [
+            "(u8, u64)",
+            "&'static [u8]",
+            "[u8; 4]",
+            "*const u8",
+            "fn(u8) -> u64",
+            "()",
+            "!",
+        ] {
+            let declaration = format!("pub type Value = {right}");
+            let super::RustTypeAlias::Opened(resolved) =
+                super::RustTypeAlias::from_spelling(&declaration)
+            else {
+                panic!("右辺を開ける: {declaration}");
+            };
+            assert_eq!(
+                read(&format!("fn f() -> {resolved}")),
+                read(&format!("fn g() -> {right}"))
+            );
+        }
+    }
+
+    #[test]
+    fn test_rust_alias_generic_parameters_cannot_be_opened() {
+        for declaration in [
+            "type Pair<T> = (T, T)",
+            "type Bytes<'a> = &'a [u8]",
+            "type Bytes<const N: usize> = [u8; N]",
+            "type Value<T = u8> = T",
+        ] {
+            assert_eq!(
+                super::RustTypeAlias::from_spelling(declaration),
+                super::RustTypeAlias::Unopenable,
+                "{declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rust_alias_scope_dependent_right_hand_sides_cannot_be_opened() {
+        for right in [
+            "Customer",
+            "module::Customer",
+            "Self",
+            "[u8; COUNT]",
+            "[u8; size_of::<u8>()]",
+            "generated!()",
+            "&'a u8",
+        ] {
+            assert_eq!(
+                super::RustTypeAlias::from_spelling(&format!("type Value = {right}")),
+                super::RustTypeAlias::Unopenable,
+                "{right}"
+            );
+        }
+        assert!(matches!(
+            super::RustTypeAlias::from_spelling("type Value = [u8; 4]"),
+            super::RustTypeAlias::Opened(_)
+        ));
+    }
+
+    #[test]
+    fn test_rust_alias_missing_or_malformed_right_hand_side_is_unopenable() {
+        for declaration in [
+            "type Amount",
+            "pub type Amount =",
+            "pub type Amount = (u8,",
+            "pub type Amount = {unknown}",
+        ] {
+            assert_eq!(
+                super::RustTypeAlias::from_spelling(declaration),
+                super::RustTypeAlias::Unopenable,
+                "{declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rust_nominal_declarations_are_not_aliases() {
+        for declaration in [
+            "pub struct User",
+            "pub enum Color",
+            "pub trait Display",
+            "pub trait Iterator { type Item; }",
+            "pub struct User { r#type: u8 }",
+        ] {
+            assert_eq!(
+                super::RustTypeAlias::from_spelling(declaration),
+                super::RustTypeAlias::NotAnAlias,
+                "{declaration}"
+            );
+        }
+    }
+
     use super::*;
 
     fn read(spelling: &str) -> RustCallable {
-        RustCallable::from_spelling(spelling).expect("関数の綴りとして読める")
+        RustCallable::from_spelling(spelling, &|_| None).expect("関数の綴りとして読める")
     }
 
     #[test]
@@ -781,14 +1049,17 @@ mod tests {
     fn test_from_spelling_const_generics_are_unreadable() {
         // hover は使用箇所を `{const}` と綴る
         assert_eq!(
-            RustCallable::from_spelling("pub fn h<const N: usize>(x: [u8; {const}]) -> (i32, u8)"),
+            RustCallable::from_spelling(
+                "pub fn h<const N: usize>(x: [u8; {const}]) -> (i32, u8)",
+                &|_| None
+            ),
             None
         );
     }
 
     #[test]
     fn test_from_spelling_non_function_is_unreadable() {
-        assert_eq!(RustCallable::from_spelling("pub struct S"), None);
+        assert_eq!(RustCallable::from_spelling("pub struct S", &|_| None), None);
     }
 
     /// ソースに書かれた関数 1 つから集めた型名の、綴りと位置（行, 列）の組。

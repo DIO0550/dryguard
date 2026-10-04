@@ -710,8 +710,8 @@ fn asked_semantics_of(
 ///
 /// hover が返す綴りは書かれた型名のままで、型エイリアスは展開されない。
 /// TypeScript は先に型名の宣言を辿って右辺を集め、綴りへ差し込んでから読む
-/// （`semantics::resolved_type`）。**Rust は hover の後に宣言の場所を集めるだけで、右辺は
-/// 差し込まない。** 順序は `semantics::type_signature::rust_type_signature_outcome_of` が
+/// （`semantics::resolved_type`）。**Rust は hover の後に宣言の場所とエイリアスの右辺を
+/// 集める。** 順序は `semantics::type_signature::rust_type_signature_outcome_of` が
 /// 中に持つ（読み込み前の definition は空を返すので、hover が落ち着くのを先に待つ）。
 ///
 /// # Errors
@@ -724,8 +724,6 @@ fn resolved_type_signature_outcome_of(
     position: SourcePosition,
 ) -> Result<TypeSignatureOutcome, ClientError> {
     if chunk.grammar() == Grammar::Rust {
-        // **宣言の場所までで止める。** エイリアスを開かないので、宣言のファイルを開かせて
-        // 尋ね直す段が要らない（`semantics::resolved_type::rust_traced_type_names_of`）
         return rust_type_signature_outcome_of(
             session,
             document,

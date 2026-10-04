@@ -185,7 +185,7 @@ newtype にしているのはこのため）。
 JSON が壊れているのは違う話）。1 語で呼ぶと、どちらの層で落ちたのかがエラーの名前から消える。
 
 **`leaf divergence` を差し込み・`type spelling` の語で呼ばない。** 「差し込み（substitution）」は
-エイリアスの右辺を綴りに入れる操作（`syntax::type_spelling`）、`spelling` を含む語は型の綴りを
+エイリアスの右辺を綴りに入れる操作（TS は `syntax::type_spelling`、Rust は `syntax::rust_callable`）、`spelling` を含む語は型の綴りを
 指している。葉の綴りの違いは**シグネチャの型を見ない**ので、同じ語で呼ぶと型シグネチャの側の話に読める。
 
 **`leaf divergence` にチャンク自身のシグネチャの型を数えない。** そこは型シグネチャ（Stage 2）が

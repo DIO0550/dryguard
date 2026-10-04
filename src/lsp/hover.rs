@@ -176,6 +176,16 @@ mod tests {
     }
 
     #[test]
+    fn test_rust_analyzer_hover_reads_alias_after_the_module_path() {
+        let hover =
+            markdown_hover("```rust\nfixture::model\n```\n\n```rust\npub type Amount = u64\n```");
+        assert_eq!(
+            outcome_for_language(&hover, ServerLanguage::Rust),
+            HoverOutcome::Answered(signature_text("pub type Amount = u64"))
+        );
+    }
+
+    #[test]
     fn test_hover_outcome_of_a_fence_broken_over_lines_keeps_every_line() {
         // オブジェクト型リテラルはサーバが複数行に展開して返す。1 行目で打ち切ると
         // 引数リストごと落ちる
