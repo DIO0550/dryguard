@@ -58,6 +58,7 @@ if structurally_similar && domains_differ { ... }
 | `codebase` | スキャンの対象になるディレクトリツリー。`scan` が受け取る根の下 |
 | `grammar` | ソースを読むのに使う tree-sitter の文法。拡張子で決まる（`.ts` / `.tsx` / `.mts` / `.cts`） |
 | `chunk` | 比較の単位。関数・メソッド・impl ブロック |
+| `impl header` | Rust メソッドが直接所属する impl の本体より前のソース。対象型・型変数・境界・実装トレイトを、そのスコープのまま運ぶ |
 | `accessor` | プロパティのように読み書きされるメンバーを実装する関数（`get` / `set`）。**チャンクとしては関数**だが、`hover` が返すのは**メンバーとしての型** |
 | `test function` | Rust のテスト属性（パス末尾が `test`）付き関数、または TypeScript / TSX の `describe` / `it` / `test`（`.only` / `.skip` を含む）の第2引数に直接書いたアロー関数・関数式。callback 側の透過ラッパーは辿るが、spread で位置が確定しない形・別名・namespace・未知の修飾は残す。TS は呼び出し名のヒューリスティックで、同名の業務 API も対象。**`scan` は既定でチャンクにしない**（`--include-tests` で入れる）。ファイル名や囲むテストでは判定せず、印の付かないヘルパー・内部の関数は残す |
 | `pair` | 比較する 2 つの chunk |
@@ -117,7 +118,7 @@ if structurally_similar && domains_differ { ... }
 | `annotatable position` | チャンクの宣言が `type annotation` を省ける位置。**`value type` 1 つと、引数ごとに 1 つ**。引数は既定値を書くと省ける |
 | `value type annotation` | `value type` の位置の `type annotation` |
 | `parameter annotation` | 引数 1 つ分の `type annotation`。**引数ごとに答えが違う** |
-| `site-dependent spelling` | **型名にならないのに、指す先が書かれた場所で決まる**綴り（`typeof localValue` / `{ [key]: string }` / `import("./local").T` / `this`）。型名のノードにならないので、尋ねる位置そのものを作れない。**Rust の `Self` とレシーバ（`&self`）もここに数える** — 型名のノードではあるが、指す先が囲む `impl` で決まる |
+| `site-dependent spelling` | **型名にならないのに、指す先が書かれた場所で決まる**綴り（`typeof localValue` / `{ [key]: string }` / `import("./local").T` / `this`）。型名のノードにならないので、尋ねる位置そのものを作れない。**Rust では直接囲む impl で置換できない Self と、Self を含む関連型を数える**。impl の対象型へ置換できた Self / レシーバは数えない |
 | `bound value name` | そのシグネチャの引数が束縛した値の名前。`typeof x` の `x` がこれなら、指す先は**書かれた場所ではなくシグネチャ**が決める。**比較に残る形には持ち込まない**（引数の名前は型を変えない） |
 | `type structure` | `type spelling` を構文木から読んだ形。**書かれ方の違い**（括弧・引数名・タプルのラベル・共用体の並び）を落としてある |
 | `callable` | 呼べる型（関数型・構築型）1 つ分の `type structure`。型変数・引数・戻り値を持つ |
@@ -399,6 +400,7 @@ setter がまとめて「注釈が無い」側へ落ちる**（コンストラ�
 **ジェネリック関数がまとめて測れない側へ落ちる**（`rules/architecture.md`
 「どこまでを「取れなかった」に数えるか」）。ただし**外側のスコープが束縛した型変数は数える** —
 そのシグネチャからは辿れないので、落とすと別のファイルの同じ綴りと重なる。
+Rust の直接囲む impl は例外で、ヘッダーごと運び、メソッド自身と別の名前空間で束縛を残す。
 
 **`module separation` を `module distance` と呼ばない。** 宣言で比べたときは段数が無い。
 1 語で呼ぶと、宣言した 2 つのドメインの間に「何段」があるように読め、`--explain` が

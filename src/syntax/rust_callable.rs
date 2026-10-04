@@ -22,7 +22,7 @@ use crate::syntax::type_reference::TypeReference;
 ///
 /// `%` は識別子に使えない文字なので、**元の型名と衝突しない**
 /// （`syntax::type_structure` と同じ印）。
-const PLACEHOLDER_PREFIX: char = '%';
+const PLACEHOLDER_PREFIX: &str = "%";
 
 /// hover の綴りを 1 つの宣言として読むために末尾へ足す字句。
 ///
@@ -54,9 +54,8 @@ const SELF_TYPE: &str = "Self";
 /// 型の綴りに現れない子の種別。
 ///
 /// **ソースではどこにでも書ける**（引数の間・`where` 句の中）。型の一部ではないので読み飛ばす。
-/// hover の綴りにも `impl` の中のメソッドで現れる（impl の境界が `// Bounds from impl:` の行と
-/// 一緒に `where` 句へ足される。rust-analyzer 1.94.1 で実測）が、そのメソッドを比べられるように
-/// するのは別の話（impl の境界の型名がメソッドのノードに無い）で、ここでは読み飛ばすだけ。
+/// hover の `// Bounds from impl:` は、境界を元の impl スコープから読み直すための区切り。
+/// それ以外のコメントは型の綴りから落とす。
 const COMMENT_KINDS: [&str; 2] = ["line_comment", "block_comment"];
 
 /// 引数に付く属性（`#[cfg(..)] a: A`）。hover の綴りには現れない。
@@ -64,7 +63,7 @@ const ATTRIBUTE_KIND: &str = "attribute_item";
 
 /// Rust の関数 1 つ分の、単一化の可否を比べられる形。
 ///
-/// 関数名・引数名・可視性を落とし、**関数が束縛した型変数を出現順に付け替えてある**
+/// 関数名・引数名・可視性を落とし、型変数を impl / メソッド別に出現順で付け替える
 /// （引数 → 戻り値 → 境界の順）。**ライフタイムは `'static` を除いて落としてある。**
 ///
 /// **Why（ライフタイムを落とす）**: 省略した綴り（`fn(x: &str) -> &str`）と
@@ -89,6 +88,8 @@ pub(crate) struct RustCallable {
     ///
     /// **使われない型変数も数える。** `f::<u8>()` と書けるかが変わる。
     type_parameter_count: usize,
+    /// 囲む impl が束縛した型変数の数。メソッド自身の型変数とは別に比べる。
+    impl_type_parameter_count: usize,
     /// 境界。**左辺の型の綴りと、境界 1 つの綴りの組**の集合。
     ///
     /// **集合で持つ。** inline と `where` の書き分け・`+` の並び・同じ左辺への述語の
@@ -99,10 +100,7 @@ pub(crate) struct RustCallable {
     /// **束縛した型変数・プリミティブ・`?Sized`・関連型の名前（`Item = u8` の `Item`）は
     /// 入らない。** どれも宣言を辿る相手が居ない。パスで書かれた型は**パスごと** 1 つの名前。
     type_names: BTreeSet<String>,
-    /// `Self` かレシーバ（`&self`）を持つか。
-    ///
-    /// **指す先が書かれた場所で決まる。** 別々の `impl` の `&self` は綴りが同じでも
-    /// 別の型を受け取る。
+    /// impl の対象に置き換えられない Self、または Self を含む関連型が残るか。
     refers_to_self: bool,
 }
 
@@ -112,12 +110,32 @@ impl RustCallable {
     /// **const generics を持つ関数も `None`。** hover は使用箇所を `[u8; {const}]` と
     /// 綴るので型として読めず、読めた部分だけで比べると長さの違う配列が重なる。
     /// 型名の位置だけに、宣言側で正規化した右辺を差し込む。
-    /// 束縛された型変数には差し込まない。
+    /// 束縛された型変数には差し込まない。`impl_header` は実ソースの直接の親 impl。
     pub(crate) fn from_spelling(
         spelling: &str,
         alias_of: &dyn Fn(&str) -> Option<String>,
+        impl_header: Option<&str>,
     ) -> Option<Self> {
-        let declaration = format!("{spelling}{DECLARATION_TERMINATOR}");
+        let function_spelling = match spelling
+            .strip_prefix("impl ")
+            .or_else(|| spelling.strip_prefix("impl<"))
+        {
+            Some(_) => {
+                impl_header?;
+                let (header, function) = spelling.split_once('\n')?;
+                let header_source = format!("{header} {{}}");
+                let header_tree = SyntaxTree::from_source(&header_source, Grammar::Rust).ok()?;
+                if header_tree.has_error() {
+                    return None;
+                }
+                function
+            }
+            None => spelling,
+        };
+        let declaration = match impl_header {
+            Some(header) => format!("{header}\n{{ {function_spelling}{DECLARATION_TERMINATOR} }}"),
+            None => format!("{function_spelling}{DECLARATION_TERMINATOR}"),
+        };
         let tree = SyntaxTree::from_source(&declaration, Grammar::Rust).ok()?;
         if tree.has_error() {
             return None;
@@ -130,6 +148,7 @@ impl RustCallable {
 
         let mut spelling = Spelling::new(&declaration);
         spelling.alias_of = alias_of;
+        spelling.from_hover = true;
         spelling.callable_of(function)
     }
 
@@ -138,7 +157,7 @@ impl RustCallable {
         &self.type_names
     }
 
-    /// `Self` かレシーバを持ち、指す先が書かれた場所で決まるか。
+    /// impl の文脈を使っても、Self の指す型を確定できない綴りが残るか。
     pub(crate) fn refers_to_self(&self) -> bool {
         self.refers_to_self
     }
@@ -259,6 +278,31 @@ fn is_openable_type_syntax(node: Node<'_>, source: &str) -> bool {
     }
 }
 
+/// 直接所属する impl のヘッダー。本体や外側の自由関数の impl は含めない。
+pub(crate) fn impl_header_of(function: Node<'_>, source: &str) -> Option<String> {
+    let implementation = enclosing_impl_of(function)?;
+    let body = implementation.child_by_field_name("body")?;
+    Some(
+        source
+            .get(implementation.start_byte()..body.start_byte())?
+            .to_owned(),
+    )
+}
+
+fn enclosing_impl_of(function: Node<'_>) -> Option<Node<'_>> {
+    let body = function.parent()?;
+    if body.kind() != "declaration_list" {
+        return None;
+    }
+    body.parent().filter(|parent| parent.kind() == "impl_item")
+}
+
+fn signature_has_error(node: Node<'_>) -> bool {
+    named_children_of(node)
+        .filter(|child| node.child_by_field_name("body") != Some(*child))
+        .any(|child| child.has_error())
+}
+
 /// ソースに書かれた関数の宣言から、比較に残る型名とその尋ねる位置を集める。
 /// 1 つも書かれていなければ空。
 ///
@@ -276,10 +320,7 @@ fn is_openable_type_syntax(node: Node<'_>, source: &str) -> bool {
 /// 回復が作った範囲の名前が同じ綴りの記録として先に入り、**別の宣言の場所で引かれうる**
 /// （偽陽性）。**本体の構文エラーは見ない** — 本体は歩かず、hover の綴りにも現れない。
 pub(crate) fn type_references_of(function: Node<'_>, source: &str) -> Vec<TypeReference> {
-    let signature_has_error = named_children_of(function)
-        .filter(|child| function.child_by_field_name("body") != Some(*child))
-        .any(|child| child.has_error());
-    if signature_has_error {
+    if signature_has_error(function) {
         return Vec::new();
     }
 
@@ -294,11 +335,15 @@ pub(crate) fn type_references_of(function: Node<'_>, source: &str) -> Vec<TypeRe
 /// 1 つの関数の綴りを読み進める途中の状態。
 ///
 /// **付け替えの番号は読んだ順に振る**ので、引数 → 戻り値 → 境界の順に歩く。
-struct Spelling<'source> {
+struct Spelling<'source, 'tree> {
     source: &'source str,
     alias_of: &'source dyn Fn(&str) -> Option<String>,
     /// 関数が束縛した型変数の名前。宣言された順。
     declared: Vec<String>,
+    impl_declared: Vec<String>,
+    impl_numbered: Vec<String>,
+    self_type: Option<Node<'tree>>,
+    from_hover: bool,
     /// 付け替えた型変数の名前。**番号の順**。
     numbered: Vec<String>,
     type_names: BTreeSet<String>,
@@ -310,12 +355,16 @@ struct Spelling<'source> {
     refers_to_self: bool,
 }
 
-impl<'source> Spelling<'source> {
+impl<'source, 'tree> Spelling<'source, 'tree> {
     fn new(source: &'source str) -> Self {
         Self {
             source,
             alias_of: &|_| None,
             declared: Vec::new(),
+            impl_declared: Vec::new(),
+            impl_numbered: Vec::new(),
+            self_type: None,
+            from_hover: false,
             numbered: Vec::new(),
             type_names: BTreeSet::new(),
             references: Vec::new(),
@@ -327,8 +376,20 @@ impl<'source> Spelling<'source> {
     ///
     /// **本体の無い宣言（hover の綴り）と本体のある宣言（ソース）のどちらも読める。**
     /// 見るのは名前付きのフィールドと `where` 句だけで、本体には触れない。
-    fn callable_of(&mut self, function: Node<'_>) -> Option<RustCallable> {
+    fn callable_of(&mut self, function: Node<'tree>) -> Option<RustCallable> {
         let modifiers = self.modifiers_of(function)?;
+        let enclosing_impl = enclosing_impl_of(function);
+        let mut impl_bounded = Vec::new();
+        if let Some(implementation) = enclosing_impl {
+            if signature_has_error(implementation) {
+                return None;
+            }
+            if let Some(parameters) = implementation.child_by_field_name("type_parameters") {
+                impl_bounded = self.declared_type_parameters_of(parameters)?;
+            }
+            self.impl_declared = self.declared.clone();
+            self.self_type = implementation.child_by_field_name("type");
+        }
 
         // 境界は型変数をすべて宣言し終えてから読む（`T: Into<U>` の `U` が後ろで宣言されうる）
         let mut bounded = Vec::new();
@@ -354,21 +415,53 @@ impl<'source> Spelling<'source> {
             self.insert_trait_bounds(&mut trait_bounds, left, bounds)?;
         }
         for clause in named_children_of(function).filter(|node| node.kind() == "where_clause") {
-            for predicate in named_children_of(clause) {
+            let mut cursor = clause.walk();
+            for predicate in clause.named_children(&mut cursor) {
+                if COMMENT_KINDS.contains(&predicate.kind()) {
+                    let inherited_bounds = self.from_hover
+                        && enclosing_impl.is_some()
+                        && self.text_of(predicate)?.trim() == "// Bounds from impl:";
+                    if inherited_bounds {
+                        // impl の境界は、メソッドの型変数が shadow しない元のスコープから読む。
+                        break;
+                    }
+                    continue;
+                }
                 self.insert_predicate(&mut trait_bounds, predicate)?;
             }
         }
 
+        if let Some(implementation) = enclosing_impl {
+            let method_declared = std::mem::replace(&mut self.declared, self.impl_declared.clone());
+            for (left, bounds) in impl_bounded {
+                self.insert_trait_bounds(&mut trait_bounds, left, bounds)?;
+            }
+            for clause in
+                named_children_of(implementation).filter(|node| node.kind() == "where_clause")
+            {
+                for predicate in named_children_of(clause) {
+                    self.insert_predicate(&mut trait_bounds, predicate)?;
+                }
+            }
+            if let Some(implemented_trait) = implementation.child_by_field_name("trait") {
+                let target = self.self_spelling()?;
+                let bound = self.spelling_of(implemented_trait)??;
+                trait_bounds.insert((target, bound));
+            }
+            self.declared = method_declared;
+        }
+
         // どこにも現れない型変数も番号を持たせる。数が型の一部なので
         for name in self.declared.clone() {
-            self.number_of(&name);
+            self.variable_spelling_of(&name);
         }
 
         Some(RustCallable {
             modifiers,
             parameters,
             value_type,
-            type_parameter_count: self.declared.len(),
+            type_parameter_count: self.declared.len() - self.impl_declared.len(),
+            impl_type_parameter_count: self.impl_declared.len(),
             trait_bounds,
             type_names: self.type_names.clone(),
             refers_to_self: self.refers_to_self,
@@ -389,10 +482,10 @@ impl<'source> Spelling<'source> {
     }
 
     /// 型変数を宣言し、inline の境界を `(左辺, 境界の並び)` で返す。読めなければ `None`。
-    fn declared_type_parameters_of<'tree>(
+    fn declared_type_parameters_of<'node>(
         &mut self,
-        type_parameters: Node<'tree>,
-    ) -> Option<Vec<(Node<'tree>, Node<'tree>)>> {
+        type_parameters: Node<'node>,
+    ) -> Option<Vec<(Node<'node>, Node<'node>)>> {
         let mut bounded = Vec::new();
 
         for parameter in named_children_of(type_parameters) {
@@ -401,7 +494,11 @@ impl<'source> Spelling<'source> {
                 "lifetime_parameter" => {}
                 "type_parameter" => {
                     let name = parameter.child_by_field_name("name")?;
-                    self.declared.push(self.text_of(name)?.to_owned());
+                    let name_text = self.text_of(name)?.to_owned();
+                    if self.declared.contains(&name_text) {
+                        return None;
+                    }
+                    self.declared.push(name_text);
                     if let Some(bounds) = parameter.child_by_field_name("bounds") {
                         bounded.push((name, bounds));
                     }
@@ -422,8 +519,22 @@ impl<'source> Spelling<'source> {
                 self.spelling_of(parameter_type)?
             }
             "self_parameter" => {
-                self.refers_to_self = true;
-                self.spelling_of(parameter)?
+                let target = self.self_spelling()?;
+                let mut cursor = parameter.walk();
+                let borrowed = parameter
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "&");
+                if !borrowed {
+                    return Some(target);
+                }
+                let mut parts = vec!["&".to_owned()];
+                for child in named_children_of(parameter).filter(|child| child.kind() != "self") {
+                    if let Some(part) = self.spelling_of(child)? {
+                        parts.push(part);
+                    }
+                }
+                parts.push(target);
+                Some(parts.join(" "))
             }
             _ => None,
         }
@@ -581,19 +692,18 @@ impl<'source> Spelling<'source> {
     /// 型名 1 つ。関数が束縛した型変数なら付け替え、そうでなければ型名として数える。
     fn type_identifier_spelling_of(&mut self, node: Node<'_>) -> Option<String> {
         let name = self.text_of(node)?;
-        if let Some(number) = self.number_of(name) {
-            return Some(format!("{PLACEHOLDER_PREFIX}{number}"));
+        if name == SELF_TYPE {
+            return self.self_spelling();
+        }
+        if let Some(variable) = self.variable_spelling_of(name) {
+            return Some(variable);
         }
 
         if let Some(resolved) = (self.alias_of)(name) {
             return Some(resolved);
         }
 
-        if name == SELF_TYPE {
-            self.refers_to_self = true;
-        } else {
-            self.insert_type_name(name.to_owned(), node);
-        }
+        self.insert_type_name(name.to_owned(), node);
 
         Some(name.to_owned())
     }
@@ -604,14 +714,17 @@ impl<'source> Spelling<'source> {
     /// **先頭がモジュールなら、パスごと 1 つの型名。** 末尾の名前だけを数えると、
     /// 別のモジュールの同名の型と重なる。
     fn scoped_type_spelling_of(&mut self, node: Node<'_>) -> Option<String> {
+        if contains_self_type(node, self.source) {
+            self.refers_to_self = true;
+        }
         let path = node.child_by_field_name("path")?;
         let name = self.text_of(node.child_by_field_name("name")?)?.to_owned();
 
         match path.kind() {
             "identifier" | "type_identifier" => {
                 let head = self.text_of(path)?;
-                if let Some(number) = self.number_of(head) {
-                    return Some(format!("{PLACEHOLDER_PREFIX}{number}::{name}"));
+                if let Some(variable) = self.variable_spelling_of(head) {
+                    return Some(format!("{variable}::{name}"));
                 }
                 if head == SELF_TYPE {
                     self.refers_to_self = true;
@@ -659,24 +772,50 @@ impl<'source> Spelling<'source> {
         }
     }
 
-    /// 関数が束縛した型変数なら、その番号。初めて現れたなら次の番号を振る。
-    fn number_of(&mut self, name: &str) -> Option<usize> {
+    /// impl の対象を、メソッドの型変数に捕捉されないスコープで綴る。
+    /// 対象が分からなければ場所依存のまま残す。
+    fn self_spelling(&mut self) -> Option<String> {
+        let Some(target) = self.self_type.take() else {
+            self.refers_to_self = true;
+            return Some(SELF_TYPE.to_owned());
+        };
+        let method_declared = std::mem::replace(&mut self.declared, self.impl_declared.clone());
+        let spelling = self.spelling_of(target);
+        self.declared = method_declared;
+        self.self_type = Some(target);
+        spelling?
+    }
+
+    /// 型変数を、impl とメソッドで別々の名前空間に付け替える。
+    fn variable_spelling_of(&mut self, name: &str) -> Option<String> {
         if !self.declared.iter().any(|declared| declared == name) {
             return None;
         }
-
-        match self.numbered.iter().position(|numbered| numbered == name) {
-            Some(number) => Some(number),
+        let from_impl = self.impl_declared.iter().any(|declared| declared == name);
+        let (numbered, prefix) = match from_impl {
+            true => (&mut self.impl_numbered, "%impl"),
+            false => (&mut self.numbered, PLACEHOLDER_PREFIX),
+        };
+        let number = match numbered.iter().position(|numbered| numbered == name) {
+            Some(number) => number,
             None => {
-                self.numbered.push(name.to_owned());
-                Some(self.numbered.len() - 1)
+                numbered.push(name.to_owned());
+                numbered.len() - 1
             }
-        }
+        };
+        Some(format!("{prefix}{number}"))
     }
 
     fn text_of(&self, node: Node<'_>) -> Option<&'source str> {
         self.source.get(node.byte_range())
     }
+}
+
+/// 修飾された関連型の中で Self を参照するか。置換前の構文で確かめる。
+fn contains_self_type(node: Node<'_>, source: &str) -> bool {
+    let is_self = matches!(node.kind(), "type_identifier" | "identifier")
+        && source.get(node.byte_range()) == Some(SELF_TYPE);
+    is_self || named_children_of(node).any(|child| contains_self_type(child, source))
 }
 
 /// `+` で並ぶ要求を集めた途中の形。
@@ -705,6 +844,177 @@ fn collapsed(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_impl_type_variables_are_renamed_with_their_bounds() {
+        let first = RustCallable::from_spelling(
+            "fn a(value: T) -> Self",
+            &|_| None,
+            Some("impl<T: Clone> Holder<T>"),
+        )
+        .unwrap();
+        let second = RustCallable::from_spelling(
+            "fn b(value: U) -> Holder<U>",
+            &|_| None,
+            Some("impl<U> Holder<U> where U: Clone"),
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.type_names(),
+            &BTreeSet::from(["Clone".to_owned(), "Holder".to_owned()])
+        );
+    }
+
+    #[test]
+    fn test_impl_and_method_variables_keep_their_binding_scope() {
+        let first = RustCallable::from_spelling(
+            "fn a<U>(value: T) -> U",
+            &|_| None,
+            Some("impl<T> Holder<T>"),
+        )
+        .unwrap();
+        let second = RustCallable::from_spelling(
+            "fn b<U>(value: U) -> T",
+            &|_| None,
+            Some("impl<T> Holder<T>"),
+        )
+        .unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn test_impl_receiver_borrow_and_mutability_are_preserved() {
+        let read =
+            |text| RustCallable::from_spelling(text, &|_| None, Some("impl Ledger")).unwrap();
+        assert_eq!(read("fn a(mut self)"), read("fn b(self)"));
+        assert_eq!(read("fn a(&'a mut self)"), read("fn b(value: &mut Ledger)"));
+        assert_eq!(
+            read("fn a(self: Box<Self>)"),
+            read("fn b(value: Box<Ledger>)")
+        );
+        assert_ne!(read("fn a(&self)"), read("fn b(&mut self)"));
+        assert_ne!(read("fn a(self)"), read("fn b(&self)"));
+        assert_ne!(read("fn a(&'static self)"), read("fn b(&self)"));
+    }
+
+    #[test]
+    fn test_impl_bounds_and_target_ignore_method_type_name_shadowing() {
+        let header = "impl<T: Bound> Holder<T>";
+        let source_style = RustCallable::from_spelling(
+            "fn a<Bound>(value: Bound) -> Self",
+            &|_| None,
+            Some(header),
+        )
+        .unwrap();
+        let hover_style = RustCallable::from_spelling("impl<T> Holder<T>\nfn b<Other>(value: Other) -> Self\nwhere\n// Bounds from impl:\nT: Bound,", &|_| None, Some(header)).unwrap();
+        assert_eq!(source_style, hover_style);
+        let target_shadow = RustCallable::from_spelling(
+            "fn a<Holder>(value: Holder) -> Self",
+            &|_| None,
+            Some(header),
+        )
+        .unwrap();
+        assert_eq!(target_shadow, hover_style);
+    }
+
+    #[test]
+    fn test_impl_different_targets_and_bounds_do_not_match() {
+        let read =
+            |header| RustCallable::from_spelling("fn a(&self)", &|_| None, Some(header)).unwrap();
+        assert_ne!(read("impl A"), read("impl B"));
+        assert_ne!(
+            read("impl<T: Clone> Holder<T>"),
+            read("impl<T: Send> Holder<T>")
+        );
+        assert_ne!(read("impl TraitA for A"), read("impl TraitB for A"));
+    }
+
+    #[test]
+    fn test_impl_self_projections_remain_site_dependent() {
+        for result in [
+            "Self::Item",
+            "<Self as Iterator>::Item",
+            "Self::Item::Nested",
+            "Self::Item<u8>",
+            "<Self::Item as Trait>::Out",
+        ] {
+            let spelling = format!("fn a(&self) -> {result}");
+            let callable =
+                RustCallable::from_spelling(&spelling, &|_| None, Some("impl Iterator for Holder"))
+                    .unwrap();
+            assert!(callable.refers_to_self(), "{result}");
+        }
+        assert!(
+            !RustCallable::from_spelling("fn a(&self) -> Self", &|_| None, Some("impl Holder"))
+                .unwrap()
+                .refers_to_self()
+        );
+    }
+
+    #[test]
+    fn test_impl_type_references_include_bounds_at_their_source_positions() {
+        let source = "impl<T: Bound> Holder<T> where T: Other { fn f(&self, x: T) {} }";
+        let references = references_of(source);
+        assert_eq!(
+            references,
+            vec![
+                ("Holder".to_owned(), 1, source.find("Holder").unwrap()),
+                ("Bound".to_owned(), 1, source.find("Bound").unwrap()),
+                ("Other".to_owned(), 1, source.find("Other").unwrap()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_impl_context_does_not_reach_nested_free_functions() {
+        let source = "impl<T: Bound> Holder<T> { fn outer() { fn inner(x: User) {} } }";
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).unwrap();
+        let inner = tree
+            .named_descendants()
+            .into_iter()
+            .rfind(|node| node.kind() == "function_item")
+            .unwrap();
+        assert_eq!(impl_header_of(inner, source), None);
+        assert_eq!(
+            type_references_of(inner, source)
+                .iter()
+                .map(|r| r.name())
+                .collect::<Vec<_>>(),
+            vec!["User"]
+        );
+    }
+
+    #[test]
+    fn test_impl_const_parameters_remain_unreadable() {
+        assert_eq!(
+            RustCallable::from_spelling(
+                "fn f(&self)",
+                &|_| None,
+                Some("impl<const N: usize> Holder<N>")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_impl_self_and_receiver_match_the_explicit_target_type() {
+        let implicit =
+            RustCallable::from_spelling("fn a(&self) -> Self", &|_| None, Some("impl Ledger "))
+                .unwrap();
+        let explicit = RustCallable::from_spelling(
+            "fn b(value: &Ledger) -> Ledger",
+            &|_| None,
+            Some("impl Ledger "),
+        )
+        .unwrap();
+        assert_eq!(implicit, explicit);
+        assert!(!implicit.refers_to_self());
+        assert_eq!(
+            implicit.type_names(),
+            &BTreeSet::from(["Ledger".to_owned()])
+        );
+    }
+
     #[test]
     fn test_rust_alias_primitive_positions_follow_the_selected_declaration_in_utf16() {
         let source = "mod a { type Value = u8; }\nmod b { /*🦀*/ type Value = u64; }";
@@ -845,7 +1155,7 @@ mod tests {
     use super::*;
 
     fn read(spelling: &str) -> RustCallable {
-        RustCallable::from_spelling(spelling, &|_| None).expect("関数の綴りとして読める")
+        RustCallable::from_spelling(spelling, &|_| None, None).expect("関数の綴りとして読める")
     }
 
     #[test]
@@ -1051,7 +1361,8 @@ mod tests {
         assert_eq!(
             RustCallable::from_spelling(
                 "pub fn h<const N: usize>(x: [u8; {const}]) -> (i32, u8)",
-                &|_| None
+                &|_| None,
+                None
             ),
             None
         );
@@ -1059,7 +1370,10 @@ mod tests {
 
     #[test]
     fn test_from_spelling_non_function_is_unreadable() {
-        assert_eq!(RustCallable::from_spelling("pub struct S", &|_| None), None);
+        assert_eq!(
+            RustCallable::from_spelling("pub struct S", &|_| None, None),
+            None
+        );
     }
 
     /// ソースに書かれた関数 1 つから集めた型名の、綴りと位置（行, 列）の組。
@@ -1164,11 +1478,10 @@ mod tests {
     }
 
     #[test]
-    fn test_type_references_of_a_source_function_leave_out_self() {
-        // `Self` の指す先は囲む `impl` で決まり、名前で辿る相手ではない。
-        // 対照に `User` を置く
+    fn test_type_references_of_a_source_method_trace_the_impl_target_for_self() {
+        // Self の問い合わせ先はメソッドの綴りではなく impl の対象型。
         let names = reference_names_of("impl A { fn f(&self, user: User) -> Self { todo!() } }\n");
 
-        assert_eq!(names, BTreeSet::from(["User".to_owned()]));
+        assert_eq!(names, BTreeSet::from(["A".to_owned(), "User".to_owned()]));
     }
 }

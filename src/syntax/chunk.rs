@@ -46,6 +46,7 @@ pub struct Chunk {
     annotated: AnnotatedPositions,
     overload_declarations: Vec<OverloadDeclaration>,
     type_references: Vec<TypeReference>,
+    rust_impl_header: Option<String>,
     source: String,
     tokens: Option<TokenSequence>,
     leaves: ChunkLeaves,
@@ -197,11 +198,20 @@ impl Chunk {
             } else {
                 chunk_type_references_of(node, source)
             },
+            rust_impl_header: match grammar {
+                Grammar::Rust => rust_callable::impl_header_of(node, source),
+                Grammar::TypeScript | Grammar::Tsx => None,
+            },
             source: source_of_lines(source, lines),
             tokens: TokenSequence::from_node(node),
             leaves: ChunkLeaves::from_node(node, name_node_of(node), source, grammar),
             imports,
         }
+    }
+
+    /// Rust メソッドが直接所属する impl のヘッダー。それ以外は `None`。
+    pub fn rust_impl_header(&self) -> Option<&str> {
+        self.rust_impl_header.as_deref()
     }
 
     /// 切り出し元のファイルパス。

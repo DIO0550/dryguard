@@ -729,6 +729,7 @@ fn resolved_type_signature_outcome_of(
             document,
             position,
             chunk.type_references(),
+            chunk.rust_impl_header(),
         );
     }
 

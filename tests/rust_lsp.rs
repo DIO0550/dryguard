@@ -176,7 +176,7 @@ fn test_rust_analyzer_signatures_compare_through_where_clauses_and_lifetimes() {
             .position(|line| line.starts_with(&format!("pub fn {name}")))
             .expect("フィクスチャにその関数がある");
         let position = SourcePosition::from_preceding_text(LineNumber::from_index(line), "pub fn ");
-        rust_type_signature_outcome_of(&mut session, &document, position, &type_references)
+        rust_type_signature_outcome_of(&mut session, &document, position, &type_references, None)
             .expect("hover を尋ねられる")
     };
 
@@ -397,18 +397,136 @@ fn test_rust_aliases_requiring_declaration_scope_or_arguments_are_unavailable() 
 
 #[test]
 #[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
-fn test_compare_rust_method_with_a_receiver_stays_site_dependent() {
-    // 辿った記録が渡るようになっても、`&self` を持つ側を比べられる答えにしない
-    // （指す先は囲む `impl` で決まる）。**辿れたかどうかは見ていない** — 相手の `charged` が
-    // 辿れず「尋ねていない」になっても、書かれた場所で決まる綴りのほうが先に出る
-    // （pipeline の `test_type_signature_match_of_a_site_dependent_spelling_outranks_*`）
+fn test_compare_rust_method_receiver_is_an_additional_typed_parameter() {
     let total = traced_fixture("src/lib.rs", "total");
     let charged = traced_fixture("src/lib.rs", "charged");
-
     assert_eq!(
         traced_type_signature_match_of(&total, &charged),
-        TypeSignatureMatch::SiteDependentSpelling
+        TypeSignatureMatch::NotUnifiable
     );
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_rust_methods_in_separate_impls_of_the_same_type_are_unifiable() {
+    let first = traced_fixture("src/impls.rs", "borrow_a");
+    let second = traced_fixture("src/impls.rs", "borrow_b");
+    assert_eq!(
+        traced_type_signature_match_of(&first, &second),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_impl_signatures_preserve_target_receiver_bounds_and_binding_scopes() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust-traced/src/impls.rs");
+    let source = source_of(&path).expect("フィクスチャを読める");
+    let tree = SyntaxTree::from_source(&source, Grammar::Rust).expect("木にできる");
+    let document = SourceDocument::new(&path, source.clone()).expect("ドキュメントを作れる");
+    let root = WorkspaceRoot::enclosing(std::slice::from_ref(&path)).expect("根がある");
+    let mut session = Client::start(&ServerCommand::rust())
+        .expect("サーバを起動できる")
+        .handshake(&root)
+        .expect("握手できる");
+    session.open_document(&document).expect("開ける");
+    let mut outcomes = std::collections::BTreeMap::new();
+    for name in [
+        "wrap_a",
+        "wrap_b",
+        "borrow_a",
+        "borrow_b",
+        "mutable",
+        "owned",
+        "owned_mut",
+        "boxed",
+        "explicit_box",
+        "mixed_a",
+        "mixed_b",
+        "shadow",
+        "target_shadow",
+        "shadow_renamed",
+        "other_bound",
+        "different_target",
+        "first_twin",
+        "second_twin",
+    ] {
+        let location = traced_fixture("src/impls.rs", name);
+        let chunk = Chunk::find_enclosing(&location, &tree).expect("メソッドがある");
+        let outcome = rust_type_signature_outcome_of(
+            &mut session,
+            &document,
+            chunk.name_position().expect("名前がある"),
+            chunk.type_references(),
+            chunk.rust_impl_header(),
+        )
+        .expect("問い合わせ成功");
+        let TypeSignatureOutcome::Normalized(signature) = outcome else {
+            panic!("{name}: {outcome:?}");
+        };
+        outcomes.insert(name, signature);
+    }
+    let access_line = source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("fn access"))
+        .map(|(index, _)| index)
+        .last()
+        .expect("実装メソッドがある");
+    let access_location = Location::new(path.clone(), LineNumber::from_index(access_line));
+    let access = Chunk::find_enclosing(&access_location, &tree).expect("トレイトの実装メソッド");
+    let access_outcome = rust_type_signature_outcome_of(
+        &mut session,
+        &document,
+        access.name_position().expect("名前がある"),
+        access.type_references(),
+        access.rust_impl_header(),
+    )
+    .expect("問い合わせ成功");
+    assert!(
+        matches!(access_outcome, TypeSignatureOutcome::Normalized(_)),
+        "{access_outcome:?}"
+    );
+    let projection_line = source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("fn projected"))
+        .map(|(index, _)| index)
+        .last()
+        .expect("実装メソッドがある");
+    let location = Location::new(path.clone(), LineNumber::from_index(projection_line));
+    let projected = Chunk::find_enclosing(&location, &tree).expect("関連型を返すメソッド");
+    let outcome = rust_type_signature_outcome_of(
+        &mut session,
+        &document,
+        projected.name_position().expect("名前がある"),
+        projected.type_references(),
+        projected.rust_impl_header(),
+    )
+    .expect("問い合わせ成功");
+    assert_eq!(outcome, TypeSignatureOutcome::SiteDependentSpelling);
+    session.shutdown().expect("終了できる");
+    for (first, second, expected) in [
+        ("wrap_a", "wrap_b", true),
+        ("borrow_a", "borrow_b", true),
+        ("borrow_a", "mutable", false),
+        ("borrow_a", "owned", false),
+        ("owned", "owned_mut", true),
+        ("boxed", "explicit_box", true),
+        ("mixed_a", "mixed_b", false),
+        ("shadow", "shadow_renamed", true),
+        ("target_shadow", "shadow_renamed", true),
+        ("borrow_a", "other_bound", false),
+        ("borrow_a", "different_target", false),
+        ("first_twin", "second_twin", false),
+    ] {
+        assert_eq!(
+            outcomes[first].is_unifiable_with(&outcomes[second]),
+            expected,
+            "{first} / {second}"
+        );
+    }
 }
 
 #[test]
@@ -437,6 +555,7 @@ fn test_rust_type_references_of_a_chunk_are_the_type_names_of_its_hover() {
             &document,
             position,
             chunk.type_references(),
+            chunk.rust_impl_header(),
         )
         .expect("hover と definition を尋ねられる");
         outcomes.push((function, outcome));

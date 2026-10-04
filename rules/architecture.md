@@ -252,9 +252,20 @@ LSP が起動しない・`callHierarchy` が使えない・チャンクが切り
 （`docs/dryguard-plan.md`「Stage 2」の「ジェネリクスは単一化を試みる」とぶつかる）。
 外すのは比較に残る綴りを数える側（`syntax::type_structure` の `Callable::type_names`）で、
 **外側のスコープが束縛した型変数は外さない**（TypeScript ではそのシグネチャからは辿れないので、
-落とすと別のファイルの同じ綴りと重なる）。**Rust の `impl<T>` の `T` は definition が impl の
-宣言まで辿る**ので、記録が付き、別の impl の同じ綴りとは宣言の場所で分かれる
-（impl の中のメソッドは今は読み解けず、比べ方は Issue #281）。
+落とすと別のファイルの同じ綴りと重なる）。**Rust のメソッドは直接囲む impl のヘッダーも
+運ぶ**ので、その型変数をメソッド自身とは別の名前空間で付け替える。個数も別々に比べ、
+impl の変数とメソッドの変数が引数・戻り値で入れ替わった形を同一視しない。
+
+**Rust の Self は直接囲む impl の対象型へ置き換える。** `self` / `&self` / `&mut self` は
+その型の値 / 参照 / 可変参照にし、`mut self` の束縛の可変性は落とす。
+対象型・impl の inline / where 境界・実装トレイトは impl のスコープで読む。
+メソッドの型変数が同名の型・トレイトを shadow しても、impl 側の意味を変えない。
+hover が `// Bounds from impl:` 以降に足す境界はソースの impl から読み直す。
+問い合わせ位置も実ソースから採り、内側の自由関数には impl の文脈を渡さない。
+
+**関連型の選択は行わない。** `Self::Item` や `<Self as Trait>::Item` など Self を含む
+関連型は `SiteDependentSpelling` のまま。impl が無い Self も同じで、const generics を持つ
+impl は読み取り不可。型エイリアスは上記の既存の展開条件を保つ。
 
 - **どの段で止まったかでは分けない。** 段で分けると、同じ「測れない」が
   typeDefinition・ファイルの読み込み・宣言の位置の hover に散り、
