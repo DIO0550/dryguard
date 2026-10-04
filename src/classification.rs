@@ -588,6 +588,7 @@ fn caller_domain_lean_of(signal: &CallerDomainOverlap, shared_threshold: Thresho
         | CallerDomainOverlap::OutsideProject { .. }
         | CallerDomainOverlap::ProjectMembershipNotProvided
         | CallerDomainOverlap::NoReferences
+        | CallerDomainOverlap::UnclassifiedReference(_)
         | CallerDomainOverlap::UnreadableReferences
         | CallerDomainOverlap::ServerStillWorking
         | CallerDomainOverlap::ReferencesNotProvided
@@ -1895,6 +1896,11 @@ mod tests {
             CallerDomainOverlap::OutsideProject { markers },
             CallerDomainOverlap::ProjectMembershipNotProvided,
             CallerDomainOverlap::NoReferences,
+            CallerDomainOverlap::UnclassifiedReference(
+                crate::semantics::caller_domain::ReferenceSourceError::Unreadable {
+                    path: std::path::PathBuf::from("/repo/caller.rs"),
+                },
+            ),
             CallerDomainOverlap::UnreadableReferences,
             CallerDomainOverlap::ServerStillWorking,
             CallerDomainOverlap::ReferencesNotProvided,

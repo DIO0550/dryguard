@@ -1,12 +1,39 @@
-//! references の応答から、参照元のファイルを取り出す。
+//! references の応答から、参照元のファイルと位置を取り出す。
 //!
 //! **サーバとの往復そのものは `connection` が持つ。** ここにあるのは受け取った応答を
 //! こちらが読める形へ直す変換だけなので、サーバを起動せずに確かめられる
 //! (rules/tdd.md「`lsp` は『応答を受け取ってから先』を切り出す」)。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use crate::source_position::SourcePosition;
 
 use super::uri::{self, UriPathError};
+
+/// 名前を使っているファイルと、その参照の開始位置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reference {
+    path: PathBuf,
+    position: SourcePosition,
+}
+
+impl Reference {
+    /// 参照元のファイル。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 参照の開始位置。列は UTF-16 のコード単位。
+    pub fn position(&self) -> SourcePosition {
+        self.position
+    }
+
+    /// テストが用意する、サーバ応答相当の参照。
+    #[cfg(test)]
+    pub(crate) fn new(path: PathBuf, position: SourcePosition) -> Self {
+        Self { path, position }
+    }
+}
 
 /// references に尋ねた結果。
 ///
@@ -15,11 +42,11 @@ use super::uri::{self, UriPathError};
 /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
 #[derive(Debug)]
 pub enum ReferencesOutcome {
-    /// 参照元のファイルが返った。
+    /// 参照元のファイルと位置が返った。
     ///
     /// **同じファイルに 2 件あれば 2 つ並ぶ。** ドメインごとの件数
     /// （`billing 3件 / inventory 5件`）が判定の根拠になるので、ファイル単位で畳まない。
-    Answered(Vec<PathBuf>),
+    Answered(Vec<Reference>),
     /// サーバはこの位置の参照元を返さなかった。
     ///
     /// **空配列もここに入れる。** tsserver は「呼び出し元が本当に無い」ときと
@@ -59,7 +86,10 @@ pub(super) fn outcome_of(locations: &[lsp_types::Location]) -> ReferencesOutcome
 
     for location in locations {
         match uri::path_of(&location.uri) {
-            Ok(path) => paths.push(path),
+            Ok(path) => paths.push(Reference {
+                path,
+                position: SourcePosition::from_lsp_position(location.range.start),
+            }),
             Err(cause) => return ReferencesOutcome::Unreadable { cause },
         }
     }
@@ -75,9 +105,22 @@ mod tests {
 
     use lsp_types::{Location, Position, Range, Uri};
 
+    #[test]
+    fn test_references_outcome_preserves_the_utf16_position_of_each_reference() {
+        let mut location = reference("file:///repo/src/lib.rs");
+        location.range = Range::new(Position::new(3, 17), Position::new(3, 23));
+        let ReferencesOutcome::Answered(references) = outcome_of(&[location]) else {
+            panic!("参照元が返る");
+        };
+        assert_eq!(
+            references[0].position().to_lsp_position(),
+            Position::new(3, 17)
+        );
+    }
+
     /// サーバが返す形の参照元 1 件。
     ///
-    /// 範囲は使わない（ドメインはファイルの位置で決まる）ので、行頭を指す最小の形にする。
+    /// このヘルパーでは行頭を指し、位置を検証するテストは範囲を上書きする。
     fn reference(uri: &str) -> Location {
         Location {
             uri: Uri::from_str(uri).expect("テストが渡す文字列は URI として読める"),
@@ -88,7 +131,10 @@ mod tests {
     /// 読み取れた参照元のパス。読み取れていなければテストを落とす。
     fn paths_of(locations: &[Location]) -> Vec<PathBuf> {
         match outcome_of(locations) {
-            ReferencesOutcome::Answered(paths) => paths,
+            ReferencesOutcome::Answered(paths) => paths
+                .iter()
+                .map(|reference| reference.path().to_path_buf())
+                .collect(),
             other => panic!("参照元を読み取れる: {other:?}"),
         }
     }
