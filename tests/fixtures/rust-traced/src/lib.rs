@@ -119,3 +119,5 @@ pub mod renamed_primitive {
 }
 
 pub mod impls;
+
+pub mod generic;

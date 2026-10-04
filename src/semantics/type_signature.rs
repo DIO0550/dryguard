@@ -392,11 +392,17 @@ fn rust_normalized_in_impl(
 ) -> TypeSignatureOutcome {
     let Some(callable) = RustCallable::from_spelling(
         signature_text.as_str(),
-        &|name| traced.resolved().resolved_of(name).map(str::to_owned),
+        &|name| traced.resolved().rust_alias_of(name),
         impl_header,
     ) else {
         return TypeSignatureOutcome::UnreadableSignature;
     };
+
+    if callable.has_unopenable_alias() {
+        return TypeSignatureOutcome::UnopenedTypeName {
+            reason: UnopenedReason::UnopenableAlias,
+        };
+    }
 
     let type_names = callable.type_names();
     if let Some(reason) = type_names
