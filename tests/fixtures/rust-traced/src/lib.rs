@@ -52,3 +52,68 @@ impl Ledger {
         amount + 1
     }
 }
+
+pub fn imported_alias(amount: model::Cost) -> model::Cost {
+    amount + 1
+}
+
+pub fn small_alias(amount: model::Small) -> model::Small {
+    amount + 1
+}
+
+pub fn generic_alias(value: model::Pair<u8>) -> u8 {
+    value.0
+}
+
+pub fn named_alias(value: model::CustomerAlias) -> model::CustomerAlias {
+    value
+}
+
+pub fn counted_alias(value: model::Counted) -> model::Counted {
+    value
+}
+
+pub mod shadowed {
+    pub struct Number;
+    use Number as u64;
+    pub type Amount = u64;
+    pub type Pair = (u64, u8);
+
+    pub fn shadowed_pair(value: Pair) -> Pair {
+        value
+    }
+
+    pub fn shadowed_alias(value: Amount) -> Amount {
+        value
+    }
+}
+
+pub type Packet = (u8, u64);
+pub type Callback = fn(u8) -> u64;
+
+pub fn compound_alias(value: &Packet, callback: Callback) -> u64 {
+    callback(value.0) + value.1
+}
+
+pub fn compound_raw(value: &(u8, u64), callback: fn(u8) -> u64) -> u64 {
+    callback(value.0) + value.1
+}
+
+pub mod shadowed_by_alias {
+    pub type Byte = u8;
+    use Byte as u64;
+    pub type Amount = u64;
+
+    pub fn shadowed_by_alias(value: Amount) -> Amount {
+        value
+    }
+}
+
+pub mod renamed_primitive {
+    use std::primitive::u8 as u64;
+    pub type Amount = u64;
+
+    pub fn renamed_primitive(value: Amount) -> Amount {
+        value
+    }
+}

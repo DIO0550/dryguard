@@ -69,7 +69,7 @@ impl DeclarationSite {
     }
 
     /// そのファイルの中で、宣言の名前が置かれている位置。
-    pub(super) fn position(&self) -> SourcePosition {
+    pub(crate) fn position(&self) -> SourcePosition {
         self.position
     }
 }

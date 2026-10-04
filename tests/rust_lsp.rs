@@ -345,16 +345,54 @@ fn test_compare_rust_functions_taking_the_same_alias_are_unifiable() {
 
 #[test]
 #[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
-fn test_compare_rust_alias_is_not_opened_into_its_right_hand_side() {
-    // エイリアスは開かない（右辺の差し込みは別の Issue）。`Amount` と `u64` は
-    // 同じ型だが重ならない。倒れる向きは偽陰性
+fn test_compare_rust_alias_is_opened_into_its_right_hand_side() {
     let charged = traced_fixture("src/lib.rs", "charged");
     let raw = traced_fixture("src/lib.rs", "raw");
 
     assert_eq!(
         traced_type_signature_match_of(&charged, &raw),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_rust_imported_qualified_alias_is_unifiable_with_its_right_hand_side() {
+    let alias = traced_fixture("src/lib.rs", "imported_alias");
+    let raw = traced_fixture("src/lib.rs", "raw");
+    assert_eq!(
+        traced_type_signature_match_of(&alias, &raw),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_rust_aliases_with_different_right_hand_sides_are_not_unifiable() {
+    let large = traced_fixture("src/lib.rs", "imported_alias");
+    let small = traced_fixture("src/lib.rs", "small_alias");
+    assert_eq!(
+        traced_type_signature_match_of(&large, &small),
         TypeSignatureMatch::NotUnifiable
     );
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_aliases_requiring_declaration_scope_or_arguments_are_unavailable() {
+    for name in ["generic_alias", "named_alias", "counted_alias"] {
+        let alias = traced_fixture("src/lib.rs", name);
+        let outcome = traced_type_signature_match_of(&alias, &alias);
+        assert!(
+            matches!(
+                outcome,
+                TypeSignatureMatch::UnopenedTypeName {
+                    reason: dryguard::semantics::resolved_type::UnopenedReason::UnopenableAlias,
+                }
+            ),
+            "{name}: {outcome:?}"
+        );
+    }
 }
 
 #[test]
@@ -516,4 +554,36 @@ fn test_rust_references_exclude_tests_in_compare_and_scan() {
         })
         .expect("呼び出し元の根拠がある");
     assert_production_callers(signal, &path);
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_alias_shadowing_a_primitive_is_not_compared_as_that_primitive() {
+    let raw = traced_fixture("src/lib.rs", "raw");
+    for function in [
+        "shadowed_alias",
+        "shadowed_pair",
+        "shadowed_by_alias",
+        "renamed_primitive",
+    ] {
+        let alias = traced_fixture("src/lib.rs", function);
+        assert_eq!(
+            traced_type_signature_match_of(&alias, &raw),
+            TypeSignatureMatch::UnopenedTypeName {
+                reason: dryguard::semantics::resolved_type::UnopenedReason::UnopenableAlias,
+            },
+            "{function}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_compound_aliases_are_unifiable_with_their_right_hand_sides() {
+    let alias = traced_fixture("src/lib.rs", "compound_alias");
+    let raw = traced_fixture("src/lib.rs", "compound_raw");
+    assert_eq!(
+        traced_type_signature_match_of(&alias, &raw),
+        TypeSignatureMatch::Unifiable
+    );
 }

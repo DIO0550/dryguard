@@ -9,18 +9,21 @@
 //! 型名の位置 --typeDefinition--> 宣言の場所 --hover--> `type Amount = number`
 //! ```
 //!
-//! **Rust は宣言の場所までで止める**（`rust_traced_type_names_of`）。尋ねるのは
-//! typeDefinition ではなく definition で、エイリアスも開かない。
+//! **Rust は definition で宣言を辿り、宣言 hover の右辺を Rust の構文で読む。**
+//! 型引数や宣言側スコープが要る右辺は、開けない理由を残す。
 //!
 //! **綴りを読む部分は LSP を呼ばない**ので、サーバが無くても確かめられる
 //! (`rules/tdd.md`「`lsp` は『応答を受け取ってから先』を切り出す」)。
 
 use std::collections::HashMap;
 
+use crate::codebase::source_of;
 use crate::lsp::{
-    ClientError, DeclarationSite, DeclarationSiteOutcome, HoverOutcome, Session, SourceDocument,
+    ClientError, DeclarationSite, DeclarationSiteOutcome, HoverOutcome, Session, SignatureText,
+    SourceDocument,
 };
 use crate::source_position::SourcePosition;
+use crate::syntax::rust_callable::{RustTypeAlias, primitive_references_of_alias};
 use crate::syntax::type_reference::TypeReference;
 
 /// 型エイリアスの宣言を導く語。前後の空白ごと見て、`typeof` のような綴りと分ける。
@@ -257,13 +260,10 @@ pub fn traced_type_names_of(
 /// 空を返し、ジェネリックな型（`Option<User>`）には型引数の宣言まで並べる。definition は
 /// 書かれた名前の宣言を 1 件返す（rust-analyzer 1.94.1 と 2026-09-21 版で実測）。
 ///
-/// **エイリアスは開かない。** 宣言の場所で比べるので、同じエイリアスを使う 2 つは重なり、
-/// 別々の宣言の同じ綴りは重ならない。**エイリアスと右辺の型（`Amount` と `u64`）は
-/// 重ならない**（偽陰性）。
-///
-/// **Why not（TypeScript と同じく右辺を差し込む）**: 差し込みは `syntax::type_spelling` が
-/// TypeScript の文法で綴りを割っている。Rust の綴りへの差し込みと、`type Pair<T>` の
-/// 型引数の当てはめが別に要る。
+/// **宣言 hover の右辺を Rust の構文で読む。** 型引数を持つエイリアスや、右辺が
+/// 別の型名・定数名を参照するものは、使用側のスコープで解決せず `UnopenableAlias` にする。
+/// Rust の宣言 hover は、宣言ファイルを didOpen していなくても返る。展開候補だけは
+/// 右辺のソース位置へ hover も尋ね、プリミティブ表記が別の型を指す場合は開かない。
 ///
 /// # Errors
 ///
@@ -273,7 +273,75 @@ pub(crate) fn rust_traced_type_names_of(
     document: &SourceDocument,
     type_references: &[TypeReference],
 ) -> Result<TracedTypeNames, ClientError> {
-    DeclarationQuery::Definition.traced_type_names_of(session, document, type_references)
+    let traced =
+        DeclarationQuery::Definition.traced_type_names_of(session, document, type_references)?;
+    let mut traced =
+        opened_type_names_with(
+            session,
+            traced,
+            |spelling| match RustTypeAlias::from_spelling(spelling) {
+                RustTypeAlias::Opened(resolved) => DeclaredAlias::Opened(resolved),
+                RustTypeAlias::NotAnAlias => DeclaredAlias::NotAnAlias,
+                RustTypeAlias::Unopenable => DeclaredAlias::Unopenable,
+            },
+        )?;
+
+    let mut sources = HashMap::new();
+    let mut unopened = Vec::new();
+    for declaration in traced.declared() {
+        let Some(right) = traced.resolved().resolved_of(declaration.name()) else {
+            continue;
+        };
+        let source = sources
+            .entry(declaration.site().path().to_path_buf())
+            .or_insert_with(|| source_of(declaration.site().path()));
+        let reason = match source {
+            Ok(source) => rust_alias_unopened_reason(session, declaration, source, right)?,
+            Err(_) => Some(UnopenedReason::UnreadableDeclaringDocument),
+        };
+        if let Some(reason) = reason {
+            unopened.push(UnopenedTypeName::new(declaration.name().to_owned(), reason));
+        }
+    }
+    for name in &unopened {
+        traced.resolved.by_name.remove(name.name());
+    }
+    Ok(traced.with_unopened(unopened))
+}
+
+/// 右辺のプリミティブ表記が、その宣言側で同じプリミティブを指すか確認する。
+/// 型や import で shadow されていたら、展開できない理由を返す。
+///
+/// # Errors
+///
+/// ドキュメントの通知・hover の往復が失敗したとき。
+fn rust_alias_unopened_reason(
+    session: &mut Session,
+    declaration: &TypeDeclaration,
+    source: &str,
+    right: &str,
+) -> Result<Option<UnopenedReason>, ClientError> {
+    let Some(primitives) =
+        primitive_references_of_alias(source, declaration.site().position(), right)
+    else {
+        return Ok(Some(UnopenedReason::UnopenableAlias));
+    };
+    let Ok(document) = SourceDocument::new(declaration.site().path(), source.to_owned()) else {
+        return Ok(Some(UnopenedReason::UnreadableDeclaringDocument));
+    };
+    session.open_document(&document)?;
+    for primitive in primitives {
+        let spelling = match declared_spelling_of(session.hover(&document, primitive.position())?) {
+            Ok(spelling) => spelling,
+            Err(reason) => return Ok(Some(reason)),
+        };
+        // typeDefinition は別のプリミティブへのエイリアスにも空を返すため、
+        // 右辺の名前そのものへの hover で、元のプリミティブ表記と一致するか見る。
+        if spelling.as_str() != primitive.name() {
+            return Ok(Some(UnopenedReason::UnopenableAlias));
+        }
+    }
+    Ok(None)
 }
 
 /// 宣言の場所を尋ねる問い合わせ。
@@ -384,45 +452,35 @@ pub fn opened_type_names_of(
     session: &mut Session,
     traced: TracedTypeNames,
 ) -> Result<TracedTypeNames, ClientError> {
+    opened_type_names_with(session, traced, declared_alias_of)
+}
+
+/// 言語ごとの宣言の読み方を使い、開けた綴りと開けなかった理由を残す。
+///
+/// # Errors
+///
+/// 宣言 hover の往復が失敗したとき。
+fn opened_type_names_with(
+    session: &mut Session,
+    traced: TracedTypeNames,
+    alias_of: impl Fn(&str) -> DeclaredAlias,
+) -> Result<TracedTypeNames, ClientError> {
     let mut resolutions = Vec::new();
     let mut unopened = Vec::new();
 
     for declaration in traced.declared() {
         let name = declaration.name().to_owned();
 
-        let declared = match session.hover_at_declaration(declaration.site())? {
-            HoverOutcome::Answered(declared) => declared,
-            HoverOutcome::NoAnswer => {
-                unopened.push(UnopenedTypeName::new(
-                    name,
-                    UnopenedReason::NoSpellingAtDeclaration,
-                ));
-                continue;
-            }
-            HoverOutcome::Unreadable => {
-                unopened.push(UnopenedTypeName::new(
-                    name,
-                    UnopenedReason::UnreadableDeclarationHover,
-                ));
-                continue;
-            }
-            HoverOutcome::ServerStillWorking => {
-                unopened.push(UnopenedTypeName::new(
-                    name,
-                    UnopenedReason::ServerStillWorking,
-                ));
-                continue;
-            }
-            HoverOutcome::NotSupported => {
-                unopened.push(UnopenedTypeName::new(
-                    name,
-                    UnopenedReason::HoverNotProvided,
-                ));
+        let declared = match declared_spelling_of(session.hover_at_declaration(declaration.site())?)
+        {
+            Ok(declared) => declared,
+            Err(reason) => {
+                unopened.push(UnopenedTypeName::new(name, reason));
                 continue;
             }
         };
 
-        match declared_alias_of(declared.as_str()) {
+        match alias_of(declared.as_str()) {
             DeclaredAlias::Opened(resolved) => resolutions.push((name, resolved)),
             // 開く先が無いのはサーバの答え。綴りのまま比べてよい。
             DeclaredAlias::NotAnAlias => continue,
@@ -435,6 +493,17 @@ pub fn opened_type_names_of(
     Ok(traced
         .with_resolved(ResolvedTypes::new(resolutions))
         .with_unopened(unopened))
+}
+
+/// 宣言側の hover 応答を綴りか、開けなかった理由に分ける。
+fn declared_spelling_of(outcome: HoverOutcome) -> Result<SignatureText, UnopenedReason> {
+    match outcome {
+        HoverOutcome::Answered(spelling) => Ok(spelling),
+        HoverOutcome::NoAnswer => Err(UnopenedReason::NoSpellingAtDeclaration),
+        HoverOutcome::Unreadable => Err(UnopenedReason::UnreadableDeclarationHover),
+        HoverOutcome::ServerStillWorking => Err(UnopenedReason::ServerStillWorking),
+        HoverOutcome::NotSupported => Err(UnopenedReason::HoverNotProvided),
+    }
 }
 
 /// 宣言の綴りを読んだ結果。
