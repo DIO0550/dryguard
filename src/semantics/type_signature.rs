@@ -333,7 +333,7 @@ fn overload_set_outcome_of(
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
 /// `Chunk::name_position` が指す識別子の位置、`type_references` は
-/// `Chunk::type_references` が集めた型名。
+/// `Chunk::type_references` が集めた型名。`impl_header` は `Chunk::rust_impl_header`。
 ///
 /// **注釈の有無もオーバーロードも見ない。** Rust の関数は引数と戻り値の型を省けず
 /// （省いた戻り値は `()`）、同じ名前で複数のシグネチャを持てない。
@@ -355,6 +355,7 @@ pub fn rust_type_signature_outcome_of(
     document: &SourceDocument,
     position: SourcePosition,
     type_references: &[TypeReference],
+    impl_header: Option<&str>,
 ) -> Result<TypeSignatureOutcome, ClientError> {
     let signature_text = match asked_signature_text_of(session, document, position)? {
         Ok(signature_text) => signature_text,
@@ -362,7 +363,11 @@ pub fn rust_type_signature_outcome_of(
     };
 
     let traced = rust_traced_type_names_of(session, document, type_references)?;
-    Ok(rust_normalized_outcome_of(&signature_text, &traced))
+    Ok(rust_normalized_in_impl(
+        &signature_text,
+        &traced,
+        impl_header,
+    ))
 }
 
 /// rust-analyzer が返した関数の綴り 1 本を、1 本だけの集合へ正規化した結果。
@@ -377,9 +382,19 @@ pub fn rust_normalized_outcome_of(
     signature_text: &SignatureText,
     traced: &TracedTypeNames,
 ) -> TypeSignatureOutcome {
-    let Some(callable) = RustCallable::from_spelling(signature_text.as_str(), &|name| {
-        traced.resolved().resolved_of(name).map(str::to_owned)
-    }) else {
+    rust_normalized_in_impl(signature_text, traced, None)
+}
+
+fn rust_normalized_in_impl(
+    signature_text: &SignatureText,
+    traced: &TracedTypeNames,
+    impl_header: Option<&str>,
+) -> TypeSignatureOutcome {
+    let Some(callable) = RustCallable::from_spelling(
+        signature_text.as_str(),
+        &|name| traced.resolved().resolved_of(name).map(str::to_owned),
+        impl_header,
+    ) else {
         return TypeSignatureOutcome::UnreadableSignature;
     };
 
@@ -391,7 +406,7 @@ pub fn rust_normalized_outcome_of(
         return TypeSignatureOutcome::UnopenedTypeName { reason };
     }
 
-    // 別々の `impl` の `&self` は、綴りが同じでも別の型を受け取る
+    // 囲む impl が無い Self と、まだ解決していない関連型は綴りだけで比べない
     if callable.refers_to_self() {
         return TypeSignatureOutcome::SiteDependentSpelling;
     }
