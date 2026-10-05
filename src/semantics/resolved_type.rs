@@ -732,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn test_declared_type_of_an_type_of_a_function_type_keeps_the_whole_type() {
+    fn test_declared_type_of_an_alias_of_a_function_type_keeps_the_whole_type() {
         // `=>` を右辺の区切りと取り違えると、`(value: string)` だけが残る
         assert_eq!(
             declared_type_of("type Handler = (value: string) => number"),

@@ -1863,6 +1863,8 @@ mod tests {
                 UnopenedReason::ServerStillWorking,
                 UnopenedReason::HoverNotProvided,
                 UnopenedReason::UnopenableAlias,
+                UnopenedReason::CyclicAlias,
+                UnopenedReason::AliasExpansionLimit,
             ]
             .into_iter()
             .map(|reason| TypeSignatureMatch::UnopenedTypeName { reason }),
