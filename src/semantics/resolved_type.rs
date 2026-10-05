@@ -11,6 +11,7 @@
 //!
 //! **Rust は definition で宣言を辿り、宣言 hover の右辺を Rust の構文で読む。**
 //! 型引数の当てはめを支え、引数のないエイリアスの右辺の名前は宣言側ソースから辿る。
+//! Self を含む関連型は、直接囲む trait impl の定義と trait の宣言元を照合して開く。
 //!
 //! **綴りを読む部分は LSP を呼ばない**ので、サーバが無くても確かめられる
 //! (`rules/tdd.md`「`lsp` は『応答を受け取ってから先』を切り出す」)。
@@ -24,7 +25,8 @@ use crate::lsp::{
 };
 use crate::source_position::SourcePosition;
 use crate::syntax::rust_callable::{
-    RustAliasSource, RustTypeResolution, primitive_references_of_alias, primitive_spelling_of,
+    RustAliasSource, RustProjectionSource, RustTypeResolution, associated_owner_position_of,
+    primitive_references_of_alias, primitive_spelling_of,
 };
 use crate::syntax::type_reference::TypeReference;
 
@@ -164,6 +166,10 @@ pub enum UnopenedReason {
     CyclicAlias,
     /// 型エイリアスの連鎖の深さ、または展開した右辺の大きさが上限に達した。
     AliasExpansionLimit,
+    /// 関連型の具体的な impl 定義を一意に選べなかった。
+    UnresolvedAssociatedType,
+    /// 選んだ関連型の RHS または型引数を展開できなかった。
+    UnopenableAssociatedType,
 }
 
 /// 開けなかった型名 1 つと、その理由。
@@ -347,6 +353,13 @@ impl<'session> RustTypeResolver<'session> {
         document: &SourceDocument,
         reference: &TypeReference,
     ) -> Result<Result<RustTypeResolution, UnopenedReason>, ClientError> {
+        if reference
+            .name()
+            .split(|character: char| !character.is_alphanumeric() && character != '_')
+            .any(|name| name == "Self")
+        {
+            return self.projection_of(document, reference);
+        }
         let hover = match declared_spelling_of(self.session.hover(document, reference.position())?)
         {
             Ok(hover) => hover,
@@ -362,6 +375,70 @@ impl<'session> RustTypeResolver<'session> {
             DeclarationSiteOutcome::Unreadable { .. } => Ok(Err(query.unreadable())),
             DeclarationSiteOutcome::NotSupported => Ok(Err(query.not_provided())),
         }
+    }
+
+    /// trait 宣言の同一性を確認してから、直接囲む impl の関連型 RHS を開く。
+    ///
+    /// # Errors
+    ///
+    /// definition / hover の往復が失敗したとき。
+    fn projection_of(
+        &mut self,
+        document: &SourceDocument,
+        reference: &TypeReference,
+    ) -> Result<Result<RustTypeResolution, UnopenedReason>, ClientError> {
+        let Some(projection) =
+            RustProjectionSource::from_source(document.source(), reference.position())
+        else {
+            return Ok(Err(UnopenedReason::UnresolvedAssociatedType));
+        };
+        let query = DeclarationQuery::Definition;
+        let member = match query.ask(self.session, document, reference.position())? {
+            DeclarationSiteOutcome::Answered(site) => site,
+            DeclarationSiteOutcome::NoAnswer => return Ok(Err(query.no_answer())),
+            DeclarationSiteOutcome::Unreadable { .. } => return Ok(Err(query.unreadable())),
+            DeclarationSiteOutcome::NotSupported => return Ok(Err(query.not_provided())),
+        };
+        let source = self
+            .sources
+            .entry(member.path().to_owned())
+            .or_insert_with(|| {
+                source_of(member.path()).map_err(|_| UnopenedReason::UnreadableDeclaringDocument)
+            })
+            .clone();
+        let source = match source {
+            Ok(source) => source,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let Some(owner) = associated_owner_position_of(&source, member.position()) else {
+            return Ok(Err(UnopenedReason::UnresolvedAssociatedType));
+        };
+        let implemented = match query.ask(
+            self.session,
+            document,
+            projection.implemented_trait().position(),
+        )? {
+            DeclarationSiteOutcome::Answered(site) => site,
+            DeclarationSiteOutcome::NoAnswer => return Ok(Err(query.no_answer())),
+            DeclarationSiteOutcome::Unreadable { .. } => return Ok(Err(query.unreadable())),
+            DeclarationSiteOutcome::NotSupported => return Ok(Err(query.not_provided())),
+        };
+        let same_trait = implemented.path() == member.path() && implemented.position() == owner;
+        if !same_trait {
+            return Ok(Err(UnopenedReason::UnresolvedAssociatedType));
+        }
+        let mut resolved = HashMap::new();
+        for reference in projection.references() {
+            match self.reference_of(document, reference)? {
+                Ok(resolution) => {
+                    resolved.insert(reference.name().to_owned(), resolution);
+                }
+                Err(reason) => return Ok(Err(reason)),
+            }
+        }
+        Ok(projection
+            .resolution_with(&|name| resolved.get(name).cloned())
+            .ok_or(UnopenedReason::UnopenableAssociatedType))
     }
 
     /// 宣言元をキーに循環を検出する。展開済みの連鎖をキャッシュしないので上限は順序に依存しない。
@@ -464,6 +541,7 @@ impl<'session> RustTypeResolver<'session> {
             RustTypeResolution::ExpansionLimit => Ok(Err(UnopenedReason::AliasExpansionLimit)),
             RustTypeResolution::Declared(_)
             | RustTypeResolution::Generic(_)
+            | RustTypeResolution::Associated { .. }
             | RustTypeResolution::NotAnAlias
             | RustTypeResolution::Unresolved
             | RustTypeResolution::Unopenable => Ok(Err(UnopenedReason::UnopenableAlias)),

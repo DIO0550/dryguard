@@ -18,6 +18,9 @@ use tree_sitter::Node;
 use crate::syntax::tree::{Grammar, SyntaxTree, source_position_of};
 use crate::syntax::type_reference::TypeReference;
 
+mod projection;
+pub(crate) use projection::{RustProjectionSource, associated_owner_position_of};
+
 /// 付け替えた型変数の綴りの前置き。
 ///
 /// `%` は識別子に使えない文字なので、**元の型名と衝突しない**
@@ -104,6 +107,7 @@ pub(crate) struct RustCallable {
     /// impl の対象に置き換えられない Self、または Self を含む関連型が残るか。
     refers_to_self: bool,
     unopenable_alias: bool,
+    unopenable_associated_type: bool,
 }
 
 impl RustCallable {
@@ -227,6 +231,10 @@ impl RustCallable {
         self.unopenable_alias
     }
 
+    pub(crate) fn has_unopenable_associated_type(&self) -> bool {
+        self.unopenable_associated_type
+    }
+
     /// impl の文脈を使っても、Self の指す型を確定できない綴りが残るか。
     pub(crate) fn refers_to_self(&self) -> bool {
         self.refers_to_self
@@ -284,6 +292,10 @@ pub(crate) enum RustTypeResolution {
     Declared(String),
     Unresolved,
     Generic(RustGenericAlias),
+    Associated {
+        alias: RustGenericAlias,
+        captures: Vec<String>,
+    },
     NotAnAlias,
     Unopenable,
     ExpansionLimit,
@@ -482,6 +494,27 @@ struct AliasParameter {
 impl RustGenericAlias {
     /// 型パラメータだけを持ち、右辺・既定値の名前が束縛内に閉じる宣言を読む。
     fn from_nodes(parameters: Node<'_>, right: Node<'_>, source: &str) -> Option<Self> {
+        let names: Option<Vec<_>> = named_children_of(parameters)
+            .map(|parameter| {
+                Some(
+                    source
+                        .get(parameter.child_by_field_name("name")?.byte_range())?
+                        .to_owned(),
+                )
+            })
+            .collect();
+        if !is_openable_type_syntax(right, source, &names?) {
+            return None;
+        }
+        Self::from_nodes_with(parameters, right, source, &|_| None)
+    }
+
+    fn from_nodes_with(
+        parameters: Node<'_>,
+        right: Node<'_>,
+        source: &str,
+        type_of: &dyn Fn(&str) -> Option<RustTypeResolution>,
+    ) -> Option<Self> {
         let mut names = Vec::new();
         let mut parsed = Vec::new();
         for parameter in named_children_of(parameters) {
@@ -506,12 +539,31 @@ impl RustGenericAlias {
             names.push(name.clone());
             parsed.push(AliasParameter { name, default });
         }
-        if !is_openable_type_syntax(right, source, &names) {
+        let resolved_type = |name: &str| {
+            if names.iter().any(|parameter| parameter == name) {
+                return Some(RustTypeResolution::Declared(String::new()));
+            }
+            type_of(name)
+        };
+        if !is_resolved_type_syntax(right, source, &resolved_type) {
+            return None;
+        }
+        let free_type = |name: &str| {
+            if names.iter().any(|parameter| parameter == name) {
+                return None;
+            }
+            type_of(name)
+        };
+        let mut spelling = Spelling::new(source);
+        spelling.type_of = &free_type;
+        spelling.spelling_limit = Some(MAXIMUM_ALIAS_SPELLING_BYTES);
+        let right = spelling.spelling_of(right)??;
+        if spelling.unopenable_alias {
             return None;
         }
         Some(Self {
             parameters: parsed,
-            right: Spelling::new(source).spelling_of(right)??,
+            right,
         })
     }
 
@@ -731,6 +783,7 @@ struct Spelling<'source, 'tree> {
     references: Vec<TypeReference>,
     refers_to_self: bool,
     unopenable_alias: bool,
+    unopenable_associated_type: bool,
     spelling_limit: Option<usize>,
     expansion_limit_reached: bool,
 }
@@ -750,6 +803,7 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
             references: Vec::new(),
             refers_to_self: false,
             unopenable_alias: false,
+            unopenable_associated_type: false,
             spelling_limit: None,
             expansion_limit_reached: false,
         }
@@ -849,6 +903,7 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
             type_names: self.type_names.clone(),
             refers_to_self: self.refers_to_self,
             unopenable_alias: self.unopenable_alias,
+            unopenable_associated_type: self.unopenable_associated_type,
         })
     }
 
@@ -1018,11 +1073,16 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
     fn generic_spelling_of(&mut self, node: Node<'_>) -> Option<String> {
         let head = node.child_by_field_name("type")?;
         let argument_nodes = node.child_by_field_name("type_arguments")?;
-        let name = collapsed(self.text_of(head)?);
+        let name = match contains_self_type(head, self.source) {
+            true => projection_name_of(head, self.source)?,
+            false => collapsed(self.text_of(head)?),
+        };
         let bound_head = name.split("::").next().is_some_and(|head| {
             head == SELF_TYPE || self.declared.iter().any(|declared| declared == head)
         });
-        if !bound_head {
+        let associated_head = contains_self_type(head, self.source);
+        let can_resolve_head = !bound_head || associated_head;
+        if can_resolve_head {
             if let Some(alias) = (self.type_of)(&name).filter(|alias| {
                 !matches!(
                     alias,
@@ -1054,6 +1114,8 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
                     )
                 });
                 if !type_arguments_only {
+                    self.unopenable_associated_type |=
+                        matches!(alias, RustTypeResolution::Associated { .. });
                     self.unopenable_alias = true;
                     return Some(name);
                 }
@@ -1086,6 +1148,7 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
 
     /// 具体的な型は引数を保ち、エイリアスは当てはめる。開けない形には印を残す。
     fn resolved_spelling(&mut self, alias: RustTypeResolution, arguments: &[String]) -> String {
+        let associated = matches!(alias, RustTypeResolution::Associated { .. });
         let resolved = match alias {
             RustTypeResolution::Opened(right) => arguments
                 .is_empty()
@@ -1098,6 +1161,19 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
             RustTypeResolution::Generic(alias) => {
                 alias.instantiated(arguments, self.spelling_limit)
             }
+            RustTypeResolution::Associated { alias, captures } => {
+                let captured: Option<Vec<_>> = captures
+                    .iter()
+                    .map(|name| self.variable_spelling_of(name))
+                    .collect();
+                match captured {
+                    Some(mut captured) => {
+                        captured.extend_from_slice(arguments);
+                        alias.instantiated(&captured, self.spelling_limit)
+                    }
+                    None => Err(AliasInstantiationError::Unopenable),
+                }
+            }
             RustTypeResolution::ExpansionLimit => Err(AliasInstantiationError::ExpansionLimit),
             RustTypeResolution::NotAnAlias
             | RustTypeResolution::Unresolved
@@ -1106,6 +1182,7 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
         match resolved {
             Ok(right) => right,
             Err(AliasInstantiationError::Unopenable) => {
+                self.unopenable_associated_type |= associated;
                 self.unopenable_alias = true;
                 String::new()
             }
@@ -1257,7 +1334,15 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
     /// 別のモジュールの同名の型と重なる。
     fn scoped_type_spelling_of(&mut self, node: Node<'_>) -> Option<String> {
         if contains_self_type(node, self.source) {
+            let name = projection_name_of(node, self.source)?;
+            if let Some(resolved) = (self.type_of)(&name)
+                .filter(|resolution| !matches!(resolution, RustTypeResolution::Unresolved))
+            {
+                return Some(self.resolved_spelling(resolved, &[]));
+            }
+            self.insert_type_name(name.clone(), node.child_by_field_name("name")?);
             self.refers_to_self = true;
+            return Some(name);
         }
         let path = node.child_by_field_name("path")?;
         let name = self.text_of(node.child_by_field_name("name")?)?.to_owned();
@@ -1363,6 +1448,34 @@ fn contains_self_type(node: Node<'_>, source: &str) -> bool {
     let is_self = matches!(node.kind(), "type_identifier" | "identifier")
         && source.get(node.byte_range()) == Some(SELF_TYPE);
     is_self || named_children_of(node).any(|child| contains_self_type(child, source))
+}
+
+/// ソースと hover のパスの空白・コメントの違いを落とす。識別子間の区切りは保つ。
+fn projection_name_of(node: Node<'_>, source: &str) -> Option<String> {
+    if COMMENT_KINDS.contains(&node.kind()) {
+        return Some(String::new());
+    }
+    if node.child_count() == 0 {
+        return Some(source.get(node.byte_range())?.to_owned());
+    }
+    let mut output = String::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let part = projection_name_of(child, source)?;
+        let identifier_boundary = output
+            .chars()
+            .last()
+            .is_some_and(|character| character.is_alphanumeric() || character == '_')
+            && part
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_alphanumeric() || character == '_');
+        if identifier_boundary {
+            output.push(' ');
+        }
+        output.push_str(&part);
+    }
+    Some(output)
 }
 
 /// `+` で並ぶ要求を集めた途中の形。

@@ -75,6 +75,11 @@ impl SourceDocument {
         &self.path
     }
 
+    /// サーバへ送ったソース。問い合わせ位置の宣言文脈を読むために使う。
+    pub(crate) fn source(&self) -> &str {
+        &self.text
+    }
+
     /// `didOpen` で送る形。
     pub(super) fn to_text_document_item(&self) -> TextDocumentItem {
         TextDocumentItem {

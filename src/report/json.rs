@@ -751,6 +751,8 @@ fn unopened_name_of(reason: UnopenedReason) -> &'static str {
         UnopenedReason::UnopenableAlias => "unopenable-alias",
         UnopenedReason::CyclicAlias => "cyclic-alias",
         UnopenedReason::AliasExpansionLimit => "alias-expansion-limit",
+        UnopenedReason::UnresolvedAssociatedType => "unresolved-associated-type",
+        UnopenedReason::UnopenableAssociatedType => "unopenable-associated-type",
     }
 }
 
@@ -1187,10 +1189,18 @@ mod tests {
     }
 
     #[test]
-    fn test_json_of_distinguishes_alias_cycles_from_expansion_limits() {
+    fn test_json_of_distinguishes_type_expansion_failures() {
         for (reason, name) in [
             (UnopenedReason::CyclicAlias, "cyclic-alias"),
             (UnopenedReason::AliasExpansionLimit, "alias-expansion-limit"),
+            (
+                UnopenedReason::UnresolvedAssociatedType,
+                "unresolved-associated-type",
+            ),
+            (
+                UnopenedReason::UnopenableAssociatedType,
+                "unopenable-associated-type",
+            ),
         ] {
             let signals = accidental_duplication().with_semantics(
                 TypeSignatureMatch::UnopenedTypeName { reason },

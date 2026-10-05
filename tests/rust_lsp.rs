@@ -17,6 +17,7 @@ use dryguard::lsp::{
 };
 use dryguard::pipeline::{chunk_pair_of, measured_pair_of, scan_of_language};
 use dryguard::report::{Explanation, scan_text_of};
+use dryguard::semantics::resolved_type::UnopenedReason;
 use dryguard::semantics::type_signature::{
     TypeSignatureOutcome, UntracedReason, rust_type_signature_outcome_of,
 };
@@ -499,7 +500,10 @@ fn test_rust_impl_signatures_preserve_target_receiver_bounds_and_binding_scopes(
         projected.rust_impl_header(),
     )
     .expect("問い合わせ成功");
-    assert_eq!(outcome, TypeSignatureOutcome::SiteDependentSpelling);
+    assert!(
+        matches!(outcome, TypeSignatureOutcome::Normalized(_)),
+        "{outcome:?}"
+    );
     session.shutdown().expect("終了できる");
     for (first, second, expected) in [
         ("wrap_a", "wrap_b", true),
@@ -900,6 +904,100 @@ fn test_rust_nominal_generics_keep_lifetime_and_associated_binding_normalization
             traced_type_signature_match_of(&first, &second),
             TypeSignatureMatch::Unifiable,
             "{a} / {b}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_associated_types_match_their_instantiated_right_hand_sides() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/rust-traced/src/projections.rs");
+    let source = source_of(&path).expect("フィクスチャを読める");
+    let tree = SyntaxTree::from_source(&source, Grammar::Rust).expect("木にできる");
+    let document = SourceDocument::new(&path, source.clone()).expect("ドキュメントを作れる");
+    let root = WorkspaceRoot::enclosing(std::slice::from_ref(&path)).expect("根がある");
+    let mut session = Client::start(&ServerCommand::rust())
+        .expect("サーバを起動できる")
+        .handshake(&root)
+        .expect("握手できる");
+    session.open_document(&document).expect("開ける");
+    let mut outcomes = std::collections::BTreeMap::new();
+    for name in [
+        "short",
+        "qualified",
+        "plain",
+        "wrapped",
+        "wrap_plain",
+        "named",
+        "named_plain",
+        "other",
+        "outside",
+        "mismatch",
+        "foreign",
+        "unsupported",
+        "borrowed",
+    ] {
+        let index = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.contains(&format!("fn {name}(")) || line.contains(&format!("fn {name}<"))
+            })
+            .map(|(index, _)| index)
+            .last()
+            .expect("メソッドがある");
+        let location = Location::new(path.clone(), LineNumber::from_index(index));
+        let chunk = Chunk::find_enclosing(&location, &tree).expect("チャンクがある");
+        let outcome = rust_type_signature_outcome_of(
+            &mut session,
+            &document,
+            chunk.name_position().expect("名前がある"),
+            chunk.type_references(),
+            chunk.rust_impl_header(),
+        )
+        .expect("問い合わせ成功");
+        outcomes.insert(name, outcome);
+    }
+    session.shutdown().expect("終了できる");
+    for (first, second) in [
+        ("short", "plain"),
+        ("qualified", "plain"),
+        ("wrapped", "wrap_plain"),
+        ("named", "named_plain"),
+    ] {
+        let TypeSignatureOutcome::Normalized(left) = &outcomes[first] else {
+            panic!("{first}: {:?}", outcomes[first]);
+        };
+        let TypeSignatureOutcome::Normalized(right) = &outcomes[second] else {
+            panic!("{second}: {:?}", outcomes[second]);
+        };
+        assert!(
+            left.is_unifiable_with(right),
+            "{first} / {second}: {left:?} / {right:?}"
+        );
+    }
+    assert!(
+        matches!(&outcomes["other"], TypeSignatureOutcome::Normalized(_)),
+        "{:?}",
+        outcomes["other"]
+    );
+    for name in ["outside", "mismatch", "foreign"] {
+        assert_eq!(
+            outcomes[name],
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::UnresolvedAssociatedType
+            },
+            "{name}"
+        );
+    }
+    for name in ["unsupported", "borrowed"] {
+        assert_eq!(
+            outcomes[name],
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::UnopenableAssociatedType
+            },
+            "{name}"
         );
     }
 }

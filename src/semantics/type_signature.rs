@@ -398,6 +398,11 @@ fn rust_normalized_in_impl(
         return TypeSignatureOutcome::UnreadableSignature;
     };
 
+    if callable.has_unopenable_associated_type() {
+        return TypeSignatureOutcome::UnopenedTypeName {
+            reason: UnopenedReason::UnopenableAssociatedType,
+        };
+    }
     if callable.has_unopenable_alias() {
         return TypeSignatureOutcome::UnopenedTypeName {
             reason: UnopenedReason::UnopenableAlias,

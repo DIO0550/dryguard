@@ -558,6 +558,12 @@ fn unopened_text_of(reason: UnopenedReason) -> &'static str {
         UnopenedReason::AliasExpansionLimit => {
             "測れない (比較に残る型名を開けない: エイリアスの展開上限に達した)"
         }
+        UnopenedReason::UnresolvedAssociatedType => {
+            "測れない (関連型の具体的な impl 定義を一意に選べない)"
+        }
+        UnopenedReason::UnopenableAssociatedType => {
+            "測れない (関連型の右辺または型引数を展開できない)"
+        }
     }
 }
 
@@ -1559,7 +1565,7 @@ mod tests {
     }
 
     #[test]
-    fn test_text_of_distinguishes_alias_cycles_from_expansion_limits() {
+    fn test_text_of_distinguishes_type_expansion_failures() {
         for (reason, explanation) in [
             (
                 UnopenedReason::CyclicAlias,
@@ -1568,6 +1574,14 @@ mod tests {
             (
                 UnopenedReason::AliasExpansionLimit,
                 "エイリアスの展開上限に達した",
+            ),
+            (
+                UnopenedReason::UnresolvedAssociatedType,
+                "関連型の具体的な impl 定義を一意に選べない",
+            ),
+            (
+                UnopenedReason::UnopenableAssociatedType,
+                "関連型の右辺または型引数を展開できない",
             ),
         ] {
             let text = text_of_accidental_duplication_with_semantics(
