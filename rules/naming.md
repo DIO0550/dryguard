@@ -58,6 +58,7 @@ if structurally_similar && domains_differ { ... }
 | `codebase` | スキャンの対象になるディレクトリツリー。`scan` が受け取る根の下 |
 | `grammar` | ソースを読むのに使う tree-sitter の文法。拡張子で決まる（`.ts` / `.tsx` / `.mts` / `.cts`） |
 | `chunk` | 比較の単位。関数・メソッド・impl ブロック |
+| `declared type identity` | Rust の具体的な型を、宣言のファイルと UTF-16 の位置で識別する比較用の綴り。局所名と独立し、Rust の識別子や正規化した型変数とは衝突しない |
 | `generic alias` | Rust の型パラメータ・既定値・右辺を持ち、使用側の型引数を当てはめて展開する型エイリアス |
 | `impl header` | Rust メソッドが直接所属する impl の本体より前のソース。対象型・型変数・境界・実装トレイトを、そのスコープのまま運ぶ |
 | `accessor` | プロパティのように読み書きされるメンバーを実装する関数（`get` / `set`）。**チャンクとしては関数**だが、`hover` が返すのは**メンバーとしての型** |

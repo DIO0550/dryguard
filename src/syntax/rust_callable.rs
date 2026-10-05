@@ -97,8 +97,9 @@ pub(crate) struct RustCallable {
     trait_bounds: BTreeSet<(String, String)>,
     /// 比較に残る綴りに現れた型名。名前順。
     ///
-    /// **束縛した型変数・プリミティブ・`?Sized`・関連型の名前（`Item = u8` の `Item`）は
-    /// 入らない。** どれも宣言を辿る相手が居ない。パスで書かれた型は**パスごと** 1 つの名前。
+    /// **束縛した型変数・確認済みのプリミティブ・`?Sized`・関連型の名前（`Item = u8` の
+    /// `Item`）は入らない。** 問い合わせに失敗したプリミティブ表記は理由を残すために数える。
+    /// パスで書かれた型は**パスごと** 1 つの名前。
     type_names: BTreeSet<String>,
     /// impl の対象に置き換えられない Self、または Self を含む関連型が残るか。
     refers_to_self: bool,
@@ -114,7 +115,7 @@ impl RustCallable {
     /// 束縛された型変数には差し込まない。`impl_header` は実ソースの直接の親 impl。
     pub(crate) fn from_spelling(
         spelling: &str,
-        alias_of: &dyn Fn(&str) -> Option<RustTypeAlias>,
+        type_of: &dyn Fn(&str) -> Option<RustTypeResolution>,
         impl_header: Option<&str>,
     ) -> Option<Self> {
         let function_spelling = match spelling
@@ -148,7 +149,7 @@ impl RustCallable {
             .find(|node| node.kind() == FUNCTION_SIGNATURE_KIND)?;
 
         let mut spelling = Spelling::new(&declaration);
-        spelling.alias_of = alias_of;
+        spelling.type_of = type_of;
         spelling.from_hover = true;
         let mut callable = spelling.callable_of(function)?;
         callable.renumber_variables();
@@ -278,18 +279,32 @@ fn string_literal_end(source: &str, quote: usize) -> usize {
 
 /// Rust の宣言 hover を、開ける右辺・型エイリアスでない宣言・開けない宣言に分ける。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RustTypeAlias {
+pub(crate) enum RustTypeResolution {
     Opened(String),
+    Declared(String),
+    Unresolved,
     Generic(RustGenericAlias),
     NotAnAlias,
     Unopenable,
+    ExpansionLimit,
 }
 
-impl RustTypeAlias {
+/// 展開する右辺の上限。深さだけではタプルで倍増する連鎖を抑えられない。
+const MAXIMUM_ALIAS_SPELLING_BYTES: usize = 64 * 1024;
+
+impl RustTypeResolution {
     /// 可視性を含む宣言から、展開候補の右辺を正規化する。
     /// プリミティブの綴りが指す実際の型の確認は、呼び出し側が意味情報から行う。
     /// ライフタイム・const 引数、および未知の型構文は開かない。
     pub(crate) fn from_spelling(spelling: &str) -> Self {
+        Self::from_spelling_with(spelling, &|_| None)
+    }
+
+    /// 宣言側で解決した名前だけを右辺に差し込む。導入した綴りは再解釈しない。
+    pub(crate) fn from_spelling_with(
+        spelling: &str,
+        type_of: &dyn Fn(&str) -> Option<RustTypeResolution>,
+    ) -> Self {
         let declaration = format!("{}{DECLARATION_TERMINATOR}", spelling.trim_end_matches(';'));
         let Ok(tree) = SyntaxTree::from_source(&declaration, Grammar::Rust) else {
             return Self::Unopenable;
@@ -331,14 +346,123 @@ impl RustTypeAlias {
                 None => Self::Unopenable,
             };
         }
-        if !is_openable_type_syntax(right, &declaration, &[]) {
+        if !is_resolved_type_syntax(right, &declaration, type_of) {
             return Self::Unopenable;
         }
         let mut spelling = Spelling::new(&declaration);
-        match spelling.spelling_of(right) {
+        spelling.type_of = type_of;
+        spelling.spelling_limit = Some(MAXIMUM_ALIAS_SPELLING_BYTES);
+        let resolved = spelling.spelling_of(right);
+        if spelling.expansion_limit_reached {
+            return Self::ExpansionLimit;
+        }
+        if spelling.unopenable_alias {
+            return Self::Unopenable;
+        }
+        match resolved {
             Some(Some(resolved)) => Self::Opened(resolved),
             Some(None) | None => Self::Unopenable,
         }
+    }
+}
+
+/// 引数のないエイリアスの宣言ソースと、右辺の型名の問い合わせ位置。
+/// プリミティブ表記も含み、未知の型構文・定数式を含む宣言からは作れない。
+pub(crate) struct RustAliasSource {
+    spelling: String,
+    references: Vec<TypeReference>,
+}
+
+impl RustAliasSource {
+    /// 宣言名の位置が一致する型エイリアスを読む。対応外の宣言なら `None`。
+    pub(crate) fn from_source(
+        source: &str,
+        position: crate::source_position::SourcePosition,
+    ) -> Option<Self> {
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
+        let alias = tree.named_descendants().into_iter().find(|node| {
+            node.kind() == "type_item"
+                && node
+                    .child_by_field_name("name")
+                    .and_then(|name| source_position_of(name, source))
+                    == Some(position)
+        })?;
+        let unsupported =
+            alias.has_error() || alias.child_by_field_name("type_parameters").is_some();
+        if unsupported {
+            return None;
+        }
+        let right = alias.child_by_field_name("type")?;
+        if !is_resolved_type_syntax(right, source, &|_| {
+            Some(RustTypeResolution::Declared(String::new()))
+        }) {
+            return None;
+        }
+        let mut spelling = Spelling::new(source);
+        spelling.spelling_of(right)??;
+        Some(Self {
+            spelling: source.get(alias.byte_range())?.to_owned(),
+            references: spelling.references,
+        })
+    }
+
+    /// 宣言全体のソース。
+    pub(crate) fn spelling(&self) -> &str {
+        &self.spelling
+    }
+
+    /// 宣言側スコープから尋ねる型名。プリミティブ表記も含む。
+    pub(crate) fn references(&self) -> &[TypeReference] {
+        &self.references
+    }
+}
+
+/// hover が単独のプリミティブ型の綴りを返したか。
+pub(crate) fn primitive_spelling_of(spelling: &str) -> Option<String> {
+    let source = format!("type Value = {spelling};");
+    let tree = SyntaxTree::from_source(&source, Grammar::Rust).ok()?;
+    if tree.has_error() {
+        return None;
+    }
+    let alias = tree
+        .named_descendants()
+        .into_iter()
+        .find(|node| node.kind() == "type_item")?;
+    let right = alias.child_by_field_name("type")?;
+    (right.kind() == "primitive_type").then(|| source[right.byte_range()].to_owned())
+}
+
+/// 名前は宣言側で解決できたものだけ許可する。定数式や関連型の選択は許可しない。
+fn is_resolved_type_syntax(
+    node: Node<'_>,
+    source: &str,
+    type_of: &dyn Fn(&str) -> Option<RustTypeResolution>,
+) -> bool {
+    match node.kind() {
+        "type_identifier" => source
+            .get(node.byte_range())
+            .is_some_and(|name| name != SELF_TYPE && type_of(name).is_some()),
+        "scoped_type_identifier" => {
+            let ordinary_path = node.child_by_field_name("path").is_some_and(|path| {
+                matches!(
+                    path.kind(),
+                    "identifier" | "scoped_identifier" | "self" | "super" | "crate"
+                )
+            });
+            ordinary_path
+                && source
+                    .get(node.byte_range())
+                    .is_some_and(|name| type_of(&collapsed(name)).is_some())
+        }
+        "generic_type" | "type_arguments" | "reference_type" | "pointer_type" | "tuple_type"
+        | "array_type" | "function_type" | "parameters" | "function_modifiers" => {
+            named_children_of(node).all(|child| is_resolved_type_syntax(child, source, type_of))
+        }
+        "primitive_type" | "unit_type" | "never_type" | "integer_literal" | "mutable_specifier" => {
+            true
+        }
+        "lifetime" => source.get(node.byte_range()) == Some(STATIC_LIFETIME),
+        _ => false,
     }
 }
 
@@ -391,36 +515,79 @@ impl RustGenericAlias {
         })
     }
 
-    /// 使用側で正規化した型引数を当てはめる。個数が合わず既定値も無ければ `None`。
-    fn instantiated(&self, arguments: &[String]) -> Option<String> {
+    /// 正規化した型引数を当てはめる。既定値の置換も、右辺と同じ上限で組み立てる。
+    fn instantiated(
+        &self,
+        arguments: &[String],
+        limit: Option<usize>,
+    ) -> Result<String, AliasInstantiationError> {
         if arguments.len() > self.parameters.len() {
-            return None;
+            return Err(AliasInstantiationError::Unopenable);
         }
         let mut substitutions = Vec::new();
         for (index, parameter) in self.parameters.iter().enumerate() {
             let argument = match arguments.get(index) {
                 Some(argument) => argument.clone(),
-                None => substituted(parameter.default.as_deref()?, &substitutions),
+                None => substituted(
+                    parameter
+                        .default
+                        .as_deref()
+                        .ok_or(AliasInstantiationError::Unopenable)?,
+                    &substitutions,
+                    limit,
+                )?,
             };
             substitutions.push((parameter.name.as_str(), argument));
         }
-        Some(substituted(&self.right, &substitutions))
+        substituted(&self.right, &substitutions, limit)
     }
+}
+
+enum AliasInstantiationError {
+    Unopenable,
+    ExpansionLimit,
 }
 
 /// AST で検証・分離した型識別子のトークンだけを置換する。
 /// 導入した引数は再走査しないので、宣言側の別の型変数に捕捉されない。
-fn substituted(template: &str, substitutions: &[(&str, String)]) -> String {
-    template
-        .split_whitespace()
-        .map(|token| {
+fn substituted(
+    template: &str,
+    substitutions: &[(&str, String)],
+    limit: Option<usize>,
+) -> Result<String, AliasInstantiationError> {
+    joined_with_limit(
+        template.split_whitespace().map(|token| {
             substitutions
                 .iter()
                 .find(|(name, _)| *name == token)
                 .map_or(token, |(_, argument)| argument.as_str())
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+        }),
+        " ",
+        limit,
+    )
+    .ok_or(AliasInstantiationError::ExpansionLimit)
+}
+
+/// 追加前に長さを確かめ、上限以上の中間文字列も作らない。
+fn joined_with_limit<'part>(
+    parts: impl IntoIterator<Item = &'part str>,
+    separator: &str,
+    limit: Option<usize>,
+) -> Option<String> {
+    let mut joined = String::new();
+    for (index, part) in parts.into_iter().enumerate() {
+        let separator = if index == 0 { "" } else { separator };
+        let length = joined
+            .len()
+            .checked_add(separator.len())?
+            .checked_add(part.len())?;
+        if limit.is_some_and(|limit| length > limit) {
+            return None;
+        }
+        joined.push_str(separator);
+        joined.push_str(part);
+    }
+    Some(joined)
 }
 
 /// 宣言の名前の位置から、右辺のプリミティブ表記と問い合わせ位置を返す。
@@ -428,7 +595,7 @@ fn substituted(template: &str, substitutions: &[(&str, String)]) -> String {
 pub(crate) fn primitive_references_of_alias(
     source: &str,
     position: crate::source_position::SourcePosition,
-    expected: &RustTypeAlias,
+    expected: &RustTypeResolution,
 ) -> Option<Vec<TypeReference>> {
     let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
     let alias = tree.named_descendants().into_iter().find(|node| {
@@ -441,7 +608,7 @@ pub(crate) fn primitive_references_of_alias(
     if alias.has_error() {
         return None;
     }
-    let actual = RustTypeAlias::from_spelling(source.get(alias.byte_range())?);
+    let actual = RustTypeResolution::from_spelling(source.get(alias.byte_range())?);
     if &actual != expected {
         return None;
     }
@@ -456,7 +623,7 @@ pub(crate) fn primitive_references_of_alias(
         .into_iter()
         .filter(|node| {
             node.kind() == "primitive_type"
-                && !matches!(expected, RustTypeAlias::Generic(alias) if alias.parameters.iter().any(|parameter| source.get(node.byte_range()) == Some(parameter.name.as_str())))
+                && !matches!(expected, RustTypeResolution::Generic(alias) if alias.parameters.iter().any(|parameter| source.get(node.byte_range()) == Some(parameter.name.as_str())))
                 && (right.byte_range().contains(&node.start_byte())
                     || defaults.iter().any(|default| default.byte_range().contains(&node.start_byte())))
         })
@@ -547,7 +714,7 @@ pub(crate) fn type_references_of(function: Node<'_>, source: &str) -> Vec<TypeRe
 /// **付け替えの番号は読んだ順に振る**ので、引数 → 戻り値 → 境界の順に歩く。
 struct Spelling<'source, 'tree> {
     source: &'source str,
-    alias_of: &'source dyn Fn(&str) -> Option<RustTypeAlias>,
+    type_of: &'source dyn Fn(&str) -> Option<RustTypeResolution>,
     /// 関数が束縛した型変数の名前。宣言された順。
     declared: Vec<String>,
     impl_declared: Vec<String>,
@@ -564,13 +731,15 @@ struct Spelling<'source, 'tree> {
     references: Vec<TypeReference>,
     refers_to_self: bool,
     unopenable_alias: bool,
+    spelling_limit: Option<usize>,
+    expansion_limit_reached: bool,
 }
 
 impl<'source, 'tree> Spelling<'source, 'tree> {
     fn new(source: &'source str) -> Self {
         Self {
             source,
-            alias_of: &|_| None,
+            type_of: &|_| None,
             declared: Vec::new(),
             impl_declared: Vec::new(),
             impl_numbered: Vec::new(),
@@ -581,6 +750,8 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
             references: Vec::new(),
             refers_to_self: false,
             unopenable_alias: false,
+            spelling_limit: None,
+            expansion_limit_reached: false,
         }
     }
 
@@ -808,6 +979,7 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
             }
             "unit_type" => UNIT_TYPE.to_owned(),
             "type_identifier" => self.type_identifier_spelling_of(node)?,
+            "primitive_type" => self.primitive_spelling_of(node)?,
             "scoped_type_identifier" => self.scoped_type_spelling_of(node)?,
             // `?Sized` は `Sized` にしか付けられず、宣言を辿る相手ではない
             "removed_trait_bound" => collapsed(self.text_of(node)?),
@@ -832,6 +1004,13 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
             _ => self.joined_children_of(node)?,
         };
 
+        if self
+            .spelling_limit
+            .is_some_and(|limit| spelled.len() > limit)
+        {
+            self.expansion_limit_reached = true;
+            return None;
+        }
         Some(Some(spelled))
     }
 
@@ -844,7 +1023,16 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
             head == SELF_TYPE || self.declared.iter().any(|declared| declared == head)
         });
         if !bound_head {
-            if let Some(alias) = (self.alias_of)(&name) {
+            if let Some(alias) = (self.type_of)(&name).filter(|alias| {
+                !matches!(
+                    alias,
+                    RustTypeResolution::NotAnAlias | RustTypeResolution::Unresolved
+                )
+            }) {
+                if matches!(alias, RustTypeResolution::Declared(_)) {
+                    let arguments = self.listed_spellings_of(argument_nodes)?;
+                    return Some(self.resolved_spelling(alias, &arguments));
+                }
                 // ライフタイム・const・関連型束縛を型引数として数えてはいけない。
                 let type_arguments_only = named_children_of(argument_nodes).all(|argument| {
                     matches!(
@@ -870,7 +1058,7 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
                     return Some(name);
                 }
                 let arguments = self.listed_spellings_of(argument_nodes)?;
-                return Some(self.alias_spelling(alias, &arguments));
+                return Some(self.resolved_spelling(alias, &arguments));
             }
         }
         let generic = self.spelling_of(head)?.unwrap_or_default();
@@ -878,19 +1066,51 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
         if arguments.is_empty() {
             return Some(generic);
         }
-        Some(format!("{generic}<{}>", arguments.join(", ")))
+        self.generic_spelling(&generic, &arguments)
     }
 
-    /// 開けない当てはめは印を残し、呼び出し側が理由付きで測定不能にする。
-    fn alias_spelling(&mut self, alias: RustTypeAlias, arguments: &[String]) -> String {
+    fn generic_spelling(&mut self, head: &str, arguments: &[String]) -> Option<String> {
+        let arguments = joined_with_limit(
+            arguments.iter().map(String::as_str),
+            ", ",
+            self.spelling_limit,
+        );
+        let joined = arguments.and_then(|arguments| {
+            joined_with_limit([head, "<", &arguments, ">"], "", self.spelling_limit)
+        });
+        if joined.is_none() {
+            self.expansion_limit_reached = true;
+        }
+        joined
+    }
+
+    /// 具体的な型は引数を保ち、エイリアスは当てはめる。開けない形には印を残す。
+    fn resolved_spelling(&mut self, alias: RustTypeResolution, arguments: &[String]) -> String {
         let resolved = match alias {
-            RustTypeAlias::Opened(right) => arguments.is_empty().then_some(right),
-            RustTypeAlias::Generic(alias) => alias.instantiated(arguments),
-            RustTypeAlias::NotAnAlias | RustTypeAlias::Unopenable => None,
+            RustTypeResolution::Opened(right) => arguments
+                .is_empty()
+                .then_some(right)
+                .ok_or(AliasInstantiationError::Unopenable),
+            RustTypeResolution::Declared(identity) if arguments.is_empty() => Ok(identity),
+            RustTypeResolution::Declared(identity) => self
+                .generic_spelling(&identity, arguments)
+                .ok_or(AliasInstantiationError::ExpansionLimit),
+            RustTypeResolution::Generic(alias) => {
+                alias.instantiated(arguments, self.spelling_limit)
+            }
+            RustTypeResolution::ExpansionLimit => Err(AliasInstantiationError::ExpansionLimit),
+            RustTypeResolution::NotAnAlias
+            | RustTypeResolution::Unresolved
+            | RustTypeResolution::Unopenable => Err(AliasInstantiationError::Unopenable),
         };
         match resolved {
-            Some(right) => right,
-            None => {
+            Ok(right) => right,
+            Err(AliasInstantiationError::Unopenable) => {
+                self.unopenable_alias = true;
+                String::new()
+            }
+            Err(AliasInstantiationError::ExpansionLimit) => {
+                self.expansion_limit_reached = true;
                 self.unopenable_alias = true;
                 String::new()
             }
@@ -900,8 +1120,17 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
     /// 名前付きの子を 1 つずつ綴り、落ちたものを除いて返す。読めなければ `None`。
     fn listed_spellings_of(&mut self, list: Node<'_>) -> Option<Vec<String>> {
         let mut spelled = Vec::new();
+        let mut length = 0_usize;
         for child in named_children_of(list) {
             if let Some(child) = self.spelling_of(child)? {
+                let separator_length = if spelled.is_empty() { 0 } else { 2 };
+                length = length
+                    .checked_add(child.len())?
+                    .checked_add(separator_length)?;
+                if self.spelling_limit.is_some_and(|limit| length > limit) {
+                    self.expansion_limit_reached = true;
+                    return None;
+                }
                 spelled.push(child);
             }
         }
@@ -942,16 +1171,28 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
             return Some(self.text_of(node)?.to_owned());
         }
 
-        let mut spelled = Vec::new();
+        let mut spelled = String::new();
+        let mut count = 0;
         let mut cursor = node.walk();
         let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
         for child in children {
             if let Some(child) = self.spelling_of(child)? {
-                spelled.push(child);
+                let separator = if count == 0 { "" } else { " " };
+                let length = spelled
+                    .len()
+                    .checked_add(separator.len())?
+                    .checked_add(child.len())?;
+                if self.spelling_limit.is_some_and(|limit| length > limit) {
+                    self.expansion_limit_reached = true;
+                    return None;
+                }
+                spelled.push_str(separator);
+                spelled.push_str(&child);
+                count += 1;
             }
         }
 
-        Some(spelled.join(" "))
+        Some(spelled)
     }
 
     /// 型名 1 つ。関数が束縛した型変数なら付け替え、そうでなければ型名として数える。
@@ -964,12 +1205,48 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
             return Some(variable);
         }
 
-        if let Some(resolved) = (self.alias_of)(name) {
-            return Some(self.alias_spelling(resolved, &[]));
+        if let Some(resolved) = (self.type_of)(name).filter(|alias| {
+            !matches!(
+                alias,
+                RustTypeResolution::NotAnAlias | RustTypeResolution::Unresolved
+            )
+        }) {
+            return Some(self.resolved_spelling(resolved, &[]));
         }
 
         self.insert_type_name(name.to_owned(), node);
 
+        Some(name.to_owned())
+    }
+
+    /// プリミティブ表記も宣言側で別の型を指しうる。束縛された型変数には問い合わせない。
+    fn primitive_spelling_of(&mut self, node: Node<'_>) -> Option<String> {
+        let name = self.text_of(node)?;
+        if let Some(variable) = self.variable_spelling_of(name) {
+            return Some(variable);
+        }
+        if let Some(resolved) = (self.type_of)(name) {
+            if matches!(
+                resolved,
+                RustTypeResolution::NotAnAlias | RustTypeResolution::Unresolved
+            ) {
+                self.insert_type_name(name.to_owned(), node);
+                return Some(name.to_owned());
+            }
+            return Some(self.resolved_spelling(resolved, &[]));
+        }
+        if !self.from_hover {
+            let already_asked = self
+                .references
+                .iter()
+                .any(|reference| reference.name() == name);
+            if !already_asked {
+                self.references.push(TypeReference::new(
+                    name.to_owned(),
+                    source_position_of(node, self.source)?,
+                ));
+            }
+        }
         Some(name.to_owned())
     }
 
@@ -1012,8 +1289,13 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
     /// 型ではなくモジュールの宣言が返る。
     fn whole_path_of(&mut self, node: Node<'_>) -> Option<String> {
         let path = collapsed(self.text_of(node)?);
-        if let Some(resolved) = (self.alias_of)(&path) {
-            return Some(self.alias_spelling(resolved, &[]));
+        if let Some(resolved) = (self.type_of)(&path).filter(|alias| {
+            !matches!(
+                alias,
+                RustTypeResolution::NotAnAlias | RustTypeResolution::Unresolved
+            )
+        }) {
+            return Some(self.resolved_spelling(resolved, &[]));
         }
         self.insert_type_name(path.clone(), node.child_by_field_name("name")?);
 
@@ -1109,6 +1391,135 @@ fn collapsed(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_alias_source_names_are_queried_at_the_selected_declaration_in_utf16() {
+        let source =
+            "mod a { type Alias = Wrong; }\nmod b { /*🦀*/ type Alias = (other::Customer, u8); }";
+        let line = crate::line_number::LineNumber::from_index(1);
+        let position = crate::source_position::SourcePosition::from_preceding_text(
+            line,
+            "mod b { /*🦀*/ type ",
+        );
+        let body = super::RustAliasSource::from_source(source, position).unwrap();
+        let references = body.references();
+        assert_eq!(references.len(), 2);
+        assert_eq!(references[0].name(), "other::Customer");
+        assert_eq!(
+            references[0].position(),
+            crate::source_position::SourcePosition::from_preceding_text(
+                line,
+                "mod b { /*🦀*/ type Alias = (other::"
+            )
+        );
+        assert_eq!(references[1].name(), "u8");
+    }
+
+    #[test]
+    fn test_alias_source_rejects_constants_unknown_syntax_and_generic_declarations() {
+        for right in [
+            "[u8; COUNT]",
+            "[u8; 2 + 3]",
+            "generated!()",
+            "Self",
+            "&'a u8",
+            "<Customer as Trait>::Out",
+        ] {
+            let source = format!("type Alias = {right};");
+            let position = crate::source_position::SourcePosition::from_preceding_text(
+                crate::line_number::LineNumber::from_index(0),
+                "type ",
+            );
+            assert!(
+                super::RustAliasSource::from_source(&source, position).is_none(),
+                "{right}"
+            );
+        }
+        let source = "type Alias<T> = T;";
+        let position = crate::source_position::SourcePosition::from_preceding_text(
+            crate::line_number::LineNumber::from_index(0),
+            "type ",
+        );
+        assert!(super::RustAliasSource::from_source(source, position).is_none());
+        assert!(super::RustAliasSource::from_source("type Alias = [u8; 4];", position).is_some());
+    }
+
+    #[test]
+    fn test_alias_declared_names_cannot_capture_use_site_type_variables() {
+        let nominal = super::RustTypeResolution::Declared("@type(\"/model.rs\", 1, 0)".to_owned());
+        let alias =
+            super::RustTypeResolution::from_spelling_with("type Alias = Customer", &|name| {
+                (name == "Customer").then(|| nominal.clone())
+            });
+        let captured = super::RustCallable::from_spelling(
+            "fn f<Customer>(value: Alias, other: Customer) -> Alias",
+            &|name| (name == "Alias").then(|| alias.clone()),
+            None,
+        )
+        .unwrap();
+        let explicit = super::RustCallable::from_spelling(
+            "fn g<T>(value: Customer, other: T) -> Customer",
+            &|name| (name == "Customer").then(|| nominal.clone()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(captured, explicit);
+    }
+
+    #[test]
+    fn test_alias_resolution_keeps_nominal_generic_arguments_and_rejects_invalid_alias_arguments() {
+        let nominal = super::RustTypeResolution::Declared("@type(\"/model.rs\", 1, 0)".to_owned());
+        let type_of = |name: &str| (name == "Wrapper").then(|| nominal.clone());
+        let first =
+            super::RustTypeResolution::from_spelling_with("type Alias = Wrapper<u8>", &type_of);
+        let second =
+            super::RustTypeResolution::from_spelling_with("type Alias = Wrapper<u64>", &type_of);
+        assert!(matches!(first, super::RustTypeResolution::Opened(_)));
+        assert_ne!(first, second);
+        let alias = super::RustTypeResolution::from_spelling("type Pair<T> = (T, T)");
+        let invalid =
+            super::RustTypeResolution::from_spelling_with("type Alias = Pair<u8, u64>", &|_| {
+                Some(alias.clone())
+            });
+        assert_eq!(invalid, super::RustTypeResolution::Unopenable);
+    }
+    #[test]
+    fn test_alias_expansion_size_accepts_the_boundary_and_rejects_wide_right_hand_sides() {
+        let limit = super::MAXIMUM_ALIAS_SPELLING_BYTES;
+        let at_limit = super::RustTypeResolution::Opened("x".repeat(limit));
+        let type_of = |name: &str| (name == "Large").then(|| at_limit.clone());
+        assert_eq!(
+            super::RustTypeResolution::from_spelling_with("type Alias = Large", &type_of),
+            at_limit,
+        );
+        for declaration in ["type Alias = (Large, Large)", "type Alias = Wrapper<Large>"] {
+            let resolved =
+                super::RustTypeResolution::from_spelling_with(declaration, &|name| match name {
+                    "Large" => Some(at_limit.clone()),
+                    "Wrapper" => Some(super::RustTypeResolution::Declared("wrapper".to_owned())),
+                    _ => None,
+                });
+            assert_eq!(resolved, super::RustTypeResolution::ExpansionLimit);
+        }
+    }
+
+    #[test]
+    fn test_alias_expansion_size_limits_generic_substitution_and_defaults() {
+        for declaration in ["type Pair<T> = (T, T)", "type Pair<T, U = (T, T)> = U"] {
+            let generic = super::RustTypeResolution::from_spelling(declaration);
+            let resolved = super::RustTypeResolution::from_spelling_with(
+                "type Alias = Pair<Large>",
+                &|name| match name {
+                    "Large" => Some(super::RustTypeResolution::Opened(
+                        "x".repeat(super::MAXIMUM_ALIAS_SPELLING_BYTES / 2),
+                    )),
+                    "Pair" => Some(generic.clone()),
+                    _ => None,
+                },
+            );
+            assert_eq!(resolved, super::RustTypeResolution::ExpansionLimit);
+        }
+    }
+
     #[test]
     fn test_impl_type_variables_are_renamed_with_their_bounds() {
         let first = RustCallable::from_spelling(
@@ -1291,7 +1702,7 @@ mod tests {
         let references = super::primitive_references_of_alias(
             source,
             position,
-            &super::RustTypeAlias::Opened("u64".to_owned()),
+            &super::RustTypeResolution::Opened("u64".to_owned()),
         )
         .expect("宣言の右辺が一致する");
         assert_eq!(references.len(), 1);
@@ -1307,7 +1718,7 @@ mod tests {
             super::primitive_references_of_alias(
                 source,
                 position,
-                &super::RustTypeAlias::Opened("u8".to_owned())
+                &super::RustTypeResolution::Opened("u8".to_owned())
             ),
             None
         );
@@ -1315,7 +1726,7 @@ mod tests {
 
     #[test]
     fn test_rust_generic_alias_arguments_are_instantiated() {
-        let alias = super::RustTypeAlias::from_spelling("type Pair<T> = (T, T)");
+        let alias = super::RustTypeResolution::from_spelling("type Pair<T> = (T, T)");
         let actual = RustCallable::from_spelling(
             "fn f(value: Pair<u8>)",
             &|name| (name == "Pair").then(|| alias.clone()),
@@ -1374,9 +1785,9 @@ mod tests {
                 "fn f(x: (u64,u64))",
             ),
         ] {
-            let alias = super::RustTypeAlias::from_spelling(declaration);
+            let alias = super::RustTypeResolution::from_spelling(declaration);
             if declaration.contains("TT") {
-                assert_eq!(alias, super::RustTypeAlias::Unopenable);
+                assert_eq!(alias, super::RustTypeResolution::Unopenable);
                 continue;
             }
             let actual = RustCallable::from_spelling(
@@ -1391,7 +1802,7 @@ mod tests {
 
     #[test]
     fn test_rust_generic_alias_invalid_arguments_are_unopenable() {
-        let alias = super::RustTypeAlias::from_spelling("type Pair<T> = (T, T)");
+        let alias = super::RustTypeResolution::from_spelling("type Pair<T> = (T, T)");
         for signature in [
             "fn f(x: Pair)",
             "fn f(x: Pair<u8,u64>)",
@@ -1429,7 +1840,7 @@ mod tests {
 
     #[test]
     fn test_rust_alias_variable_order_after_a_quoted_byte_is_preserved() {
-        let alias = super::RustTypeAlias::from_spelling("type Flip<A,B> = (B,A)");
+        let alias = super::RustTypeResolution::from_spelling("type Flip<A,B> = (B,A)");
         let actual = RustCallable::from_spelling(
             r#"fn f<T,U>(x: ([u8; b'"' as usize], Flip<T,U>), y:T)"#,
             &|name| (name == "Flip").then(|| alias.clone()),
@@ -1449,8 +1860,8 @@ mod tests {
             "type Pair<T> = (T, [u8; COUNT])",
         ] {
             assert_eq!(
-                super::RustTypeAlias::from_spelling(declaration),
-                super::RustTypeAlias::Unopenable,
+                super::RustTypeResolution::from_spelling(declaration),
+                super::RustTypeResolution::Unopenable,
                 "{declaration}"
             );
         }
@@ -1465,8 +1876,8 @@ mod tests {
             "pub(in crate::billing) type Amount = u64",
         ] {
             assert_eq!(
-                super::RustTypeAlias::from_spelling(declaration),
-                super::RustTypeAlias::Opened("u64".to_owned()),
+                super::RustTypeResolution::from_spelling(declaration),
+                super::RustTypeResolution::Opened("u64".to_owned()),
                 "{declaration}"
             );
         }
@@ -1484,8 +1895,8 @@ mod tests {
             "!",
         ] {
             let declaration = format!("pub type Value = {right}");
-            let super::RustTypeAlias::Opened(resolved) =
-                super::RustTypeAlias::from_spelling(&declaration)
+            let super::RustTypeResolution::Opened(resolved) =
+                super::RustTypeResolution::from_spelling(&declaration)
             else {
                 panic!("右辺を開ける: {declaration}");
             };
@@ -1503,8 +1914,8 @@ mod tests {
             "type Bytes<const N: usize> = [u8; N]",
         ] {
             assert_eq!(
-                super::RustTypeAlias::from_spelling(declaration),
-                super::RustTypeAlias::Unopenable,
+                super::RustTypeResolution::from_spelling(declaration),
+                super::RustTypeResolution::Unopenable,
                 "{declaration}"
             );
         }
@@ -1522,14 +1933,14 @@ mod tests {
             "&'a u8",
         ] {
             assert_eq!(
-                super::RustTypeAlias::from_spelling(&format!("type Value = {right}")),
-                super::RustTypeAlias::Unopenable,
+                super::RustTypeResolution::from_spelling(&format!("type Value = {right}")),
+                super::RustTypeResolution::Unopenable,
                 "{right}"
             );
         }
         assert!(matches!(
-            super::RustTypeAlias::from_spelling("type Value = [u8; 4]"),
-            super::RustTypeAlias::Opened(_)
+            super::RustTypeResolution::from_spelling("type Value = [u8; 4]"),
+            super::RustTypeResolution::Opened(_)
         ));
     }
 
@@ -1542,8 +1953,8 @@ mod tests {
             "pub type Amount = {unknown}",
         ] {
             assert_eq!(
-                super::RustTypeAlias::from_spelling(declaration),
-                super::RustTypeAlias::Unopenable,
+                super::RustTypeResolution::from_spelling(declaration),
+                super::RustTypeResolution::Unopenable,
                 "{declaration}"
             );
         }
@@ -1559,8 +1970,8 @@ mod tests {
             "pub struct User { r#type: u8 }",
         ] {
             assert_eq!(
-                super::RustTypeAlias::from_spelling(declaration),
-                super::RustTypeAlias::NotAnAlias,
+                super::RustTypeResolution::from_spelling(declaration),
+                super::RustTypeResolution::NotAnAlias,
                 "{declaration}"
             );
         }
@@ -1842,13 +2253,15 @@ mod tests {
 
     #[test]
     fn test_type_references_of_a_source_function_leave_out_what_has_no_declaration_to_trace() {
-        // 対照に `Iterator` を置く。型変数・プリミティブ・関連型の名前（`Item`）は
-        // 辿る相手が居ない
+        // Why: 型変数・関連型名は除き、shadow されうるプリミティブ表記は尋ねる。
         let names = reference_names_of(
             "fn f<T: Iterator<Item = u8>>(t: T, n: usize) -> T::Item { todo!() }\n",
         );
 
-        assert_eq!(names, BTreeSet::from(["Iterator".to_owned()]));
+        assert_eq!(
+            names,
+            BTreeSet::from(["Iterator".to_owned(), "u8".to_owned(), "usize".to_owned()])
+        );
     }
 
     #[test]

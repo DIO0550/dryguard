@@ -376,8 +376,8 @@ pub fn rust_type_signature_outcome_of(
 /// 書かれた場所で決まる綴り → 辿った記録の無い型名の順に見て、どれにも当たらなければ
 /// 比べられる形にする。
 ///
-/// **右辺は型名の位置だけに差し込む。** 宣言側スコープに依存しない形に限って
-/// `syntax::rust_callable` が開いているので、使用側の型変数や宣言記録を流用しない。
+/// **右辺は型名の位置だけに差し込む。** 宣言側で解決・正規化した綴りを
+/// `syntax::rust_callable` がそのまま使い、使用側の型変数や宣言記録を流用しない。
 pub fn rust_normalized_outcome_of(
     signature_text: &SignatureText,
     traced: &TracedTypeNames,
@@ -392,7 +392,7 @@ fn rust_normalized_in_impl(
 ) -> TypeSignatureOutcome {
     let Some(callable) = RustCallable::from_spelling(
         signature_text.as_str(),
-        &|name| traced.resolved().rust_alias_of(name),
+        &|name| traced.resolved().rust_type_of(name),
         impl_header,
     ) else {
         return TypeSignatureOutcome::UnreadableSignature;
