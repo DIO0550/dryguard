@@ -552,6 +552,12 @@ fn unopened_text_of(reason: UnopenedReason) -> &'static str {
         UnopenedReason::UnopenableAlias => {
             "測れない (比較に残る型名を開けない: エイリアスの右辺を差し込める形にできない)"
         }
+        UnopenedReason::CyclicAlias => {
+            "測れない (比較に残る型名を開けない: エイリアスの宣言が循環している)"
+        }
+        UnopenedReason::AliasExpansionLimit => {
+            "測れない (比較に残る型名を開けない: エイリアスの展開上限に達した)"
+        }
     }
 }
 
@@ -1550,6 +1556,27 @@ mod tests {
             ),
             "尋ねた問い合わせの名前が出る: {text}"
         );
+    }
+
+    #[test]
+    fn test_text_of_distinguishes_alias_cycles_from_expansion_limits() {
+        for (reason, explanation) in [
+            (
+                UnopenedReason::CyclicAlias,
+                "エイリアスの宣言が循環している",
+            ),
+            (
+                UnopenedReason::AliasExpansionLimit,
+                "エイリアスの展開上限に達した",
+            ),
+        ] {
+            let text = text_of_accidental_duplication_with_semantics(
+                TypeSignatureMatch::UnopenedTypeName { reason },
+                CallerDomainOverlap::NoReferences,
+            );
+            assert!(text.contains(explanation), "{text}");
+            assert!(text.contains("測れない"), "{text}");
+        }
     }
 
     #[test]

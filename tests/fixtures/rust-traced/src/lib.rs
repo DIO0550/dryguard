@@ -121,3 +121,5 @@ pub mod renamed_primitive {
 pub mod impls;
 
 pub mod generic;
+
+pub mod alias_scope;

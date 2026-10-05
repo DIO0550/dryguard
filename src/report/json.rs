@@ -749,6 +749,8 @@ fn unopened_name_of(reason: UnopenedReason) -> &'static str {
         UnopenedReason::HoverNotProvided => "hover-not-provided",
         UnopenedReason::ServerStillWorking => "server-still-working",
         UnopenedReason::UnopenableAlias => "unopenable-alias",
+        UnopenedReason::CyclicAlias => "cyclic-alias",
+        UnopenedReason::AliasExpansionLimit => "alias-expansion-limit",
     }
 }
 
@@ -1182,6 +1184,23 @@ mod tests {
             json_for(UnopenedReason::NoDefinitionSite),
             "no-definition-site"
         );
+    }
+
+    #[test]
+    fn test_json_of_distinguishes_alias_cycles_from_expansion_limits() {
+        for (reason, name) in [
+            (UnopenedReason::CyclicAlias, "cyclic-alias"),
+            (UnopenedReason::AliasExpansionLimit, "alias-expansion-limit"),
+        ] {
+            let signals = accidental_duplication().with_semantics(
+                TypeSignatureMatch::UnopenedTypeName { reason },
+                CallerDomainOverlap::NoReferences,
+            );
+            let json = json_of_signals(&signals, Explanation::AskedSignals);
+            let value = &reason_of(&json, "type-signature-match")["value"];
+            assert_eq!(value["status"], "unmeasurable");
+            assert_eq!(value["unopened"], name);
+        }
     }
 
     #[test]

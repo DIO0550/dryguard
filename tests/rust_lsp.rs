@@ -379,20 +379,14 @@ fn test_compare_rust_aliases_with_different_right_hand_sides_are_not_unifiable()
 
 #[test]
 #[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
-fn test_rust_aliases_requiring_declaration_scope_are_unavailable() {
-    for name in ["named_alias", "counted_alias"] {
-        let alias = traced_fixture("src/lib.rs", name);
-        let outcome = traced_type_signature_match_of(&alias, &alias);
-        assert!(
-            matches!(
-                outcome,
-                TypeSignatureMatch::UnopenedTypeName {
-                    reason: dryguard::semantics::resolved_type::UnopenedReason::UnopenableAlias,
-                }
-            ),
-            "{name}: {outcome:?}"
-        );
-    }
+fn test_rust_aliases_requiring_constant_evaluation_are_unavailable() {
+    let alias = traced_fixture("src/lib.rs", "counted_alias");
+    assert_eq!(
+        traced_type_signature_match_of(&alias, &alias),
+        TypeSignatureMatch::UnopenedTypeName {
+            reason: dryguard::semantics::resolved_type::UnopenedReason::UnopenableAlias,
+        }
+    );
 }
 
 #[test]
@@ -688,9 +682,7 @@ fn test_rust_alias_shadowing_a_primitive_is_not_compared_as_that_primitive() {
         let alias = traced_fixture("src/lib.rs", function);
         assert_eq!(
             traced_type_signature_match_of(&alias, &raw),
-            TypeSignatureMatch::UnopenedTypeName {
-                reason: dryguard::semantics::resolved_type::UnopenedReason::UnopenableAlias,
-            },
+            TypeSignatureMatch::NotUnifiable,
             "{function}"
         );
     }
@@ -773,4 +765,141 @@ fn test_rust_generic_alias_const_arguments_remain_unmeasurable() {
         ),
         "const の値を失った hover を綴りで比較しない: {outcome:?}"
     );
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_alias_declaration_scope_matches_the_original_type() {
+    let alias = traced_fixture("src/lib.rs", "named_alias");
+    assert_eq!(
+        traced_type_signature_match_of(&alias, &alias),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "rust-analyzer と rust-src が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_alias_chains_reexports_and_nested_types_keep_declaration_scope() {
+    for (a, b) in [
+        ("aliased", "direct"),
+        ("chained", "direct"),
+        ("imported", "direct"),
+        ("paired", "pair_raw"),
+        ("option", "option_raw"),
+        ("instantiated", "pair_raw"),
+        ("captured", "explicit"),
+    ] {
+        let first = traced_fixture("src/alias_scope.rs", a);
+        let second = traced_fixture("src/alias_scope.rs", b);
+        assert_eq!(
+            traced_type_signature_match_of(&first, &second),
+            TypeSignatureMatch::Unifiable,
+            "{a} / {b}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_aliases_do_not_capture_a_different_same_spelled_type() {
+    let imported = traced_fixture("src/alias_scope.rs", "imported");
+    let wrong = traced_fixture("src/alias_scope.rs", "wrong");
+    assert_eq!(
+        traced_type_signature_match_of(&imported, &wrong),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_alias_same_spelled_types_from_different_modules_are_not_unifiable() {
+    let a = traced_fixture("src/alias_scope.rs", "aliased");
+    let b = traced_fixture("src/alias_scope.rs", "other_aliased");
+    assert_eq!(
+        traced_type_signature_match_of(&a, &b),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_alias_cycles_and_expansion_limits_have_distinct_reasons() {
+    use dryguard::semantics::resolved_type::UnopenedReason;
+    for (name, reason) in [
+        ("cyclic", UnopenedReason::CyclicAlias),
+        ("limit", UnopenedReason::AliasExpansionLimit),
+        ("size_limit", UnopenedReason::AliasExpansionLimit),
+        ("warm_limit", UnopenedReason::AliasExpansionLimit),
+        ("cold_limit", UnopenedReason::AliasExpansionLimit),
+    ] {
+        let a = traced_fixture("src/alias_scope.rs", name);
+        assert_eq!(
+            traced_type_signature_match_of(&a, &a),
+            TypeSignatureMatch::UnopenedTypeName { reason },
+            "{name}"
+        );
+    }
+    let boundary = traced_fixture("src/alias_scope.rs", "boundary");
+    let raw = traced_fixture("src/alias_scope.rs", "raw");
+    assert_eq!(
+        traced_type_signature_match_of(&boundary, &raw),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_alias_unresolved_constants_are_not_compared_by_their_spelling() {
+    let a = traced_fixture("src/alias_scope.rs", "bytes_a");
+    let b = traced_fixture("src/alias_scope.rs", "bytes_b");
+    assert_eq!(
+        traced_type_signature_match_of(&a, &b),
+        TypeSignatureMatch::UnopenedTypeName {
+            reason: dryguard::semantics::resolved_type::UnopenedReason::UnopenableAlias
+        }
+    );
+}
+
+#[test]
+#[ignore = "rust-analyzer と rust-src が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_nominal_generic_arguments_are_preserved() {
+    let a = traced_fixture("src/alias_scope.rs", "option_raw");
+    let b = traced_fixture("src/alias_scope.rs", "other_option");
+    assert_eq!(
+        traced_type_signature_match_of(&a, &b),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_shadowed_primitive_aliases_match_direct_uses() {
+    let alias = traced_fixture("src/lib.rs", "shadowed_alias");
+    let direct = traced_fixture("src/alias_scope.rs", "shadowed_direct");
+    assert_eq!(
+        traced_type_signature_match_of(&alias, &direct),
+        TypeSignatureMatch::Unifiable
+    );
+    let raw = traced_fixture("src/lib.rs", "raw");
+    assert_eq!(
+        traced_type_signature_match_of(&direct, &raw),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "rust-analyzer と rust-src が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_nominal_generics_keep_lifetime_and_associated_binding_normalization() {
+    for (a, b) in [
+        ("lifetime_nominal", "lifetime_nominal_renamed"),
+        ("iterator_binding", "iterator_binding_renamed"),
+    ] {
+        let first = traced_fixture("src/alias_scope.rs", a);
+        let second = traced_fixture("src/alias_scope.rs", b);
+        assert_eq!(
+            traced_type_signature_match_of(&first, &second),
+            TypeSignatureMatch::Unifiable,
+            "{a} / {b}"
+        );
+    }
 }
