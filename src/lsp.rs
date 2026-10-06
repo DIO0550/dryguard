@@ -57,6 +57,7 @@ pub use call_hierarchy::CalleesOutcome;
 pub use hover::{HoverOutcome, SignatureText};
 pub use references::{Reference, ReferencesOutcome};
 // 型の宣言の場所は、開かせる相手を決める材料として `pipeline` が読む。
+pub(crate) use declaration_site::UniqueDeclarationSiteOutcome;
 pub use declaration_site::{DeclarationSite, DeclarationSiteOutcome};
 pub use workspace::{WorkspaceError, WorkspaceRoot};
 // 根の決め方と所属の確かめ方は `pipeline` だけが使う手順なので、クレートの外へは出さない
@@ -380,6 +381,27 @@ impl Session {
         self.client
             .connection
             .definition(document, position)
+            .map_err(ClientError::Conversation)
+    }
+
+    /// 定数の宣言を一意に選べるかを含めて尋ねる。
+    ///
+    /// # Errors
+    ///
+    /// 未開封のドキュメント、往復または応答の解釈に失敗したとき。
+    pub(crate) fn unique_definition(
+        &mut self,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<UniqueDeclarationSiteOutcome, ClientError> {
+        if !provides_definition(&self.capabilities) {
+            return Ok(UniqueDeclarationSiteOutcome::Unambiguous(
+                DeclarationSiteOutcome::NotSupported,
+            ));
+        }
+        self.client
+            .connection
+            .unique_definition(document, position)
             .map_err(ClientError::Conversation)
     }
 

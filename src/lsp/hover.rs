@@ -10,7 +10,8 @@ use lsp_types::{Hover, HoverContents};
 /// マークダウンのコードフェンスの印。
 const FENCE: &str = "```";
 
-/// hover が返した綴りそのもの。**正規化前**（`rules/naming.md` の `signature text`）。
+/// hover に由来する綴り。**型構造の正規化前**（`rules/naming.md` の `signature text`）。
+/// Rust の配列長をソースから復元した綴りも、構造比較の前はこの型で持つ。
 ///
 /// **素の `String` で持ち回らない。** 正規化後の
 /// [`crate::semantics::type_signature::TypeSignature`] と混ぜても型では止まらず、

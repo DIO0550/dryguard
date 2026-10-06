@@ -380,13 +380,11 @@ fn test_compare_rust_aliases_with_different_right_hand_sides_are_not_unifiable()
 
 #[test]
 #[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
-fn test_rust_aliases_requiring_constant_evaluation_are_unavailable() {
+fn test_rust_aliases_with_evaluated_constant_lengths_are_unifiable() {
     let alias = traced_fixture("src/lib.rs", "counted_alias");
     assert_eq!(
         traced_type_signature_match_of(&alias, &alias),
-        TypeSignatureMatch::UnopenedTypeName {
-            reason: dryguard::semantics::resolved_type::UnopenedReason::UnopenableAlias,
-        }
+        TypeSignatureMatch::Unifiable
     );
 }
 
@@ -853,14 +851,12 @@ fn test_rust_alias_cycles_and_expansion_limits_have_distinct_reasons() {
 
 #[test]
 #[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
-fn test_rust_alias_unresolved_constants_are_not_compared_by_their_spelling() {
+fn test_rust_alias_same_spelled_constants_with_different_values_are_not_unifiable() {
     let a = traced_fixture("src/alias_scope.rs", "bytes_a");
     let b = traced_fixture("src/alias_scope.rs", "bytes_b");
     assert_eq!(
         traced_type_signature_match_of(&a, &b),
-        TypeSignatureMatch::UnopenedTypeName {
-            reason: dryguard::semantics::resolved_type::UnopenedReason::UnopenableAlias
-        }
+        TypeSignatureMatch::NotUnifiable
     );
 }
 
@@ -1000,4 +996,114 @@ fn test_rust_associated_types_match_their_instantiated_right_hand_sides() {
             "{name}"
         );
     }
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_array_lengths_compare_values_in_declaration_scope() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/rust-array-lengths/src/lib.rs");
+    let source = source_of(&path).expect("フィクスチャを読める");
+    let tree = SyntaxTree::from_source(&source, Grammar::Rust).expect("構文木を作れる");
+    let document = SourceDocument::new(&path, source.clone()).expect("ドキュメントを作れる");
+    let root = WorkspaceRoot::enclosing(std::slice::from_ref(&path)).expect("根を作れる");
+    let mut session = Client::start(&ServerCommand::rust())
+        .expect("rust-analyzer を起動できる")
+        .handshake(&root)
+        .expect("握手できる");
+    session.open_document(&document).expect("ソースを開ける");
+    let mut outcomes = std::collections::BTreeMap::new();
+    for (index, line) in source.lines().enumerate() {
+        let Some(function) = line.strip_prefix("pub fn ") else {
+            continue;
+        };
+        let name = function.split(['(', '<']).next().expect("関数名");
+        let location = Location::new(path.clone(), LineNumber::from_index(index));
+        let chunk = Chunk::find_enclosing(&location, &tree).expect("関数のチャンク");
+        let outcome = rust_type_signature_outcome_of(
+            &mut session,
+            &document,
+            chunk.name_position().expect("関数の位置"),
+            chunk.type_references(),
+            chunk.rust_impl_header(),
+        )
+        .expect("LSP 問い合わせに成功する");
+        outcomes.insert(name, outcome);
+    }
+    session.shutdown().expect("正常終了できる");
+
+    let TypeSignatureOutcome::Normalized(literal) = &outcomes["literal"] else {
+        panic!("{:?}", outcomes["literal"]);
+    };
+    for name in [
+        "arithmetic",
+        "imported",
+        "aliased",
+        "expression",
+        "suffix",
+        "commented",
+    ] {
+        let TypeSignatureOutcome::Normalized(other) = &outcomes[name] else {
+            panic!("{name}: {:?}", outcomes[name]);
+        };
+        assert!(literal.is_unifiable_with(other), "{name}: {other:?}");
+    }
+    let TypeSignatureOutcome::Normalized(different) = &outcomes["different"] else {
+        panic!("{:?}", outcomes["different"]);
+    };
+    assert!(
+        !literal.is_unifiable_with(different),
+        "同名 COUNT は宣言側で異なる値"
+    );
+    let TypeSignatureOutcome::Normalized(nested) = &outcomes["nested"] else {
+        panic!("{:?}", outcomes["nested"]);
+    };
+    let TypeSignatureOutcome::Normalized(plain) = &outcomes["nested_plain"] else {
+        panic!("{:?}", outcomes["nested_plain"]);
+    };
+    assert!(nested.is_unifiable_with(plain));
+    let TypeSignatureOutcome::Normalized(different) = &outcomes["nested_different"] else {
+        panic!("{:?}", outcomes["nested_different"]);
+    };
+    assert!(!nested.is_unifiable_with(different), "外側の長さも区別する");
+
+    for (name, reason) in [
+        ("unsupported", UnopenedReason::UnevaluableArrayLength),
+        ("cyclic", UnopenedReason::CyclicArrayLength),
+        ("limited", UnopenedReason::ArrayLengthEvaluationLimit),
+        ("zero_division", UnopenedReason::UnevaluableArrayLength),
+        ("negative", UnopenedReason::UnevaluableArrayLength),
+        ("cast", UnopenedReason::UnevaluableArrayLength),
+        ("shadowed", UnopenedReason::UnevaluableArrayLength),
+        ("unsupported_alias", UnopenedReason::UnevaluableArrayLength),
+        ("cyclic_alias", UnopenedReason::CyclicArrayLength),
+        (
+            "large_intermediate",
+            UnopenedReason::ArrayLengthEvaluationLimit,
+        ),
+        ("chain_limit", UnopenedReason::ArrayLengthEvaluationLimit),
+        ("work_limit", UnopenedReason::ArrayLengthEvaluationLimit),
+        (
+            "expression_limit",
+            UnopenedReason::ArrayLengthEvaluationLimit,
+        ),
+        ("macro_type", UnopenedReason::UnmatchedArrayLength),
+    ] {
+        assert_eq!(
+            outcomes[name],
+            TypeSignatureOutcome::UnopenedTypeName { reason },
+            "{name}"
+        );
+    }
+    for name in ["maximum", "chain_boundary"] {
+        assert!(
+            matches!(outcomes[name], TypeSignatureOutcome::Normalized(_)),
+            "{name}: {:?}",
+            outcomes[name]
+        );
+    }
+    assert_eq!(
+        outcomes["generic"],
+        TypeSignatureOutcome::UnreadableSignature
+    );
 }

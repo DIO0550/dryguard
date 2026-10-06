@@ -408,6 +408,46 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         document: &SourceDocument,
         position: SourcePosition,
     ) -> Result<DeclarationSiteOutcome, ConnectionError> {
+        Ok(
+            match self
+                .declaration_sites_of(method, document, position)?
+                .as_ref()
+            {
+                Some(answered) => declaration_site::outcome_of(answered),
+                None => DeclarationSiteOutcome::NoAnswer,
+            },
+        )
+    }
+
+    /// 複数の候補が返ったときに先頭を選ばない definition。
+    ///
+    /// # Errors
+    ///
+    /// definition の往復、応答の解釈に失敗したとき。
+    pub(crate) fn unique_definition(
+        &mut self,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<declaration_site::UniqueDeclarationSiteOutcome, ConnectionError> {
+        Ok(
+            match self
+                .declaration_sites_of(GotoDefinition::METHOD, document, position)?
+                .as_ref()
+            {
+                Some(answered) => declaration_site::unique_outcome_of(answered),
+                None => declaration_site::UniqueDeclarationSiteOutcome::Unambiguous(
+                    DeclarationSiteOutcome::NoAnswer,
+                ),
+            },
+        )
+    }
+
+    fn declaration_sites_of(
+        &mut self,
+        method: &'static str,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<Option<GotoDefinitionResponse>, ConnectionError> {
         // 開かせていないドキュメントへ送ると、サーバは中身を知らないまま null を返す。
         // 「宣言が無い」と「開かせ忘れ」が同じ答えになるので、送る前に断る。
         if !self.open_documents.contains(document.uri()) {
@@ -437,10 +477,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
                 cause,
             })?;
 
-        Ok(match answered.as_ref() {
-            Some(answered) => declaration_site::outcome_of(answered),
-            None => DeclarationSiteOutcome::NoAnswer,
-        })
+        Ok(answered)
     }
 
     /// 開かせたファイルの、指定位置にある名前を参照しているところを尋ねる。

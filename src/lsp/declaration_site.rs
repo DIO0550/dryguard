@@ -97,6 +97,24 @@ pub enum DeclarationSiteOutcome {
     NotSupported,
 }
 
+/// 定数の意味を確定するため、複数の宣言候補を選ばずに残す。
+pub(crate) enum UniqueDeclarationSiteOutcome {
+    Unambiguous(DeclarationSiteOutcome),
+    Ambiguous,
+}
+
+pub(super) fn unique_outcome_of(answered: &GotoDefinitionResponse) -> UniqueDeclarationSiteOutcome {
+    let count = match answered {
+        GotoDefinitionResponse::Scalar(_) => 1,
+        GotoDefinitionResponse::Array(locations) => locations.len(),
+        GotoDefinitionResponse::Link(links) => links.len(),
+    };
+    if count > 1 {
+        return UniqueDeclarationSiteOutcome::Ambiguous;
+    }
+    UniqueDeclarationSiteOutcome::Unambiguous(outcome_of(answered))
+}
+
 /// typeDefinition / definition の応答を、読み取れたかどうかが分かる形にする。
 ///
 /// **返った先頭の 1 件だけを採る。** TypeScript で宣言が複数返るのは同じ名前が複数箇所で
@@ -170,6 +188,29 @@ mod tests {
             DeclarationSiteOutcome::Answered(site) => site,
             other => panic!("宣言の場所を読み取れる: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_unique_definition_keeps_ambiguous_declarations_without_picking_one() {
+        let locations = vec![
+            location("file:///repo/a.rs", 0, 0),
+            location("file:///repo/b.rs", 0, 0),
+        ];
+        assert!(matches!(
+            unique_outcome_of(&GotoDefinitionResponse::Array(locations)),
+            UniqueDeclarationSiteOutcome::Ambiguous
+        ));
+        let one = GotoDefinitionResponse::Scalar(location("file:///repo/a.rs", 0, 0));
+        let UniqueDeclarationSiteOutcome::Unambiguous(DeclarationSiteOutcome::Answered(site)) =
+            unique_outcome_of(&one)
+        else {
+            panic!("一意な宣言が返る");
+        };
+        assert_eq!(site.path(), Path::new("/repo/a.rs"));
+        assert!(matches!(
+            unique_outcome_of(&GotoDefinitionResponse::Array(vec![])),
+            UniqueDeclarationSiteOutcome::Unambiguous(DeclarationSiteOutcome::NoAnswer)
+        ));
     }
 
     #[test]

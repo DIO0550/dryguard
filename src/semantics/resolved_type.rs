@@ -30,6 +30,10 @@ use crate::syntax::rust_callable::{
 };
 use crate::syntax::type_reference::TypeReference;
 
+mod array_length;
+use array_length::evaluated_array_spelling_of;
+pub(crate) use array_length::restored_array_spelling_of;
+
 /// 型エイリアスの宣言を導く語。前後の空白ごと見て、`typeof` のような綴りと分ける。
 const ALIAS_KEYWORD: &str = "type ";
 
@@ -170,6 +174,14 @@ pub enum UnopenedReason {
     UnresolvedAssociatedType,
     /// 選んだ関連型の RHS または型引数を展開できなかった。
     UnopenableAssociatedType,
+    /// 配列長が未対応の式、無効な演算、または一意に選べない定数だった。
+    UnevaluableArrayLength,
+    /// 配列長の定数連鎖が同じ宣言へ戻った。
+    CyclicArrayLength,
+    /// 配列長の値・式・連鎖・評価全体の作業量が上限に達した。
+    ArrayLengthEvaluationLimit,
+    /// ソースの配列長と hover の型構造・値を対応させられなかった。
+    UnmatchedArrayLength,
 }
 
 /// 開けなかった型名 1 つと、その理由。
@@ -286,6 +298,7 @@ pub fn traced_type_names_of(
 /// **宣言 hover の右辺を Rust の構文で読む。** 型引数は使用側で当てはめる。
 /// 引数のないエイリアスの右辺の型名は、宣言側ソースの位置から再帰的に辿る。
 /// プリミティブ表記も hover で確認し、別の型を指すなら definition で辿る。
+/// 非ジェネリック宣言の配列長は元の式を宣言側で評価する。
 /// ジェネリック宣言の自由な名前と定数式は `UnopenableAlias` のままにする。
 ///
 /// # Errors
@@ -533,9 +546,13 @@ impl<'session> RustTypeResolver<'session> {
                 Err(reason) => return Ok(Err(reason)),
             }
         }
-        let alias = RustTypeResolution::from_spelling_with(body.spelling(), &|name| {
-            resolved.get(name).cloned()
-        });
+        let spelling =
+            match evaluated_array_spelling_of(self.session, document, body.array_lengths())? {
+                Ok(spelling) => spelling,
+                Err(reason) => return Ok(Err(reason)),
+            };
+        let alias =
+            RustTypeResolution::from_spelling_with(&spelling, &|name| resolved.get(name).cloned());
         match alias {
             RustTypeResolution::Opened(_) => Ok(Ok(alias)),
             RustTypeResolution::ExpansionLimit => Ok(Err(UnopenedReason::AliasExpansionLimit)),

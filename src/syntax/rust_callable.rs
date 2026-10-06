@@ -20,6 +20,10 @@ use crate::syntax::type_reference::TypeReference;
 
 mod projection;
 pub(crate) use projection::{RustProjectionSource, associated_owner_position_of};
+mod array_length;
+pub(crate) use array_length::{
+    ArithmeticOperator, ConstSyntaxError, RustArrayLengths, RustConstExpression, RustConstSource,
+};
 
 /// 付け替えた型変数の綴りの前置き。
 ///
@@ -114,7 +118,8 @@ impl RustCallable {
     /// hover が返した関数の綴りから読む。関数の宣言として読めなければ `None`。
     ///
     /// **const generics を持つ関数も `None`。** hover は使用箇所を `[u8; {const}]` と
-    /// 綴るので型として読めず、読めた部分だけで比べると長さの違う配列が重なる。
+    /// 綴り、引数の当てはめを扱わないため、読めた部分だけでは長さの違う配列が重なる。
+    /// それ以外の配列長も、意味情報側で復元した整数だけを比較する。
     /// 型名の位置だけに、宣言側で正規化した右辺を差し込む。
     /// 束縛された型変数には差し込まない。`impl_header` は実ソースの直接の親 impl。
     pub(crate) fn from_spelling(
@@ -379,9 +384,9 @@ impl RustTypeResolution {
 }
 
 /// 引数のないエイリアスの宣言ソースと、右辺の型名の問い合わせ位置。
-/// プリミティブ表記も含み、未知の型構文・定数式を含む宣言からは作れない。
+/// プリミティブ表記も含む。配列長の評価は宣言側の位置から別に行う。
 pub(crate) struct RustAliasSource {
-    spelling: String,
+    array_lengths: RustArrayLengths,
     references: Vec<TypeReference>,
 }
 
@@ -405,22 +410,27 @@ impl RustAliasSource {
             return None;
         }
         let right = alias.child_by_field_name("type")?;
-        if !is_resolved_type_syntax(right, source, &|_| {
-            Some(RustTypeResolution::Declared(String::new()))
-        }) {
+        let array_lengths = RustArrayLengths::from_node(alias, source, alias.end_byte())?;
+        let masked = array_lengths.with_values(&vec![0; array_lengths.len()])?;
+        let supported = matches!(
+            RustTypeResolution::from_spelling_with(&masked, &|_| {
+                Some(RustTypeResolution::Declared(String::new()))
+            }),
+            RustTypeResolution::Opened(_)
+        );
+        if !supported {
             return None;
         }
         let mut spelling = Spelling::new(source);
         spelling.spelling_of(right)??;
         Some(Self {
-            spelling: source.get(alias.byte_range())?.to_owned(),
+            array_lengths,
             references: spelling.references,
         })
     }
 
-    /// 宣言全体のソース。
-    pub(crate) fn spelling(&self) -> &str {
-        &self.spelling
+    pub(crate) fn array_lengths(&self) -> &RustArrayLengths {
+        &self.array_lengths
     }
 
     /// 宣言側スコープから尋ねる型名。プリミティブ表記も含む。
@@ -1045,6 +1055,16 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
                 format!("{name} = {}", self.spelling_of(bound)?.unwrap_or_default())
             }
             "generic_type" => self.generic_spelling_of(node)?,
+            "array_type" => {
+                let element = self.spelling_of(node.child_by_field_name("element")?)??;
+                match node.child_by_field_name("length") {
+                    Some(length) => {
+                        let length = self.array_length_spelling_of(length)?;
+                        format!("[ {element} ; {length} ]")
+                    }
+                    None => format!("[ {element} ]"),
+                }
+            }
             // `+` で並ぶ要求は並びを問わない
             "bounded_type" | "trait_bounds" => {
                 let mut members = BoundedMembers::default();
@@ -1067,6 +1087,20 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
             return None;
         }
         Some(Some(spelled))
+    }
+
+    /// リテラルを整数へ揃える。ソースの未評価の式は問い合わせ位置の抽出用にだけ残す。
+    fn array_length_spelling_of(&self, length: Node<'_>) -> Option<String> {
+        let text = self.text_of(length)?;
+        if length.kind() == "integer_literal" {
+            if let Ok(value) = array_length::integer_of(text) {
+                return Some(value.to_string());
+            }
+        }
+        if self.from_hover {
+            return None;
+        }
+        Some(collapsed(text))
     }
 
     /// 型引数を使用側で正規化してから、エイリアス全体へ当てはめる。
@@ -1528,15 +1562,8 @@ mod tests {
     }
 
     #[test]
-    fn test_alias_source_rejects_constants_unknown_syntax_and_generic_declarations() {
-        for right in [
-            "[u8; COUNT]",
-            "[u8; 2 + 3]",
-            "generated!()",
-            "Self",
-            "&'a u8",
-            "<Customer as Trait>::Out",
-        ] {
+    fn test_alias_source_rejects_unknown_type_syntax_and_generic_declarations() {
+        for right in ["generated!()", "Self", "&'a u8", "<Customer as Trait>::Out"] {
             let source = format!("type Alias = {right};");
             let position = crate::source_position::SourcePosition::from_preceding_text(
                 crate::line_number::LineNumber::from_index(0),
@@ -1935,32 +1962,49 @@ mod tests {
     }
 
     #[test]
-    fn test_rust_variable_numbering_preserves_percent_in_literals_and_remainders() {
-        for (first, second) in [
-            (
-                r#"fn f(x: [u8; b"%1"[1] as usize])"#,
-                r#"fn f(x: [u8; b"%2"[1] as usize])"#,
-            ),
-            (
-                r##"fn f(x: [u8; br#"\"%1"#[2] as usize])"##,
-                r##"fn f(x: [u8; br#"\"%2"#[2] as usize])"##,
-            ),
-            ("fn f(x: [u8; 4 % 3])", "fn f(x: [u8; 4 % 2])"),
+    fn test_generic_alias_integer_array_defaults_match_direct_integer_spellings() {
+        let alias =
+            super::RustTypeResolution::from_spelling("type Pair<T, U = [T; 0x2_usize]> = (T, U)");
+        let aliased = RustCallable::from_spelling(
+            "fn f(a: Pair<u64>)",
+            &|name| (name == "Pair").then(|| alias.clone()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(aliased, read("fn g(a: (u64, [u64; 2]))"));
+    }
+
+    #[test]
+    fn test_nested_array_lengths_keep_the_outer_length_distinct() {
+        assert_ne!(read("fn f(a: [[u8; 2]; 3])"), read("fn f(a: [[u8; 2]; 4])"));
+    }
+
+    #[test]
+    fn test_rust_unevaluated_array_expressions_are_not_comparable() {
+        for signature in [
+            r#"fn f(x: [u8; b"%1"[1] as usize])"#,
+            r##"fn f(x: [u8; br#"\"%1"#[2] as usize])"##,
+            "fn f(x: [u8; 4 % 3])",
+            "fn f(x: [u8; COUNT])",
+            "fn f(x: [u8; {const}])",
         ] {
-            assert_ne!(read(first), read(second));
+            assert!(
+                RustCallable::from_spelling(signature, &|_| None, None).is_none(),
+                "{signature}"
+            );
         }
     }
 
     #[test]
-    fn test_rust_alias_variable_order_after_a_quoted_byte_is_preserved() {
+    fn test_rust_alias_variable_order_after_an_array_length_is_preserved() {
         let alias = super::RustTypeResolution::from_spelling("type Flip<A,B> = (B,A)");
         let actual = RustCallable::from_spelling(
-            r#"fn f<T,U>(x: ([u8; b'"' as usize], Flip<T,U>), y:T)"#,
+            "fn f<T,U>(x: ([u8; 34], Flip<T,U>), y:T)",
             &|name| (name == "Flip").then(|| alias.clone()),
             None,
         )
         .unwrap();
-        let expected = read(r#"fn g<A,B>(x: ([u8; b'"' as usize], (B,A)), y:A)"#);
+        let expected = read("fn g<A,B>(x: ([u8; 34], (B,A)), y:A)");
         assert_eq!(actual, expected);
     }
 
