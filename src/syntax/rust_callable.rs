@@ -1073,14 +1073,14 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
     fn generic_spelling_of(&mut self, node: Node<'_>) -> Option<String> {
         let head = node.child_by_field_name("type")?;
         let argument_nodes = node.child_by_field_name("type_arguments")?;
-        let name = match contains_self_type(head, self.source) {
+        let associated_head = contains_self_type(head, self.source);
+        let name = match associated_head {
             true => projection_name_of(head, self.source)?,
             false => collapsed(self.text_of(head)?),
         };
         let bound_head = name.split("::").next().is_some_and(|head| {
             head == SELF_TYPE || self.declared.iter().any(|declared| declared == head)
         });
-        let associated_head = contains_self_type(head, self.source);
         let can_resolve_head = !bound_head || associated_head;
         if can_resolve_head {
             if let Some(alias) = (self.type_of)(&name).filter(|alias| {
