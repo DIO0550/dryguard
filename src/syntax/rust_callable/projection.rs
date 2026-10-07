@@ -275,7 +275,7 @@ fn parameter_names_of(
         .collect()
 }
 
-fn has_attribute(node: Node<'_>) -> bool {
+pub(super) fn has_attribute(node: Node<'_>) -> bool {
     let mut preceding = node.prev_named_sibling();
     while let Some(previous) = preceding {
         if previous.kind() == "attribute_item" {

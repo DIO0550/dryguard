@@ -8,7 +8,7 @@
 //! **型名の同一性はここでは決めない。** 対応する位置の型名の組を返し、
 //! 宣言元の照合は `semantics::resolved_type` が両側のソースの位置から行う。
 
-use super::projection::{ancestor_of_kind, projection_at, terminal_name_of};
+use super::projection::{ancestor_of_kind, has_attribute, projection_at, terminal_name_of};
 use super::*;
 use crate::source_position::SourcePosition;
 
@@ -118,7 +118,8 @@ impl RustImplCandidate {
     /// 1 つのファイルにある trait impl のうち、照合できるものを読む。
     ///
     /// **選べない impl は入れない。** 型パラメータの境界・where 句・const 引数・負の impl・
-    /// 対象が型名で終わらない（blanket impl の `T` / 参照）・構文エラーのどれかがある impl。
+    /// 属性（`cfg` など）・`default impl`・対象が型名で終わらない（blanket impl の `T` / 参照）・
+    /// 構文エラーのどれかがある impl。
     /// 境界の充足を確かめずに選ぶと、境界を満たさない使用側にも RHS を当てはめてしまう。
     pub(crate) fn candidates_of(source: &str) -> Vec<Self> {
         let Ok(tree) = SyntaxTree::from_source(source, Grammar::Rust) else {
@@ -146,7 +147,15 @@ impl RustImplCandidate {
                     named_children_of(parameters)
                         .any(|parameter| parameter.child_by_field_name("bounds").is_some())
                 });
-        if negative || constrained {
+        // Why: rust-analyzer は cfg(test) も有効にして解析するので、属性付きの impl は
+        // 実際のビルドに無い候補でありうる。`default impl` は specialization で上書きされうる。
+        // tree-sitter-rust は `default` を impl の外（直前の兄弟）に置く。
+        let specialized = implementation
+            .prev_sibling()
+            .and_then(|previous| source.get(previous.byte_range()))
+            .is_some_and(|text| text.trim_end().ends_with("default"));
+        let conditional = has_attribute(implementation) || specialized;
+        if negative || constrained || conditional {
             return None;
         }
         let implemented = implementation.child_by_field_name("trait")?;
