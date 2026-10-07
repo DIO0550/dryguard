@@ -113,7 +113,7 @@ const EXIT_LIMIT: Duration = Duration::from_secs(10);
 /// 終わったかを確かめ直す間隔。
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// 出力を閉じたサーバの stderr が閉じるのを待つ上限。
+/// 接続を閉じたサーバの stderr が閉じるのを待つ上限。
 ///
 /// 子プロセスを kill した後に待つので、普通はすぐ閉じる。閉じないのは、サーバが起こした
 /// 孫プロセスが stderr を握ったまま残ったとき。
@@ -305,7 +305,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// 往復が失敗したとき。サーバが答えないまま出力を閉じた場合は
+    /// 往復が失敗したとき。サーバが答えないまま接続を閉じた場合は
     /// [`ClientError::ServerClosedDuringHandshake`]、何も送ってこないまま期限を過ぎた場合は
     /// [`ClientError::ServerUnresponsive`]。抜けた [`Client`] は `Drop` が kill する。
     pub fn handshake(mut self, root: &WorkspaceRoot) -> Result<Session, ClientError> {
@@ -324,16 +324,19 @@ impl Client {
 impl Client {
     /// 握手の失敗を、サーバが黙った場合とそれ以外に分ける。
     ///
-    /// フレームの切れ目の EOF は「起動はしたが、答えないまま出力を閉じた」。利用者が次に
-    /// 試すこと（stderr を見る・サーバを直接起動する）は他の失敗と違うので、専用の
-    /// バリアントで返す。
+    /// フレームの切れ目の EOF と、`initialize` を書き込めない（`BrokenPipe`）のは、どちらも
+    /// 「起動はしたが、答えないまま接続を閉じた」。利用者が次に試すこと（stderr を見る・
+    /// サーバを直接起動する）は他の失敗と違うので、専用のバリアントで返す。
+    ///
+    /// **Why（書き込みの失敗も含める）**: 起動直後に死ぬサーバは、こちらが `initialize` を
+    /// 書く前に死ぬことがある。EOF だけを見ると、どちらが先かで stderr の末尾が消える。
     ///
     /// **Why not（`Child::try_wait` で終了を確かめてから名乗る）**: EOF の直後は、
     /// 終了したサーバでもまだ回収できていないことがある。確かめたつもりで取り違えるより、
-    /// **観測した事実（出力が閉じた）だけを名前にする**
+    /// **観測した事実（接続が閉じた）だけを名前にする**
     /// (rules/naming.md「名前と実体を一致させる」)。
     fn handshake_error_of(&mut self, cause: ConnectionError) -> ClientError {
-        if !matches!(cause, ConnectionError::Framing(FramingError::ServerClosed)) {
+        if !is_connection_closed(&cause) {
             return self.conversation_error_of(cause);
         }
 
@@ -805,6 +808,15 @@ fn provides_tsserver_requests(capabilities: &ServerCapabilities) -> bool {
         })
 }
 
+/// 往復の失敗が、サーバが接続を閉じたことによるものか。
+fn is_connection_closed(cause: &ConnectionError) -> bool {
+    match cause {
+        ConnectionError::Framing(FramingError::ServerClosed) => true,
+        ConnectionError::Send(sent) => sent.kind() == io::ErrorKind::BrokenPipe,
+        _ => false,
+    }
+}
+
 /// 往復の失敗が、沈黙の上限を超えたことによるものか。
 ///
 /// **`framing` に専用のバリアントを置かない。** 期限は区切りの話ではなく読み口
@@ -850,7 +862,7 @@ pub enum ClientError {
     },
     /// 子プロセスの stdin / stdout を取り出せなかった。
     PipesNotWired,
-    /// 起動はしたが、握手に答えないまま出力を閉じた。
+    /// 起動はしたが、握手に答えないまま接続（stdout か stdin）を閉じた。
     ///
     /// 子プロセスが終了したかまでは見ていない。閉じた時点で会話は続けられないので、
     /// どちらでも kill する。
@@ -905,7 +917,7 @@ impl fmt::Display for ClientError {
             } => {
                 write!(
                     formatter,
-                    "LSP サーバ ({program}) が握手に答えないまま出力を閉じました。\
+                    "LSP サーバ ({program}) が握手に答えないまま接続を閉じました。\
                      {program} を直接起動して、起動時のエラーを確認してください"
                 )?;
                 if stderr_tail.is_empty() {
@@ -1413,7 +1425,7 @@ mod tests {
     #[cfg(unix)]
     fn test_client_handshake_with_a_server_that_dies_writing_to_stderr_carries_its_tail() {
         // 起動時のエラーを stderr にだけ書いて死ぬサーバ。捨てていたときは
-        // 「出力を閉じた」しか残らなかった
+        // 「接続を閉じた」しか残らなかった
         let client = Client::start(&fake_server("echo 'tsserver not found' >&2; exit 1"))
             .expect("起動できる");
 
@@ -1427,6 +1439,29 @@ mod tests {
                 if program == "sh" && stderr_tail == "tsserver not found"
         ));
         assert!(error.to_string().contains("tsserver not found"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_client_handshake_with_a_server_that_closed_its_input_carries_its_stderr_tail() {
+        // stdin と stdout を閉じてから stderr に書くサーバ。起動直後に死ぬサーバは、こちらが
+        // `initialize` を書く前に閉じることがある。閉じ終えるのを待ってから握手を始め、
+        // 書き込みが `BrokenPipe` で落ちる経路を通す（間に合わなくても EOF で同じ答えになる）
+        let client = Client::start(&fake_server(
+            "exec 0<&- 1>&-; echo 'tsserver not found' >&2; exec sleep 30",
+        ))
+        .expect("起動できる");
+        thread::sleep(SHORT_LIMIT);
+
+        let error = client
+            .handshake(&fixture_workspace_root())
+            .expect_err("握手に答えない");
+
+        assert!(matches!(
+            &error,
+            ClientError::ServerClosedDuringHandshake { stderr_tail, .. }
+                if stderr_tail == "tsserver not found"
+        ));
     }
 
     #[test]
