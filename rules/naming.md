@@ -59,6 +59,8 @@ if structurally_similar && domains_differ { ... }
 | `grammar` | ソースを読むのに使う tree-sitter の文法。拡張子で決まる（`.ts` / `.tsx` / `.mts` / `.cts`） |
 | `chunk` | 比較の単位。関数・メソッド・impl ブロック |
 | `declared type identity` | Rust の具体的な型を、宣言のファイルと UTF-16 の位置で識別する比較用の綴り。局所名と独立し、Rust の識別子や正規化した型変数とは衝突しない |
+| `array length` | Rust の配列型の要素数。宣言側で評価した整数で比較し、定数名や未評価の式の綴りは比較に使わない |
+| `array length correspondence` | ソースと hover の配列長の出現番号を持つ型構造が一致した組。出現の個数だけでは対応したと扱わない |
 | `generic alias` | Rust の型パラメータ・既定値・右辺を持ち、使用側の型引数を当てはめて展開する型エイリアス |
 | `impl header` | Rust メソッドが直接所属する impl の本体より前のソース。対象型・型変数・境界・実装トレイトを、そのスコープのまま運ぶ |
 | `accessor` | プロパティのように読み書きされるメンバーを実装する関数（`get` / `set`）。**チャンクとしては関数**だが、`hover` が返すのは**メンバーとしての型** |
@@ -108,7 +110,7 @@ if structurally_similar && domains_differ { ... }
 | `callee domain` | 呼び出し先が属する `domain`。ドメインごとの件数を持つ |
 | `progress` | サーバが自分で始めた作業（プロジェクトの読み込みなど）。作成の要求と、終わりの通知で挟まれる |
 | `source position` | ファイルの中の 1 点。行と、**UTF-16 のコード単位で数えた**列 |
-| `signature text` | hover が返した型の綴りそのもの。**正規化前** |
+| `signature text` | hover に由来する型の綴り。Rust の配列長をソースから復元した後も含み、引数名・型変数名などの**型構造の正規化前** |
 | `type spelling` | 型 1 つ分の綴り。`signature text` を割った先の 1 つ（引数の型・戻り値の型・制約） |
 | `type reference` | チャンクのシグネチャに書かれた型名 1 つ分と、その位置。**解決前** |
 | `open` | 型名を宣言まで辿り、エイリアスの右辺の綴りを取ること |

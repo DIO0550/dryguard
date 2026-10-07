@@ -564,6 +564,14 @@ fn unopened_text_of(reason: UnopenedReason) -> &'static str {
         UnopenedReason::UnopenableAssociatedType => {
             "測れない (関連型の右辺または型引数を展開できない)"
         }
+        UnopenedReason::UnevaluableArrayLength => {
+            "測れない (配列長の式または定数を一意に評価できない)"
+        }
+        UnopenedReason::CyclicArrayLength => "測れない (配列長の定数宣言が循環している)",
+        UnopenedReason::ArrayLengthEvaluationLimit => "測れない (配列長の評価上限に達した)",
+        UnopenedReason::UnmatchedArrayLength => {
+            "測れない (配列長をソースと hover の間で対応させられない)"
+        }
     }
 }
 
@@ -1582,6 +1590,22 @@ mod tests {
             (
                 UnopenedReason::UnopenableAssociatedType,
                 "関連型の右辺または型引数を展開できない",
+            ),
+            (
+                UnopenedReason::UnevaluableArrayLength,
+                "配列長の式または定数を一意に評価できない",
+            ),
+            (
+                UnopenedReason::CyclicArrayLength,
+                "配列長の定数宣言が循環している",
+            ),
+            (
+                UnopenedReason::ArrayLengthEvaluationLimit,
+                "配列長の評価上限に達した",
+            ),
+            (
+                UnopenedReason::UnmatchedArrayLength,
+                "配列長をソースと hover の間で対応させられない",
             ),
         ] {
             let text = text_of_accidental_duplication_with_semantics(

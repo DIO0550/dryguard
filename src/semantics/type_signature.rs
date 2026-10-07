@@ -363,6 +363,16 @@ pub fn rust_type_signature_outcome_of(
     };
 
     let traced = rust_traced_type_names_of(session, document, type_references)?;
+    let signature_text = match super::resolved_type::restored_array_spelling_of(
+        session,
+        document,
+        position,
+        &signature_text,
+        impl_header,
+    )? {
+        Ok(signature) => signature,
+        Err(reason) => return Ok(TypeSignatureOutcome::UnopenedTypeName { reason }),
+    };
     Ok(rust_normalized_in_impl(
         &signature_text,
         &traced,

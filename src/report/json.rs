@@ -753,6 +753,10 @@ fn unopened_name_of(reason: UnopenedReason) -> &'static str {
         UnopenedReason::AliasExpansionLimit => "alias-expansion-limit",
         UnopenedReason::UnresolvedAssociatedType => "unresolved-associated-type",
         UnopenedReason::UnopenableAssociatedType => "unopenable-associated-type",
+        UnopenedReason::UnevaluableArrayLength => "unevaluable-array-length",
+        UnopenedReason::CyclicArrayLength => "cyclic-array-length",
+        UnopenedReason::ArrayLengthEvaluationLimit => "array-length-evaluation-limit",
+        UnopenedReason::UnmatchedArrayLength => "unmatched-array-length",
     }
 }
 
@@ -1200,6 +1204,19 @@ mod tests {
             (
                 UnopenedReason::UnopenableAssociatedType,
                 "unopenable-associated-type",
+            ),
+            (
+                UnopenedReason::UnevaluableArrayLength,
+                "unevaluable-array-length",
+            ),
+            (UnopenedReason::CyclicArrayLength, "cyclic-array-length"),
+            (
+                UnopenedReason::ArrayLengthEvaluationLimit,
+                "array-length-evaluation-limit",
+            ),
+            (
+                UnopenedReason::UnmatchedArrayLength,
+                "unmatched-array-length",
             ),
         ] {
             let signals = accidental_duplication().with_semantics(
