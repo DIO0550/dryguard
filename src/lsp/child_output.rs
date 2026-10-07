@@ -15,14 +15,14 @@ use std::time::Duration;
 /// 吸う側のスレッドが 1 度に読む量。
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 
-/// 読んだまま受け取られていない塊を溜める上限（8 KiB × 64 = 512 KiB）。
+/// 読んだまま受け取られていない塊を溜める上限（塊の数）。
 ///
 /// **Why not（上限なしのチャネル）**: パイプの背圧が消え、問い合わせの合間にサーバが
 /// 送り続けたログの分だけ、こちらのメモリが際限なく膨らむ。上限で吸う側が止まれば、
 /// パイプが埋まってサーバの側が待つ（スレッドを挟む前と同じ振る舞い）。
 const PENDING_CHUNKS: usize = 64;
 
-/// stderr から残す末尾の量（4 KiB）。
+/// stderr から残す末尾のバイト数。
 ///
 /// 起動直後に死んだサーバの診断は最後の数行に出る。全部を持つと、進捗を stderr へ
 /// 流し続けるサーバで際限なく膨らむ。
@@ -30,7 +30,7 @@ const STDERR_TAIL_BYTES: usize = 4 * 1024;
 
 /// 読んだ内容を、別スレッドから期限付きで受け取る読み口。
 ///
-/// **期限は「最後に何か届いてから」で数える。** rust-analyzer は読み込みの間ずっと
+/// **期限は「受け取った分を読み終えて待ち始めてから」で数える。** 要求ごとの合計ではない。 rust-analyzer は読み込みの間ずっと
 /// `$/progress` を流すので、沈黙で切れば正常に遅いサーバを殺さずに、固まったサーバだけを捉える。
 ///
 /// **Why not（要求ごとの合計時間で切る）**: 落ち着くまでの合計はワークスペースの大きさで
@@ -48,10 +48,17 @@ impl SilenceLimitedReader {
     /// 読み取りを [`io::ErrorKind::TimedOut`] で失敗させる読み口を作る。
     ///
     /// スレッドは `source` が尽きるか失敗すると終わる。子プロセスを kill すれば尽きる。
-    pub(super) fn spawn<R: Read + Send + 'static>(source: R, silence_limit: Duration) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// 読むスレッドを作れないとき。
+    pub(super) fn spawn<R: Read + Send + 'static>(
+        source: R,
+        silence_limit: Duration,
+    ) -> io::Result<Self> {
         let (sender, chunks) = mpsc::sync_channel(PENDING_CHUNKS);
 
-        thread::spawn(move || {
+        thread::Builder::new().spawn(move || {
             let mut source = source;
             let mut buffer = [0; READ_CHUNK_BYTES];
 
@@ -71,14 +78,14 @@ impl SilenceLimitedReader {
                     return;
                 }
             }
-        });
+        })?;
 
-        Self {
+        Ok(Self {
             chunks,
             pending: Vec::new(),
             consumed: 0,
             silence_limit,
-        }
+        })
     }
 }
 
@@ -88,6 +95,11 @@ impl Read for SilenceLimitedReader {
     /// 期限を超えて何も届かなかったとき（[`io::ErrorKind::TimedOut`]）、読み取り自体が
     /// 失敗したとき。尽きたときは `Ok(0)` を返す。
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        // 0 バイトを求められたら待たない。待つと、届かないだけで失敗にしてしまう。
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
         if self.consumed == self.pending.len() {
             match self.chunks.recv_timeout(self.silence_limit) {
                 Ok(Ok(chunk)) => {
@@ -133,12 +145,16 @@ pub(super) struct StderrTail {
 
 impl StderrTail {
     /// `source` を別スレッドで読み続ける。
-    pub(super) fn spawn<R: Read + Send + 'static>(source: R) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// 読むスレッドを作れないとき。
+    pub(super) fn spawn<R: Read + Send + 'static>(source: R) -> io::Result<Self> {
         let tail = Arc::new(Mutex::new(VecDeque::new()));
         let (closing, closed) = mpsc::channel::<()>();
         let written = Arc::clone(&tail);
 
-        thread::spawn(move || {
+        thread::Builder::new().spawn(move || {
             // 終わるときに落として、待っている側へ閉じたことを伝える。
             let _closing = closing;
             let mut source = source;
@@ -157,9 +173,9 @@ impl StderrTail {
                 let overflow = tail.len().saturating_sub(STDERR_TAIL_BYTES);
                 tail.drain(..overflow);
             }
-        });
+        })?;
 
-        Self { tail, closed }
+        Ok(Self { tail, closed })
     }
 
     /// stderr が閉じるのを `limit` まで待ち、それまでに届いた末尾を返す。
@@ -167,7 +183,7 @@ impl StderrTail {
     /// **閉じるまで待つのは、出力の閉じた直後には末尾がまだ届いていないことがあるため。**
     /// 待ち切れなければ、それまでの分を返す（サーバが起こした孫プロセスが stderr を
     /// 握ったまま残ると、閉じない）。
-    pub(super) fn text_after_close(&self, limit: Duration) -> String {
+    pub(super) fn tail_text_within(&self, limit: Duration) -> String {
         // 何も送られないので、返るのは閉じたか期限かのどちらか。どちらでも末尾を読む。
         let _ = self.closed.recv_timeout(limit);
 
@@ -193,7 +209,8 @@ mod tests {
         let mut reader = SilenceLimitedReader::spawn(
             io::Cursor::new(b"Content-Length: 2".to_vec()),
             GENEROUS_LIMIT,
-        );
+        )
+        .expect("スレッドを作れる");
 
         let mut read = String::new();
         reader.read_to_string(&mut read).expect("尽きるまで読める");
@@ -211,7 +228,8 @@ mod tests {
             .spawn()
             .expect("sleep を起動できる");
         let stdout = silent.stdout.take().expect("stdout をパイプにした");
-        let mut reader = SilenceLimitedReader::spawn(stdout, Duration::from_millis(100));
+        let mut reader = SilenceLimitedReader::spawn(stdout, Duration::from_millis(100))
+            .expect("スレッドを作れる");
 
         let started = Instant::now();
         let error = reader
@@ -232,7 +250,9 @@ mod tests {
         written.extend(std::iter::repeat_n(b'x', STDERR_TAIL_BYTES));
         written.extend(b"TAIL");
 
-        let tail = StderrTail::spawn(io::Cursor::new(written)).text_after_close(GENEROUS_LIMIT);
+        let tail = StderrTail::spawn(io::Cursor::new(written))
+            .expect("スレッドを作れる")
+            .tail_text_within(GENEROUS_LIMIT);
 
         assert!(tail.ends_with("TAIL"), "末尾が残る");
         assert!(!tail.contains("HEAD"), "上限より前は残らない");

@@ -282,13 +282,22 @@ impl Client {
             return Err(ClientError::PipesNotWired);
         };
 
-        let output = SilenceLimitedReader::spawn(stdout, command.wait_limits.silence);
+        let drained = SilenceLimitedReader::spawn(stdout, command.wait_limits.silence)
+            .and_then(|output| Ok((output, StderrTail::spawn(stderr)?)));
+        let (output, stderr) = match drained {
+            Ok(drained) => drained,
+            Err(cause) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ClientError::OutputNotDrained(cause));
+            }
+        };
 
         Ok(Self {
             child,
             connection: Connection::new(BufReader::new(output), stdin)
                 .with_language(command.language),
-            stderr: StderrTail::spawn(stderr),
+            stderr,
             program: command.program.clone(),
             wait_limits: command.wait_limits,
             terminated: false,
@@ -345,7 +354,7 @@ impl Client {
 
         ClientError::ServerClosedDuringHandshake {
             program: self.program.clone(),
-            stderr_tail: self.stderr.text_after_close(STDERR_CLOSE_LIMIT),
+            stderr_tail: self.stderr.tail_text_within(STDERR_CLOSE_LIMIT),
         }
     }
 
@@ -810,11 +819,8 @@ fn provides_tsserver_requests(capabilities: &ServerCapabilities) -> bool {
 
 /// 往復の失敗が、サーバが接続を閉じたことによるものか。
 fn is_connection_closed(cause: &ConnectionError) -> bool {
-    match cause {
-        ConnectionError::Framing(FramingError::ServerClosed) => true,
-        ConnectionError::Send(sent) => sent.kind() == io::ErrorKind::BrokenPipe,
-        _ => false,
-    }
+    matches!(cause, ConnectionError::Framing(FramingError::ServerClosed))
+        || matches!(cause, ConnectionError::Send(sent) if sent.kind() == io::ErrorKind::BrokenPipe)
 }
 
 /// 往復の失敗が、沈黙の上限を超えたことによるものか。
@@ -862,6 +868,8 @@ pub enum ClientError {
     },
     /// 子プロセスの stdin / stdout を取り出せなかった。
     PipesNotWired,
+    /// 子プロセスの出力を吸うスレッドを作れなかった。
+    OutputNotDrained(io::Error),
     /// 起動はしたが、握手に答えないまま接続（stdout か stdin）を閉じた。
     ///
     /// 子プロセスが終了したかまでは見ていない。閉じた時点で会話は続けられないので、
@@ -935,6 +943,10 @@ impl fmt::Display for ClientError {
                 "LSP サーバ ({program}) が終了の通知から {} 秒たっても終わらないため、止めました",
                 waited.as_secs_f64()
             ),
+            Self::OutputNotDrained(cause) => write!(
+                formatter,
+                "LSP サーバの出力を読むスレッドを作れません: {cause}"
+            ),
             Self::Conversation(cause) => write!(formatter, "{cause}"),
             Self::Wait(cause) => {
                 write!(formatter, "LSP サーバの終了を待てませんでした: {cause}")
@@ -957,7 +969,7 @@ impl Error for ClientError {
             | Self::AbnormalExit { .. } => None,
             Self::Spawn { cause, .. } => Some(cause),
             Self::Conversation(cause) => Some(cause),
-            Self::Wait(cause) => Some(cause),
+            Self::Wait(cause) | Self::OutputNotDrained(cause) => Some(cause),
         }
     }
 }
@@ -1287,22 +1299,32 @@ mod tests {
         assert!(!provides_tsserver_requests(&capabilities));
     }
 
-    /// テストで待つ沈黙の上限。黙るサーバはこれより十分長く（30 秒）黙る。
+    /// 期限に触れることを確かめるテストだけが使う、短い上限。
+    ///
+    /// **黙る相手は、何も送らない・終わらないことが台本で決まっている**ので、短くても
+    /// 起動の遅れで答えが変わらない。
     const SHORT_LIMIT: Duration = Duration::from_millis(300);
+
+    /// 握手に答えてから黙るサーバの沈黙の上限。握手の応答が、起動の遅れを含めて
+    /// この間に届けばよい。
+    const AFTER_HANDSHAKE_LIMIT: Duration = Duration::from_secs(2);
 
     /// 届くはずのものが届かないときだけ効く、テストの上限。
     const GENEROUS_LIMIT: Duration = Duration::from_secs(10);
+
+    /// 期限に触れないはずのテストが使う期限の組。
+    const GENEROUS_LIMITS: WaitLimits = WaitLimits {
+        silence: GENEROUS_LIMIT,
+        exit: GENEROUS_LIMIT,
+    };
 
     /// `sh -c` で台本どおりに振る舞う、LSP サーバのフェイク。
     ///
     /// **孫プロセスを作らないよう、黙るときは `exec sleep` にする。** 孫がパイプを握ると、
     /// テスト自身が「子プロセスを残さない」を破る。
-    fn fake_server(script: &str) -> ServerCommand {
+    fn fake_server(script: &str, wait_limits: WaitLimits) -> ServerCommand {
         ServerCommand {
-            wait_limits: WaitLimits {
-                silence: SHORT_LIMIT,
-                exit: SHORT_LIMIT,
-            },
+            wait_limits,
             ..ServerCommand::new("sh", vec!["-c".to_owned(), script.to_owned()], Vec::new())
         }
     }
@@ -1322,22 +1344,33 @@ mod tests {
     /// 2 通目の要求（握手の直後の `shutdown`）への応答。
     const SHUTDOWN_RESPONSE: &str = r#"{"jsonrpc":"2.0","id":2,"result":null}"#;
 
+    /// 台本のサーバを起動して握手させた結果。
+    fn handshake_with(script: &str, wait_limits: WaitLimits) -> Result<Session, ClientError> {
+        Client::start(&fake_server(script, wait_limits))
+            .expect("起動できる")
+            .handshake(&fixture_workspace_root())
+    }
+
     #[test]
     #[cfg(unix)]
     fn test_client_handshake_with_a_server_that_stays_silent_reports_it_unresponsive() {
         // 起動したまま何も送ってこないサーバ。期限が無ければ、ここで止まり続ける
-        let client = Client::start(&fake_server("exec sleep 30")).expect("起動できる");
+        let limits = WaitLimits {
+            silence: SHORT_LIMIT,
+            ..GENEROUS_LIMITS
+        };
 
         let started = Instant::now();
-        let error = client
-            .handshake(&fixture_workspace_root())
-            .expect_err("握手に答えない");
+        let error = handshake_with("exec sleep 30", limits).expect_err("握手に答えない");
 
-        assert!(matches!(
-            error,
-            ClientError::ServerUnresponsive { program, silence }
-                if program == "sh" && silence == SHORT_LIMIT
-        ));
+        assert!(
+            matches!(
+                &error,
+                ClientError::ServerUnresponsive { program, silence }
+                    if program == "sh" && *silence == SHORT_LIMIT
+            ),
+            "{error:?}"
+        );
         assert!(started.elapsed() < GENEROUS_LIMIT, "期限で戻る");
     }
 
@@ -1347,10 +1380,11 @@ mod tests {
         // 握手には答えたが、その後に黙り込んだサーバ。`pipeline` は 1 つが落ちても
         // 残りを尋ねるので、断らないと問い合わせの数だけ期限を待つ
         let script = format!("{}; exec sleep 30", printed_frame(INITIALIZE_RESPONSE));
-        let client = Client::start(&fake_server(&script)).expect("起動できる");
-        let mut session = client
-            .handshake(&fixture_workspace_root())
-            .expect("握手できる");
+        let limits = WaitLimits {
+            silence: AFTER_HANDSHAKE_LIMIT,
+            ..GENEROUS_LIMITS
+        };
+        let mut session = handshake_with(&script, limits).expect("握手できる");
         let document = fixture_document();
         session.open_document(&document).expect("開かせられる");
         let position = SourcePosition::from_preceding_text(line(5), "export function ");
@@ -1358,17 +1392,22 @@ mod tests {
         let first = session.hover(&document, position);
         let started = Instant::now();
         let second = session.hover(&document, position);
+        let refused_in = started.elapsed();
 
-        assert!(matches!(first, Err(ClientError::ServerUnresponsive { .. })));
-        assert!(matches!(
-            second,
-            Err(ClientError::ServerUnresponsive { .. })
-        ));
-        assert!(started.elapsed() < SHORT_LIMIT, "2 度目は待たずに断る");
-        assert!(matches!(
-            session.shutdown(),
-            Err(ClientError::ServerUnresponsive { .. })
-        ));
+        assert!(
+            matches!(first, Err(ClientError::ServerUnresponsive { .. })),
+            "{first:?}"
+        );
+        assert!(
+            matches!(second, Err(ClientError::ServerUnresponsive { .. })),
+            "{second:?}"
+        );
+        assert!(refused_in < AFTER_HANDSHAKE_LIMIT, "2 度目は待たずに断る");
+        let shutdown = session.shutdown();
+        assert!(
+            matches!(shutdown, Err(ClientError::ServerUnresponsive { .. })),
+            "{shutdown:?}"
+        );
     }
 
     #[test]
@@ -1380,19 +1419,23 @@ mod tests {
             printed_frame(INITIALIZE_RESPONSE),
             printed_frame(SHUTDOWN_RESPONSE)
         );
-        let client = Client::start(&fake_server(&script)).expect("起動できる");
-        let session = client
-            .handshake(&fixture_workspace_root())
-            .expect("握手できる");
+        let limits = WaitLimits {
+            exit: SHORT_LIMIT,
+            ..GENEROUS_LIMITS
+        };
+        let session = handshake_with(&script, limits).expect("握手できる");
 
         let started = Instant::now();
         let error = session.shutdown().expect_err("終わらない");
 
-        assert!(matches!(
-            error,
-            ClientError::ExitTimedOut { program, waited }
-                if program == "sh" && waited == SHORT_LIMIT
-        ));
+        assert!(
+            matches!(
+                &error,
+                ClientError::ExitTimedOut { program, waited }
+                    if program == "sh" && *waited == SHORT_LIMIT
+            ),
+            "{error:?}"
+        );
         assert!(started.elapsed() < GENEROUS_LIMIT, "期限で戻る");
     }
 
@@ -1406,17 +1449,7 @@ mod tests {
             printed_frame(INITIALIZE_RESPONSE),
             printed_frame(SHUTDOWN_RESPONSE)
         );
-        let client = Client::start(&ServerCommand {
-            wait_limits: WaitLimits {
-                silence: GENEROUS_LIMIT,
-                exit: GENEROUS_LIMIT,
-            },
-            ..fake_server(&script)
-        })
-        .expect("起動できる");
-        let session = client
-            .handshake(&fixture_workspace_root())
-            .expect("握手できる");
+        let session = handshake_with(&script, GENEROUS_LIMITS).expect("握手できる");
 
         session.shutdown().expect("終了できる");
     }
@@ -1424,20 +1457,18 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_client_handshake_with_a_server_that_dies_writing_to_stderr_carries_its_tail() {
-        // 起動時のエラーを stderr にだけ書いて死ぬサーバ。捨てていたときは
-        // 「接続を閉じた」しか残らなかった
-        let client = Client::start(&fake_server("echo 'tsserver not found' >&2; exit 1"))
-            .expect("起動できる");
-
-        let error = client
-            .handshake(&fixture_workspace_root())
+        // 起動時のエラーを stderr にだけ書いて死ぬサーバ
+        let error = handshake_with("echo 'tsserver not found' >&2; exit 1", GENEROUS_LIMITS)
             .expect_err("握手に答えない");
 
-        assert!(matches!(
-            &error,
-            ClientError::ServerClosedDuringHandshake { program, stderr_tail }
-                if program == "sh" && stderr_tail == "tsserver not found"
-        ));
+        assert!(
+            matches!(
+                &error,
+                ClientError::ServerClosedDuringHandshake { program, stderr_tail }
+                    if program == "sh" && stderr_tail == "tsserver not found"
+            ),
+            "{error:?}"
+        );
         assert!(error.to_string().contains("tsserver not found"));
     }
 
@@ -1449,6 +1480,7 @@ mod tests {
         // 書き込みが `BrokenPipe` で落ちる経路を通す（間に合わなくても EOF で同じ答えになる）
         let client = Client::start(&fake_server(
             "exec 0<&- 1>&-; echo 'tsserver not found' >&2; exec sleep 30",
+            GENEROUS_LIMITS,
         ))
         .expect("起動できる");
         thread::sleep(SHORT_LIMIT);
@@ -1457,27 +1489,30 @@ mod tests {
             .handshake(&fixture_workspace_root())
             .expect_err("握手に答えない");
 
-        assert!(matches!(
-            &error,
-            ClientError::ServerClosedDuringHandshake { stderr_tail, .. }
-                if stderr_tail == "tsserver not found"
-        ));
+        assert!(
+            matches!(
+                &error,
+                ClientError::ServerClosedDuringHandshake { stderr_tail, .. }
+                    if stderr_tail == "tsserver not found"
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]
     #[cfg(unix)]
     fn test_client_handshake_with_a_server_that_dies_silently_has_no_stderr_tail() {
         // 対照は上のテスト。何も書かずに死んだサーバに、末尾をこしらえない
-        let client = Client::start(&fake_server("exit 1")).expect("起動できる");
+        let error = handshake_with("exit 1", GENEROUS_LIMITS).expect_err("握手に答えない");
 
-        let error = client
-            .handshake(&fixture_workspace_root())
-            .expect_err("握手に答えない");
-
-        assert!(matches!(
-            &error,
-            ClientError::ServerClosedDuringHandshake { stderr_tail, .. } if stderr_tail.is_empty()
-        ));
+        assert!(
+            matches!(
+                &error,
+                ClientError::ServerClosedDuringHandshake { stderr_tail, .. }
+                    if stderr_tail.is_empty()
+            ),
+            "{error:?}"
+        );
         assert!(!error.to_string().contains("stderr"));
     }
 
@@ -1490,16 +1525,8 @@ mod tests {
             "head -c 262144 /dev/zero | tr '\\0' x >&2; {}; exec sleep 30",
             printed_frame(INITIALIZE_RESPONSE)
         );
-        let client = Client::start(&ServerCommand {
-            wait_limits: WaitLimits {
-                silence: GENEROUS_LIMIT,
-                exit: SHORT_LIMIT,
-            },
-            ..fake_server(&script)
-        })
-        .expect("起動できる");
 
-        let session = client.handshake(&fixture_workspace_root());
+        let session = handshake_with(&script, GENEROUS_LIMITS);
 
         assert!(session.is_ok(), "握手できる: {:?}", session.err());
     }
@@ -1508,17 +1535,21 @@ mod tests {
     #[cfg(unix)]
     fn test_client_handshake_with_a_broken_frame_stays_a_conversation_error() {
         // 「サーバが黙った」以外まで起動失敗や沈黙として畳むと、直す先を取り違える
-        let client = Client::start(&fake_server("printf 'Bogus: 1\\r\\n\\r\\n'; exec sleep 30"))
-            .expect("起動できる");
+        let error = handshake_with(
+            "printf 'Bogus: 1\\r\\n\\r\\n'; exec sleep 30",
+            GENEROUS_LIMITS,
+        )
+        .expect_err("フレームを読めない");
 
-        let error = client
-            .handshake(&fixture_workspace_root())
-            .expect_err("フレームを読めない");
-
-        assert!(matches!(
-            error,
-            ClientError::Conversation(ConnectionError::Framing(FramingError::MissingContentLength))
-        ));
+        assert!(
+            matches!(
+                &error,
+                ClientError::Conversation(ConnectionError::Framing(
+                    FramingError::MissingContentLength
+                ))
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]
