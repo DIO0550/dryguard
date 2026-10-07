@@ -115,6 +115,50 @@ pub(super) fn unique_outcome_of(answered: &GotoDefinitionResponse) -> UniqueDecl
     UniqueDeclarationSiteOutcome::Unambiguous(outcome_of(answered))
 }
 
+/// implementation に尋ねた結果。
+///
+/// **先頭の 1 件に絞らない。** rust-analyzer は trait の impl ごとに**対象型の範囲**を返し
+/// （2026-09-21 版で実測）、どれを選ぶかは対象型と trait 引数を照合する側が決める。
+#[derive(Debug)]
+pub enum ImplementationOutcome {
+    /// 1 件以上が返った。
+    Answered {
+        /// パスとして読めた件。
+        sites: Vec<DeclarationSite>,
+        /// パスとして読めない URI の件があったか。
+        ///
+        /// **その件だけを落とし、全体を失敗にしない。** std の trait には数百件が返るので、
+        /// 1 件のために選べる impl まで捨てない。選べなかったときの理由には残す。
+        has_unreadable: bool,
+    },
+    /// サーバは impl を返さなかった。
+    ///
+    /// **空配列もここに入れる。** プロジェクトの読み込み前にも空が返るので、
+    /// 「impl が無い」という答えにしない（[`DeclarationSiteOutcome::NoAnswer`] と同じ理由）。
+    NoAnswer,
+    /// サーバが implementation を提供していない。要求は送っていない。
+    NotSupported,
+}
+
+/// implementation の応答を、読めた件と読めない件があったかに分ける。
+pub(super) fn implementation_outcome_of(
+    answered: &GotoDefinitionResponse,
+) -> ImplementationOutcome {
+    let read: Vec<Result<DeclarationSite, UriPathError>> = match answered {
+        GotoDefinitionResponse::Scalar(location) => vec![site_of(location)],
+        GotoDefinitionResponse::Array(locations) => locations.iter().map(site_of).collect(),
+        GotoDefinitionResponse::Link(links) => links.iter().map(site_of_link).collect(),
+    };
+    if read.is_empty() {
+        return ImplementationOutcome::NoAnswer;
+    }
+    let has_unreadable = read.iter().any(Result::is_err);
+    ImplementationOutcome::Answered {
+        sites: read.into_iter().filter_map(Result::ok).collect(),
+        has_unreadable,
+    }
+}
+
 /// typeDefinition / definition の応答を、読み取れたかどうかが分かる形にする。
 ///
 /// **返った先頭の 1 件だけを採る。** TypeScript で宣言が複数返るのは同じ名前が複数箇所で

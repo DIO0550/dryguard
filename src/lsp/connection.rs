@@ -14,8 +14,8 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     CallHierarchyOutgoingCalls, CallHierarchyPrepare, ExecuteCommand, GotoDefinition,
-    GotoTypeDefinition, HoverRequest, Initialize, References, Request as _, Shutdown,
-    WorkDoneProgressCreate,
+    GotoImplementation, GotoTypeDefinition, HoverRequest, Initialize, References, Request as _,
+    Shutdown, WorkDoneProgressCreate,
 };
 use lsp_types::{
     CallHierarchyItem, CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
@@ -29,7 +29,9 @@ use serde_json::{Value, json};
 
 use super::ServerLanguage;
 use super::call_hierarchy::{self, CallHierarchyStart, CalleesOutcome};
-use super::declaration_site::{self, DeclarationSite, DeclarationSiteOutcome};
+use super::declaration_site::{
+    self, DeclarationSite, DeclarationSiteOutcome, ImplementationOutcome,
+};
 use super::document::SourceDocument;
 use super::framing::{self, FramingError};
 use super::hover::{self, HoverOutcome};
@@ -392,6 +394,31 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         position: SourcePosition,
     ) -> Result<DeclarationSiteOutcome, ConnectionError> {
         self.declaration_site_of(GotoDefinition::METHOD, document, position)
+    }
+
+    /// 開かせたファイルの、指定位置に書かれた trait の impl を尋ねる。
+    ///
+    /// `position` は trait パスの末尾の名前。rust-analyzer は impl ごとに**対象型の範囲**を
+    /// 返す（2026-09-21 版で実測）。モジュール名（`other::Far` の `other`）には空を返す。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、パラメータを JSON にできないとき、
+    /// 送受信が失敗したとき、応答を implementation の結果として読めないとき。
+    pub(crate) fn implementation(
+        &mut self,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<ImplementationOutcome, ConnectionError> {
+        Ok(
+            match self
+                .declaration_sites_of(GotoImplementation::METHOD, document, position)?
+                .as_ref()
+            {
+                Some(answered) => declaration_site::implementation_outcome_of(answered),
+                None => ImplementationOutcome::NoAnswer,
+            },
+        )
     }
 
     /// 宣言の場所を返す問い合わせ（typeDefinition / definition）を 1 往復尋ねる。

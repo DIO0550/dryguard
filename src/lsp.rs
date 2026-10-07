@@ -41,8 +41,8 @@ use std::io::{self, BufReader};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
 use lsp_types::{
-    CallHierarchyServerCapability, HoverProviderCapability, OneOf, ServerCapabilities,
-    TypeDefinitionProviderCapability,
+    CallHierarchyServerCapability, HoverProviderCapability, ImplementationProviderCapability,
+    OneOf, ServerCapabilities, TypeDefinitionProviderCapability,
 };
 
 use crate::source_position::SourcePosition;
@@ -58,7 +58,7 @@ pub use hover::{HoverOutcome, SignatureText};
 pub use references::{Reference, ReferencesOutcome};
 // 型の宣言の場所は、開かせる相手を決める材料として `pipeline` が読む。
 pub(crate) use declaration_site::UniqueDeclarationSiteOutcome;
-pub use declaration_site::{DeclarationSite, DeclarationSiteOutcome};
+pub use declaration_site::{DeclarationSite, DeclarationSiteOutcome, ImplementationOutcome};
 pub use workspace::{WorkspaceError, WorkspaceRoot};
 // 根の決め方と所属の確かめ方は `pipeline` だけが使う手順なので、クレートの外へは出さない
 // (rules/architecture.md「モジュールの公開 API」)。所属のほうは**サーバ固有の要求の形**
@@ -384,6 +384,29 @@ impl Session {
             .map_err(ClientError::Conversation)
     }
 
+    /// 開かせたファイルの、指定位置に書かれた trait の impl の場所を全件尋ねる。
+    ///
+    /// **implementation を提供していないサーバには送らない**
+    /// （[`ImplementationOutcome::NotSupported`]）。[`Session::definition`] と同じ理由。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、往復が失敗したとき、
+    /// 応答を implementation の結果として読めないとき。
+    pub(crate) fn implementation(
+        &mut self,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<ImplementationOutcome, ClientError> {
+        if !provides_implementation(&self.capabilities) {
+            return Ok(ImplementationOutcome::NotSupported);
+        }
+        self.client
+            .connection
+            .implementation(document, position)
+            .map_err(ClientError::Conversation)
+    }
+
     /// 定数の宣言を一意に選べるかを含めて尋ねる。
     ///
     /// # Errors
@@ -611,6 +634,17 @@ fn provides_definition(capabilities: &ServerCapabilities) -> bool {
     matches!(
         capabilities.definition_provider,
         Some(OneOf::Left(true) | OneOf::Right(_))
+    )
+}
+
+/// そのサーバが implementation に答えるか。
+///
+/// definition と同じく**有無ではなく中身を見る**。無効を表す `Simple(false)` も「宣言はある」。
+fn provides_implementation(capabilities: &ServerCapabilities) -> bool {
+    matches!(
+        capabilities.implementation_provider,
+        Some(ImplementationProviderCapability::Simple(true))
+            | Some(ImplementationProviderCapability::Options(_))
     )
 }
 
@@ -990,16 +1024,6 @@ mod tests {
         let capabilities = capabilities_declaring_definition(None);
 
         assert!(!provides_definition(&capabilities));
-    }
-
-    /// そのサーバができることとして references だけを宣言した capabilities。
-    fn capabilities_declaring_references(
-        references_provider: Option<OneOf<bool, lsp_types::ReferencesOptions>>,
-    ) -> ServerCapabilities {
-        ServerCapabilities {
-            references_provider,
-            ..ServerCapabilities::default()
-        }
     }
 
     #[test]
