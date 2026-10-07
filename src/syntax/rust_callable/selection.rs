@@ -407,3 +407,215 @@ fn terminal_name_text_of(target: Node<'_>, source: &str) -> Option<String> {
             .to_owned(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 使用側のソースの、最初の完全修飾形の投影を読む。
+    fn qualified_of(source: &str) -> Option<RustQualifiedProjection> {
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).unwrap();
+        let function = tree
+            .named_descendants()
+            .into_iter()
+            .find(|node| node.kind() == "function_item")
+            .unwrap();
+        let reference = type_references_of(function, source)
+            .into_iter()
+            .find(|reference| reference.name().starts_with("<Self"))
+            .expect("投影を尋ねる");
+        RustQualifiedProjection::from_source(source, reference.position())
+    }
+
+    fn only_candidate_of(source: &str) -> Option<RustImplCandidate> {
+        let mut candidates = RustImplCandidate::candidates_of(source);
+        assert!(candidates.len() <= 1, "{source}");
+        candidates.pop()
+    }
+
+    #[test]
+    fn test_binding_maps_candidate_variables_to_use_site_impl_variables() {
+        let used =
+            qualified_of("impl<A, B> Pair<A, B> { fn f(x: <Self as Other<B, u8>>::Item) {} }")
+                .unwrap();
+        let candidate =
+            only_candidate_of("impl<Y, X> Other<Y, u8> for Pair<X, Y> { type Item = X; }").unwrap();
+        let binding = candidate.binding_with(&used).expect("付け替えで一致する");
+        assert_eq!(binding.captures(), ["B", "A"]);
+        let names: Vec<_> = binding
+            .names()
+            .iter()
+            .map(|(candidate, used)| (candidate.name(), used.name()))
+            .collect();
+        assert_eq!(names, [("u8", "u8"), ("Pair", "Pair")]);
+    }
+
+    #[test]
+    fn test_binding_accepts_two_candidate_variables_bound_to_the_same_use_site_variable() {
+        let used =
+            qualified_of("impl<A> Pair<A, A> { fn f(x: <Self as Other>::Item) {} }").unwrap();
+        let candidate =
+            only_candidate_of("impl<X, Y> Other for Pair<X, Y> { type Item = X; }").unwrap();
+        assert_eq!(
+            candidate
+                .binding_with(&used)
+                .expect("一般化した候補も当てはまる")
+                .captures(),
+            ["A", "A"]
+        );
+    }
+
+    #[test]
+    fn test_binding_rejects_candidate_variables_bound_to_concrete_types() {
+        let candidate =
+            only_candidate_of("impl<X> Other for Holder<X> { type Item = X; }").unwrap();
+        let concrete = qualified_of("impl Holder<u8> { fn f(x: <Self as Other>::Item) {} }")
+            .expect("使用側は読める");
+        assert_eq!(candidate.binding_with(&concrete), None);
+        let generic = qualified_of("impl<T> Holder<T> { fn f(x: <Self as Other>::Item) {} }")
+            .expect("使用側は読める");
+        assert!(candidate.binding_with(&generic).is_some(), "対照");
+    }
+
+    #[test]
+    fn test_binding_rejects_inconsistent_variables_and_concrete_candidates_for_variables() {
+        let used =
+            qualified_of("impl<A, B> Pair<A, B> { fn f(x: <Self as Other>::Item) {} }").unwrap();
+        for candidate in [
+            "impl<X> Other for Pair<X, X> { type Item = X; }",
+            "impl<X> Other for Pair<X, u8> { type Item = X; }",
+            "impl<X, Y> Other for Pair<X, (Y,)> { type Item = X; }",
+        ] {
+            let candidate = only_candidate_of(candidate).unwrap();
+            assert_eq!(candidate.binding_with(&used), None, "{candidate:?}");
+        }
+        let matching =
+            only_candidate_of("impl<X, Y> Other for Pair<X, Y> { type Item = X; }").unwrap();
+        assert!(matching.binding_with(&used).is_some(), "対照");
+    }
+
+    #[test]
+    fn test_binding_rejects_method_variables_in_trait_arguments() {
+        let used =
+            qualified_of("impl<T> Holder<T> { fn f<U>(x: <Self as Other<U>>::Item) {} }").unwrap();
+        let candidate =
+            only_candidate_of("impl<A, X> Other<A> for Holder<X> { type Item = A; }").unwrap();
+        assert_eq!(candidate.binding_with(&used), None);
+    }
+
+    #[test]
+    fn test_binding_compares_written_paths_as_name_pairs() {
+        let used =
+            qualified_of("impl<T> Holder<T> { fn f(x: <Self as Other<model::Amount>>::Item) {} }")
+                .unwrap();
+        let candidate =
+            only_candidate_of("impl<X> Other<Amount> for super::Holder<X> { type Item = X; }")
+                .unwrap();
+        let binding = candidate.binding_with(&used).unwrap();
+        let names: Vec<_> = binding
+            .names()
+            .iter()
+            .map(|(candidate, used)| (candidate.name(), used.name()))
+            .collect();
+        assert_eq!(
+            names,
+            [("Amount", "model::Amount"), ("super::Holder", "Holder")]
+        );
+    }
+
+    #[test]
+    fn test_qualified_projection_rejects_forms_that_impl_selection_does_not_decide() {
+        for source in [
+            "impl<T> Holder<T> { fn f(x: Self::Item) {} }",
+            "impl<T> Holder<T> { fn f(x: <<Self as Other>::Item as Next>::Out) {} }",
+            "impl<T> Holder<T> { fn f(x: <Self as Other>::Item) where Self: Other {} }",
+            "impl<T> Holder<T> where Holder<T>: Other { fn f(x: <Self as Other>::Item) {} }",
+            "impl<T> Other for Holder<T> { type Item = T; fn f(x: <Self as Other>::Item) {} }",
+            "impl<T> Holder<T> { fn f(x: <Self as Other<Self>>::Item) {} }",
+            "impl<T> Holder<T> { fn f(x: <Self as Other<Item = u8>>::Item) {} }",
+        ] {
+            let tree = SyntaxTree::from_source(source, Grammar::Rust).unwrap();
+            let function = tree
+                .named_descendants()
+                .into_iter()
+                .find(|node| node.kind() == "function_item")
+                .unwrap();
+            let reference = type_references_of(function, source)
+                .into_iter()
+                .find(|reference| reference.name().contains("Self"))
+                .unwrap_or_else(|| panic!("投影を尋ねる: {source}"));
+            assert_eq!(
+                RustQualifiedProjection::from_source(source, reference.position()),
+                None,
+                "{source}"
+            );
+        }
+        assert!(
+            qualified_of("impl<T> Show for Holder<T> { fn f(x: <Self as Other>::Item) {} }")
+                .is_some(),
+            "対照: 別の trait の impl からは選ぶ"
+        );
+    }
+
+    #[test]
+    fn test_candidates_skip_impls_whose_application_needs_bounds_or_is_not_a_named_target() {
+        let source = "impl<T: Clone> Other for Holder<T> { type Item = T; }
+impl<T> Other for Pair<T> where T: Copy { type Item = T; }
+impl<T> Other for T { type Item = T; }
+impl<T> Other for &Holder<T> { type Item = T; }
+impl !Other for Plain {}
+impl<T, const N: usize> Other for Arr<T> { type Item = T; }
+impl<T> Other for Single<T> { type Item = T; }";
+        let candidates = RustImplCandidate::candidates_of(source);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.target_name.as_str())
+                .collect::<Vec<_>>(),
+            ["Single"]
+        );
+        let line = source.lines().count() - 1;
+        assert_eq!(
+            candidates[0].target_position(),
+            SourcePosition::from_preceding_text(
+                crate::line_number::LineNumber::from_index(line),
+                "impl<T> Other for "
+            )
+        );
+    }
+
+    #[test]
+    fn test_associated_definition_of_a_selected_impl_takes_use_site_captures() {
+        let source = "impl<Y, X> Other<Y> for Pair<X, Y> { type Item = (X, Y); }";
+        let candidate = only_candidate_of(source).unwrap();
+        let definition =
+            RustAssociatedDefinition::from_impl_at(source, candidate.target_position(), "Item")
+                .unwrap()
+                .with_captures(vec!["B".to_owned(), "A".to_owned()])
+                .unwrap();
+        let resolution = definition.resolution_with(&|_| None).unwrap();
+        let header = Some("impl<A, B> Pair<A, B>");
+        let selected = RustCallable::from_spelling(
+            "fn f(x: <Self as Other<B>>::Item)",
+            &|name| name.contains("Other").then(|| resolution.clone()),
+            header,
+        )
+        .unwrap();
+        let explicit = RustCallable::from_spelling("fn f(x: (A, B))", &|_| None, header).unwrap();
+        assert_eq!(selected, explicit);
+        for missing in [
+            "impl<X> Other for Pair<X> { type Other = X; }",
+            "impl<X> Other for Pair<X> { default type Item = X; }",
+            "impl<X> Other for Pair<X> { #[cfg(test)] type Item = X; }",
+        ] {
+            let position = SourcePosition::from_preceding_text(
+                crate::line_number::LineNumber::from_index(0),
+                "impl<X> Other for ",
+            );
+            assert!(
+                RustAssociatedDefinition::from_impl_at(missing, position, "Item").is_none(),
+                "{missing}"
+            );
+        }
+    }
+}
