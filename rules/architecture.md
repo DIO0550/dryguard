@@ -193,15 +193,36 @@ LSP が起動しない・`callHierarchy` が使えない・チャンクが切り
 hover に具体的な整数が残る場合は評価値との一致も確認し、未知の式は印として扱わない。
 対応できなければ `UnmatchedArrayLength`、未評価の式は綴りで比較しない。
 
-**Self を含む関連型は、直接囲む trait impl の定義に限って展開する。**
+**Self を含む関連型は、直接囲む trait impl の定義か、型変数の付け替えだけで一致する impl の
+定義に限って展開する。**
 `syntax::rust_callable::RustProjectionSource` が投影の末尾の位置と直接の impl から
 一意な関連型定義を読み、`semantics::resolved_type` が definition の返した trait メンバーの
 所有 trait と impl の実装 trait の宣言位置を照合する。完全修飾形は対象が Self 自体で、
 trait と型引数が同じソースの束縛環境で一致するものに限る。
 RHS の名前は定義側の位置から辿り、impl 型変数と GAT の型引数はそれぞれの束縛元を保って
-正規化した後に代入する。条件付き・複数の定義、別 impl の選択、入れ子の投影は
+正規化した後に代入する。条件付き・複数の定義、入れ子の投影は
 `UnresolvedAssociatedType`、未対応の RHS・ライフタイム GAT・型引数の不一致は
 `UnopenableAssociatedType`。具体的な型は関連型の名前や宣言元ではなく、展開した RHS で比べる。
+
+**直接囲む impl が別 trait の impl・inherent impl なら、完全修飾形の trait の impl を選ぶ。**
+`syntax::rust_callable::RustQualifiedProjection` が使用側の trait 引数と対象型を、
+`RustImplCandidate` が `implementation` の返した impl を読み、`binding_with` が
+**候補の型変数を使用側の impl の型変数へ付け替えるだけで構文が揃うか**を確かめて、
+同じ位置の型名の組を返す。組は `semantics::resolved_type` が両側のソースの位置から辿り、
+具体的な宣言元か確かめたプリミティブ・開いた右辺が等しいときだけ一致にする（綴りでは比べない）。
+一致する候補がちょうど 1 つのときだけ、その RHS を候補側のソースで解決して展開する。
+
+- **選んでよい根拠は coherence。** 付け替えで一致し境界を持たない impl があれば、他の impl は
+  重ならない。だから blanket impl を含む残りの候補を数えず、読めない候補も飛ばしてよい
+- **選ばないもの**（偽陰性側）: 型変数が具体的な型に当たる候補・境界や where 句・const 引数を
+  持つ候補・blanket impl（Issue #318）、使用側の where 句の左辺に Self か対象型が現れる形
+  （rustc も param-env を優先して正規化しない）、短縮形・入れ子の投影・RHS の Self（Issue #317）
+- **理由**: 候補が無い・一致しない・2 つ以上は `UnresolvedAssociatedType`。implementation を
+  提供しない・空・URI を読めないは、それぞれ `ImplementationNotProvided` /
+  `NoImplementationSite` / `UnreadableImplementation`。辿れなかった型名があればその理由
+- **`const trait` は読めない。** tree-sitter-rust が `pub const trait` を構文エラーにするので、
+  std の多くの trait（`Iterator` / `Deref` など）は所有 trait を照合できず
+  `UnresolvedAssociatedType` に倒れる
 
 **書かれた型名がここに来ることはある。** `syntax` が集めた型名は必ず尋ねる（TypeScript は
 `pipeline`、Rust は hover の後に `semantics::type_signature` が尋ねる）が、
@@ -314,8 +335,8 @@ impl の変数とメソッドの変数が引数・戻り値で入れ替わった
 hover が `// Bounds from impl:` 以降に足す境界はソースの impl から読み直す。
 問い合わせ位置も実ソースから採り、内側の自由関数には impl の文脈を渡さない。
 
-**関連型の選択は行わない。** `Self::Item` や `<Self as Trait>::Item` など Self を含む
-関連型は `SiteDependentSpelling` のまま。impl が無い Self も同じで、const generics を持つ
+**Self を含む関連型は、上の展開条件に当たるものだけを開く。** 当たらないものは理由付きで
+測れない。impl が無い Self は `SiteDependentSpelling` のままで、const generics を持つ
 impl は読み取り不可。型エイリアスは上記の既存の展開条件を保つ。
 
 - **どの段で止まったかでは分けない。** 段で分けると、同じ「測れない」が
