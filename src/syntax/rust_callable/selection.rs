@@ -26,8 +26,8 @@ impl RustQualifiedProjection {
     /// 使用位置の投影を読む。次のどれかなら `None`:
     /// - 対象が `Self` 自体でない・短縮形（`Self::Name`）・入れ子の投影
     /// - 直接囲む impl が同じ trait パスの impl（直接の impl の経路が答える）
-    /// - impl / メソッドの where 句の左辺に `Self` か対象型が現れる（param-env の候補が
-    ///   impl より優先され、rustc も投影を正規化しない）
+    /// - impl / メソッドの where 句に、左辺が型変数そのものでない述語がある（`Self` や
+    ///   対象型を左辺に持つ param-env の候補は impl より優先され、rustc も投影を正規化しない）
     /// - impl が const 引数を持つ・trait 引数に関連型の束縛や `Self` がある
     pub(crate) fn from_source(source: &str, position: SourcePosition) -> Option<Self> {
         let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
@@ -61,18 +61,26 @@ impl RustQualifiedProjection {
             return None;
         }
         let target = implementation.child_by_field_name("type")?;
-        let target_text = collapsed(source.get(target.byte_range())?);
-        let constrains_self = [function, implementation]
+        let parameters = type_parameter_names_of(implementation, source)?;
+        let method_parameters = type_parameter_names_of(function, source)?;
+        // Why: 左辺が型変数そのもの以外の述語は、Self や対象型を別の綴り（パス・エイリアス）で
+        // 書いた param-env の候補でありうる。綴りの一覧で弾くと漏れが選ぶ側へ倒れるので、
+        // 型変数そのものだけを通す許可リストにする。
+        let only_variables_constrained = [function, implementation]
             .into_iter()
             .flat_map(where_predicate_lefts_of)
-            .any(|left| {
-                let left = collapsed(source.get(left.byte_range()).unwrap_or_default());
-                left == SELF_TYPE || left == target_text
+            .all(|left| {
+                left.kind() == "type_identifier"
+                    && source.get(left.byte_range()).is_some_and(|name| {
+                        parameters
+                            .iter()
+                            .chain(&method_parameters)
+                            .any(|parameter| parameter == name)
+                    })
             });
-        if constrains_self {
+        if !only_variables_constrained {
             return None;
         }
-        let parameters = type_parameter_names_of(implementation, source)?;
         let mut shapes = trait_argument_shapes_of(projected_trait, source)?;
         shapes.push(TypeShape::from_node(target, source)?);
         Some(Self {
