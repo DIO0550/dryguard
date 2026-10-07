@@ -342,6 +342,35 @@ mod tests {
     }
 
     #[test]
+    fn test_associated_rhs_substitutes_impl_variables_inside_type_arguments_of_declared_types() {
+        let source = "impl<T> Named for Holder<T> { type Item = Vec<T>; fn f(x: Self::Item) {} }";
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).unwrap();
+        let function = tree
+            .named_descendants()
+            .into_iter()
+            .find(|node| node.kind() == "function_item")
+            .unwrap();
+        let references = type_references_of(function, source);
+        let reference = references
+            .iter()
+            .find(|reference| reference.name() == "Self::Item")
+            .unwrap();
+        let projection = RustProjectionSource::from_source(source, reference.position()).unwrap();
+        let declared =
+            |name: &str| (name == "Vec").then(|| RustTypeResolution::Declared("@vec".to_owned()));
+        let resolution = projection.resolution_with(&declared).unwrap();
+        let header = Some("impl<T> Named for Holder<T>");
+        let projected = RustCallable::from_spelling(
+            "fn f(x: Self::Item)",
+            &|name| (name == "Self::Item").then(|| resolution.clone()),
+            header,
+        )
+        .unwrap();
+        let explicit = RustCallable::from_spelling("fn f(x: Vec<T>)", &declared, header).unwrap();
+        assert_eq!(projected, explicit);
+    }
+
+    #[test]
     fn test_associated_rhs_names_keep_their_declaration_scope() {
         let source = "impl<T> Project for Holder<T> { type Item = Payload; fn f<Payload>(x: Self::Item) {} }";
         let tree = SyntaxTree::from_source(source, Grammar::Rust).unwrap();
