@@ -1077,6 +1077,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_unselected_impls_prefer_the_untraced_candidate_over_unreadable_files() {
+        let unselected = UnselectedImpls {
+            untraced: Some(UnopenedReason::NoDefinitionSite),
+            has_unreadable_file: true,
+            has_unreadable_site: true,
+        };
+        assert_eq!(unselected.reason_with(0), UnopenedReason::NoDefinitionSite);
+    }
+
+    #[test]
+    fn test_unselected_impls_report_unreadable_files_before_unreadable_sites() {
+        let unselected = UnselectedImpls {
+            has_unreadable_file: true,
+            has_unreadable_site: true,
+            ..UnselectedImpls::default()
+        };
+        assert_eq!(
+            unselected.reason_with(0),
+            UnopenedReason::UnreadableDeclaringDocument
+        );
+        let unselected = UnselectedImpls {
+            has_unreadable_site: true,
+            ..UnselectedImpls::default()
+        };
+        assert_eq!(
+            unselected.reason_with(0),
+            UnopenedReason::UnreadableImplementation
+        );
+    }
+
+    #[test]
+    fn test_unselected_impls_with_two_matches_are_unresolved_even_with_untraced_candidates() {
+        let unselected = UnselectedImpls {
+            untraced: Some(UnopenedReason::NoDefinitionSite),
+            ..UnselectedImpls::default()
+        };
+        assert_eq!(
+            unselected.reason_with(2),
+            UnopenedReason::UnresolvedAssociatedType
+        );
+        assert_eq!(
+            UnselectedImpls::default().reason_with(0),
+            UnopenedReason::UnresolvedAssociatedType
+        );
+    }
+
+    #[test]
     fn test_declared_type_of_an_alias_declaration_is_the_spelling_on_its_right() {
         assert_eq!(
             declared_type_of("type Amount = number"),
