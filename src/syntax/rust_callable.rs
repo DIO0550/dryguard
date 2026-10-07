@@ -2172,6 +2172,37 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn test_substituted_replaces_whole_identifiers_outside_identities_and_placeholders() {
+        let substitutions = [
+            ("T", "X".to_owned()),
+            ("impl0", "Y".to_owned()),
+            ("static", "Z".to_owned()),
+        ];
+        let actual = substituted(
+            "(@type(\"a/T.rs\", 1, 2)<T>, TT, T, %impl0, &'static T, \"q\\\"T\")",
+            &substitutions,
+            None,
+        );
+        assert_eq!(
+            actual.ok().as_deref(),
+            Some("(@type(\"a/T.rs\", 1, 2)<X>, TT, X, %impl0, &'static X, \"q\\\"T\")")
+        );
+    }
+
+    #[test]
+    fn test_substituted_fails_only_when_the_result_exceeds_the_limit() {
+        let substitutions = [("T", "abc".to_owned())];
+        assert_eq!(
+            substituted("<T>", &substitutions, Some(5)).ok().as_deref(),
+            Some("<abc>")
+        );
+        assert!(matches!(
+            substituted("<T>", &substitutions, Some(4)),
+            Err(AliasInstantiationError::ExpansionLimit)
+        ));
+    }
+
     fn read(spelling: &str) -> RustCallable {
         RustCallable::from_spelling(spelling, &|_| None, None).expect("関数の綴りとして読める")
     }
