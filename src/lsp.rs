@@ -8,6 +8,7 @@
 //! | `framing` | `Content-Length` による区切り |
 //! | `message` | JSON-RPC の payload の組み立てと解釈 |
 //! | `connection` | 要求と応答の対応付け・ライフサイクル |
+//! | `child_output` | 子プロセスの出力を吸い続け、期限付きで受け取る |
 //! | `uri` | パスから `file:` URI への変換 |
 //! | `workspace` | サーバに見せるワークスペースの根 |
 //! | `document` | サーバに開かせるソースファイル |
@@ -24,6 +25,7 @@
 //! (rules/architecture.md「モジュールの公開 API」)。
 
 pub(crate) mod call_hierarchy;
+mod child_output;
 pub(crate) mod connection;
 pub(crate) mod declaration_site;
 pub(crate) mod document;
@@ -38,7 +40,9 @@ pub(crate) mod workspace;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, BufReader};
-use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use lsp_types::{
     CallHierarchyServerCapability, HoverProviderCapability, OneOf, ServerCapabilities,
@@ -47,6 +51,7 @@ use lsp_types::{
 
 use crate::source_position::SourcePosition;
 use crate::syntax::tree::Grammar;
+use child_output::{SilenceLimitedReader, StderrTail};
 use connection::Connection;
 
 // 開かせるドキュメントとワークスペースの根は、呼ぶ側が組み立てて渡す。
@@ -92,6 +97,48 @@ const TYPESCRIPT_PROJECT_MARKERS: [&str; 2] = ["tsconfig.json", "jsconfig.json"]
 /// rust-analyzer がワークスペースを見つけるためのマニフェスト。
 const RUST_PROJECT_MARKERS: [&str; 1] = ["Cargo.toml"];
 
+/// サーバが何も送ってこないまま待つ上限。
+///
+/// rust-analyzer（2026-09-21 リリース）で dryguard 自身を初回に読ませたときの、
+/// フレームの間の最長の沈黙が 6.69 秒（typescript-language-server は 0.63 秒）。
+/// 大きなワークスペースの build script が報告なしに長引く分を見込んで、広く取る。
+/// **狭く取ると、正常に遅いサーバを殺す側に倒れる。**
+const SILENCE_LIMIT: Duration = Duration::from_secs(120);
+
+/// `exit` を送ってから、子プロセスが終わるのを待つ上限。
+///
+/// 同じ実測で、終わるまで最長 0.34 秒だった。
+const EXIT_LIMIT: Duration = Duration::from_secs(10);
+
+/// 終わったかを確かめ直す間隔。
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// 出力を閉じたサーバの stderr が閉じるのを待つ上限。
+///
+/// 子プロセスを kill した後に待つので、普通はすぐ閉じる。閉じないのは、サーバが起こした
+/// 孫プロセスが stderr を握ったまま残ったとき。
+const STDERR_CLOSE_LIMIT: Duration = Duration::from_secs(1);
+
+/// サーバを待つ期限の組。
+///
+/// **値はハードコードの 1 組だけ。** 設定ファイルへの外出しは、実際に調整したくなってから
+/// （`docs/dryguard-plan.md`「Phase 3」の「実際に調整したくなった項目だけ切り出す」）。
+/// 組にしてあるのは、テストが短い期限でサーバを起動できるようにするため。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WaitLimits {
+    /// 何も届かないまま待つ上限。
+    silence: Duration,
+    /// `exit` の後に終了を待つ上限。
+    exit: Duration,
+}
+
+impl WaitLimits {
+    const HARDCODED: Self = Self {
+        silence: SILENCE_LIMIT,
+        exit: EXIT_LIMIT,
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ServerLanguage {
     TypeScript,
@@ -109,6 +156,7 @@ pub struct ServerCommand {
     args: Vec<String>,
     project_markers: Vec<String>,
     language: ServerLanguage,
+    wait_limits: WaitLimits,
 }
 
 impl ServerCommand {
@@ -128,6 +176,7 @@ impl ServerCommand {
             args,
             project_markers,
             language: ServerLanguage::TypeScript,
+            wait_limits: WaitLimits::HARDCODED,
         }
     }
 
@@ -188,19 +237,26 @@ impl ServerCommand {
 #[derive(Debug)]
 pub struct Client {
     child: Child,
-    connection: Connection<BufReader<ChildStdout>, ChildStdin>,
+    connection: Connection<BufReader<SilenceLimitedReader>, ChildStdin>,
+    stderr: StderrTail,
     program: String,
+    wait_limits: WaitLimits,
     terminated: bool,
+    /// 沈黙の上限を超えたか。超えたサーバは kill 済みで、以後は送らずに断る。
+    ///
+    /// **Why（断る）**: kill しても、サーバが起こした孫プロセスがパイプを握ったまま残ると
+    /// 読み口は閉じない。送れば、もう 1 度期限まで待つ。理由も `ServerUnresponsive` のまま
+    /// 保てる（`pipeline` は 1 つが落ちても残りを尋ねるので、後続は必ず来る）。
+    unresponsive: bool,
 }
 
 impl Client {
-    /// サーバを起動し、stdin / stdout を配線する。
+    /// サーバを起動し、stdin / stdout / stderr を配線する。
     ///
-    /// stderr は捨てる。サーバのログをこちらの出力に混ぜないため。起動直後に黙った場合は
-    /// [`ClientError::ServerClosedDuringHandshake`] として表に出る。
-    ///
-    /// **Why not（`Stdio::piped()` で診断を取る）**: こちらが読まないままにすると、
-    /// パイプが埋まった時点でサーバが write でブロックする。診断が消えるより悪い。
+    /// stdout と stderr は別スレッドが吸い続ける。stdout は期限付きで受け取り、
+    /// stderr は末尾だけを持つ。stderr をこちらの出力に混ぜないのは、サーバのログで
+    /// 結果が読めなくなるため。起動直後に黙った場合は、その末尾を
+    /// [`ClientError::ServerClosedDuringHandshake`] に載せる。
     ///
     /// # Errors
     ///
@@ -210,23 +266,33 @@ impl Client {
             .args(&command.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|cause| spawn_error_of(&command.program, cause))?;
 
-        let pipes = child.stdin.take().zip(child.stdout.take());
-        let Some((stdin, stdout)) = pipes else {
+        let pipes = child
+            .stdin
+            .take()
+            .zip(child.stdout.take())
+            .zip(child.stderr.take());
+        let Some(((stdin, stdout), stderr)) = pipes else {
             // piped を指定した以上ここへは来ないが、来たときに子プロセスを残さない。
             let _ = child.kill();
+            let _ = child.wait();
             return Err(ClientError::PipesNotWired);
         };
 
+        let output = SilenceLimitedReader::spawn(stdout, command.wait_limits.silence);
+
         Ok(Self {
             child,
-            connection: Connection::new(BufReader::new(stdout), stdin)
+            connection: Connection::new(BufReader::new(output), stdin)
                 .with_language(command.language),
+            stderr: StderrTail::spawn(stderr),
             program: command.program.clone(),
+            wait_limits: command.wait_limits,
             terminated: false,
+            unresponsive: false,
         })
     }
 
@@ -240,17 +306,128 @@ impl Client {
     /// # Errors
     ///
     /// 往復が失敗したとき。サーバが答えないまま出力を閉じた場合は
-    /// [`ClientError::ServerClosedDuringHandshake`]。抜けた [`Client`] は `Drop` が kill する。
+    /// [`ClientError::ServerClosedDuringHandshake`]、何も送ってこないまま期限を過ぎた場合は
+    /// [`ClientError::ServerUnresponsive`]。抜けた [`Client`] は `Drop` が kill する。
     pub fn handshake(mut self, root: &WorkspaceRoot) -> Result<Session, ClientError> {
         let capabilities = match self.connection.handshake(root) {
             Ok(capabilities) => capabilities,
-            Err(cause) => return Err(handshake_error_of(&self.program, cause)),
+            Err(cause) => return Err(self.handshake_error_of(cause)),
         };
 
         Ok(Session {
             client: self,
             capabilities,
         })
+    }
+}
+
+impl Client {
+    /// 握手の失敗を、サーバが黙った場合とそれ以外に分ける。
+    ///
+    /// フレームの切れ目の EOF は「起動はしたが、答えないまま出力を閉じた」。利用者が次に
+    /// 試すこと（stderr を見る・サーバを直接起動する）は他の失敗と違うので、専用の
+    /// バリアントで返す。
+    ///
+    /// **Why not（`Child::try_wait` で終了を確かめてから名乗る）**: EOF の直後は、
+    /// 終了したサーバでもまだ回収できていないことがある。確かめたつもりで取り違えるより、
+    /// **観測した事実（出力が閉じた）だけを名前にする**
+    /// (rules/naming.md「名前と実体を一致させる」)。
+    fn handshake_error_of(&mut self, cause: ConnectionError) -> ClientError {
+        if !matches!(cause, ConnectionError::Framing(FramingError::ServerClosed)) {
+            return self.conversation_error_of(cause);
+        }
+
+        // 先に止める。止めると stderr が閉じ、末尾を読み切ってから取り出せる。
+        self.terminate();
+
+        ClientError::ServerClosedDuringHandshake {
+            program: self.program.clone(),
+            stderr_tail: self.stderr.text_after_close(STDERR_CLOSE_LIMIT),
+        }
+    }
+
+    /// 往復を 1 つ行う。沈黙の上限を超えたサーバには送らずに断る。
+    ///
+    /// **`ClientError` への直し方はここに 1 つだけ置く。** 往復ごとに直すと、
+    /// 沈黙の見分けが漏れた経路だけ `Conversation` のまま出る。
+    ///
+    /// # Errors
+    ///
+    /// 既に黙り込んだと分かっているとき、往復が失敗したとき。
+    fn converse<T>(
+        &mut self,
+        exchange: impl FnOnce(
+            &mut Connection<BufReader<SilenceLimitedReader>, ChildStdin>,
+        ) -> Result<T, ConnectionError>,
+    ) -> Result<T, ClientError> {
+        if self.unresponsive {
+            return Err(self.unresponsive_error());
+        }
+
+        exchange(&mut self.connection).map_err(|cause| self.conversation_error_of(cause))
+    }
+
+    /// 往復の失敗を、沈黙の上限を超えた場合とそれ以外に分ける。
+    ///
+    /// **超えたらその場で kill する。** 待ちをやめた後も生かしておくと、固まったサーバが
+    /// `Drop` まで残る。
+    fn conversation_error_of(&mut self, cause: ConnectionError) -> ClientError {
+        if !is_silence_exceeded(&cause) {
+            return ClientError::Conversation(cause);
+        }
+
+        self.unresponsive = true;
+        self.terminate();
+        self.unresponsive_error()
+    }
+
+    fn unresponsive_error(&self) -> ClientError {
+        ClientError::ServerUnresponsive {
+            program: self.program.clone(),
+            silence: self.wait_limits.silence,
+        }
+    }
+
+    /// `exit` を送った後、子プロセスが終わるのを期限まで待つ。
+    ///
+    /// **Why not（`Child::wait`）**: `exit` を受け取っても終わらないサーバの前で止まり続ける。
+    ///
+    /// # Errors
+    ///
+    /// 終了を確かめられなかったとき、期限までに終わらなかったとき（kill してから返す）。
+    fn exit_status_within_limit(&mut self) -> Result<ExitStatus, ClientError> {
+        let started = Instant::now();
+
+        loop {
+            if let Some(status) = self.child.try_wait().map_err(ClientError::Wait)? {
+                self.terminated = true;
+                return Ok(status);
+            }
+
+            if started.elapsed() >= self.wait_limits.exit {
+                self.terminate();
+                return Err(ClientError::ExitTimedOut {
+                    program: self.program.clone(),
+                    waited: self.wait_limits.exit,
+                });
+            }
+
+            thread::sleep(EXIT_POLL_INTERVAL);
+        }
+    }
+
+    /// 子プロセスを kill して回収する。既に終わっていれば何もしない。
+    ///
+    /// 失敗しても報告先が無いので捨てる（`Drop` と同じ）。出力を吸うスレッドは join しない。
+    /// 孫プロセスがパイプを握っていると終わらず、そこで止まる。
+    fn terminate(&mut self) {
+        if self.terminated {
+            return;
+        }
+
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.terminated = true;
     }
 }
 
@@ -284,9 +461,7 @@ impl Session {
     /// 送信が失敗したとき。
     pub fn open_document(&mut self, document: &SourceDocument) -> Result<(), ClientError> {
         self.client
-            .connection
-            .open_document(document)
-            .map_err(ClientError::Conversation)
+            .converse(|connection| connection.open_document(document))
     }
 
     /// 開かせたファイルの、指定位置にある名前の型の綴りを尋ねる。
@@ -317,9 +492,7 @@ impl Session {
         }
 
         self.client
-            .connection
-            .hover(document, position)
-            .map_err(ClientError::Conversation)
+            .converse(|connection| connection.hover(document, position))
     }
 
     /// 開かせたファイルの、指定位置に書かれた型が宣言されている場所を尋ねる。
@@ -347,9 +520,7 @@ impl Session {
         }
 
         self.client
-            .connection
-            .type_definition(document, position)
-            .map_err(ClientError::Conversation)
+            .converse(|connection| connection.type_definition(document, position))
     }
 
     /// 開かせたファイルの、指定位置に書かれた名前が宣言されている場所を尋ねる。
@@ -379,9 +550,7 @@ impl Session {
         }
 
         self.client
-            .connection
-            .definition(document, position)
-            .map_err(ClientError::Conversation)
+            .converse(|connection| connection.definition(document, position))
     }
 
     /// 定数の宣言を一意に選べるかを含めて尋ねる。
@@ -400,9 +569,7 @@ impl Session {
             ));
         }
         self.client
-            .connection
-            .unique_definition(document, position)
-            .map_err(ClientError::Conversation)
+            .converse(|connection| connection.unique_definition(document, position))
     }
 
     /// 宣言の場所を指して、そこにある名前の型の綴りを尋ねる。
@@ -426,9 +593,7 @@ impl Session {
         }
 
         self.client
-            .connection
-            .hover_at_declaration(site)
-            .map_err(ClientError::Conversation)
+            .converse(|connection| connection.hover_at_declaration(site))
     }
 
     /// 開かせたファイルの、指定位置にある名前を参照しているところを尋ねる。
@@ -455,9 +620,7 @@ impl Session {
         }
 
         self.client
-            .connection
-            .references(document, position)
-            .map_err(ClientError::Conversation)
+            .converse(|connection| connection.references(document, position))
     }
 
     /// そのサーバが references に答えるか。
@@ -492,9 +655,7 @@ impl Session {
         }
 
         self.client
-            .connection
-            .callees(document, position)
-            .map_err(ClientError::Conversation)
+            .converse(|connection| connection.callees(document, position))
     }
 
     /// そのファイルを、サーバがどのプロジェクトの一員として扱っているかを尋ねる。
@@ -517,9 +678,7 @@ impl Session {
         }
 
         self.client
-            .connection
-            .project_membership(document)
-            .map_err(ClientError::Conversation)
+            .converse(|connection| connection.project_membership(document))
     }
 
     /// 開かせたファイルを閉じさせる。開いていなければ何もしない。
@@ -529,9 +688,7 @@ impl Session {
     /// 送信が失敗したとき。
     pub fn close_document(&mut self, document: &SourceDocument) -> Result<(), ClientError> {
         self.client
-            .connection
-            .close_document(document)
-            .map_err(ClientError::Conversation)
+            .converse(|connection| connection.close_document(document))
     }
 
     /// サーバを終わらせ、子プロセスの終了を待つ。
@@ -541,17 +698,11 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// 往復が失敗したとき、終了を待てなかったとき、サーバが異常終了したとき。
-    /// 往復の失敗で抜けた場合は `Drop` が kill する。
+    /// 往復が失敗したとき、終了を待てなかったとき、期限までに終わらなかったとき、
+    /// サーバが異常終了したとき。往復の失敗で抜けた場合は `Drop` が kill する。
     pub fn shutdown(mut self) -> Result<(), ClientError> {
-        self.client
-            .connection
-            .shutdown()
-            .map_err(ClientError::Conversation)?;
-        let status = self.client.child.wait().map_err(ClientError::Wait)?;
-
-        // 待ち終えた時点で子プロセスは残っていない。ここより後で失敗しても kill は要らない。
-        self.client.terminated = true;
+        self.client.converse(|connection| connection.shutdown())?;
+        let status = self.client.exit_status_within_limit()?;
 
         // `wait` は終了できたことしか言わない。**異常終了も `Ok` で返る**ので、
         // 状態を見ずに握りつぶすと「終了しました」と報告してしまう
@@ -570,12 +721,7 @@ impl Drop for Client {
     /// 失敗しても報告先が無いので捨てる。ここで報告できないことが、
     /// [`Client::shutdown`] を別に持つ理由でもある。
     fn drop(&mut self) {
-        if self.terminated {
-            return;
-        }
-
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.terminate();
     }
 }
 
@@ -659,24 +805,15 @@ fn provides_tsserver_requests(capabilities: &ServerCapabilities) -> bool {
         })
 }
 
-/// 握手の失敗を、サーバが黙った場合とそれ以外に分ける。
+/// 往復の失敗が、沈黙の上限を超えたことによるものか。
 ///
-/// フレームの切れ目の EOF は「起動はしたが、答えないまま出力を閉じた」。stderr を捨てて
-/// いるので**閉じた理由そのものは残っていない**が、利用者が次に試すこと（サーバを直接
-/// 起動して起動時のエラーを見る）は他の失敗と違うので、専用のバリアントで返す。
-///
-/// **Why not（`Child::try_wait` で終了を確かめてから名乗る）**: EOF の直後は、
-/// 終了したサーバでもまだ回収できていないことがある。確かめたつもりで取り違えるより、
-/// **観測した事実（出力が閉じた）だけを名前にする**
-/// (rules/naming.md「名前と実体を一致させる」)。
-fn handshake_error_of(program: &str, cause: ConnectionError) -> ClientError {
-    if matches!(cause, ConnectionError::Framing(FramingError::ServerClosed)) {
-        return ClientError::ServerClosedDuringHandshake {
-            program: program.to_owned(),
-        };
-    }
-
-    ClientError::Conversation(cause)
+/// **`framing` に専用のバリアントを置かない。** 期限は区切りの話ではなく読み口
+/// （[`SilenceLimitedReader`]）の性質で、`TimedOut` を返すのはこの読み口だけ。
+fn is_silence_exceeded(cause: &ConnectionError) -> bool {
+    matches!(
+        cause,
+        ConnectionError::Framing(FramingError::Read(read)) if read.kind() == io::ErrorKind::TimedOut
+    )
 }
 
 /// 起動の失敗を、実行ファイルが無い場合とそれ以外に分ける。
@@ -716,10 +853,26 @@ pub enum ClientError {
     /// 起動はしたが、握手に答えないまま出力を閉じた。
     ///
     /// 子プロセスが終了したかまでは見ていない。閉じた時点で会話は続けられないので、
-    /// どちらでも `Drop` が kill する。
+    /// どちらでも kill する。
     ServerClosedDuringHandshake {
         /// 黙った実行ファイル名。
         program: String,
+        /// サーバが stderr に書いた末尾。何も書かなければ空。
+        stderr_tail: String,
+    },
+    /// 何も送ってこないまま、沈黙の上限を超えた。サーバは kill 済み。
+    ServerUnresponsive {
+        /// 黙り込んだ実行ファイル名。
+        program: String,
+        /// 待った長さ。
+        silence: Duration,
+    },
+    /// `exit` を送った後、期限までに終わらなかった。サーバは kill 済み。
+    ExitTimedOut {
+        /// 終わらなかった実行ファイル名。
+        program: String,
+        /// 待った長さ。
+        waited: Duration,
     },
     /// 起動した後の往復が失敗した。
     Conversation(ConnectionError),
@@ -745,11 +898,30 @@ impl fmt::Display for ClientError {
                 formatter,
                 "LSP サーバの stdin / stdout を取り出せませんでした"
             ),
-            // 閉じた理由はこちらに残っていない。次に試すことを出す。
-            Self::ServerClosedDuringHandshake { program } => write!(
+            // stderr に何も残っていなければ、次に試すことだけを出す。
+            Self::ServerClosedDuringHandshake {
+                program,
+                stderr_tail,
+            } => {
+                write!(
+                    formatter,
+                    "LSP サーバ ({program}) が握手に答えないまま出力を閉じました。\
+                     {program} を直接起動して、起動時のエラーを確認してください"
+                )?;
+                if stderr_tail.is_empty() {
+                    return Ok(());
+                }
+                write!(formatter, "\n{program} の stderr の末尾:\n{stderr_tail}")
+            }
+            Self::ServerUnresponsive { program, silence } => write!(
                 formatter,
-                "LSP サーバ ({program}) が握手に答えないまま出力を閉じました。\
-                 {program} を直接起動して、起動時のエラーを確認してください"
+                "LSP サーバ ({program}) が {} 秒のあいだ何も送ってこないため、止めました",
+                silence.as_secs_f64()
+            ),
+            Self::ExitTimedOut { program, waited } => write!(
+                formatter,
+                "LSP サーバ ({program}) が終了の通知から {} 秒たっても終わらないため、止めました",
+                waited.as_secs_f64()
             ),
             Self::Conversation(cause) => write!(formatter, "{cause}"),
             Self::Wait(cause) => {
@@ -768,6 +940,8 @@ impl Error for ClientError {
             Self::ServerNotFound { .. }
             | Self::PipesNotWired
             | Self::ServerClosedDuringHandshake { .. }
+            | Self::ServerUnresponsive { .. }
+            | Self::ExitTimedOut { .. }
             | Self::AbnormalExit { .. } => None,
             Self::Spawn { cause, .. } => Some(cause),
             Self::Conversation(cause) => Some(cause),
@@ -780,6 +954,7 @@ impl Error for ClientError {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::time::Instant;
 
     use crate::codebase;
     use crate::test_support::{line, repository_path, signature_text};
@@ -1100,29 +1275,215 @@ mod tests {
         assert!(!provides_tsserver_requests(&capabilities));
     }
 
-    #[test]
-    fn test_handshake_error_of_a_server_that_closed_names_the_program() {
-        // 起動して答えないまま出力を閉じたサーバ。理由は stderr と共に消えているので、
-        // 利用者が次に試すこと（直接起動して確かめる）を出せる形で返す
-        let cause = ConnectionError::Framing(FramingError::ServerClosed);
+    /// テストで待つ沈黙の上限。黙るサーバはこれより十分長く（30 秒）黙る。
+    const SHORT_LIMIT: Duration = Duration::from_millis(300);
 
-        let error = handshake_error_of("typescript-language-server", cause);
+    /// 届くはずのものが届かないときだけ効く、テストの上限。
+    const GENEROUS_LIMIT: Duration = Duration::from_secs(10);
+
+    /// `sh -c` で台本どおりに振る舞う、LSP サーバのフェイク。
+    ///
+    /// **孫プロセスを作らないよう、黙るときは `exec sleep` にする。** 孫がパイプを握ると、
+    /// テスト自身が「子プロセスを残さない」を破る。
+    fn fake_server(script: &str) -> ServerCommand {
+        ServerCommand {
+            wait_limits: WaitLimits {
+                silence: SHORT_LIMIT,
+                exit: SHORT_LIMIT,
+            },
+            ..ServerCommand::new("sh", vec!["-c".to_owned(), script.to_owned()], Vec::new())
+        }
+    }
+
+    /// payload を 1 フレームとして stdout へ書く台本。
+    fn printed_frame(payload: &str) -> String {
+        format!(
+            "printf 'Content-Length: {}\\r\\n\\r\\n%s' '{payload}'",
+            payload.len()
+        )
+    }
+
+    /// 1 通目の要求（`initialize`）への応答。hover を提供すると答える。
+    const INITIALIZE_RESPONSE: &str =
+        r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"hoverProvider":true}}}"#;
+
+    /// 2 通目の要求（握手の直後の `shutdown`）への応答。
+    const SHUTDOWN_RESPONSE: &str = r#"{"jsonrpc":"2.0","id":2,"result":null}"#;
+
+    #[test]
+    #[cfg(unix)]
+    fn test_client_handshake_with_a_server_that_stays_silent_reports_it_unresponsive() {
+        // 起動したまま何も送ってこないサーバ。期限が無ければ、ここで止まり続ける
+        let client = Client::start(&fake_server("exec sleep 30")).expect("起動できる");
+
+        let started = Instant::now();
+        let error = client
+            .handshake(&fixture_workspace_root())
+            .expect_err("握手に答えない");
 
         assert!(matches!(
             error,
-            ClientError::ServerClosedDuringHandshake { program }
-                if program == "typescript-language-server"
+            ClientError::ServerUnresponsive { program, silence }
+                if program == "sh" && silence == SHORT_LIMIT
+        ));
+        assert!(started.elapsed() < GENEROUS_LIMIT, "期限で戻る");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_session_after_the_server_went_silent_refuses_without_waiting_again() {
+        // 握手には答えたが、その後に黙り込んだサーバ。`pipeline` は 1 つが落ちても
+        // 残りを尋ねるので、断らないと問い合わせの数だけ期限を待つ
+        let script = format!("{}; exec sleep 30", printed_frame(INITIALIZE_RESPONSE));
+        let client = Client::start(&fake_server(&script)).expect("起動できる");
+        let mut session = client
+            .handshake(&fixture_workspace_root())
+            .expect("握手できる");
+        let document = fixture_document();
+        session.open_document(&document).expect("開かせられる");
+        let position = SourcePosition::from_preceding_text(line(5), "export function ");
+
+        let first = session.hover(&document, position);
+        let started = Instant::now();
+        let second = session.hover(&document, position);
+
+        assert!(matches!(first, Err(ClientError::ServerUnresponsive { .. })));
+        assert!(matches!(
+            second,
+            Err(ClientError::ServerUnresponsive { .. })
+        ));
+        assert!(started.elapsed() < SHORT_LIMIT, "2 度目は待たずに断る");
+        assert!(matches!(
+            session.shutdown(),
+            Err(ClientError::ServerUnresponsive { .. })
         ));
     }
 
     #[test]
-    fn test_handshake_error_of_another_framing_failure_stays_a_conversation_error() {
-        // 「サーバが黙った」以外まで起動失敗として畳むと、直す先を取り違える
-        let cause = ConnectionError::Framing(FramingError::MissingContentLength);
+    #[cfg(unix)]
+    fn test_session_shutdown_with_a_server_that_does_not_exit_reports_it() {
+        // `shutdown` には答えるが、`exit` を受け取っても終わらないサーバ
+        let script = format!(
+            "{}; {}; exec sleep 30",
+            printed_frame(INITIALIZE_RESPONSE),
+            printed_frame(SHUTDOWN_RESPONSE)
+        );
+        let client = Client::start(&fake_server(&script)).expect("起動できる");
+        let session = client
+            .handshake(&fixture_workspace_root())
+            .expect("握手できる");
 
-        let error = handshake_error_of("typescript-language-server", cause);
+        let started = Instant::now();
+        let error = session.shutdown().expect_err("終わらない");
 
-        assert!(matches!(error, ClientError::Conversation(_)));
+        assert!(matches!(
+            error,
+            ClientError::ExitTimedOut { program, waited }
+                if program == "sh" && waited == SHORT_LIMIT
+        ));
+        assert!(started.elapsed() < GENEROUS_LIMIT, "期限で戻る");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_session_shutdown_with_a_server_that_exits_succeeds() {
+        // 対照は上のテスト。期限より先に終わるサーバは通る。読まずに 1 秒で終わるが、
+        // 送る 4 通はパイプのバッファに収まり、その間に書き終わる
+        let script = format!(
+            "{}; {}; exec sleep 1",
+            printed_frame(INITIALIZE_RESPONSE),
+            printed_frame(SHUTDOWN_RESPONSE)
+        );
+        let client = Client::start(&ServerCommand {
+            wait_limits: WaitLimits {
+                silence: GENEROUS_LIMIT,
+                exit: GENEROUS_LIMIT,
+            },
+            ..fake_server(&script)
+        })
+        .expect("起動できる");
+        let session = client
+            .handshake(&fixture_workspace_root())
+            .expect("握手できる");
+
+        session.shutdown().expect("終了できる");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_client_handshake_with_a_server_that_dies_writing_to_stderr_carries_its_tail() {
+        // 起動時のエラーを stderr にだけ書いて死ぬサーバ。捨てていたときは
+        // 「出力を閉じた」しか残らなかった
+        let client = Client::start(&fake_server("echo 'tsserver not found' >&2; exit 1"))
+            .expect("起動できる");
+
+        let error = client
+            .handshake(&fixture_workspace_root())
+            .expect_err("握手に答えない");
+
+        assert!(matches!(
+            &error,
+            ClientError::ServerClosedDuringHandshake { program, stderr_tail }
+                if program == "sh" && stderr_tail == "tsserver not found"
+        ));
+        assert!(error.to_string().contains("tsserver not found"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_client_handshake_with_a_server_that_dies_silently_has_no_stderr_tail() {
+        // 対照は上のテスト。何も書かずに死んだサーバに、末尾をこしらえない
+        let client = Client::start(&fake_server("exit 1")).expect("起動できる");
+
+        let error = client
+            .handshake(&fixture_workspace_root())
+            .expect_err("握手に答えない");
+
+        assert!(matches!(
+            &error,
+            ClientError::ServerClosedDuringHandshake { stderr_tail, .. } if stderr_tail.is_empty()
+        ));
+        assert!(!error.to_string().contains("stderr"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_client_handshake_with_a_server_flooding_stderr_still_completes() {
+        // パイプのバッファ（64 KiB）を超えて stderr に書いてから答えるサーバ。
+        // 吸い続けていなければ、サーバが write で止まり、握手は沈黙の上限で落ちる
+        let script = format!(
+            "head -c 262144 /dev/zero | tr '\\0' x >&2; {}; exec sleep 30",
+            printed_frame(INITIALIZE_RESPONSE)
+        );
+        let client = Client::start(&ServerCommand {
+            wait_limits: WaitLimits {
+                silence: GENEROUS_LIMIT,
+                exit: SHORT_LIMIT,
+            },
+            ..fake_server(&script)
+        })
+        .expect("起動できる");
+
+        let session = client.handshake(&fixture_workspace_root());
+
+        assert!(session.is_ok(), "握手できる: {:?}", session.err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_client_handshake_with_a_broken_frame_stays_a_conversation_error() {
+        // 「サーバが黙った」以外まで起動失敗や沈黙として畳むと、直す先を取り違える
+        let client = Client::start(&fake_server("printf 'Bogus: 1\\r\\n\\r\\n'; exec sleep 30"))
+            .expect("起動できる");
+
+        let error = client
+            .handshake(&fixture_workspace_root())
+            .expect_err("フレームを読めない");
+
+        assert!(matches!(
+            error,
+            ClientError::Conversation(ConnectionError::Framing(FramingError::MissingContentLength))
+        ));
     }
 
     #[test]
