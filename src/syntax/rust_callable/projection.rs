@@ -5,9 +5,7 @@ use crate::source_position::SourcePosition;
 
 /// 直接囲む trait impl の関連型 RHS、束縛変数と宣言側の問い合わせ位置。
 pub(crate) struct RustProjectionSource {
-    declaration: String,
-    captures: Vec<String>,
-    references: Vec<TypeReference>,
+    definition: RustAssociatedDefinition,
     implemented_trait: TypeReference,
 }
 
@@ -16,13 +14,7 @@ impl RustProjectionSource {
     /// 別 impl の選択、入れ子の投影、条件付き・複数の定義は `None`。
     pub(crate) fn from_source(source: &str, position: SourcePosition) -> Option<Self> {
         let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
-        let projection = tree.named_descendants().into_iter().find(|node| {
-            node.kind() == "scoped_type_identifier"
-                && node
-                    .child_by_field_name("name")
-                    .and_then(|name| source_position_of(name, source))
-                    == Some(position)
-        })?;
+        let projection = projection_at(&tree, source, position)?;
         let function = ancestor_of_kind(projection, "function_item")?;
         let implementation = enclosing_impl_of(function)?;
         if signature_has_error(implementation) {
@@ -34,6 +26,45 @@ impl RustProjectionSource {
             return None;
         }
         let name = source.get(projection.child_by_field_name("name")?.byte_range())?;
+        let definition = RustAssociatedDefinition::from_nodes(implementation, name, source)?;
+        let trait_name = terminal_name_of(implemented)?;
+        Some(Self {
+            definition,
+            implemented_trait: TypeReference::new(
+                collapsed(source.get(implemented.byte_range())?),
+                source_position_of(trait_name, source)?,
+            ),
+        })
+    }
+
+    pub(crate) fn references(&self) -> &[TypeReference] {
+        self.definition.references()
+    }
+
+    pub(crate) fn implemented_trait(&self) -> &TypeReference {
+        &self.implemented_trait
+    }
+
+    /// 宣言側で解決した RHS と、使用側で代入する impl 型変数を束ねる。
+    pub(crate) fn resolution_with(
+        &self,
+        type_of: &dyn Fn(&str) -> Option<RustTypeResolution>,
+    ) -> Option<RustTypeResolution> {
+        self.definition.resolution_with(type_of)
+    }
+}
+
+/// trait impl に書かれた関連型定義 1 つの RHS と、使用側で代入する impl 型変数。
+///
+/// **captures は使用側の型変数名。** 直接囲む impl では impl 自身の型変数名。
+pub(crate) struct RustAssociatedDefinition {
+    declaration: String,
+    captures: Vec<String>,
+    references: Vec<TypeReference>,
+}
+
+impl RustAssociatedDefinition {
+    fn from_nodes(implementation: Node<'_>, name: &str, source: &str) -> Option<Self> {
         let body = implementation.child_by_field_name("body")?;
         let mut candidates = named_children_of(body).filter(|node| {
             node.kind() == "type_item"
@@ -69,24 +100,16 @@ impl RustProjectionSource {
             "type Projection{parameters} = {};",
             source.get(right.byte_range())?
         );
-        let trait_name = terminal_name_of(implemented)?;
         Some(Self {
             declaration,
             captures,
             references: spelling.references,
-            implemented_trait: TypeReference::new(
-                collapsed(source.get(implemented.byte_range())?),
-                source_position_of(trait_name, source)?,
-            ),
         })
     }
 
+    /// RHS に書かれた型名と、その宣言側ソースでの問い合わせ位置。
     pub(crate) fn references(&self) -> &[TypeReference] {
         &self.references
-    }
-
-    pub(crate) fn implemented_trait(&self) -> &TypeReference {
-        &self.implemented_trait
     }
 
     /// 宣言側で解決した RHS と、使用側で代入する impl 型変数を束ねる。
@@ -123,6 +146,21 @@ impl RustProjectionSource {
             captures: self.captures.clone(),
         })
     }
+}
+
+/// `position` に名前を持つ投影（`scoped_type_identifier`）。
+fn projection_at<'tree>(
+    tree: &'tree SyntaxTree<'_>,
+    source: &str,
+    position: SourcePosition,
+) -> Option<Node<'tree>> {
+    tree.named_descendants().into_iter().find(|node| {
+        node.kind() == "scoped_type_identifier"
+            && node
+                .child_by_field_name("name")
+                .and_then(|name| source_position_of(name, source))
+                == Some(position)
+    })
 }
 
 /// trait の関連型宣言を持つ trait 名の位置。impl の定義や自由な alias は `None`。
