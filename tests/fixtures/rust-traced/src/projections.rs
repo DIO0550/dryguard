@@ -9,6 +9,7 @@ pub trait Project<T> {
     fn wrap_plain<U>(value: (T, U)) -> (T, U);
     fn mismatch<U>(value: <Self as Project<U>>::Item) -> <Self as Project<U>>::Item where Self: Project<U>;
     fn foreign(value: <Self as Other>::Item) -> <Self as Other>::Item where Self: Other;
+    fn foreign_plain(value: u64) -> u64;
 }
 impl<T> Project<T> for Holder<T> {
     type Item = T;
@@ -20,6 +21,7 @@ impl<T> Project<T> for Holder<T> {
     fn wrap_plain<U>(value: (T, U)) -> (T, U) { value }
     fn mismatch<U>(value: <Self as Project<U>>::Item) -> <Self as Project<U>>::Item where Self: Project<U> { value }
     fn foreign(value: <Self as Other>::Item) -> <Self as Other>::Item { value }
+    fn foreign_plain(value: u64) -> u64 { value }
 }
 pub mod model {
     pub struct Twin;
@@ -44,6 +46,7 @@ impl<T> Other for Holder<T> {
 }
 impl<T> Holder<T> {
     pub fn outside(value: <Self as Other>::Item) -> u64 { value }
+    pub fn outside_plain(value: u64) -> u64 { value }
 }
 pub trait Limited {
     type Item;

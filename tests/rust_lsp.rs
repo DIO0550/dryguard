@@ -931,6 +931,8 @@ fn test_rust_associated_types_match_their_instantiated_right_hand_sides() {
         "outside",
         "mismatch",
         "foreign",
+        "foreign_plain",
+        "outside_plain",
         "unsupported",
         "borrowed",
     ] {
@@ -973,25 +975,123 @@ fn test_rust_associated_types_match_their_instantiated_right_hand_sides() {
             "{first} / {second}: {left:?} / {right:?}"
         );
     }
-    assert!(
-        matches!(&outcomes["other"], TypeSignatureOutcome::Normalized(_)),
-        "{:?}",
-        outcomes["other"]
-    );
-    for name in ["outside", "mismatch", "foreign"] {
-        assert_eq!(
-            outcomes[name],
-            TypeSignatureOutcome::UnopenedTypeName {
-                reason: UnopenedReason::UnresolvedAssociatedType
-            },
-            "{name}"
+    // 直接囲む impl とは別の trait（`Other`）の impl を選ぶ。`mismatch` は where 句の対照
+    for (first, second) in [("foreign", "foreign_plain"), ("outside", "outside_plain")] {
+        let TypeSignatureOutcome::Normalized(left) = &outcomes[first] else {
+            panic!("{first}: {:?}", outcomes[first]);
+        };
+        let TypeSignatureOutcome::Normalized(right) = &outcomes[second] else {
+            panic!("{second}: {:?}", outcomes[second]);
+        };
+        assert!(
+            left.is_unifiable_with(right),
+            "{first} / {second}: {left:?} / {right:?}"
         );
     }
+    assert_eq!(
+        outcomes["mismatch"],
+        TypeSignatureOutcome::UnopenedTypeName {
+            reason: UnopenedReason::UnresolvedAssociatedType
+        }
+    );
     for name in ["unsupported", "borrowed"] {
         assert_eq!(
             outcomes[name],
             TypeSignatureOutcome::UnopenedTypeName {
                 reason: UnopenedReason::UnopenableAssociatedType
+            },
+            "{name}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_qualified_self_projections_select_the_impl_matching_target_and_trait_arguments() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/rust-traced/src/selections.rs");
+    let source = source_of(&path).expect("フィクスチャを読める");
+    let tree = SyntaxTree::from_source(&source, Grammar::Rust).expect("木にできる");
+    let document = SourceDocument::new(&path, source.clone()).expect("ドキュメントを作れる");
+    let root = WorkspaceRoot::enclosing(std::slice::from_ref(&path)).expect("根がある");
+    let mut session = Client::start(&ServerCommand::rust())
+        .expect("サーバを起動できる")
+        .handshake(&root)
+        .expect("握手できる");
+    session.open_document(&document).expect("開ける");
+    let mut outcomes = std::collections::BTreeMap::new();
+    for name in [
+        "inherent",
+        "inherent_plain",
+        "sixteen",
+        "sixteen_plain",
+        "wrapped",
+        "wrapped_plain",
+        "renamed",
+        "renamed_plain",
+        "distant",
+        "distant_plain",
+        "shown",
+        "shown_plain",
+        "owned",
+        "owned_plain",
+        "bounded",
+        "concrete",
+        "blanket",
+    ] {
+        // trait の宣言（本体なし）より後ろにある実装メソッドを採る
+        let index = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.contains(&format!("fn {name}(")) || line.contains(&format!("fn {name}<"))
+            })
+            .map(|(index, _)| index)
+            .last()
+            .expect("メソッドがある");
+        let location = Location::new(path.clone(), LineNumber::from_index(index));
+        let chunk = Chunk::find_enclosing(&location, &tree).expect("チャンクがある");
+        let outcome = rust_type_signature_outcome_of(
+            &mut session,
+            &document,
+            chunk.name_position().expect("名前がある"),
+            chunk.type_references(),
+            chunk.rust_impl_header(),
+        )
+        .expect("問い合わせ成功");
+        outcomes.insert(name, outcome);
+    }
+    session.shutdown().expect("終了できる");
+    let normalized = |name: &str| {
+        let TypeSignatureOutcome::Normalized(signature) = &outcomes[name] else {
+            panic!("{name}: {:?}", outcomes[name]);
+        };
+        signature.clone()
+    };
+    for (first, second, expected) in [
+        ("inherent", "inherent_plain", true),
+        ("sixteen", "sixteen_plain", true),
+        ("wrapped", "wrapped_plain", true),
+        ("renamed", "renamed_plain", true),
+        ("distant", "distant_plain", true),
+        ("shown", "shown_plain", true),
+        ("owned", "owned_plain", true),
+        // 同じ trait の別の trait 引数の impl を選んでいない
+        ("inherent", "sixteen_plain", false),
+        // 同名の別 trait の impl を選んでいない
+        ("renamed", "inherent_plain", false),
+    ] {
+        assert_eq!(
+            normalized(first).is_unifiable_with(&normalized(second)),
+            expected,
+            "{first} / {second}"
+        );
+    }
+    for name in ["bounded", "concrete", "blanket"] {
+        assert_eq!(
+            outcomes[name],
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::UnresolvedAssociatedType
             },
             "{name}"
         );
