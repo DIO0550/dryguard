@@ -538,6 +538,8 @@ mod tests {
             "impl<T> Holder<T> { fn f(x: <<Self as Other>::Item as Next>::Out) {} }",
             "impl<T> Holder<T> { fn f(x: <Self as Other>::Item) where Self: Other {} }",
             "impl<T> Holder<T> where Holder<T>: Other { fn f(x: <Self as Other>::Item) {} }",
+            "impl<T> Holder<T> where crate::Holder<T>: Other { fn f(x: <Self as Other>::Item) {} }",
+            "impl<T> Holder<T> { fn f(x: <Self as Other>::Item) where Holder<T,>: Other {} }",
             "impl<T> Other for Holder<T> { type Item = T; fn f(x: <Self as Other>::Item) {} }",
             "impl<T> Holder<T> { fn f(x: <Self as Other<Self>>::Item) {} }",
             "impl<T> Holder<T> { fn f(x: <Self as Other<Item = u8>>::Item) {} }",
@@ -562,6 +564,13 @@ mod tests {
             qualified_of("impl<T> Show for Holder<T> { fn f(x: <Self as Other>::Item) {} }")
                 .is_some(),
             "対照: 別の trait の impl からは選ぶ"
+        );
+        assert!(
+            qualified_of(
+                "impl<T> Holder<T> where T: Clone { fn f<U>(x: <Self as Other>::Item) where U: Copy {} }"
+            )
+            .is_some(),
+            "対照: 型変数そのものへの境界は param-env の候補にならない"
         );
     }
 
