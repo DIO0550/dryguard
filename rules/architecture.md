@@ -215,11 +215,15 @@ RHS の名前は定義側の位置から辿り、impl 型変数と GAT の型引
 - **選んでよい根拠は coherence。** 付け替えで一致し境界を持たない impl があれば、他の impl は
   重ならない。だから blanket impl を含む残りの候補を数えず、読めない候補も飛ばしてよい
 - **選ばないもの**（偽陰性側）: 型変数が具体的な型に当たる候補・境界や where 句・const 引数を
-  持つ候補・blanket impl（Issue #318）、使用側の where 句の左辺に Self か対象型が現れる形
-  （rustc も param-env を優先して正規化しない）、短縮形・入れ子の投影・RHS の Self（Issue #317）
-- **理由**: 候補が無い・一致しない・2 つ以上は `UnresolvedAssociatedType`。implementation を
-  提供しない・空・URI を読めないは、それぞれ `ImplementationNotProvided` /
-  `NoImplementationSite` / `UnreadableImplementation`。辿れなかった型名があればその理由
+  持つ候補・blanket impl（Issue #318）、属性（`cfg` など）付きの候補と `default impl`、
+  使用側の where 句に**左辺が型変数そのものでない述語**がある形（Self や対象型を別の綴りで
+  書いた param-env の候補でありうる。rustc も param-env を優先して正規化しない）、
+  短縮形・入れ子の投影・RHS の Self（Issue #317）
+- **理由**: implementation を提供しない・空は `ImplementationNotProvided` /
+  `NoImplementationSite`。一致が 2 つ以上なら `UnresolvedAssociatedType`。0 件なら、照合まで
+  進めたが辿れなかった候補の理由 → 候補のファイルを読めない（`UnreadableDeclaringDocument`）→
+  URI を読めない（`UnreadableImplementation`）→ `UnresolvedAssociatedType` の順
+  （`semantics::resolved_type` の `UnselectedImpls`）
 - **`const trait` は読めない。** tree-sitter-rust が `pub const trait` を構文エラーにするので、
   std の多くの trait（`Iterator` / `Deref` など）は所有 trait を照合できず
   `UnresolvedAssociatedType` に倒れる
