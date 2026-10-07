@@ -399,12 +399,9 @@ impl<'session> RustTypeResolver<'session> {
         if let Some(primitive) = primitive_spelling_of(hover.as_str()) {
             return Ok(Ok(RustTypeResolution::Opened(primitive)));
         }
-        let query = DeclarationQuery::Definition;
-        match query.ask(self.session, document, reference.position())? {
-            DeclarationSiteOutcome::Answered(site) => self.at_declaration(&site),
-            DeclarationSiteOutcome::NoAnswer => Ok(Err(query.no_answer())),
-            DeclarationSiteOutcome::Unreadable { .. } => Ok(Err(query.unreadable())),
-            DeclarationSiteOutcome::NotSupported => Ok(Err(query.not_provided())),
+        match DeclarationQuery::Definition.site_of(self.session, document, reference.position())? {
+            Ok(site) => self.at_declaration(&site),
+            Err(reason) => Ok(Err(reason)),
         }
     }
 
@@ -495,8 +492,8 @@ impl<'session> RustTypeResolver<'session> {
     /// **具体的な宣言元か、確かめたプリミティブ・開いた右辺が等しい**ときだけ一致とする。
     /// 綴りでは比べない（辿れなかった `Holder` 同士を一致にしない）。
     ///
-    /// 選べなければ、最初に辿れなかった理由、読めない候補があったこと、
-    /// `UnresolvedAssociatedType` の順で理由を返す。
+    /// 選べなかったときの理由は [`UnselectedImpls::reason_with`] が決める。選んだ impl に
+    /// 関連型定義が無い（`default type`・属性付き・複数を含む）ときは `UnresolvedAssociatedType`。
     ///
     /// # Errors
     ///
@@ -527,7 +524,10 @@ impl<'session> RustTypeResolver<'session> {
                 return Ok(Err(UnopenedReason::ImplementationNotProvided));
             }
         };
-        let mut failure = None;
+        let mut unselected = UnselectedImpls {
+            has_unreadable_site: has_unreadable,
+            ..UnselectedImpls::default()
+        };
         let mut used_names = Vec::new();
         let mut selected = Vec::new();
         for site in &sites {
@@ -537,8 +537,8 @@ impl<'session> RustTypeResolver<'session> {
             };
             let source = match source {
                 Ok(source) => source,
-                Err(reason) => {
-                    failure.get_or_insert(reason);
+                Err(_) => {
+                    unselected.has_unreadable_file = true;
                     continue;
                 }
             };
@@ -550,35 +550,28 @@ impl<'session> RustTypeResolver<'session> {
                 .find(|candidate| candidate.target_position() == site.position())
                 .filter(|candidate| candidate.may_match(projection))
                 .cloned();
-            let Some(binding) = candidate
+            let Some((binding, candidate)) = candidate
                 .and_then(|candidate| Some((candidate.binding_with(projection)?, candidate)))
             else {
                 continue;
             };
             let Ok(candidate_document) = SourceDocument::new(site.path(), source.clone()) else {
-                failure.get_or_insert(UnopenedReason::UnreadableDeclaringDocument);
+                unselected.has_unreadable_file = true;
                 continue;
             };
             self.session.open_document(&candidate_document)?;
-            match self.names_agree(document, &candidate_document, &binding.0, &mut used_names)? {
-                NamesAgree::Yes => selected.push((binding.0, binding.1, candidate_document)),
+            match self.names_agree(document, &candidate_document, &binding, &mut used_names)? {
+                NamesAgree::Yes => selected.push((binding, candidate, candidate_document)),
                 NamesAgree::No => {}
                 NamesAgree::Untraced(reason) => {
-                    failure.get_or_insert(reason);
+                    unselected.untraced.get_or_insert(reason);
                 }
                 NamesAgree::UseSiteUntraced(reason) => return Ok(Err(reason)),
             }
         }
         let (binding, candidate, candidate_document) = match <[_; 1]>::try_from(selected) {
             Ok([selected]) => selected,
-            Err(selected) => {
-                let reason = match (selected.len(), failure) {
-                    (0, Some(reason)) => reason,
-                    (0, None) if has_unreadable => UnopenedReason::UnreadableImplementation,
-                    _ => UnopenedReason::UnresolvedAssociatedType,
-                };
-                return Ok(Err(reason));
-            }
+            Err(selected) => return Ok(Err(unselected.reason_with(selected.len()))),
         };
         let Some(definition) = RustAssociatedDefinition::from_impl_at(
             candidate_document.source(),
@@ -699,14 +692,7 @@ impl<'session> RustTypeResolver<'session> {
         if self.active.len() >= MAXIMUM_ALIAS_DEPTH {
             return Ok(Err(UnopenedReason::AliasExpansionLimit));
         }
-        let source = self
-            .sources
-            .entry(site.path().to_path_buf())
-            .or_insert_with(|| {
-                source_of(site.path()).map_err(|_| UnopenedReason::UnreadableDeclaringDocument)
-            })
-            .clone();
-        let source = match source {
+        let source = match self.source_of(site.path()) {
             Ok(source) => source,
             Err(reason) => return Ok(Err(reason)),
         };
@@ -769,6 +755,41 @@ impl<'session> RustTypeResolver<'session> {
             | RustTypeResolution::Unresolved
             | RustTypeResolution::Unopenable => Ok(Err(UnopenedReason::UnopenableAlias)),
         }
+    }
+}
+
+/// impl を 1 つに選べなかったときに、その理由を決める材料。
+#[derive(Debug, Default)]
+struct UnselectedImpls {
+    /// 候補側の型名を辿れなかった最初の理由。
+    untraced: Option<UnopenedReason>,
+    /// 候補のファイルを読めなかった、またはドキュメントにできなかったか。
+    has_unreadable_file: bool,
+    /// implementation が返した場所に、パスとして読めない URI があったか。
+    has_unreadable_site: bool,
+}
+
+impl UnselectedImpls {
+    /// 一致した候補の数から理由を決める。
+    ///
+    /// **2 つ以上一致したら、材料に関わらず `UnresolvedAssociatedType`。** coherence が
+    /// 成り立つなら起きない形で、辿れなかった候補を直しても 1 つに決まらない。
+    /// **0 件なら、照合まで進めたが辿れなかった候補を先に出す。** 読めないファイルは
+    /// 対象型の名前で絞る前に数えるので、無関係な impl のファイルも含みうる。
+    fn reason_with(self, matched: usize) -> UnopenedReason {
+        if matched > 0 {
+            return UnopenedReason::UnresolvedAssociatedType;
+        }
+        if let Some(reason) = self.untraced {
+            return reason;
+        }
+        if self.has_unreadable_file {
+            return UnopenedReason::UnreadableDeclaringDocument;
+        }
+        if self.has_unreadable_site {
+            return UnopenedReason::UnreadableImplementation;
+        }
+        UnopenedReason::UnresolvedAssociatedType
     }
 }
 
