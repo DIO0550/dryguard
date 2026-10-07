@@ -11,7 +11,8 @@ pub(crate) struct RustProjectionSource {
 
 impl RustProjectionSource {
     /// 使用位置と直接の trait impl が対応する関連型定義を読む。
-    /// 別 impl の選択、入れ子の投影、条件付き・複数の定義は `None`。
+    /// 別 impl の選択（[`super::RustQualifiedProjection`]）、入れ子の投影、
+    /// 条件付き・複数の定義は `None`。
     pub(crate) fn from_source(source: &str, position: SourcePosition) -> Option<Self> {
         let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
         let projection = projection_at(&tree, source, position)?;
@@ -56,7 +57,8 @@ impl RustProjectionSource {
 
 /// trait impl に書かれた関連型定義 1 つの RHS と、使用側で代入する impl 型変数。
 ///
-/// **captures は使用側の型変数名。** 直接囲む impl では impl 自身の型変数名。
+/// **captures は使用側の型変数名。** 直接囲む impl では impl 自身の型変数名、
+/// 別の impl を選んだときは束縛で写した使用側の名前（[`Self::with_captures`]）。
 pub(crate) struct RustAssociatedDefinition {
     declaration: String,
     captures: Vec<String>,
@@ -64,6 +66,27 @@ pub(crate) struct RustAssociatedDefinition {
 }
 
 impl RustAssociatedDefinition {
+    /// 対象型が `target_position` から始まる impl の、`name` の関連型定義を読む。
+    /// 見つからない・複数・属性付き・本体に構文エラー（`default type` を含む）は `None`。
+    pub(crate) fn from_impl_at(
+        source: &str,
+        target_position: SourcePosition,
+        name: &str,
+    ) -> Option<Self> {
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
+        let implementation = tree.named_descendants().into_iter().find(|node| {
+            node.kind() == "impl_item"
+                && node
+                    .child_by_field_name("type")
+                    .and_then(|target| source_position_of(target, source))
+                    == Some(target_position)
+        })?;
+        if implementation.child_by_field_name("body")?.has_error() {
+            return None;
+        }
+        Self::from_nodes(implementation, name, source)
+    }
+
     fn from_nodes(implementation: Node<'_>, name: &str, source: &str) -> Option<Self> {
         let body = implementation.child_by_field_name("body")?;
         let mut candidates = named_children_of(body).filter(|node| {
@@ -105,6 +128,12 @@ impl RustAssociatedDefinition {
             captures,
             references: spelling.references,
         })
+    }
+
+    /// impl 型変数の代わりに、使用側の型変数名を宣言順に代入する。
+    /// 個数が impl の型変数と揃わなければ `None`。
+    pub(crate) fn with_captures(self, captures: Vec<String>) -> Option<Self> {
+        (captures.len() == self.captures.len()).then_some(Self { captures, ..self })
     }
 
     /// RHS に書かれた型名と、その宣言側ソースでの問い合わせ位置。
@@ -149,7 +178,7 @@ impl RustAssociatedDefinition {
 }
 
 /// `position` に名前を持つ投影（`scoped_type_identifier`）。
-fn projection_at<'tree>(
+pub(super) fn projection_at<'tree>(
     tree: &'tree SyntaxTree<'_>,
     source: &str,
     position: SourcePosition,
@@ -185,7 +214,7 @@ pub(crate) fn associated_owner_position_of(
     source_position_of(owner.child_by_field_name("name")?, source)
 }
 
-fn ancestor_of_kind<'tree>(mut node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+pub(super) fn ancestor_of_kind<'tree>(mut node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
     while let Some(parent) = node.parent() {
         if parent.kind() == kind {
             return Some(parent);
@@ -217,7 +246,7 @@ fn is_direct_projection(path: Node<'_>, implemented: Node<'_>, source: &str) -> 
     direct_self && matching_trait_arguments
 }
 
-fn terminal_name_of(node: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn terminal_name_of(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "generic_type" => terminal_name_of(node.child_by_field_name("type")?),
         "scoped_type_identifier" => node.child_by_field_name("name"),

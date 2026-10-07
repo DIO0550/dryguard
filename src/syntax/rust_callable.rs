@@ -19,7 +19,11 @@ use crate::syntax::tree::{Grammar, SyntaxTree, source_position_of};
 use crate::syntax::type_reference::TypeReference;
 
 mod projection;
-pub(crate) use projection::{RustProjectionSource, associated_owner_position_of};
+pub(crate) use projection::{
+    RustAssociatedDefinition, RustProjectionSource, associated_owner_position_of,
+};
+mod selection;
+pub(crate) use selection::{RustImplBinding, RustImplCandidate, RustQualifiedProjection};
 mod array_length;
 pub(crate) use array_length::{
     ArithmeticOperator, ConstSyntaxError, RustArrayLengths, RustConstExpression, RustConstSource,

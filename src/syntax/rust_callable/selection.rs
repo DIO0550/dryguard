@@ -1,0 +1,409 @@
+//! Self を直接の対象にした完全修飾形の関連型について、別の impl を選ぶための構文情報。
+//!
+//! **選ぶのは、候補 impl の型変数を使用側の impl の型変数へ付け替えるだけで、
+//! trait 引数と対象型が一致する impl だけ。** coherence により、そうした impl があれば
+//! 他の impl は重ならないので、blanket impl を含む残りの候補を数えずに 1 つへ決められる。
+//! 型変数が具体的な型に当たる候補・境界や where 句を持つ候補は選ばない（偽陰性側）。
+//!
+//! **型名の同一性はここでは決めない。** 対応する位置の型名の組を返し、
+//! 宣言元の照合は `semantics::resolved_type` が両側のソースの位置から行う。
+
+use super::projection::{ancestor_of_kind, projection_at, terminal_name_of};
+use super::*;
+use crate::source_position::SourcePosition;
+
+/// 使用側の `<Self as Trait<Args>>::Name` と、直接囲む impl の文脈。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RustQualifiedProjection {
+    associated_name: String,
+    trait_position: SourcePosition,
+    target_name: String,
+    parameters: Vec<String>,
+    shapes: Vec<TypeShape>,
+}
+
+impl RustQualifiedProjection {
+    /// 使用位置の投影を読む。次のどれかなら `None`:
+    /// - 対象が `Self` 自体でない・短縮形（`Self::Name`）・入れ子の投影
+    /// - 直接囲む impl が同じ trait パスの impl（直接の impl の経路が答える）
+    /// - impl / メソッドの where 句の左辺に `Self` か対象型が現れる（param-env の候補が
+    ///   impl より優先され、rustc も投影を正規化しない）
+    /// - impl が const 引数を持つ・trait 引数に関連型の束縛や `Self` がある
+    pub(crate) fn from_source(source: &str, position: SourcePosition) -> Option<Self> {
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
+        let projection = projection_at(&tree, source, position)?;
+        let path = projection.child_by_field_name("path")?;
+        if path.kind() != "bracketed_type" {
+            return None;
+        }
+        let qualified = named_children_of(path).next()?;
+        let direct_self = qualified.kind() == "qualified_type"
+            && qualified
+                .child_by_field_name("type")
+                .is_some_and(|node| source.get(node.byte_range()) == Some(SELF_TYPE));
+        if !direct_self {
+            return None;
+        }
+        let projected_trait = qualified.child_by_field_name("alias")?;
+        let function = ancestor_of_kind(projection, "function_item")?;
+        let implementation = enclosing_impl_of(function)?;
+        if signature_has_error(implementation) || signature_has_error(function) {
+            return None;
+        }
+        let same_trait_as_enclosing =
+            implementation
+                .child_by_field_name("trait")
+                .is_some_and(|implemented| {
+                    projection_name_of(implemented, source)
+                        == projection_name_of(projected_trait, source)
+                });
+        if same_trait_as_enclosing {
+            return None;
+        }
+        let target = implementation.child_by_field_name("type")?;
+        let target_text = collapsed(source.get(target.byte_range())?);
+        let constrains_self = [function, implementation]
+            .into_iter()
+            .flat_map(where_predicate_lefts_of)
+            .any(|left| {
+                let left = collapsed(source.get(left.byte_range()).unwrap_or_default());
+                left == SELF_TYPE || left == target_text
+            });
+        if constrains_self {
+            return None;
+        }
+        let parameters = type_parameter_names_of(implementation, source)?;
+        let mut shapes = trait_argument_shapes_of(projected_trait, source)?;
+        shapes.push(TypeShape::from_node(target, source)?);
+        Some(Self {
+            associated_name: source
+                .get(projection.child_by_field_name("name")?.byte_range())?
+                .to_owned(),
+            trait_position: source_position_of(terminal_name_of(projected_trait)?, source)?,
+            target_name: terminal_name_text_of(target, source)?,
+            parameters,
+            shapes,
+        })
+    }
+
+    /// 投影の末尾の関連型の名前（`Item`）。
+    pub(crate) fn associated_name(&self) -> &str {
+        &self.associated_name
+    }
+
+    /// trait パスの末尾の名前。implementation と definition をここへ尋ねる。
+    pub(crate) fn trait_position(&self) -> SourcePosition {
+        self.trait_position
+    }
+}
+
+/// implementation が返した impl 1 つの、照合に使う構文。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RustImplCandidate {
+    target_position: SourcePosition,
+    target_name: String,
+    parameters: Vec<String>,
+    shapes: Vec<TypeShape>,
+}
+
+impl RustImplCandidate {
+    /// 1 つのファイルにある trait impl のうち、照合できるものを読む。
+    ///
+    /// **選べない impl は入れない。** 型パラメータの境界・where 句・const 引数・負の impl・
+    /// 対象が型名で終わらない（blanket impl の `T` / 参照）・構文エラーのどれかがある impl。
+    /// 境界の充足を確かめずに選ぶと、境界を満たさない使用側にも RHS を当てはめてしまう。
+    pub(crate) fn candidates_of(source: &str) -> Vec<Self> {
+        let Ok(tree) = SyntaxTree::from_source(source, Grammar::Rust) else {
+            return Vec::new();
+        };
+        tree.named_descendants()
+            .into_iter()
+            .filter(|node| node.kind() == "impl_item")
+            .filter_map(|implementation| Self::from_node(implementation, source))
+            .collect()
+    }
+
+    fn from_node(implementation: Node<'_>, source: &str) -> Option<Self> {
+        if signature_has_error(implementation) {
+            return None;
+        }
+        let mut cursor = implementation.walk();
+        let negative = implementation
+            .children(&mut cursor)
+            .any(|child| child.kind() == "!");
+        let constrained = where_predicate_lefts_of(implementation).next().is_some()
+            || implementation
+                .child_by_field_name("type_parameters")
+                .is_some_and(|parameters| {
+                    named_children_of(parameters)
+                        .any(|parameter| parameter.child_by_field_name("bounds").is_some())
+                });
+        if negative || constrained {
+            return None;
+        }
+        let implemented = implementation.child_by_field_name("trait")?;
+        let target = implementation.child_by_field_name("type")?;
+        let parameters = type_parameter_names_of(implementation, source)?;
+        let target_name = terminal_name_text_of(target, source)?;
+        let blanket = parameters.contains(&target_name) && target.kind() == "type_identifier";
+        if blanket {
+            return None;
+        }
+        let mut shapes = trait_argument_shapes_of(implemented, source)?;
+        shapes.push(TypeShape::from_node(target, source)?);
+        Some(Self {
+            target_position: source_position_of(target, source)?,
+            target_name,
+            parameters,
+            shapes,
+        })
+    }
+
+    /// implementation が返す位置（対象型の始まり）。
+    pub(crate) fn target_position(&self) -> SourcePosition {
+        self.target_position
+    }
+
+    /// 対象型の末尾の名前が使用側と同じか。違えば LSP に尋ねずに飛ばしてよい。
+    ///
+    /// **別名（`use Holder as H`）で書かれた本物の候補も飛ばす。** 選べずに
+    /// `UnresolvedAssociatedType` へ倒れるだけで、別の impl を選ぶことはない
+    /// （coherence により、本物と重なる候補は他に無い）。
+    pub(crate) fn may_match(&self, projection: &RustQualifiedProjection) -> bool {
+        self.target_name == projection.target_name
+    }
+
+    /// 型変数の付け替えだけで使用側と一致するかを構文で確かめ、束縛と型名の組を返す。
+    ///
+    /// 一致しなければ `None`。候補の型変数が具体的な型・メソッドの型変数に当たる、
+    /// 束縛が食い違う、束縛されない型変数が残る、構文の形が違う、のどれか。
+    /// **型名の綴りは比べない** — 宣言元は呼び出し側が組ごとに照合する。
+    pub(crate) fn binding_with(
+        &self,
+        projection: &RustQualifiedProjection,
+    ) -> Option<RustImplBinding> {
+        if self.shapes.len() != projection.shapes.len() {
+            return None;
+        }
+        let mut walk = BindingWalk {
+            candidate_parameters: &self.parameters,
+            use_parameters: &projection.parameters,
+            bound: vec![None; self.parameters.len()],
+            names: Vec::new(),
+        };
+        for (candidate, used) in self.shapes.iter().zip(&projection.shapes) {
+            walk.walk(candidate, used)?;
+        }
+        let captures = walk.bound.into_iter().collect::<Option<Vec<_>>>()?;
+        Some(RustImplBinding {
+            captures,
+            names: walk.names,
+        })
+    }
+}
+
+/// 候補 impl と使用側の対応。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RustImplBinding {
+    captures: Vec<String>,
+    names: Vec<(TypeReference, TypeReference)>,
+}
+
+impl RustImplBinding {
+    /// 候補 impl の型変数を宣言順に並べたときの、束縛先の使用側の型変数名。
+    pub(crate) fn captures(&self) -> &[String] {
+        &self.captures
+    }
+
+    /// 同じ位置にあった型名の組（候補側, 使用側）。どちらも自分のソースの問い合わせ位置を持つ。
+    pub(crate) fn names(&self) -> &[(TypeReference, TypeReference)] {
+        &self.names
+    }
+}
+
+/// 型の構文を、照合に要る形だけ持ち出したもの。
+///
+/// **型名はパスごと 1 つの葉にする。** `super::Holder` と `Holder` は綴りが違っても
+/// 同じ宣言を指しうるので、形ではなく宣言元で比べる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypeShape {
+    /// 型名（パスを含む）・プリミティブ。宣言元で比べる。
+    Name(TypeReference),
+    /// ライフタイム。`'static` だけを区別する。
+    Lifetime { is_static: bool },
+    /// 子を持たない、その他の字句（`mut` など）。綴りで比べる。
+    Token { kind: String, text: String },
+    /// 子を持つ構文。種別と子の並びで比べる。
+    Node {
+        kind: String,
+        children: Vec<TypeShape>,
+    },
+}
+
+impl TypeShape {
+    /// 読めない構文（`Self`・関連型の束縛・マクロ・エラー）を含めば `None`。
+    fn from_node(node: Node<'_>, source: &str) -> Option<Self> {
+        let text = source.get(node.byte_range())?;
+        match node.kind() {
+            "type_identifier" | "scoped_type_identifier" if text == SELF_TYPE => None,
+            "type_identifier" | "primitive_type" => Some(Self::Name(TypeReference::new(
+                text.to_owned(),
+                source_position_of(node, source)?,
+            ))),
+            "scoped_type_identifier" => {
+                let path = node.child_by_field_name("path")?;
+                let simple_path = matches!(
+                    path.kind(),
+                    "identifier" | "scoped_identifier" | "super" | "crate" | "self"
+                );
+                if !simple_path {
+                    return None;
+                }
+                Some(Self::Name(TypeReference::new(
+                    collapsed(text),
+                    source_position_of(node.child_by_field_name("name")?, source)?,
+                )))
+            }
+            "lifetime" => Some(Self::Lifetime {
+                is_static: text == STATIC_LIFETIME,
+            }),
+            "type_binding" | "macro_invocation" | "ERROR" | "qualified_type" | "bracketed_type" => {
+                None
+            }
+            _ if node.named_child_count() == 0 => Some(Self::Token {
+                kind: node.kind().to_owned(),
+                text: text.to_owned(),
+            }),
+            _ => Some(Self::Node {
+                kind: node.kind().to_owned(),
+                children: named_children_of(node)
+                    .filter(|child| !COMMENT_KINDS.contains(&child.kind()))
+                    .map(|child| Self::from_node(child, source))
+                    .collect::<Option<_>>()?,
+            }),
+        }
+    }
+}
+
+struct BindingWalk<'a> {
+    candidate_parameters: &'a [String],
+    use_parameters: &'a [String],
+    bound: Vec<Option<String>>,
+    names: Vec<(TypeReference, TypeReference)>,
+}
+
+impl BindingWalk<'_> {
+    fn walk(&mut self, candidate: &TypeShape, used: &TypeShape) -> Option<()> {
+        let used_parameter = match used {
+            TypeShape::Name(name) => self
+                .use_parameters
+                .iter()
+                .any(|parameter| parameter == name.name())
+                .then(|| name.name().to_owned()),
+            _ => None,
+        };
+        if let TypeShape::Name(name) = candidate {
+            if let Some(index) = self
+                .candidate_parameters
+                .iter()
+                .position(|parameter| parameter == name.name())
+            {
+                // 具体的な型に当たる束縛は #318 の対象。ここでは使用側の型変数だけを受ける。
+                let used_parameter = used_parameter?;
+                return match &self.bound[index] {
+                    Some(bound) if *bound != used_parameter => None,
+                    _ => {
+                        self.bound[index] = Some(used_parameter);
+                        Some(())
+                    }
+                };
+            }
+        }
+        if used_parameter.is_some() {
+            return None;
+        }
+        match (candidate, used) {
+            (TypeShape::Name(candidate), TypeShape::Name(used)) => {
+                self.names.push((candidate.clone(), used.clone()));
+                Some(())
+            }
+            (
+                TypeShape::Lifetime {
+                    is_static: candidate,
+                },
+                TypeShape::Lifetime { is_static: used },
+            ) => (candidate == used).then_some(()),
+            (TypeShape::Token { .. }, TypeShape::Token { .. }) => (candidate == used).then_some(()),
+            (
+                TypeShape::Node {
+                    kind: candidate_kind,
+                    children: candidate_children,
+                },
+                TypeShape::Node {
+                    kind: used_kind,
+                    children: used_children,
+                },
+            ) => {
+                let same_shape =
+                    candidate_kind == used_kind && candidate_children.len() == used_children.len();
+                if !same_shape {
+                    return None;
+                }
+                for (candidate, used) in candidate_children.iter().zip(used_children) {
+                    self.walk(candidate, used)?;
+                }
+                Some(())
+            }
+            _ => None,
+        }
+    }
+}
+
+/// trait パスの型引数の形。型引数が無ければ空。
+fn trait_argument_shapes_of(implemented: Node<'_>, source: &str) -> Option<Vec<TypeShape>> {
+    if implemented.kind() != "generic_type" {
+        return Some(Vec::new());
+    }
+    let arguments = implemented.child_by_field_name("type_arguments")?;
+    named_children_of(arguments)
+        .filter(|child| !COMMENT_KINDS.contains(&child.kind()))
+        .map(|argument| TypeShape::from_node(argument, source))
+        .collect()
+}
+
+/// impl の型パラメータ名。ライフタイムは除き、const 引数があれば `None`。
+fn type_parameter_names_of(implementation: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let Some(parameters) = implementation.child_by_field_name("type_parameters") else {
+        return Some(Vec::new());
+    };
+    named_children_of(parameters)
+        .filter(|parameter| parameter.kind() != "lifetime_parameter")
+        .map(|parameter| {
+            if parameter.kind() != "type_parameter" {
+                return None;
+            }
+            Some(
+                source
+                    .get(parameter.child_by_field_name("name")?.byte_range())?
+                    .to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// 本体を除いた where 句の述語の左辺。
+fn where_predicate_lefts_of(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
+    named_children_of(node)
+        .filter(|child| child.kind() == "where_clause")
+        .flat_map(named_children_of)
+        .filter_map(|predicate| predicate.child_by_field_name("left"))
+}
+
+/// 対象型の末尾の名前の綴り。型名で終わらない（参照・タプルなど）なら `None`。
+fn terminal_name_text_of(target: Node<'_>, source: &str) -> Option<String> {
+    Some(
+        source
+            .get(terminal_name_of(target)?.byte_range())?
+            .to_owned(),
+    )
+}
