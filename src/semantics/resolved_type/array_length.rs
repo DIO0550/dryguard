@@ -292,10 +292,10 @@ impl<'session> ArrayLengthEvaluator<'session> {
 }
 
 fn validate_constant_hover(hover: &SignatureText, value: u64) -> Result<u64, UnopenedReason> {
-    let Some((_, right)) = hover.as_str().split_once(" = ") else {
+    let Some((_, right)) = hover.as_str().split_once('=') else {
         return Err(UnopenedReason::UnevaluableArrayLength);
     };
-    let right = right.trim().trim_end_matches(';');
+    let right = right.trim().trim_end_matches(';').trim();
     if let Ok(answered) = right.parse::<u64>() {
         if answered != value {
             return Err(UnopenedReason::UnevaluableArrayLength);
@@ -339,6 +339,54 @@ fn arithmetic_value_of(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_constant_hover_accepts_matching_value_with_flexible_whitespace() {
+        for spelling in [
+            "const COUNT: usize = 4",
+            "const COUNT: usize = 4 ; ",
+            "const COUNT: usize=4",
+            "const COUNT: usize\t=\t4;",
+            "const COUNT: usize\n=\n 4 ; \n",
+        ] {
+            let hover = SignatureText::new(spelling.to_owned()).expect("定数の hover");
+            assert_eq!(validate_constant_hover(&hover, 4), Ok(4), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn test_constant_hover_rejects_different_value_with_flexible_whitespace() {
+        for spelling in [
+            "const COUNT: usize = 5",
+            "const COUNT: usize = 5 ; ",
+            "const COUNT: usize=5",
+            "const COUNT: usize\t=\t5;",
+            "const COUNT: usize\n=\n 5 ; \n",
+        ] {
+            let hover = SignatureText::new(spelling.to_owned()).expect("定数の hover");
+            assert_eq!(
+                validate_constant_hover(&hover, 4),
+                Err(UnopenedReason::UnevaluableArrayLength),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_constant_hover_without_initializer_is_unevaluable() {
+        let hover = SignatureText::new("const COUNT: usize".to_owned()).expect("定数の hover");
+        assert_eq!(
+            validate_constant_hover(&hover, 4),
+            Err(UnopenedReason::UnevaluableArrayLength)
+        );
+    }
+
+    #[test]
+    fn test_constant_hover_with_symbolic_initializer_keeps_evaluated_source_value() {
+        let hover =
+            SignatureText::new("const COUNT: usize=BASE + 2".to_owned()).expect("定数の hover");
+        assert_eq!(validate_constant_hover(&hover, 4), Ok(4));
+    }
 
     #[test]
     fn test_array_correspondence_restores_each_parameter_and_return_occurrence() {

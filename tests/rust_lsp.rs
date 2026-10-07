@@ -1005,6 +1005,10 @@ fn test_rust_array_lengths_compare_values_in_declaration_scope() {
         .join("tests/fixtures/rust-array-lengths/src/lib.rs");
     let source = source_of(&path).expect("フィクスチャを読める");
     let tree = SyntaxTree::from_source(&source, Grammar::Rust).expect("構文木を作れる");
+    assert!(
+        !tree.named_descendants()[0].has_error(),
+        "usize の遮蔽を含め、フィクスチャに構文エラーがない"
+    );
     let document = SourceDocument::new(&path, source.clone()).expect("ドキュメントを作れる");
     let root = WorkspaceRoot::enclosing(std::slice::from_ref(&path)).expect("根を作れる");
     let mut session = Client::start(&ServerCommand::rust())
@@ -1014,7 +1018,7 @@ fn test_rust_array_lengths_compare_values_in_declaration_scope() {
     session.open_document(&document).expect("ソースを開ける");
     let mut outcomes = std::collections::BTreeMap::new();
     for (index, line) in source.lines().enumerate() {
-        let Some(function) = line.strip_prefix("pub fn ") else {
+        let Some(function) = line.trim_start().strip_prefix("pub fn ") else {
             continue;
         };
         let name = function.split(['(', '<']).next().expect("関数名");
@@ -1042,6 +1046,7 @@ fn test_rust_array_lengths_compare_values_in_declaration_scope() {
         "expression",
         "suffix",
         "commented",
+        "scoped_count",
     ] {
         let TypeSignatureOutcome::Normalized(other) = &outcomes[name] else {
             panic!("{name}: {:?}", outcomes[name]);
@@ -1053,7 +1058,14 @@ fn test_rust_array_lengths_compare_values_in_declaration_scope() {
     };
     assert!(
         !literal.is_unifiable_with(different),
-        "同名 COUNT は宣言側で異なる値"
+        "リテラルの長さ4と COUNT の値5は異なる"
+    );
+    let TypeSignatureOutcome::Normalized(scoped_count) = &outcomes["scoped_count"] else {
+        panic!("{:?}", outcomes["scoped_count"]);
+    };
+    assert!(
+        !scoped_count.is_unifiable_with(different),
+        "同名 COUNT も宣言側の値4と5を区別する"
     );
     let TypeSignatureOutcome::Normalized(nested) = &outcomes["nested"] else {
         panic!("{:?}", outcomes["nested"]);

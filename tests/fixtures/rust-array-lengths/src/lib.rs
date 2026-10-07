@@ -86,8 +86,14 @@ pub fn work_limit(a: [u8; DAG10]) {}
 pub fn expression_limit(a: [u8; (((((((((((((((((((((((((((((((((4)))))))))))))))))))))))))))))))))]) {}
 
 mod shadow {
+    // Why: usize と綴られていても、遮蔽された型を配列長のプリミティブとして扱わない。
     type usize = u8;
     const BAD: usize = 4;
-pub fn shadowed(a: [u8; BAD]) {}
+    pub fn shadowed(a: [u8; BAD]) {}
+}
+
+mod same_named {
+    use super::counts::COUNT;
+    pub fn scoped_count(a: [u8; COUNT]) -> [u8; 5] { [0; 5] }
 }
 pub fn nested_different(a: ([u8; 4], [[u8; 2]; 4])) -> [u8; 1] { [0; 1] }
