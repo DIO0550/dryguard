@@ -1209,6 +1209,18 @@ mod tests {
                 "unopenable-associated-type",
             ),
             (
+                UnopenedReason::ImplementationNotProvided,
+                "implementation-not-provided",
+            ),
+            (
+                UnopenedReason::NoImplementationSite,
+                "no-implementation-site",
+            ),
+            (
+                UnopenedReason::UnreadableImplementation,
+                "unreadable-implementation",
+            ),
+            (
                 UnopenedReason::UnevaluableArrayLength,
                 "unevaluable-array-length",
             ),

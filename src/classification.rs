@@ -1865,6 +1865,9 @@ mod tests {
                 UnopenedReason::UnopenableAlias,
                 UnopenedReason::CyclicAlias,
                 UnopenedReason::AliasExpansionLimit,
+                UnopenedReason::ImplementationNotProvided,
+                UnopenedReason::NoImplementationSite,
+                UnopenedReason::UnreadableImplementation,
             ]
             .into_iter()
             .map(|reason| TypeSignatureMatch::UnopenedTypeName { reason }),

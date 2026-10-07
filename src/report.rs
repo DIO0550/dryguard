@@ -1601,6 +1601,18 @@ mod tests {
                 "関連型の右辺または型引数を展開できない",
             ),
             (
+                UnopenedReason::ImplementationNotProvided,
+                "サーバが implementation を提供していない",
+            ),
+            (
+                UnopenedReason::NoImplementationSite,
+                "サーバが trait の impl の場所を答えない",
+            ),
+            (
+                UnopenedReason::UnreadableImplementation,
+                "implementation の応答を読めない",
+            ),
+            (
                 UnopenedReason::UnevaluableArrayLength,
                 "配列長の式または定数を一意に評価できない",
             ),
