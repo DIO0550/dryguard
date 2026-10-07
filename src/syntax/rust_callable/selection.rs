@@ -591,6 +591,9 @@ impl<T> Other for T { type Item = T; }
 impl<T> Other for &Holder<T> { type Item = T; }
 impl !Other for Plain {}
 impl<T, const N: usize> Other for Arr<T> { type Item = T; }
+#[cfg(test)]
+impl<T> Other for Tested<T> { type Item = T; }
+default impl<T> Other for Special<T> { type Item = T; }
 impl<T> Other for Single<T> { type Item = T; }";
         let candidates = RustImplCandidate::candidates_of(source);
         assert_eq!(
