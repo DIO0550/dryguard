@@ -235,6 +235,64 @@ mod tests {
     }
 
     #[test]
+    fn test_implementation_outcome_of_several_locations_keeps_every_impl() {
+        let locations = vec![
+            location("file:///repo/a.rs", 6, 22),
+            location("file:///repo/b.rs", 9, 23),
+        ];
+        let ImplementationOutcome::Answered {
+            sites,
+            has_unreadable,
+        } = implementation_outcome_of(&GotoDefinitionResponse::Array(locations))
+        else {
+            panic!("impl の場所が返る");
+        };
+        assert_eq!(
+            sites
+                .iter()
+                .map(|site| (site.path().to_path_buf(), site.position()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    PathBuf::from("/repo/a.rs"),
+                    SourcePosition::from_lsp_position(lsp_types::Position::new(6, 22))
+                ),
+                (
+                    PathBuf::from("/repo/b.rs"),
+                    SourcePosition::from_lsp_position(lsp_types::Position::new(9, 23))
+                ),
+            ]
+        );
+        assert!(!has_unreadable);
+    }
+
+    #[test]
+    fn test_implementation_outcome_drops_only_the_unreadable_location() {
+        let locations = vec![
+            location("untitled:Untitled-1", 0, 0),
+            location("file:///repo/b.rs", 9, 23),
+        ];
+        let ImplementationOutcome::Answered {
+            sites,
+            has_unreadable,
+        } = implementation_outcome_of(&GotoDefinitionResponse::Array(locations))
+        else {
+            panic!("読める件は残る");
+        };
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].path(), Path::new("/repo/b.rs"));
+        assert!(has_unreadable);
+    }
+
+    #[test]
+    fn test_implementation_outcome_of_no_locations_is_not_an_empty_answer() {
+        assert!(matches!(
+            implementation_outcome_of(&GotoDefinitionResponse::Array(Vec::new())),
+            ImplementationOutcome::NoAnswer
+        ));
+    }
+
+    #[test]
     fn test_unique_definition_keeps_ambiguous_declarations_without_picking_one() {
         let locations = vec![
             location("file:///repo/a.rs", 0, 0),

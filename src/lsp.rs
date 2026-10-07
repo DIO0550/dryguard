@@ -1027,6 +1027,32 @@ mod tests {
     }
 
     #[test]
+    fn test_provides_implementation_with_a_server_that_turned_it_off_is_false() {
+        let declared = |implementation_provider| ServerCapabilities {
+            implementation_provider,
+            ..ServerCapabilities::default()
+        };
+
+        assert!(provides_implementation(&declared(Some(
+            ImplementationProviderCapability::Simple(true)
+        ))));
+        assert!(!provides_implementation(&declared(Some(
+            ImplementationProviderCapability::Simple(false)
+        ))));
+        assert!(!provides_implementation(&declared(None)));
+    }
+
+    /// そのサーバができることとして references だけを宣言した capabilities。
+    fn capabilities_declaring_references(
+        references_provider: Option<OneOf<bool, lsp_types::ReferencesOptions>>,
+    ) -> ServerCapabilities {
+        ServerCapabilities {
+            references_provider,
+            ..ServerCapabilities::default()
+        }
+    }
+
+    #[test]
     fn test_provides_references_with_a_server_that_declares_it_is_true() {
         let capabilities = capabilities_declaring_references(Some(OneOf::Left(true)));
 
