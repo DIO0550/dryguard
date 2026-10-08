@@ -1865,9 +1865,15 @@ mod tests {
                 UnopenedReason::UnopenableAlias,
                 UnopenedReason::CyclicAlias,
                 UnopenedReason::AliasExpansionLimit,
+                UnopenedReason::UnresolvedAssociatedType,
                 UnopenedReason::ImplementationNotProvided,
                 UnopenedReason::NoImplementationSite,
                 UnopenedReason::UnreadableImplementation,
+                UnopenedReason::UnopenableAssociatedType,
+                UnopenedReason::UnevaluableArrayLength,
+                UnopenedReason::CyclicArrayLength,
+                UnopenedReason::ArrayLengthEvaluationLimit,
+                UnopenedReason::UnmatchedArrayLength,
             ]
             .into_iter()
             .map(|reason| TypeSignatureMatch::UnopenedTypeName { reason }),
