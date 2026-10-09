@@ -301,9 +301,12 @@ pub(crate) enum RustTypeResolution {
     Declared(String),
     Unresolved,
     Generic(RustGenericAlias),
+    /// 関連型の RHS。型引数は captures（使用側の型変数名）→ RHS の Self → GAT の順に当てる。
     Associated {
         alias: RustGenericAlias,
         captures: Vec<String>,
+        /// RHS に単独の Self があり、使用側の impl の対象型を当てるか。
+        substitutes_self: bool,
     },
     NotAnAlias,
     Unopenable,
@@ -1231,11 +1234,25 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
             RustTypeResolution::Generic(alias) => {
                 alias.instantiated(arguments, self.spelling_limit)
             }
-            RustTypeResolution::Associated { alias, captures } => {
-                let captured: Option<Vec<_>> = captures
+            RustTypeResolution::Associated {
+                alias,
+                captures,
+                substitutes_self,
+            } => {
+                let mut captured: Option<Vec<_>> = captures
                     .iter()
                     .map(|name| self.variable_spelling_of(name))
                     .collect();
+                // Why: RHS を書いた impl の対象型は、使用側の対象型と型変数の付け替えだけで一致する
+                // （直接囲む impl はそれ自身、別の impl は束縛と宣言元の照合で確かめてある）。
+                // 対象型に投影は現れないので、綴る途中でここへ再入しない。
+                if substitutes_self {
+                    let target = self.self_spelling();
+                    captured = captured.zip(target).map(|(mut captured, target)| {
+                        captured.push(target);
+                        captured
+                    });
+                }
                 match captured {
                     Some(mut captured) => {
                         captured.extend_from_slice(arguments);

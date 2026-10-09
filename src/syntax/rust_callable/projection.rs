@@ -59,9 +59,12 @@ impl RustProjectionSource {
 ///
 /// **captures は使用側の型変数名。** 直接囲む impl では impl 自身の型変数名、
 /// 別の impl を選んだときは束縛で写した使用側の名前（[`Self::with_captures`]）。
+/// RHS の単独の Self は captures に入れず、使用側の impl の対象型を当てる。
 pub(crate) struct RustAssociatedDefinition {
     declaration: String,
     captures: Vec<String>,
+    /// RHS の単独の Self を、impl の型パラメータの直後の型パラメータへ書き換えたか。
+    substitutes_self: bool,
     references: Vec<TypeReference>,
 }
 
@@ -109,23 +112,30 @@ impl RustAssociatedDefinition {
             parameter_texts.extend(parameter_names_of(parameters, source, false)?);
         }
         let captures = spelling.declared.clone();
+        let right = alias.child_by_field_name("type")?;
+        let self_parameter = fresh_parameter_name_of(source);
+        let right_text = match self_positions_of(right, source) {
+            Some(positions) if !positions.is_empty() => {
+                parameter_texts.push(self_parameter.clone());
+                replaced(source, right, &positions, &self_parameter)?
+            }
+            _ => source.get(right.byte_range())?.to_owned(),
+        };
+        let substitutes_self = parameter_texts.contains(&self_parameter);
         if let Some(parameters) = alias.child_by_field_name("type_parameters") {
             spelling.declared_type_parameters_of(parameters)?;
             parameter_texts.extend(parameter_names_of(parameters, source, true)?);
         }
-        let right = alias.child_by_field_name("type")?;
         spelling.spelling_of(right)??;
         let parameters = match parameter_texts.is_empty() {
             true => String::new(),
             false => format!("<{}>", parameter_texts.join(", ")),
         };
-        let declaration = format!(
-            "type Projection{parameters} = {};",
-            source.get(right.byte_range())?
-        );
+        let declaration = format!("type Projection{parameters} = {right_text};");
         Some(Self {
             declaration,
             captures,
+            substitutes_self,
             references: spelling.references,
         })
     }
@@ -165,6 +175,7 @@ impl RustAssociatedDefinition {
                     right,
                 },
                 captures: Vec::new(),
+                substitutes_self: false,
             });
         };
         let right = alias.child_by_field_name("type")?;
@@ -173,8 +184,59 @@ impl RustAssociatedDefinition {
         Some(RustTypeResolution::Associated {
             alias,
             captures: self.captures.clone(),
+            substitutes_self: self.substitutes_self,
         })
     }
+}
+
+/// RHS の中の単独の Self（`type_identifier`）の位置。
+/// 投影の中に Self があれば `None`（再帰投影は展開しない。書き換えずに今の理由へ倒す）。
+fn self_positions_of(right: Node<'_>, source: &str) -> Option<Vec<std::ops::Range<usize>>> {
+    let mut positions = Vec::new();
+    let mut pending = vec![right];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "scoped_type_identifier" && contains_self_type(node, source) {
+            return None;
+        }
+        let is_self =
+            node.kind() == "type_identifier" && source.get(node.byte_range()) == Some(SELF_TYPE);
+        if is_self {
+            positions.push(node.byte_range());
+        }
+        pending.extend(named_children_of(node));
+    }
+    positions.sort_by_key(|range| range.start);
+    Some(positions)
+}
+
+/// ソースのどこにも現れない、Self の代わりの型パラメータ名。
+///
+/// **大文字で始める。** 展開後の右辺に残る裸の識別子はプリミティブ・キーワード・型パラメータ
+/// だけで、どれとも衝突しない。ソースに無い名前なら、RHS の他の型名とも衝突しない。
+fn fresh_parameter_name_of(source: &str) -> String {
+    let mut name = "SelfTarget".to_owned();
+    while source.contains(&name) {
+        name.push('_');
+    }
+    name
+}
+
+/// `node` のソースのうち、`positions` の範囲を `name` へ置き換えた綴り。
+fn replaced(
+    source: &str,
+    node: Node<'_>,
+    positions: &[std::ops::Range<usize>],
+    name: &str,
+) -> Option<String> {
+    let mut output = String::new();
+    let mut start = node.start_byte();
+    for position in positions {
+        output.push_str(source.get(start..position.start)?);
+        output.push_str(name);
+        start = position.end;
+    }
+    output.push_str(source.get(start..node.end_byte())?);
+    Some(output)
 }
 
 /// `position` に名前を持つ投影（`scoped_type_identifier`）。
