@@ -200,7 +200,12 @@ hover に具体的な整数が残る場合は評価値との一致も確認し�
 所有 trait と impl の実装 trait の宣言位置を照合する。完全修飾形は対象が Self 自体で、
 trait と型引数が同じソースの束縛環境で一致するものに限る。
 RHS の名前は定義側の位置から辿り、impl 型変数と GAT の型引数はそれぞれの束縛元を保って
-正規化した後に代入する。条件付き・複数の定義、入れ子の投影は
+正規化した後に代入する。**RHS の単独の Self は使用側の impl の対象型を代入する**
+（`RustTypeResolution::Associated` の `substitutes_self`）。RHS を書いた impl の対象型は、
+直接囲む impl ならそれ自身、選んだ impl なら束縛と宣言元の照合で使用側の対象型と
+一致を確かめてあるので、候補側の構文から綴り直さない。そのため使用側のソースも、
+Self を含む投影を歩くときに対象型の型名を尋ねる位置として集める。
+条件付き・複数の定義、入れ子の投影・RHS の中の投影（`type Item = Self::Other`。Issue #327）は
 `UnresolvedAssociatedType`、未対応の RHS・ライフタイム GAT・型引数の不一致は
 `UnopenableAssociatedType`。具体的な型は関連型の名前や宣言元ではなく、展開した RHS で比べる。
 
@@ -218,7 +223,7 @@ RHS の名前は定義側の位置から辿り、impl 型変数と GAT の型引
   持つ候補・blanket impl（Issue #318）、属性（`cfg` など）付きの候補と `default impl`、
   使用側の where 句に**左辺が型変数そのものでない述語**がある形（Self や対象型を別の綴りで
   書いた param-env の候補でありうる。rustc も param-env を優先して正規化しない）、
-  短縮形・入れ子の投影・RHS の Self（Issue #317）
+  短縮形・入れ子の投影（Issue #327）
 - **理由**: implementation を提供しない・空は `ImplementationNotProvided` /
   `NoImplementationSite`。一致が 2 つ以上なら `UnresolvedAssociatedType`。0 件なら、照合まで
   進めたが辿れなかった候補の理由 → 候補のファイルを読めない（`UnreadableDeclaringDocument`）→
