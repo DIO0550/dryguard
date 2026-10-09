@@ -16,6 +16,12 @@ impl<X> Other<u16> for Holder<X> {
     type Item = u16;
     type Wrap<U> = U;
 }
+pub trait Echo {
+    type Me;
+}
+impl<X> Echo for Holder<X> {
+    type Me = (Self, X);
+}
 pub mod same_name {
     pub trait Other<A> {
         type Item;
@@ -57,6 +63,8 @@ impl<T> Holder<T> {
     pub fn renamed_plain(value: u64) -> u64 { value }
     pub fn distant(value: <Self as far::Far>::Out) -> Vec<T> { value }
     pub fn distant_plain(value: Vec<T>) -> Vec<T> { value }
+    pub fn echoed(value: <Self as Echo>::Me) -> T { value.1 }
+    pub fn echoed_plain(value: (Holder<T>, T)) -> T { value.1 }
     pub fn bounded(value: <Self as Other<u8>>::Item) -> <Self as Other<u8>>::Item where Self: Other<u8> { value }
 }
 impl<T> Show for Holder<T> {
