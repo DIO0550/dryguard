@@ -1245,7 +1245,6 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
                     .collect();
                 // Why: RHS を書いた impl の対象型は、使用側の対象型と型変数の付け替えだけで一致する
                 // （直接囲む impl はそれ自身、別の impl は束縛と宣言元の照合で確かめてある）。
-                // 対象型に投影は現れないので、綴る途中でここへ再入しない。
                 if substitutes_self {
                     let target = self.self_spelling();
                     captured = captured.zip(target).map(|(mut captured, target)| {
@@ -1421,8 +1420,8 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
     /// 別のモジュールの同名の型と重なる。
     fn scoped_type_spelling_of(&mut self, node: Node<'_>) -> Option<String> {
         if contains_self_type(node, self.source) {
-            // Why: RHS の Self は hover 側で対象型として綴られるので、その型名を尋ねる位置を
-            // ソース側でも集める。receiver の無い inherent impl のメソッドは他に対象型を歩かない。
+            // Why: RHS の Self は hover 側で対象型として綴られる。RHS はここでは分からないので、
+            // 使わない回も含めて投影ごとに対象型の型名を尋ねる（同じ綴りは 1 回）。
             if !self.from_hover && self.self_type.is_some() {
                 self.self_spelling()?;
             }

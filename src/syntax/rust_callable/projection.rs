@@ -114,12 +114,13 @@ impl RustAssociatedDefinition {
         let captures = spelling.declared.clone();
         let right = alias.child_by_field_name("type")?;
         let self_parameter = fresh_parameter_name_of(source);
-        let right_text = match self_positions_of(right, source) {
-            Some(positions) if !positions.is_empty() => {
+        let positions = self_positions_of(right, source);
+        let right_text = match positions.is_empty() {
+            true => source.get(right.byte_range())?.to_owned(),
+            false => {
                 parameter_texts.push(self_parameter.clone());
                 replaced(source, right, &positions, &self_parameter)?
             }
-            _ => source.get(right.byte_range())?.to_owned(),
         };
         let substitutes_self = parameter_texts.contains(&self_parameter);
         if let Some(parameters) = alias.child_by_field_name("type_parameters") {
@@ -190,14 +191,13 @@ impl RustAssociatedDefinition {
 }
 
 /// RHS の中の単独の Self（`type_identifier`）の位置。
-/// 投影の中に Self があれば `None`（再帰投影は展開しない。書き換えずに今の理由へ倒す）。
-fn self_positions_of(right: Node<'_>, source: &str) -> Option<Vec<std::ops::Range<usize>>> {
+///
+/// 投影のパスの Self（`Self::Other`）は `identifier` なので含まない。中の投影は書かれた
+/// 綴りのまま尋ねる型名になり、意味情報の側が `UnresolvedAssociatedType` で止める。
+fn self_positions_of(right: Node<'_>, source: &str) -> Vec<std::ops::Range<usize>> {
     let mut positions = Vec::new();
     let mut pending = vec![right];
     while let Some(node) = pending.pop() {
-        if node.kind() == "scoped_type_identifier" && contains_self_type(node, source) {
-            return None;
-        }
         let is_self =
             node.kind() == "type_identifier" && source.get(node.byte_range()) == Some(SELF_TYPE);
         if is_self {
@@ -206,13 +206,13 @@ fn self_positions_of(right: Node<'_>, source: &str) -> Option<Vec<std::ops::Rang
         pending.extend(named_children_of(node));
     }
     positions.sort_by_key(|range| range.start);
-    Some(positions)
+    positions
 }
 
 /// ソースのどこにも現れない、Self の代わりの型パラメータ名。
 ///
-/// **大文字で始める。** 展開後の右辺に残る裸の識別子はプリミティブ・キーワード・型パラメータ
-/// だけで、どれとも衝突しない。ソースに無い名前なら、RHS の他の型名とも衝突しない。
+/// **ソースに無い名前にする。** 展開後の右辺で置換される裸の識別子は型パラメータ名だけで
+/// （宣言元の印・付け替えた型変数は置換しない）、それらはどれもソースに書かれている。
 fn fresh_parameter_name_of(source: &str) -> String {
     let mut name = "SelfTarget".to_owned();
     while source.contains(&name) {
