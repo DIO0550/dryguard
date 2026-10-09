@@ -1048,6 +1048,8 @@ fn test_rust_qualified_self_projections_select_the_impl_matching_target_and_trai
         "anything",
         "anything_plain",
         "every",
+        "slice",
+        "slice_plain",
     ] {
         // trait の宣言（本体なし）より後ろにある実装メソッドを採る
         let index = source
@@ -1093,6 +1095,8 @@ fn test_rust_qualified_self_projections_select_the_impl_matching_target_and_trai
         ("declared", "declared_plain", true),
         // 境界の無い blanket impl は、型変数が Self 全体に当たる
         ("anything", "anything_plain", true),
+        // unsized な型の固有 impl は、blanket impl と両方一致しても型変数だけの当てはめを選ぶ
+        ("slice", "slice_plain", true),
         // 同じ trait の別の trait 引数の impl を選んでいない
         ("inherent", "sixteen_plain", false),
         // 同名の別 trait の impl を選んでいない

@@ -59,6 +59,11 @@ impl<T> Every for T {
 impl Every for Bytes {
     type Out = u16;
 }
+pub struct Slice([u8]);
+// 暗黙の `T: Sized` により Every の blanket impl と共存する。属性が無いので候補として読む
+impl Every for Slice {
+    type Out = u16;
+}
 pub trait Show {
     fn shown(value: u16) -> u16;
     fn shown_plain(value: u16) -> u16;
@@ -106,4 +111,8 @@ impl Unique {
 }
 impl Bytes {
     pub fn every(value: <Self as Every>::Out) -> u16 { value }
+}
+impl Slice {
+    pub fn slice(value: <Self as Every>::Out) -> u16 { value }
+    pub fn slice_plain(value: u16) -> u16 { value }
 }
