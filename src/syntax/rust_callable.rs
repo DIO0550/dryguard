@@ -1421,6 +1421,11 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
     /// 別のモジュールの同名の型と重なる。
     fn scoped_type_spelling_of(&mut self, node: Node<'_>) -> Option<String> {
         if contains_self_type(node, self.source) {
+            // Why: RHS の Self は hover 側で対象型として綴られるので、その型名を尋ねる位置を
+            // ソース側でも集める。receiver の無い inherent impl のメソッドは他に対象型を歩かない。
+            if !self.from_hover && self.self_type.is_some() {
+                self.self_spelling()?;
+            }
             let name = projection_name_of(node, self.source)?;
             if let Some(resolved) = (self.type_of)(&name)
                 .filter(|resolution| !matches!(resolution, RustTypeResolution::Unresolved))
