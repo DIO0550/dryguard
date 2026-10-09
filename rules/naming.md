@@ -112,6 +112,7 @@ if structurally_similar && domains_differ { ... }
 | `callee domain` | 呼び出し先が属する `domain`。ドメインごとの件数を持つ |
 | `progress` | サーバが自分で始めた作業（プロジェクトの読み込みなど）。作成の要求と、終わりの通知で挟まれる |
 | `silence limit` | サーバから何も届かないまま待つ上限。**要求ごとの合計時間ではなく、受け取った分を読み終えて待ち始めてから何も届かない時間**で数える。超えたサーバは kill し、以後は送らずに断る |
+| `intake limit` | サーバが送ったものを受け取らないまま待つ上限。`silence limit` の書き込み側で、**フレーム全体ではなく、書き込みの 1 塊（パイプのバッファより小さい）が受け取られないまま待つ時間**で数える。超えたサーバは kill し、書き口が以後の書き込みを待たずに断る（`lsp::child_input` の `IntakeLimitedWriter`） |
 | `source position` | ファイルの中の 1 点。行と、**UTF-16 のコード単位で数えた**列 |
 | `signature text` | hover に由来する型の綴り。Rust の配列長をソースから復元した後も含み、引数名・型変数名などの**型構造の正規化前** |
 | `type spelling` | 型 1 つ分の綴り。`signature text` を割った先の 1 つ（引数の型・戻り値の型・制約） |
