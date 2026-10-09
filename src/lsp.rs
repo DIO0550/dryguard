@@ -108,10 +108,11 @@ const RUST_PROJECT_MARKERS: [&str; 1] = ["Cargo.toml"];
 /// **狭く取ると、正常に遅いサーバを殺す側に倒れる。**
 const SILENCE_LIMIT: Duration = Duration::from_secs(120);
 
-/// サーバが送ったものを受け取らないまま待つ上限。書き込みの 1 塊ごとに数える。
+/// こちらが送ったものを、サーバが受け取らないまま待つ上限。書き込みの 1 塊ごとに数える。
 ///
-/// **沈黙の上限と揃える。** サーバは stdin を別スレッドで読むので普通はすぐ受け取り、
-/// 遅れるのは CPU を奪い合うときくらい。狭くする根拠になる実測が無い。
+/// **沈黙の上限と揃える。** 狭くする根拠になる実測が無い。サーバが stdin をどう読むか
+/// （読み取り専用のスレッドか、イベントループか）は確かめておらず、後者なら重い処理の間は
+/// 受け取らないので、狭く取ると正常に遅いサーバを殺す側に倒れうる。
 const INTAKE_LIMIT: Duration = SILENCE_LIMIT;
 
 /// `exit` を送ってから、子プロセスが終わるのを待つ上限。
@@ -383,7 +384,7 @@ impl Client {
         }
     }
 
-    /// 往復を 1 つ行う。沈黙の上限を超えたサーバには送らずに断る。
+    /// 往復を 1 つ行う。期限を超えたサーバには送らずに断る（受け取りの上限は書き口が断る）。
     ///
     /// **`ClientError` への直し方はここに 1 つだけ置く。** 往復ごとに直すと、
     /// 期限の見分けが漏れた経路だけ `Conversation` のまま出る。
@@ -1526,13 +1527,10 @@ mod tests {
     }
 
     /// パイプのバッファを超える中身のドキュメント。読まない相手には書き切れない。
-    ///
-    /// Linux の既定のバッファは 16 ページで、x86_64 では 64 KiB、64 KiB ページの
-    /// カーネルでは 1 MiB。どちらも超えるよう広く取る。
     fn larger_than_pipe_buffer_document() -> SourceDocument {
         SourceDocument::new(
             &repository_path(A_CANDIDATE_PAIR_FILE),
-            "x".repeat(4 * 1024 * 1024),
+            "x".repeat(child_input::MORE_THAN_PIPE_BUFFER),
         )
         .expect("ドキュメントにできる")
     }
@@ -1540,8 +1538,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_session_opening_a_large_document_on_a_server_that_does_not_read_reports_it() {
-        // 握手には答えたが、その後 stdin を読まないサーバ。パイプのバッファ（Linux で 64 KiB）を
-        // 超えるドキュメントは書き切れず、期限が無ければ `didOpen` の書き込みで止まり続ける
+        // 握手には答えたが、その後 stdin を読まないサーバ。パイプのバッファを超えるドキュメントは
+        // 書き切れず、期限が無ければ `didOpen` の書き込みで止まり続ける
         let script = format!("{}; exec sleep 30", printed_frame(INITIALIZE_RESPONSE));
         let limits = WaitLimits {
             intake: SHORT_LIMIT,

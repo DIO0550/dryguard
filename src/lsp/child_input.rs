@@ -15,6 +15,13 @@ use std::time::Duration;
 /// 塊がバッファより大きいと、読んでいる相手でも 1 塊を受け取り終えるまでに時間がかかる。
 const WRITE_CHUNK_BYTES: usize = 8 * 1024;
 
+/// パイプのバッファを超える量。読まない相手に書くと、途中で止まる。
+///
+/// Linux の既定のバッファは 16 ページで、x86_64 では 64 KiB、64 KiB ページの
+/// カーネルでは 1 MiB。どちらも超えるよう広く取る。
+#[cfg(test)]
+pub(super) const MORE_THAN_PIPE_BUFFER: usize = 4 * 1024 * 1024;
+
 /// 別スレッドへ書かせ、書き終わりを期限付きで待つ書き口。
 ///
 /// **期限は 1 塊が受け取られないまま待つ時間で数える。** 1 回の書き込みは
@@ -137,12 +144,6 @@ mod tests {
 
     /// 読まない相手に書いて、期限に触れさせるための期限。
     const SHORT_LIMIT: Duration = Duration::from_millis(300);
-
-    /// パイプのバッファを超える量。読まない相手に書くと、途中で止まる。
-    ///
-    /// Linux の既定のバッファは 16 ページで、x86_64 では 64 KiB、64 KiB ページの
-    /// カーネルでは 1 MiB。どちらも超えるよう広く取る。
-    const MORE_THAN_PIPE_BUFFER: usize = 4 * 1024 * 1024;
 
     #[test]
     #[cfg(unix)]
