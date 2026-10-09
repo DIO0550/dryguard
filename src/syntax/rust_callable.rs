@@ -19,7 +19,11 @@ use crate::syntax::tree::{Grammar, SyntaxTree, source_position_of};
 use crate::syntax::type_reference::TypeReference;
 
 mod projection;
-pub(crate) use projection::{RustProjectionSource, associated_owner_position_of};
+pub(crate) use projection::{
+    RustAssociatedDefinition, RustProjectionSource, associated_owner_position_of,
+};
+mod selection;
+pub(crate) use selection::{RustImplBinding, RustImplCandidate, RustQualifiedProjection};
 mod array_length;
 pub(crate) use array_length::{
     ArithmeticOperator, ConstSyntaxError, RustArrayLengths, RustConstExpression, RustConstSource,
@@ -610,24 +614,56 @@ enum AliasInstantiationError {
     ExpansionLimit,
 }
 
-/// AST で検証・分離した型識別子のトークンだけを置換する。
+/// 正規化した綴りの中の、型変数の名前の識別子だけを置換する。
 /// 導入した引数は再走査しないので、宣言側の別の型変数に捕捉されない。
+///
+/// **空白ではなく識別子の境界で切る。** 宣言元の型の型引数は `@type(..)<T>` のように
+/// 空白なしで綴られるので、空白で切ると `<T>` の `T` が置換されずに残り、
+/// 別の impl の同名の型変数と綴りで一致してしまう。
+/// 引用符の中（宣言元のパス）と、`%` / `@` / `'` に続く識別子（付け替えた型変数・
+/// 宣言元の印・ライフタイム）は置換しない。
 fn substituted(
     template: &str,
     substitutions: &[(&str, String)],
     limit: Option<usize>,
 ) -> Result<String, AliasInstantiationError> {
-    joined_with_limit(
-        template.split_whitespace().map(|token| {
-            substitutions
-                .iter()
-                .find(|(name, _)| *name == token)
-                .map_or(token, |(_, argument)| argument.as_str())
-        }),
-        " ",
-        limit,
-    )
-    .ok_or(AliasInstantiationError::ExpansionLimit)
+    let is_identifier = |character: char| character.is_alphanumeric() || character == '_';
+    let mut output = String::new();
+    let mut rest = template;
+    while let Some(first) = rest.chars().next() {
+        let (part, length) = match first {
+            '"' => {
+                let end = string_literal_end(rest, 0);
+                (&rest[..end], end)
+            }
+            '%' | '@' | '\'' => {
+                let end = first.len_utf8()
+                    + rest[first.len_utf8()..]
+                        .find(|character: char| !is_identifier(character))
+                        .unwrap_or(rest.len() - first.len_utf8());
+                (&rest[..end], end)
+            }
+            _ if is_identifier(first) => {
+                let end = rest
+                    .find(|character: char| !is_identifier(character))
+                    .unwrap_or(rest.len());
+                let token = &rest[..end];
+                let replaced = substitutions
+                    .iter()
+                    .find(|(name, _)| *name == token)
+                    .map_or(token, |(_, argument)| argument.as_str());
+                (replaced, end)
+            }
+            _ => (&rest[..first.len_utf8()], first.len_utf8()),
+        };
+        let within_limit = limit.is_none_or(|limit| output.len() + part.len() <= limit);
+        if !within_limit {
+            return Err(AliasInstantiationError::ExpansionLimit);
+        }
+        output.push_str(part);
+        rest = &rest[length..];
+    }
+    Ok(output)
 }
 
 /// 追加前に長さを確かめ、上限以上の中間文字列も作らない。
@@ -2135,6 +2171,37 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn test_substituted_replaces_whole_identifiers_outside_identities_and_placeholders() {
+        let substitutions = [
+            ("T", "X".to_owned()),
+            ("impl0", "Y".to_owned()),
+            ("static", "Z".to_owned()),
+        ];
+        let actual = substituted(
+            "(@type(\"a/T.rs\", 1, 2)<T>, TT, T, %impl0, &'static T, \"q\\\"T\")",
+            &substitutions,
+            None,
+        );
+        assert_eq!(
+            actual.ok().as_deref(),
+            Some("(@type(\"a/T.rs\", 1, 2)<X>, TT, X, %impl0, &'static X, \"q\\\"T\")")
+        );
+    }
+
+    #[test]
+    fn test_substituted_fails_only_when_the_result_exceeds_the_limit() {
+        let substitutions = [("T", "abc".to_owned())];
+        assert_eq!(
+            substituted("<T>", &substitutions, Some(5)).ok().as_deref(),
+            Some("<abc>")
+        );
+        assert!(matches!(
+            substituted("<T>", &substitutions, Some(4)),
+            Err(AliasInstantiationError::ExpansionLimit)
+        ));
+    }
 
     fn read(spelling: &str) -> RustCallable {
         RustCallable::from_spelling(spelling, &|_| None, None).expect("関数の綴りとして読める")

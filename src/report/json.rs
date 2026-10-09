@@ -753,6 +753,9 @@ fn unopened_name_of(reason: UnopenedReason) -> &'static str {
         UnopenedReason::AliasExpansionLimit => "alias-expansion-limit",
         UnopenedReason::UnresolvedAssociatedType => "unresolved-associated-type",
         UnopenedReason::UnopenableAssociatedType => "unopenable-associated-type",
+        UnopenedReason::ImplementationNotProvided => "implementation-not-provided",
+        UnopenedReason::NoImplementationSite => "no-implementation-site",
+        UnopenedReason::UnreadableImplementation => "unreadable-implementation",
         UnopenedReason::UnevaluableArrayLength => "unevaluable-array-length",
         UnopenedReason::CyclicArrayLength => "cyclic-array-length",
         UnopenedReason::ArrayLengthEvaluationLimit => "array-length-evaluation-limit",
@@ -1204,6 +1207,18 @@ mod tests {
             (
                 UnopenedReason::UnopenableAssociatedType,
                 "unopenable-associated-type",
+            ),
+            (
+                UnopenedReason::ImplementationNotProvided,
+                "implementation-not-provided",
+            ),
+            (
+                UnopenedReason::NoImplementationSite,
+                "no-implementation-site",
+            ),
+            (
+                UnopenedReason::UnreadableImplementation,
+                "unreadable-implementation",
             ),
             (
                 UnopenedReason::UnevaluableArrayLength,

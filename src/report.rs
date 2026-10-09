@@ -564,6 +564,15 @@ fn unopened_text_of(reason: UnopenedReason) -> &'static str {
         UnopenedReason::UnopenableAssociatedType => {
             "測れない (関連型の右辺または型引数を展開できない)"
         }
+        UnopenedReason::ImplementationNotProvided => {
+            "測れない (関連型の impl を選べない: サーバが implementation を提供していない)"
+        }
+        UnopenedReason::NoImplementationSite => {
+            "測れない (関連型の impl を選べない: サーバが trait の impl の場所を答えない)"
+        }
+        UnopenedReason::UnreadableImplementation => {
+            "測れない (関連型の impl を選べない: implementation の応答を読めない)"
+        }
         UnopenedReason::UnevaluableArrayLength => {
             "測れない (配列長の式または定数を一意に評価できない)"
         }
@@ -1590,6 +1599,18 @@ mod tests {
             (
                 UnopenedReason::UnopenableAssociatedType,
                 "関連型の右辺または型引数を展開できない",
+            ),
+            (
+                UnopenedReason::ImplementationNotProvided,
+                "サーバが implementation を提供していない",
+            ),
+            (
+                UnopenedReason::NoImplementationSite,
+                "サーバが trait の impl の場所を答えない",
+            ),
+            (
+                UnopenedReason::UnreadableImplementation,
+                "implementation の応答を読めない",
             ),
             (
                 UnopenedReason::UnevaluableArrayLength,

@@ -125,3 +125,5 @@ pub mod generic;
 pub mod alias_scope;
 
 pub mod projections;
+
+pub mod selections;

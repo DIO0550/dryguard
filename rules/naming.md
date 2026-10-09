@@ -100,6 +100,8 @@ if structurally_similar && domains_differ { ... }
 | `hover` | ソースの 1 点を指して、そこにある名前の型を尋ねる問い合わせ |
 | `type definition` | ソースの 1 点を指して、そこに書かれた型がどこで宣言されているかを尋ねる問い合わせ。**名前ではなく、その名前が指す型の宣言**を返す（Rust のエイリアスには空を返す） |
 | `definition` | ソースの 1 点を指して、**そこに書かれた名前**がどこで宣言されているかを尋ねる問い合わせ。Rust の型名はこちらで辿る（TypeScript では輸入した名前が import 文へ戻るので使わない） |
+| `implementation` | ソースの 1 点（trait パスの末尾の名前）を指して、その trait の impl を尋ねる問い合わせ。rust-analyzer は impl ごとに**対象型の範囲**を返し、全件を候補として持つ（先頭の 1 件に絞らない） |
+| `impl candidate` | `implementation` が返した impl 1 つ。**型変数の付け替えだけで**使用側の対象型・trait 引数と一致し、同じ位置の型名が同じ型（宣言元・確かめたプリミティブ・開いた右辺のどれか）を指すときだけ選ぶ（`syntax::rust_callable::RustImplCandidate`） |
 | `declaration site` | `type definition` / `definition` が返す宣言の場所。ファイルと、その中の 1 点 |
 | `references` | ソースの 1 点を指して、そこにある名前を使っているところを尋ねる問い合わせ |
 | `reference` | `references` が返す 1 件。**その名前を使っている側**のファイルの位置 |
@@ -137,7 +139,8 @@ if structurally_similar && domains_differ { ... }
 | `unifiable` | 2 つの `overload set` が同じ型構造に重なること（単一化可能） |
 
 `snippet` / `fragment` / `candidate`（chunk の意味で）/ `label`（verdict の意味で）は使わない。
-**`candidate` が指すのはペアであって chunk ではない。**
+**`candidate` が指すのはペアであって chunk ではない。** 例外は `impl candidate` で、
+必ず `impl` を前に付けて、関連型を展開するために選ぶ impl を指す（ペアの意味では使わない）。
 
 **`undersized chunk` の下限を `configured threshold` に入れない。** 判定に当てる閾値ではなく、
 **比べる相手を決める線引き**で、`--explain` が出す「当てた閾値」にも現れない。外から動かせると、

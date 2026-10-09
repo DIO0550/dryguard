@@ -5,24 +5,17 @@ use crate::source_position::SourcePosition;
 
 /// 直接囲む trait impl の関連型 RHS、束縛変数と宣言側の問い合わせ位置。
 pub(crate) struct RustProjectionSource {
-    declaration: String,
-    captures: Vec<String>,
-    references: Vec<TypeReference>,
+    definition: RustAssociatedDefinition,
     implemented_trait: TypeReference,
 }
 
 impl RustProjectionSource {
     /// 使用位置と直接の trait impl が対応する関連型定義を読む。
-    /// 別 impl の選択、入れ子の投影、条件付き・複数の定義は `None`。
+    /// 別 impl の選択（[`super::RustQualifiedProjection`]）、入れ子の投影、
+    /// 条件付き・複数の定義は `None`。
     pub(crate) fn from_source(source: &str, position: SourcePosition) -> Option<Self> {
         let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
-        let projection = tree.named_descendants().into_iter().find(|node| {
-            node.kind() == "scoped_type_identifier"
-                && node
-                    .child_by_field_name("name")
-                    .and_then(|name| source_position_of(name, source))
-                    == Some(position)
-        })?;
+        let projection = projection_at(&tree, source, position)?;
         let function = ancestor_of_kind(projection, "function_item")?;
         let implementation = enclosing_impl_of(function)?;
         if signature_has_error(implementation) {
@@ -34,6 +27,67 @@ impl RustProjectionSource {
             return None;
         }
         let name = source.get(projection.child_by_field_name("name")?.byte_range())?;
+        let definition = RustAssociatedDefinition::from_nodes(implementation, name, source)?;
+        let trait_name = terminal_name_of(implemented)?;
+        Some(Self {
+            definition,
+            implemented_trait: TypeReference::new(
+                collapsed(source.get(implemented.byte_range())?),
+                source_position_of(trait_name, source)?,
+            ),
+        })
+    }
+
+    pub(crate) fn references(&self) -> &[TypeReference] {
+        self.definition.references()
+    }
+
+    pub(crate) fn implemented_trait(&self) -> &TypeReference {
+        &self.implemented_trait
+    }
+
+    /// 宣言側で解決した RHS と、使用側で代入する impl 型変数を束ねる。
+    pub(crate) fn resolution_with(
+        &self,
+        type_of: &dyn Fn(&str) -> Option<RustTypeResolution>,
+    ) -> Option<RustTypeResolution> {
+        self.definition.resolution_with(type_of)
+    }
+}
+
+/// trait impl に書かれた関連型定義 1 つの RHS と、使用側で代入する impl 型変数。
+///
+/// **captures は使用側の型変数名。** 直接囲む impl では impl 自身の型変数名、
+/// 別の impl を選んだときは束縛で写した使用側の名前（[`Self::with_captures`]）。
+pub(crate) struct RustAssociatedDefinition {
+    declaration: String,
+    captures: Vec<String>,
+    references: Vec<TypeReference>,
+}
+
+impl RustAssociatedDefinition {
+    /// 対象型が `target_position` から始まる impl の、`name` の関連型定義を読む。
+    /// 見つからない・複数・属性付き・本体に構文エラー（`default type` を含む）は `None`。
+    pub(crate) fn from_impl_at(
+        source: &str,
+        target_position: SourcePosition,
+        name: &str,
+    ) -> Option<Self> {
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
+        let implementation = tree.named_descendants().into_iter().find(|node| {
+            node.kind() == "impl_item"
+                && node
+                    .child_by_field_name("type")
+                    .and_then(|target| source_position_of(target, source))
+                    == Some(target_position)
+        })?;
+        if implementation.child_by_field_name("body")?.has_error() {
+            return None;
+        }
+        Self::from_nodes(implementation, name, source)
+    }
+
+    fn from_nodes(implementation: Node<'_>, name: &str, source: &str) -> Option<Self> {
         let body = implementation.child_by_field_name("body")?;
         let mut candidates = named_children_of(body).filter(|node| {
             node.kind() == "type_item"
@@ -69,24 +123,22 @@ impl RustProjectionSource {
             "type Projection{parameters} = {};",
             source.get(right.byte_range())?
         );
-        let trait_name = terminal_name_of(implemented)?;
         Some(Self {
             declaration,
             captures,
             references: spelling.references,
-            implemented_trait: TypeReference::new(
-                collapsed(source.get(implemented.byte_range())?),
-                source_position_of(trait_name, source)?,
-            ),
         })
     }
 
-    pub(crate) fn references(&self) -> &[TypeReference] {
-        &self.references
+    /// impl 型変数の代わりに、使用側の型変数名を宣言順に代入する。
+    /// 個数が impl の型変数と揃わなければ `None`。
+    pub(crate) fn with_captures(self, captures: Vec<String>) -> Option<Self> {
+        (captures.len() == self.captures.len()).then_some(Self { captures, ..self })
     }
 
-    pub(crate) fn implemented_trait(&self) -> &TypeReference {
-        &self.implemented_trait
+    /// RHS に書かれた型名と、その宣言側ソースでの問い合わせ位置。
+    pub(crate) fn references(&self) -> &[TypeReference] {
+        &self.references
     }
 
     /// 宣言側で解決した RHS と、使用側で代入する impl 型変数を束ねる。
@@ -125,6 +177,21 @@ impl RustProjectionSource {
     }
 }
 
+/// `position` に名前を持つ投影（`scoped_type_identifier`）。
+pub(super) fn projection_at<'tree>(
+    tree: &'tree SyntaxTree<'_>,
+    source: &str,
+    position: SourcePosition,
+) -> Option<Node<'tree>> {
+    tree.named_descendants().into_iter().find(|node| {
+        node.kind() == "scoped_type_identifier"
+            && node
+                .child_by_field_name("name")
+                .and_then(|name| source_position_of(name, source))
+                == Some(position)
+    })
+}
+
 /// trait の関連型宣言を持つ trait 名の位置。impl の定義や自由な alias は `None`。
 pub(crate) fn associated_owner_position_of(
     source: &str,
@@ -147,7 +214,7 @@ pub(crate) fn associated_owner_position_of(
     source_position_of(owner.child_by_field_name("name")?, source)
 }
 
-fn ancestor_of_kind<'tree>(mut node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+pub(super) fn ancestor_of_kind<'tree>(mut node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
     while let Some(parent) = node.parent() {
         if parent.kind() == kind {
             return Some(parent);
@@ -179,7 +246,7 @@ fn is_direct_projection(path: Node<'_>, implemented: Node<'_>, source: &str) -> 
     direct_self && matching_trait_arguments
 }
 
-fn terminal_name_of(node: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn terminal_name_of(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "generic_type" => terminal_name_of(node.child_by_field_name("type")?),
         "scoped_type_identifier" => node.child_by_field_name("name"),
@@ -208,7 +275,7 @@ fn parameter_names_of(
         .collect()
 }
 
-fn has_attribute(node: Node<'_>) -> bool {
+pub(super) fn has_attribute(node: Node<'_>) -> bool {
     let mut preceding = node.prev_named_sibling();
     while let Some(previous) = preceding {
         if previous.kind() == "attribute_item" {
@@ -339,6 +406,35 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn test_associated_rhs_substitutes_impl_variables_inside_type_arguments_of_declared_types() {
+        let source = "impl<T> Named for Holder<T> { type Item = Vec<T>; fn f(x: Self::Item) {} }";
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).unwrap();
+        let function = tree
+            .named_descendants()
+            .into_iter()
+            .find(|node| node.kind() == "function_item")
+            .unwrap();
+        let references = type_references_of(function, source);
+        let reference = references
+            .iter()
+            .find(|reference| reference.name() == "Self::Item")
+            .unwrap();
+        let projection = RustProjectionSource::from_source(source, reference.position()).unwrap();
+        let declared =
+            |name: &str| (name == "Vec").then(|| RustTypeResolution::Declared("@vec".to_owned()));
+        let resolution = projection.resolution_with(&declared).unwrap();
+        let header = Some("impl<T> Named for Holder<T>");
+        let projected = RustCallable::from_spelling(
+            "fn f(x: Self::Item)",
+            &|name| (name == "Self::Item").then(|| resolution.clone()),
+            header,
+        )
+        .unwrap();
+        let explicit = RustCallable::from_spelling("fn f(x: Vec<T>)", &declared, header).unwrap();
+        assert_eq!(projected, explicit);
     }
 
     #[test]
