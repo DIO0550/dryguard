@@ -220,12 +220,13 @@ RHS の名前は定義側の位置から辿り、impl 型変数と GAT の型引
   `T` に Self 全体を当てはめる
 - **選んでよい根拠は coherence。** 当てはめで一致し境界を持たない impl があれば、他の impl は
   重ならない。だから残りの候補を数えず、読めない候補も飛ばしてよい
-- **ただし具体的な型を当てはめるなら、implementation が返した impl をすべて読んで照合し終えた
-  ときだけ選ぶ**（`semantics::resolved_type` の `UnselectedImpls::is_complete`）。境界の無い impl にも
-  暗黙の `Sized` があり、unsized な型（`str`・スライス・unsized な構造体）には別の impl が
-  共存できる。使用側の型変数は Sized なので型変数だけの当てはめでは穴にならない。
-  対象型の末尾の名前で飛ばした候補は照合し終えた側に数えるので、別名で書いた impl を
-  取りこぼす緩みは残る
+- **型変数だけを当てはめた候補が一致すれば、それを選ぶ。具体的な型を当てはめた候補は、
+  implementation が返した impl をすべて読んで照合し終えたときだけ選ぶ**（`semantics::resolved_type`
+  の `UnselectedImpls::chosen_from`）。境界の無い impl にも暗黙の `Sized` があり、unsized な型
+  （`str`・スライス・unsized な構造体）には別の impl が共存できる。使用側の型変数は Sized なので、
+  型変数だけの当てはめは確実に当てはまり、unsized な型の固有 impl と blanket impl が両方
+  一致しても固有 impl を選べる。対象型の末尾の名前が違う impl（候補として読めない impl を含む）は
+  照合し終えた側に数えるので、別名で書いた impl を取りこぼす緩みは残る
 - **選ばないもの**（偽陰性側）: 境界や where 句・const 引数を持つ候補（blanket impl を含む。
   境界を満たさない型には別の impl が共存できるので coherence では 1 つに決まらず、
   trait 解決が要る）、同じ型変数が 2 回以上現れて具体的な型に当たる候補（2 つが同じ型かを
@@ -233,12 +234,16 @@ RHS の名前は定義側の位置から辿り、impl 型変数と GAT の型引
   ライフタイムに当たる候補、属性（`cfg` など）付きの候補と `default impl`、
   使用側の where 句に**左辺が型変数そのものでない述語**がある形（Self や対象型を別の綴りで
   書いた param-env の候補でありうる。rustc も param-env を優先して正規化しない）、
+  使用側の対象が**境界つきの型変数そのもの**の形（`impl<T: Other> Show for T`。境界が Self への
+  param-env の候補で、supertrait 経由でも投影の trait を含みうる）、
   短縮形・入れ子の投影・RHS の Self（Issue #317）
 - **理由**: implementation を提供しない・空は `ImplementationNotProvided` /
   `NoImplementationSite`。一致が 2 つ以上なら `UnresolvedAssociatedType`。0 件なら、照合まで
   進めたが辿れなかった候補の理由 → 候補のファイルを読めない（`UnreadableDeclaringDocument`）→
   URI を読めない（`UnreadableImplementation`）→ `UnresolvedAssociatedType` の順
-  （`semantics::resolved_type` の `UnselectedImpls`）。選んだ候補に当てはめる具体的な型は、
+  （`semantics::resolved_type` の `UnselectedImpls`）。具体的な型を当てはめた候補が照合し終える前に
+  1 つ残ったときも 0 件と同じ順で決める（候補として読めない impl だけなら
+  `UnresolvedAssociatedType`）。選んだ候補に当てはめる具体的な型は、
   型名を辿れなければその理由、テンプレートにできなければ `UnopenableAssociatedType`
 - **`const trait` は読めない。** tree-sitter-rust が `pub const trait` を構文エラーにするので、
   std の多くの trait（`Iterator` / `Deref` など）は所有 trait を照合できず
