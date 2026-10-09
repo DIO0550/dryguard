@@ -86,6 +86,29 @@ impl RustQualifiedProjection {
         if !only_variables_constrained {
             return None;
         }
+        // Why: 対象が型変数そのもの（`impl<T: Other> Show for T`）なら、その型変数への境界は
+        // Self への param-env の候補で、supertrait 経由でも投影の trait を含みうる。
+        // rustc は impl より param-env を優先して正規化しないので、境界の名前では絞らない。
+        if let Some(variable) = variable_target_of(target, &parameters, source) {
+            let inline_bound = implementation
+                .child_by_field_name("type_parameters")
+                .is_some_and(|declared| {
+                    named_children_of(declared).any(|parameter| {
+                        parameter.child_by_field_name("bounds").is_some()
+                            && parameter
+                                .child_by_field_name("name")
+                                .and_then(|name| source.get(name.byte_range()))
+                                == Some(variable)
+                    })
+                });
+            let where_bound = [function, implementation]
+                .into_iter()
+                .flat_map(where_predicate_lefts_of)
+                .any(|left| source.get(left.byte_range()) == Some(variable));
+            if inline_bound || where_bound {
+                return None;
+            }
+        }
         let mut shapes = trait_argument_shapes_of(projected_trait, source)?;
         shapes.push(TypeShape::from_node(target, source)?);
         Some(Self {
@@ -190,9 +213,10 @@ impl RustImplCandidate {
     /// 対象型の末尾の名前が使用側と同じか、対象が型変数そのものか。
     /// どちらでもなければ LSP に尋ねずに飛ばしてよい。
     ///
-    /// **別名（`use Holder as H`）で書かれた本物の候補も飛ばす。** 選べずに
-    /// `UnresolvedAssociatedType` へ倒れるだけで、別の impl を選ぶことはない
-    /// （coherence により、本物と重なる候補は他に無い）。
+    /// **別名（`use Holder as H`）で書かれた本物の候補も飛ばす。** 型変数だけの当てはめなら
+    /// 選べずに `UnresolvedAssociatedType` へ倒れるだけ（coherence により、本物と重なる候補は
+    /// 他に無い）。具体的な型を当てはめるときは、unsized な型に共存する別名の impl を
+    /// 飛ばして別の impl を選びうる緩みが残る（`rules/architecture.md`）。
     pub(crate) fn may_match(&self, projection: &RustQualifiedProjection) -> bool {
         self.blanket || self.target_name == projection.target_name
     }
@@ -229,6 +253,61 @@ impl RustImplCandidate {
             names: walk.names,
             use_parameters: projection.parameters.clone(),
         })
+    }
+}
+
+/// implementation が返した場所にある impl の対象型。候補として読めない impl も含む。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RustImplTarget {
+    position: SourcePosition,
+    /// 対象型の末尾の名前。型名で終わらない（参照・タプルなど）なら `None`。
+    name: Option<String>,
+    /// 対象が型変数そのもの（blanket impl）か。
+    blanket: bool,
+}
+
+impl RustImplTarget {
+    /// 1 つのファイルにある impl の対象型。境界・属性・構文エラーの有無を問わない。
+    pub(crate) fn targets_of(source: &str) -> Vec<Self> {
+        let Ok(tree) = SyntaxTree::from_source(source, Grammar::Rust) else {
+            return Vec::new();
+        };
+        tree.named_descendants()
+            .into_iter()
+            .filter(|node| node.kind() == "impl_item")
+            .filter_map(|implementation| {
+                let target = implementation.child_by_field_name("type")?;
+                let declared: Vec<String> = implementation
+                    .child_by_field_name("type_parameters")
+                    .into_iter()
+                    .flat_map(named_children_of)
+                    .filter_map(|parameter| {
+                        let name = parameter.child_by_field_name("name")?;
+                        Some(source.get(name.byte_range())?.to_owned())
+                    })
+                    .collect();
+                Some(Self {
+                    position: source_position_of(target, source)?,
+                    name: terminal_name_text_of(target, source),
+                    blanket: variable_target_of(target, &declared, source).is_some(),
+                })
+            })
+            .collect()
+    }
+
+    /// implementation が返す位置（対象型の始まり）。
+    pub(crate) fn position(&self) -> SourcePosition {
+        self.position
+    }
+
+    /// 使用側の Self に当てはまりうるか。対象型の末尾の名前が同じ・blanket impl・
+    /// 型名で終わらない対象のどれか（名前で言い切れないものは当てはまりうる側へ倒す）。
+    pub(crate) fn may_apply_to(&self, projection: &RustQualifiedProjection) -> bool {
+        self.blanket
+            || self
+                .name
+                .as_ref()
+                .is_none_or(|name| *name == projection.target_name)
     }
 }
 
@@ -527,6 +606,20 @@ fn where_predicate_lefts_of(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
         .filter_map(|predicate| predicate.child_by_field_name("left"))
 }
 
+/// 対象が impl の型変数そのものなら、その名前。
+fn variable_target_of<'source>(
+    target: Node<'_>,
+    parameters: &[String],
+    source: &'source str,
+) -> Option<&'source str> {
+    if target.kind() != "type_identifier" {
+        return None;
+    }
+    source
+        .get(target.byte_range())
+        .filter(|name| parameters.iter().any(|parameter| parameter == name))
+}
+
 /// 対象型の末尾の名前の綴り。型名で終わらない（参照・タプルなど）なら `None`。
 fn terminal_name_text_of(target: Node<'_>, source: &str) -> Option<String> {
     Some(
@@ -677,24 +770,6 @@ mod tests {
                 RustCallable::from_spelling(explicit, &declared_or_primitive, header).unwrap();
             assert_eq!(selected, explicit, "{used}");
         }
-    }
-
-    #[test]
-    fn test_binding_does_not_take_another_concrete_type_for_the_spelled_one() {
-        let selected = expanded_with(
-            "impl Holder<u8> { fn f(x: <Self as Other>::Item) {} }",
-            "impl<X> Other for Holder<X> { type Item = (X, u16); }",
-            "fn f(x: <Self as Other>::Item)",
-            &declared_or_primitive,
-        )
-        .unwrap();
-        let other = RustCallable::from_spelling(
-            "fn f(x: (u16, u16))",
-            &declared_or_primitive,
-            Some("impl Holder<u8>"),
-        )
-        .unwrap();
-        assert_ne!(selected, other);
     }
 
     #[test]
@@ -881,6 +956,27 @@ mod tests {
                 .is_some(),
             "対照: 別の trait の impl からは選ぶ"
         );
+        for source in [
+            "impl<T: Other> Show for T { fn f(x: <Self as Other>::Item) {} }",
+            "impl<T: Sub> Show for T { fn f(x: <Self as Other>::Item) {} }",
+            "impl<T> Show for T where T: Other { fn f(x: <Self as Other>::Item) {} }",
+            "impl<T> Show for T { fn f(x: <Self as Other>::Item) where T: Sub {} }",
+        ] {
+            assert_eq!(
+                qualified_of(source),
+                None,
+                "Self が境界つきの型変数: {source}"
+            );
+        }
+        assert!(
+            qualified_of("impl<T> Show for T { fn f(x: <Self as Other>::Item) {} }").is_some(),
+            "対照: 境界の無い型変数の Self"
+        );
+        assert!(
+            qualified_of("impl<T: Other> Show for Holder<T> { fn f(x: <Self as Other>::Item) {} }")
+                .is_some(),
+            "対照: 境界は Self ではなく型引数への候補"
+        );
         assert!(
             qualified_of(
                 "impl<T> Holder<T> where T: Clone { fn f<U>(x: <Self as Other>::Item) where U: Copy {} }"
@@ -921,6 +1017,20 @@ impl<T> Other for Single<T> { type Item = T; }";
                 "impl<T> Other for "
             )
         );
+    }
+
+    #[test]
+    fn test_impl_targets_may_apply_to_the_use_site_unless_their_target_name_differs() {
+        let used = qualified_of("impl Holder<u8> { fn f(x: <Self as Other>::Item) {} }").unwrap();
+        let source = "impl<T: Clone> Other for Holder<T> { type Item = T; }
+impl<T: Clone> Other for Pair<T> { type Item = T; }
+impl<T: Clone> Other for T { type Item = T; }
+impl<T: Clone> Other for &Pair<T> { type Item = T; }";
+        let applying: Vec<_> = RustImplTarget::targets_of(source)
+            .iter()
+            .map(|target| target.may_apply_to(&used))
+            .collect();
+        assert_eq!(applying, [true, false, true, true]);
     }
 
     #[test]

@@ -23,7 +23,9 @@ pub(crate) use projection::{
     RustAssociatedDefinition, RustProjectionSource, associated_owner_position_of,
 };
 mod selection;
-pub(crate) use selection::{RustImplBinding, RustImplCandidate, RustQualifiedProjection};
+pub(crate) use selection::{
+    RustImplBinding, RustImplCandidate, RustImplTarget, RustQualifiedProjection,
+};
 mod array_length;
 pub(crate) use array_length::{
     ArithmeticOperator, ConstSyntaxError, RustArrayLengths, RustConstExpression, RustConstSource,
