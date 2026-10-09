@@ -13,7 +13,8 @@
 //! 型引数の当てはめを支え、引数のないエイリアスの右辺の名前は宣言側ソースから辿る。
 //! Self を含む関連型は、直接囲む trait impl の定義と trait の宣言元を照合して開く。
 //! 直接囲む impl が別の trait の impl・inherent impl なら、完全修飾形の trait の impl を
-//! implementation で集め、型変数の付け替えだけで対象型と trait 引数が一致する 1 つを選ぶ。
+//! implementation で集め、型変数に使用側の型を当てはめるだけで対象型と trait 引数が
+//! 一致する 1 つを選ぶ。
 //!
 //! **綴りを読む部分は LSP を呼ばない**ので、サーバが無くても確かめられる
 //! (`rules/tdd.md`「`lsp` は『応答を受け取ってから先』を切り出す」)。
@@ -486,14 +487,18 @@ impl<'session> RustTypeResolver<'session> {
         })
     }
 
-    /// 完全修飾形の trait の impl から、型変数の付け替えだけで一致する 1 つを選んで RHS を開く。
+    /// 完全修飾形の trait の impl から、型変数に使用側の型を当てはめるだけで一致する 1 つを
+    /// 選んで RHS を開く。
     ///
     /// 対応する位置の型名は、候補側はそのソースの位置から、使用側は使用位置から辿り、
     /// **具体的な宣言元か、確かめたプリミティブ・開いた右辺が等しい**ときだけ一致とする。
     /// 綴りでは比べない（辿れなかった `Holder` 同士を一致にしない）。
+    /// 候補の型変数に当たった使用側の具体的な型も、その型名を使用位置から辿って代入する。
     ///
     /// 選べなかったときの理由は [`UnselectedImpls::reason_with`] が決める。選んだ impl に
     /// 関連型定義が無い（`default type`・属性付き・複数を含む）ときは `UnresolvedAssociatedType`。
+    /// 代入する具体的な型の型名を辿れなければその理由、テンプレートにできなければ
+    /// `UnopenableAssociatedType`。
     ///
     /// # Errors
     ///
@@ -548,8 +553,11 @@ impl<'session> RustTypeResolver<'session> {
                 .or_insert_with(|| RustImplCandidate::candidates_of(&source))
                 .iter()
                 .find(|candidate| candidate.target_position() == site.position())
-                .filter(|candidate| candidate.may_match(projection))
                 .cloned();
+            if candidate.is_none() {
+                unselected.has_skipped_impl = true;
+            }
+            let candidate = candidate.filter(|candidate| candidate.may_match(projection));
             let Some((binding, candidate)) = candidate
                 .and_then(|candidate| Some((candidate.binding_with(projection)?, candidate)))
             else {
@@ -573,13 +581,41 @@ impl<'session> RustTypeResolver<'session> {
             Ok([selected]) => selected,
             Err(selected) => return Ok(Err(unselected.reason_with(selected.len()))),
         };
+        // Why: 境界の無い impl にも暗黙の `Sized` があり、unsized な型には別の impl が共存できる。
+        // 使用側の型変数は Sized なので穴にならないが、具体的な型を当てはめるなら
+        // 読めなかった・照合しなかった impl が残っている限り 1 つに決まらない。
+        if binding.binds_concrete_types() && !unselected.is_complete() {
+            return Ok(Err(unselected.reason_with(0)));
+        }
         let Some(definition) = RustAssociatedDefinition::from_impl_at(
             candidate_document.source(),
             candidate.target_position(),
             projection.associated_name(),
-        )
-        .and_then(|definition| definition.with_captures(binding.captures().to_vec())) else {
+        ) else {
             return Ok(Err(UnopenedReason::UnresolvedAssociatedType));
+        };
+        let mut captured = HashMap::new();
+        for reference in binding.capture_references() {
+            let cached = used_names
+                .iter()
+                .find(|(position, _)| *position == reference.position())
+                .map(|(_, resolution)| resolution.clone());
+            let resolution = match cached {
+                Some(resolution) => resolution,
+                None => self.reference_of(document, reference)?,
+            };
+            match resolution {
+                Ok(resolution) => {
+                    captured.insert(reference.name().to_owned(), resolution);
+                }
+                Err(reason) => return Ok(Err(reason)),
+            }
+        }
+        let Some(definition) = binding
+            .captures_with(&|name| captured.get(name).cloned())
+            .and_then(|captures| definition.with_captures(captures))
+        else {
+            return Ok(Err(UnopenedReason::UnopenableAssociatedType));
         };
         let mut resolved = HashMap::new();
         for reference in definition.references() {
@@ -767,6 +803,9 @@ struct UnselectedImpls {
     has_unreadable_file: bool,
     /// implementation が返した場所に、パスとして読めない URI があったか。
     has_unreadable_site: bool,
+    /// implementation が返した場所に、候補として読めない impl（境界・属性・マクロ生成など）が
+    /// あったか。
+    has_skipped_impl: bool,
 }
 
 impl UnselectedImpls {
@@ -776,6 +815,18 @@ impl UnselectedImpls {
     /// 成り立つなら起きない形で、辿れなかった候補を直しても 1 つに決まらない。
     /// **0 件なら、照合まで進めたが辿れなかった候補を先に出す。** 読めないファイルは
     /// 対象型の名前で絞る前に数えるので、無関係な impl のファイルも含みうる。
+    /// implementation が返した impl を、すべて読んで照合し終えたか。
+    ///
+    /// 対象型の末尾の名前で飛ばした候補は照合し終えた側に数える（別名で書いた本物の候補を
+    /// 取りこぼす緩みは残る）。
+    fn is_complete(&self) -> bool {
+        let incomplete = self.untraced.is_some()
+            || self.has_unreadable_file
+            || self.has_unreadable_site
+            || self.has_skipped_impl;
+        !incomplete
+    }
+
     fn reason_with(self, matched: usize) -> UnopenedReason {
         if matched > 0 {
             return UnopenedReason::UnresolvedAssociatedType;
@@ -1082,6 +1133,7 @@ mod tests {
             untraced: Some(UnopenedReason::NoDefinitionSite),
             has_unreadable_file: true,
             has_unreadable_site: true,
+            has_skipped_impl: true,
         };
         assert_eq!(unselected.reason_with(0), UnopenedReason::NoDefinitionSite);
     }
@@ -1105,6 +1157,31 @@ mod tests {
             unselected.reason_with(0),
             UnopenedReason::UnreadableImplementation
         );
+    }
+
+    #[test]
+    fn test_unselected_impls_are_complete_only_without_any_impl_left_unmatched() {
+        assert!(UnselectedImpls::default().is_complete(), "対照");
+        for incomplete in [
+            UnselectedImpls {
+                untraced: Some(UnopenedReason::UnopenableAlias),
+                ..UnselectedImpls::default()
+            },
+            UnselectedImpls {
+                has_unreadable_file: true,
+                ..UnselectedImpls::default()
+            },
+            UnselectedImpls {
+                has_unreadable_site: true,
+                ..UnselectedImpls::default()
+            },
+            UnselectedImpls {
+                has_skipped_impl: true,
+                ..UnselectedImpls::default()
+            },
+        ] {
+            assert!(!incomplete.is_complete(), "{incomplete:?}");
+        }
     }
 
     #[test]

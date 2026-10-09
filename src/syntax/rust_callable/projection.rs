@@ -57,11 +57,11 @@ impl RustProjectionSource {
 
 /// trait impl に書かれた関連型定義 1 つの RHS と、使用側で代入する impl 型変数。
 ///
-/// **captures は使用側の型変数名。** 直接囲む impl では impl 自身の型変数名、
-/// 別の impl を選んだときは束縛で写した使用側の名前（[`Self::with_captures`]）。
+/// **captures は使用側で代入するもの。** 直接囲む impl では impl 自身の型変数名、
+/// 別の impl を選んだときは束縛で写した使用側の型変数か具体的な型（[`Self::with_captures`]）。
 pub(crate) struct RustAssociatedDefinition {
     declaration: String,
-    captures: Vec<String>,
+    captures: Vec<RustCapture>,
     references: Vec<TypeReference>,
 }
 
@@ -108,7 +108,12 @@ impl RustAssociatedDefinition {
             spelling.declared_type_parameters_of(parameters)?;
             parameter_texts.extend(parameter_names_of(parameters, source, false)?);
         }
-        let captures = spelling.declared.clone();
+        let captures = spelling
+            .declared
+            .iter()
+            .cloned()
+            .map(RustCapture::Variable)
+            .collect();
         if let Some(parameters) = alias.child_by_field_name("type_parameters") {
             spelling.declared_type_parameters_of(parameters)?;
             parameter_texts.extend(parameter_names_of(parameters, source, true)?);
@@ -130,9 +135,9 @@ impl RustAssociatedDefinition {
         })
     }
 
-    /// impl 型変数の代わりに、使用側の型変数名を宣言順に代入する。
+    /// impl 型変数の代わりに、使用側の型変数・具体的な型を宣言順に代入する。
     /// 個数が impl の型変数と揃わなければ `None`。
-    pub(crate) fn with_captures(self, captures: Vec<String>) -> Option<Self> {
+    pub(crate) fn with_captures(self, captures: Vec<RustCapture>) -> Option<Self> {
         (captures.len() == self.captures.len()).then_some(Self { captures, ..self })
     }
 
