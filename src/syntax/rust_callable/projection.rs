@@ -633,34 +633,59 @@ mod tests {
     }
 
     #[test]
-    fn test_associated_rhs_with_self_inside_a_projection_is_not_opened() {
-        for right in ["Self::Other", "(Self, <Self as Other>::Out)"] {
-            let source = format!(
-                "impl<T> Project for Holder<T> {{ type Item = {right}; fn f(x: Self::Item) {{}} }}"
-            );
-            let tree = SyntaxTree::from_source(&source, Grammar::Rust).unwrap();
-            let function = tree
-                .named_descendants()
-                .into_iter()
-                .find(|node| node.kind() == "function_item")
-                .unwrap();
-            let references = type_references_of(function, &source);
-            let reference = references
+    fn test_associated_rhs_keeps_self_inside_projections_spelled_as_written() {
+        let source = "impl<T> Project for Holder<T> { type Item = (Self, Self::Other); fn f(x: Self::Item) {} }";
+        let header = Some("impl<T> Project for Holder<T>");
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).unwrap();
+        let function = tree
+            .named_descendants()
+            .into_iter()
+            .find(|node| node.kind() == "function_item")
+            .unwrap();
+        let references = type_references_of(function, source);
+        let reference = references
+            .iter()
+            .find(|reference| reference.name() == "Self::Item")
+            .unwrap();
+        let projection = RustProjectionSource::from_source(source, reference.position()).unwrap();
+        // 中の投影は書かれた綴りで尋ね、意味情報の側が辿る（今は理由付きで止まる）
+        assert!(
+            projection
+                .references()
                 .iter()
-                .find(|reference| reference.name() == "Self::Item")
+                .any(|inner| inner.name() == "Self::Other")
+        );
+        let inner = |name: &str| {
+            (name == "Self::Other").then(|| RustTypeResolution::Declared("@other".to_owned()))
+        };
+        assert!(projection.resolution_with(&|_| None).is_none(), "対照");
+        let resolution = projection.resolution_with(&inner).unwrap();
+        let actual = RustCallable::from_spelling(
+            "fn f(x: Self::Item)",
+            &|name| (name == "Self::Item").then(|| resolution.clone()),
+            header,
+        )
+        .unwrap();
+        let explicit =
+            RustCallable::from_spelling("fn f(x: (Holder<T>, Self::Other))", &inner, header)
                 .unwrap();
-            let projection =
-                RustProjectionSource::from_source(&source, reference.position()).unwrap();
-            // 中の投影は尋ねる型名として残り、意味情報の側が理由付きで止める
-            assert!(
-                projection
-                    .references()
-                    .iter()
-                    .any(|inner| inner.name().contains("Self")),
-                "{right}"
-            );
-            assert!(projection.resolution_with(&|_| None).is_none(), "{right}");
-        }
+        assert_eq!(actual, explicit);
+    }
+
+    #[test]
+    fn test_projection_in_an_inherent_impl_asks_for_the_type_names_of_its_target() {
+        let source = "impl<T> Holder<T> { fn f(x: <Self as Echo>::Me) {} }";
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).unwrap();
+        let function = tree
+            .named_descendants()
+            .into_iter()
+            .find(|node| node.kind() == "function_item")
+            .unwrap();
+        let names: Vec<_> = type_references_of(function, source)
+            .into_iter()
+            .map(|reference| reference.name().to_owned())
+            .collect();
+        assert_eq!(names, ["Holder", "<Self as Echo>::Me"]);
     }
 
     #[test]

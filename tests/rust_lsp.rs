@@ -933,8 +933,8 @@ fn test_rust_associated_types_match_their_instantiated_right_hand_sides() {
         "foreign",
         "foreign_plain",
         "outside_plain",
-        "unsupported",
-        "unsupported_plain",
+        "itself",
+        "itself_plain",
         "paired",
         "paired_plain",
         "again",
@@ -968,7 +968,7 @@ fn test_rust_associated_types_match_their_instantiated_right_hand_sides() {
         ("wrapped", "wrap_plain"),
         ("named", "named_plain"),
         // RHS の Self は、使用側の impl の対象型（`Holder<T>`）として展開する
-        ("unsupported", "unsupported_plain"),
+        ("itself", "itself_plain"),
         ("paired", "paired_plain"),
     ] {
         let TypeSignatureOutcome::Normalized(left) = &outcomes[first] else {
