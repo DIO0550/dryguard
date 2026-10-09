@@ -499,6 +499,170 @@ mod tests {
         assert_eq!(projected, explicit);
     }
 
+    /// `source` のメソッドの `name` の投影を、`hover` の綴りで展開した形。
+    fn projected_of(
+        source: &str,
+        name: &str,
+        hover: &str,
+        header: Option<&str>,
+        type_of: &dyn Fn(&str) -> Option<RustTypeResolution>,
+    ) -> RustCallable {
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).unwrap();
+        let function = tree
+            .named_descendants()
+            .into_iter()
+            .find(|node| node.kind() == "function_item")
+            .unwrap();
+        let references = type_references_of(function, source);
+        let reference = references
+            .iter()
+            .find(|reference| reference.name() == name)
+            .unwrap_or_else(|| panic!("投影を尋ねる: {source}"));
+        let projection = RustProjectionSource::from_source(source, reference.position())
+            .unwrap_or_else(|| panic!("直接囲む impl の定義を読む: {source}"));
+        let resolution = projection
+            .resolution_with(type_of)
+            .unwrap_or_else(|| panic!("RHS を開く: {source}"));
+        RustCallable::from_spelling(
+            hover,
+            &|candidate| match candidate == name {
+                true => Some(resolution.clone()),
+                false => type_of(candidate),
+            },
+            header,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_associated_rhs_self_becomes_the_impl_target_in_every_type_position() {
+        let header = Some("impl<T> Project for Holder<T>");
+        let declared =
+            |name: &str| (name == "Vec").then(|| RustTypeResolution::Declared("@vec".to_owned()));
+        for (right, expected) in [
+            ("Self", "Holder<T>"),
+            ("(Self, T)", "(Holder<T>, T)"),
+            ("Vec<Self>", "Vec<Holder<T>>"),
+            ("&'static Self", "&'static Holder<T>"),
+            ("[Self; 4]", "[Holder<T>; 4]"),
+            ("fn(Self) -> Self", "fn(Holder<T>) -> Holder<T>"),
+        ] {
+            let source = format!(
+                "impl<T> Project for Holder<T> {{ type Item = {right}; fn f(x: Self::Item) {{}} }}"
+            );
+            let actual = projected_of(
+                &source,
+                "Self::Item",
+                "fn f(x: Self::Item)",
+                header,
+                &declared,
+            );
+            let explicit =
+                RustCallable::from_spelling(&format!("fn f(x: {expected})"), &declared, header)
+                    .unwrap();
+            assert_eq!(actual, explicit, "{right}");
+            assert!(!actual.refers_to_self(), "{right}");
+        }
+    }
+
+    #[test]
+    fn test_associated_rhs_self_comes_after_impl_variables_and_before_gat_arguments() {
+        let source = "impl<A, B> Project for Pair<A, B> { type Wrap<U> = (U, Self, B); fn f<V>(x: Self::Wrap<V>) {} }";
+        let header = Some("impl<A, B> Project for Pair<A, B>");
+        let actual = projected_of(
+            source,
+            "Self::Wrap",
+            "fn f<V>(x: Self::Wrap<V>)",
+            header,
+            &|_| None,
+        );
+        let explicit =
+            RustCallable::from_spelling("fn f<V>(x: (V, Pair<A, B>, B))", &|_| None, header)
+                .unwrap();
+        assert_eq!(actual, explicit);
+    }
+
+    #[test]
+    fn test_associated_rhs_self_of_an_impl_without_type_parameters_is_its_target() {
+        let source = "impl Project for Plain { type Item = Self; fn f(x: Self::Item) {} }";
+        let header = Some("impl Project for Plain");
+        let actual = projected_of(source, "Self::Item", "fn f(x: Self::Item)", header, &|_| {
+            None
+        });
+        let explicit = RustCallable::from_spelling("fn f(x: Plain)", &|_| None, header).unwrap();
+        assert_eq!(actual, explicit);
+    }
+
+    #[test]
+    fn test_associated_rhs_self_stays_site_dependent_without_an_impl_context() {
+        let source = "impl Project for Plain { type Item = Self; fn f(x: Self::Item) {} }";
+        let actual = projected_of(source, "Self::Item", "fn f(x: Self::Item)", None, &|_| None);
+        assert!(actual.refers_to_self());
+    }
+
+    #[test]
+    fn test_associated_rhs_self_parameter_does_not_capture_a_type_with_the_same_spelling() {
+        let source = "pub struct SelfTarget; impl<T> Project for Holder<T> { type Item = (Self, SelfTarget); fn f(x: Self::Item) {} }";
+        let header = Some("impl<T> Project for Holder<T>");
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).unwrap();
+        let function = tree
+            .named_descendants()
+            .into_iter()
+            .find(|node| node.kind() == "function_item")
+            .unwrap();
+        let references = type_references_of(function, source);
+        let reference = references
+            .iter()
+            .find(|reference| reference.name() == "Self::Item")
+            .unwrap();
+        let projection = RustProjectionSource::from_source(source, reference.position()).unwrap();
+        let declared = |name: &str| {
+            (name == "SelfTarget").then(|| RustTypeResolution::Declared("@target".to_owned()))
+        };
+        let resolution = projection.resolution_with(&declared).unwrap();
+        let actual = RustCallable::from_spelling(
+            "fn f(x: Self::Item)",
+            &|name| (name == "Self::Item").then(|| resolution.clone()),
+            header,
+        )
+        .unwrap();
+        let explicit =
+            RustCallable::from_spelling("fn f(x: (Holder<T>, SelfTarget))", &declared, header)
+                .unwrap();
+        assert_eq!(actual, explicit);
+    }
+
+    #[test]
+    fn test_associated_rhs_with_self_inside_a_projection_is_not_opened() {
+        for right in ["Self::Other", "(Self, <Self as Other>::Out)"] {
+            let source = format!(
+                "impl<T> Project for Holder<T> {{ type Item = {right}; fn f(x: Self::Item) {{}} }}"
+            );
+            let tree = SyntaxTree::from_source(&source, Grammar::Rust).unwrap();
+            let function = tree
+                .named_descendants()
+                .into_iter()
+                .find(|node| node.kind() == "function_item")
+                .unwrap();
+            let references = type_references_of(function, &source);
+            let reference = references
+                .iter()
+                .find(|reference| reference.name() == "Self::Item")
+                .unwrap();
+            let projection =
+                RustProjectionSource::from_source(&source, reference.position()).unwrap();
+            // 中の投影は尋ねる型名として残り、意味情報の側が理由付きで止める
+            assert!(
+                projection
+                    .references()
+                    .iter()
+                    .any(|inner| inner.name().contains("Self")),
+                "{right}"
+            );
+            assert!(projection.resolution_with(&|_| None).is_none(), "{right}");
+        }
+    }
+
     #[test]
     fn test_associated_rhs_names_keep_their_declaration_scope() {
         let source = "impl<T> Project for Holder<T> { type Item = Payload; fn f<Payload>(x: Self::Item) {} }";

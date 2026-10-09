@@ -614,6 +614,37 @@ impl<T> Other for Single<T> { type Item = T; }";
     }
 
     #[test]
+    fn test_rhs_self_of_a_selected_impl_is_the_use_site_target_even_for_non_injective_bindings() {
+        let candidate_source = "impl<X, Y> Echo for Pair<X, Y> { type Me = (Self, Y); }";
+        let candidate = only_candidate_of(candidate_source).unwrap();
+        let used_source = "impl<T> Pair<T, T> { fn f(x: <Self as Echo>::Me) {} }";
+        let used = qualified_of(used_source).expect("使用側は読める");
+        let binding = candidate.binding_with(&used).expect("付け替えで一致する");
+        let definition = RustAssociatedDefinition::from_impl_at(
+            candidate_source,
+            candidate.target_position(),
+            "Me",
+        )
+        .unwrap()
+        .with_captures(binding.captures().to_vec())
+        .unwrap();
+        let resolution = definition.resolution_with(&|_| None).unwrap();
+        let header = Some("impl<T> Pair<T, T>");
+        let selected = RustCallable::from_spelling(
+            "fn f(x: <Self as Echo>::Me)",
+            &|name| name.contains("Echo").then(|| resolution.clone()),
+            header,
+        )
+        .unwrap();
+        let explicit =
+            RustCallable::from_spelling("fn f(x: (Pair<T, T>, T))", &|_| None, header).unwrap();
+        assert_eq!(selected, explicit);
+        let swapped =
+            RustCallable::from_spelling("fn f(x: (T, Pair<T, T>))", &|_| None, header).unwrap();
+        assert_ne!(selected, swapped, "対照: Self の位置を保つ");
+    }
+
+    #[test]
     fn test_associated_definition_of_a_selected_impl_takes_use_site_captures() {
         let source = "impl<Y, X> Other<Y> for Pair<X, Y> { type Item = (X, Y); }";
         let candidate = only_candidate_of(source).unwrap();
