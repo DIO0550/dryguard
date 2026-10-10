@@ -9,6 +9,7 @@
 //! | `message` | JSON-RPC の payload の組み立てと解釈 |
 //! | `connection` | 要求と応答の対応付け・ライフサイクル |
 //! | `child_output` | 子プロセスの出力を吸い続け、期限付きで受け取る |
+//! | `child_input` | 子プロセスの入力へ別スレッドで書き、期限付きで書き終わりを待つ |
 //! | `uri` | パスから `file:` URI への変換 |
 //! | `workspace` | サーバに見せるワークスペースの根 |
 //! | `document` | サーバに開かせるソースファイル |
@@ -25,6 +26,7 @@
 //! (rules/architecture.md「モジュールの公開 API」)。
 
 pub(crate) mod call_hierarchy;
+mod child_input;
 mod child_output;
 pub(crate) mod connection;
 pub(crate) mod declaration_site;
@@ -40,7 +42,7 @@ pub(crate) mod workspace;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, BufReader};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -51,6 +53,7 @@ use lsp_types::{
 
 use crate::source_position::SourcePosition;
 use crate::syntax::tree::Grammar;
+use child_input::IntakeLimitedWriter;
 use child_output::{SilenceLimitedReader, StderrTail};
 use connection::Connection;
 
@@ -105,6 +108,13 @@ const RUST_PROJECT_MARKERS: [&str; 1] = ["Cargo.toml"];
 /// **狭く取ると、正常に遅いサーバを殺す側に倒れる。**
 const SILENCE_LIMIT: Duration = Duration::from_secs(120);
 
+/// こちらが送ったものを、サーバが受け取らないまま待つ上限。書き込みの 1 塊ごとに数える。
+///
+/// **沈黙の上限と揃える。** 狭くする根拠になる実測が無い。サーバが stdin をどう読むか
+/// （読み取り専用のスレッドか、イベントループか）は確かめておらず、後者なら重い処理の間は
+/// 受け取らないので、狭く取ると正常に遅いサーバを殺す側に倒れうる。
+const INTAKE_LIMIT: Duration = SILENCE_LIMIT;
+
 /// `exit` を送ってから、子プロセスが終わるのを待つ上限。
 ///
 /// 同じ実測で、終わるまで最長 0.34 秒だった。
@@ -128,6 +138,8 @@ const STDERR_CLOSE_LIMIT: Duration = Duration::from_secs(1);
 struct WaitLimits {
     /// 何も届かないまま待つ上限。
     silence: Duration,
+    /// 送ったものが受け取られないまま待つ上限。
+    intake: Duration,
     /// `exit` の後に終了を待つ上限。
     exit: Duration,
 }
@@ -135,6 +147,7 @@ struct WaitLimits {
 impl WaitLimits {
     const HARDCODED: Self = Self {
         silence: SILENCE_LIMIT,
+        intake: INTAKE_LIMIT,
         exit: EXIT_LIMIT,
     };
 }
@@ -237,7 +250,7 @@ impl ServerCommand {
 #[derive(Debug)]
 pub struct Client {
     child: Child,
-    connection: Connection<BufReader<SilenceLimitedReader>, ChildStdin>,
+    connection: Connection<BufReader<SilenceLimitedReader>, IntakeLimitedWriter>,
     stderr: StderrTail,
     program: String,
     wait_limits: WaitLimits,
@@ -247,6 +260,9 @@ pub struct Client {
     /// **Why（断る）**: kill しても、サーバが起こした孫プロセスがパイプを握ったまま残ると
     /// 読み口は閉じない。送れば、もう 1 度期限まで待つ。理由も `ServerUnresponsive` のまま
     /// 保てる（`pipeline` は 1 つが落ちても残りを尋ねるので、後続は必ず来る）。
+    ///
+    /// **受け取りの上限はここで覚えない。** 書き口（[`IntakeLimitedWriter`]）自身が、
+    /// 超えた後の書き込みを待たずに断る。
     unresponsive: bool,
 }
 
@@ -282,6 +298,15 @@ impl Client {
             return Err(ClientError::PipesNotWired);
         };
 
+        let input = match IntakeLimitedWriter::spawn(stdin, command.wait_limits.intake) {
+            Ok(input) => input,
+            Err(cause) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ClientError::InputNotForwarded(cause));
+            }
+        };
+
         let drained = SilenceLimitedReader::spawn(stdout, command.wait_limits.silence)
             .and_then(|output| Ok((output, StderrTail::spawn(stderr)?)));
         let (output, stderr) = match drained {
@@ -295,7 +320,7 @@ impl Client {
 
         Ok(Self {
             child,
-            connection: Connection::new(BufReader::new(output), stdin)
+            connection: Connection::new(BufReader::new(output), input)
                 .with_language(command.language),
             stderr,
             program: command.program.clone(),
@@ -316,7 +341,8 @@ impl Client {
     ///
     /// 往復が失敗したとき。サーバが答えないまま接続を閉じた場合は
     /// [`ClientError::ServerClosedDuringHandshake`]、何も送ってこないまま期限を過ぎた場合は
-    /// [`ClientError::ServerUnresponsive`]。抜けた [`Client`] は `Drop` が kill する。
+    /// [`ClientError::ServerUnresponsive`]、送ったものを受け取らないまま期限を過ぎた場合は
+    /// [`ClientError::ServerNotReading`]。抜けた [`Client`] は `Drop` が kill する。
     pub fn handshake(mut self, root: &WorkspaceRoot) -> Result<Session, ClientError> {
         let capabilities = match self.connection.handshake(root) {
             Ok(capabilities) => capabilities,
@@ -358,10 +384,10 @@ impl Client {
         }
     }
 
-    /// 往復を 1 つ行う。沈黙の上限を超えたサーバには送らずに断る。
+    /// 往復を 1 つ行う。期限を超えたサーバには送らずに断る（受け取りの上限は書き口が断る）。
     ///
     /// **`ClientError` への直し方はここに 1 つだけ置く。** 往復ごとに直すと、
-    /// 沈黙の見分けが漏れた経路だけ `Conversation` のまま出る。
+    /// 期限の見分けが漏れた経路だけ `Conversation` のまま出る。
     ///
     /// # Errors
     ///
@@ -369,7 +395,7 @@ impl Client {
     fn converse<T>(
         &mut self,
         exchange: impl FnOnce(
-            &mut Connection<BufReader<SilenceLimitedReader>, ChildStdin>,
+            &mut Connection<BufReader<SilenceLimitedReader>, IntakeLimitedWriter>,
         ) -> Result<T, ConnectionError>,
     ) -> Result<T, ClientError> {
         if self.unresponsive {
@@ -379,18 +405,26 @@ impl Client {
         exchange(&mut self.connection).map_err(|cause| self.conversation_error_of(cause))
     }
 
-    /// 往復の失敗を、沈黙の上限を超えた場合とそれ以外に分ける。
+    /// 往復の失敗を、期限を超えた場合（どの期限か）とそれ以外に分ける。
     ///
     /// **超えたらその場で kill する。** 待ちをやめた後も生かしておくと、固まったサーバが
     /// `Drop` まで残る。
     fn conversation_error_of(&mut self, cause: ConnectionError) -> ClientError {
-        if !is_silence_exceeded(&cause) {
-            return ClientError::Conversation(cause);
+        if is_silence_exceeded(&cause) {
+            self.unresponsive = true;
+            self.terminate();
+            return self.unresponsive_error();
         }
 
-        self.unresponsive = true;
-        self.terminate();
-        self.unresponsive_error()
+        if is_intake_exceeded(&cause) {
+            self.terminate();
+            return ClientError::ServerNotReading {
+                program: self.program.clone(),
+                waited: self.wait_limits.intake,
+            };
+        }
+
+        ClientError::Conversation(cause)
     }
 
     fn unresponsive_error(&self) -> ClientError {
@@ -860,12 +894,19 @@ fn is_connection_closed(cause: &ConnectionError) -> bool {
 /// 往復の失敗が、沈黙の上限を超えたことによるものか。
 ///
 /// **`framing` に専用のバリアントを置かない。** 期限は区切りの話ではなく読み口
-/// （[`SilenceLimitedReader`]）の性質で、`TimedOut` を返すのはこの読み口だけ。
+/// （[`SilenceLimitedReader`]）の性質で、読み取りで `TimedOut` を返すのはこの読み口だけ。
 fn is_silence_exceeded(cause: &ConnectionError) -> bool {
     matches!(
         cause,
         ConnectionError::Framing(FramingError::Read(read)) if read.kind() == io::ErrorKind::TimedOut
     )
+}
+
+/// 往復の失敗が、受け取りの上限を超えたことによるものか。
+///
+/// 書き込みで `TimedOut` を返すのは書き口（[`IntakeLimitedWriter`]）だけ。
+fn is_intake_exceeded(cause: &ConnectionError) -> bool {
+    matches!(cause, ConnectionError::Send(sent) if sent.kind() == io::ErrorKind::TimedOut)
 }
 
 /// 起動の失敗を、実行ファイルが無い場合とそれ以外に分ける。
@@ -904,6 +945,8 @@ pub enum ClientError {
     PipesNotWired,
     /// 子プロセスの出力を吸うスレッドを作れなかった。
     OutputNotDrained(io::Error),
+    /// 子プロセスの入力へ書き込むスレッドを作れなかった。
+    InputNotForwarded(io::Error),
     /// 起動はしたが、握手に答えないまま接続（stdout か stdin）を閉じた。
     ///
     /// 子プロセスが終了したかまでは見ていない。閉じた時点で会話は続けられないので、
@@ -920,6 +963,16 @@ pub enum ClientError {
         program: String,
         /// 待った長さ。
         silence: Duration,
+    },
+    /// 送ったものを受け取らないまま、上限を超えた。サーバは kill 済み。
+    ///
+    /// **`ServerUnresponsive` と分ける。** stdin を読まないままログを流し続けるサーバもあり、
+    /// 「何も送ってこない」とは限らない。
+    ServerNotReading {
+        /// 受け取らなかった実行ファイル名。
+        program: String,
+        /// 1 塊が受け取られるのを待った長さ。
+        waited: Duration,
     },
     /// `exit` を送った後、期限までに終わらなかった。サーバは kill 済み。
     ExitTimedOut {
@@ -972,6 +1025,11 @@ impl fmt::Display for ClientError {
                 "LSP サーバ ({program}) が {} 秒のあいだ何も送ってこないため、止めました",
                 silence.as_secs_f64()
             ),
+            Self::ServerNotReading { program, waited } => write!(
+                formatter,
+                "LSP サーバ ({program}) が {} 秒のあいだ送ったものを受け取らないため、止めました",
+                waited.as_secs_f64()
+            ),
             Self::ExitTimedOut { program, waited } => write!(
                 formatter,
                 "LSP サーバ ({program}) が終了の通知から {} 秒たっても終わらないため、止めました",
@@ -980,6 +1038,10 @@ impl fmt::Display for ClientError {
             Self::OutputNotDrained(cause) => write!(
                 formatter,
                 "LSP サーバの出力を読むスレッドを作れません: {cause}"
+            ),
+            Self::InputNotForwarded(cause) => write!(
+                formatter,
+                "LSP サーバへ書き込むスレッドを作れません: {cause}"
             ),
             Self::Conversation(cause) => write!(formatter, "{cause}"),
             Self::Wait(cause) => {
@@ -999,11 +1061,14 @@ impl Error for ClientError {
             | Self::PipesNotWired
             | Self::ServerClosedDuringHandshake { .. }
             | Self::ServerUnresponsive { .. }
+            | Self::ServerNotReading { .. }
             | Self::ExitTimedOut { .. }
             | Self::AbnormalExit { .. } => None,
             Self::Spawn { cause, .. } => Some(cause),
             Self::Conversation(cause) => Some(cause),
-            Self::Wait(cause) | Self::OutputNotDrained(cause) => Some(cause),
+            Self::Wait(cause) | Self::OutputNotDrained(cause) | Self::InputNotForwarded(cause) => {
+                Some(cause)
+            }
         }
     }
 }
@@ -1365,6 +1430,7 @@ mod tests {
     /// 期限に触れないはずのテストが使う期限の組。
     const GENEROUS_LIMITS: WaitLimits = WaitLimits {
         silence: GENEROUS_LIMIT,
+        intake: GENEROUS_LIMIT,
         exit: GENEROUS_LIMIT,
     };
 
@@ -1456,6 +1522,71 @@ mod tests {
         let shutdown = session.shutdown();
         assert!(
             matches!(shutdown, Err(ClientError::ServerUnresponsive { .. })),
+            "{shutdown:?}"
+        );
+    }
+
+    /// パイプのバッファを超える中身のドキュメント。読まない相手には書き切れない。
+    fn larger_than_pipe_buffer_document() -> SourceDocument {
+        SourceDocument::new(
+            &repository_path(A_CANDIDATE_PAIR_FILE),
+            "x".repeat(child_input::MORE_THAN_PIPE_BUFFER),
+        )
+        .expect("ドキュメントにできる")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_session_opening_a_large_document_on_a_server_that_does_not_read_reports_it() {
+        // 握手には答えたが、その後 stdin を読まないサーバ。パイプのバッファを超えるドキュメントは
+        // 書き切れず、期限が無ければ `didOpen` の書き込みで止まり続ける
+        let script = format!("{}; exec sleep 30", printed_frame(INITIALIZE_RESPONSE));
+        let limits = WaitLimits {
+            intake: SHORT_LIMIT,
+            ..GENEROUS_LIMITS
+        };
+        let mut session = handshake_with(&script, limits).expect("握手できる");
+        let large = larger_than_pipe_buffer_document();
+
+        let started = Instant::now();
+        let error = session.open_document(&large).expect_err("書き切れない");
+
+        assert!(
+            matches!(
+                &error,
+                ClientError::ServerNotReading { program, waited }
+                    if program == "sh" && *waited == SHORT_LIMIT
+            ),
+            "{error:?}"
+        );
+        assert!(started.elapsed() < GENEROUS_LIMIT, "期限で戻る");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_session_after_the_server_stopped_reading_refuses_with_the_same_reason() {
+        // 見限った理由を後続にも出す。沈黙の理由に取り違えると「何も送ってこない」と嘘をつき、
+        // 送り直すと、もう 1 度期限まで待つ
+        let script = format!("{}; exec sleep 30", printed_frame(INITIALIZE_RESPONSE));
+        let limits = WaitLimits {
+            intake: SHORT_LIMIT,
+            ..GENEROUS_LIMITS
+        };
+        let mut session = handshake_with(&script, limits).expect("握手できる");
+        let large = larger_than_pipe_buffer_document();
+        let _ = session.open_document(&large);
+
+        let started = Instant::now();
+        let second = session.open_document(&fixture_document());
+
+        assert!(
+            matches!(second, Err(ClientError::ServerNotReading { .. })),
+            "{second:?}"
+        );
+        assert!(started.elapsed() < SHORT_LIMIT, "2 度目は待たずに断る");
+        let shutdown = session.shutdown();
+        assert!(
+            matches!(shutdown, Err(ClientError::ServerNotReading { .. })),
             "{shutdown:?}"
         );
     }
