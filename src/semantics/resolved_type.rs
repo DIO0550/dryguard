@@ -13,7 +13,8 @@
 //! 型引数の当てはめを支え、引数のないエイリアスの右辺の名前は宣言側ソースから辿る。
 //! Self を含む関連型は、直接囲む trait impl の定義と trait の宣言元を照合して開く。
 //! 直接囲む impl が別の trait の impl・inherent impl なら、完全修飾形の trait の impl を
-//! implementation で集め、型変数の付け替えだけで対象型と trait 引数が一致する 1 つを選ぶ。
+//! implementation で集め、型変数に使用側の型を当てはめるだけで対象型と trait 引数が
+//! 一致する 1 つを選ぶ。
 //!
 //! **綴りを読む部分は LSP を呼ばない**ので、サーバが無くても確かめられる
 //! (`rules/tdd.md`「`lsp` は『応答を受け取ってから先』を切り出す」)。
@@ -27,7 +28,7 @@ use crate::lsp::{
 };
 use crate::source_position::SourcePosition;
 use crate::syntax::rust_callable::{
-    RustAliasSource, RustAssociatedDefinition, RustImplBinding, RustImplCandidate,
+    RustAliasSource, RustAssociatedDefinition, RustImplBinding, RustImplCandidate, RustImplTarget,
     RustProjectionSource, RustQualifiedProjection, RustTypeResolution,
     associated_owner_position_of, primitive_references_of_alias, primitive_spelling_of,
 };
@@ -359,6 +360,7 @@ struct RustTypeResolver<'session> {
     session: &'session mut Session,
     sources: HashMap<std::path::PathBuf, Result<String, UnopenedReason>>,
     candidates: HashMap<std::path::PathBuf, Vec<RustImplCandidate>>,
+    targets: HashMap<std::path::PathBuf, Vec<RustImplTarget>>,
     terminals: Vec<(DeclarationSite, RustTypeResolution)>,
     active: Vec<DeclarationSite>,
 }
@@ -369,6 +371,7 @@ impl<'session> RustTypeResolver<'session> {
             session,
             sources: HashMap::new(),
             candidates: HashMap::new(),
+            targets: HashMap::new(),
             terminals: Vec::new(),
             active: Vec::new(),
         }
@@ -486,14 +489,19 @@ impl<'session> RustTypeResolver<'session> {
         })
     }
 
-    /// 完全修飾形の trait の impl から、型変数の付け替えだけで一致する 1 つを選んで RHS を開く。
+    /// 完全修飾形の trait の impl から、型変数に使用側の型を当てはめるだけで一致する 1 つを
+    /// 選んで RHS を開く。
     ///
     /// 対応する位置の型名は、候補側はそのソースの位置から、使用側は使用位置から辿り、
     /// **具体的な宣言元か、確かめたプリミティブ・開いた右辺が等しい**ときだけ一致とする。
     /// 綴りでは比べない（辿れなかった `Holder` 同士を一致にしない）。
+    /// 候補の型変数に当たった使用側の具体的な型も、その型名を使用位置から辿って代入する。
     ///
-    /// 選べなかったときの理由は [`UnselectedImpls::reason_with`] が決める。選んだ impl に
+    /// 一致した候補から 1 つを選ぶ規則と、選べなかったときの理由は
+    /// [`UnselectedImpls::chosen_from`] が決める。選んだ impl に
     /// 関連型定義が無い（`default type`・属性付き・複数を含む）ときは `UnresolvedAssociatedType`。
+    /// 代入する具体的な型の型名を辿れなければその理由、テンプレートにできなければ
+    /// `UnopenableAssociatedType`。
     ///
     /// # Errors
     ///
@@ -548,8 +556,20 @@ impl<'session> RustTypeResolver<'session> {
                 .or_insert_with(|| RustImplCandidate::candidates_of(&source))
                 .iter()
                 .find(|candidate| candidate.target_position() == site.position())
-                .filter(|candidate| candidate.may_match(projection))
                 .cloned();
+            if candidate.is_none() {
+                // Why: 対象型の名前が違う impl は Self に当てはまらないので、照合し終えた側に数える。
+                // 位置に impl が無い（マクロ生成など）なら何に当てはまるか分からない。
+                let may_apply = self
+                    .targets
+                    .entry(site.path().to_owned())
+                    .or_insert_with(|| RustImplTarget::targets_of(&source))
+                    .iter()
+                    .find(|target| target.position() == site.position())
+                    .is_none_or(|target| target.may_apply_to(projection));
+                unselected.has_skipped_impl |= may_apply;
+            }
+            let candidate = candidate.filter(|candidate| candidate.may_match(projection));
             let Some((binding, candidate)) = candidate
                 .and_then(|candidate| Some((candidate.binding_with(projection)?, candidate)))
             else {
@@ -561,7 +581,7 @@ impl<'session> RustTypeResolver<'session> {
             };
             self.session.open_document(&candidate_document)?;
             match self.names_agree(document, &candidate_document, &binding, &mut used_names)? {
-                NamesAgree::Yes => selected.push((binding, candidate, candidate_document)),
+                NamesAgree::Yes => selected.push((binding, (candidate, candidate_document))),
                 NamesAgree::No => {}
                 NamesAgree::Untraced(reason) => {
                     unselected.untraced.get_or_insert(reason);
@@ -569,17 +589,39 @@ impl<'session> RustTypeResolver<'session> {
                 NamesAgree::UseSiteUntraced(reason) => return Ok(Err(reason)),
             }
         }
-        let (binding, candidate, candidate_document) = match <[_; 1]>::try_from(selected) {
-            Ok([selected]) => selected,
-            Err(selected) => return Ok(Err(unselected.reason_with(selected.len()))),
+        let (binding, (candidate, candidate_document)) = match unselected.chosen_from(selected) {
+            Ok(chosen) => chosen,
+            Err(reason) => return Ok(Err(reason)),
         };
         let Some(definition) = RustAssociatedDefinition::from_impl_at(
             candidate_document.source(),
             candidate.target_position(),
             projection.associated_name(),
-        )
-        .and_then(|definition| definition.with_captures(binding.captures().to_vec())) else {
+        ) else {
             return Ok(Err(UnopenedReason::UnresolvedAssociatedType));
+        };
+        let mut captured = HashMap::new();
+        for reference in binding.capture_references() {
+            let cached = used_names
+                .iter()
+                .find(|(position, _)| *position == reference.position())
+                .map(|(_, resolution)| resolution.clone());
+            let resolution = match cached {
+                Some(resolution) => resolution,
+                None => self.reference_of(document, reference)?,
+            };
+            match resolution {
+                Ok(resolution) => {
+                    captured.insert(reference.name().to_owned(), resolution);
+                }
+                Err(reason) => return Ok(Err(reason)),
+            }
+        }
+        let Some(definition) = binding
+            .captures_with(&|name| captured.get(name).cloned())
+            .and_then(|captures| definition.with_captures(captures))
+        else {
+            return Ok(Err(UnopenedReason::UnopenableAssociatedType));
         };
         let mut resolved = HashMap::new();
         for reference in definition.references() {
@@ -767,9 +809,55 @@ struct UnselectedImpls {
     has_unreadable_file: bool,
     /// implementation が返した場所に、パスとして読めない URI があったか。
     has_unreadable_site: bool,
+    /// implementation が返した場所に、候補として読めない impl（境界・属性・マクロ生成など）が
+    /// あったか。
+    has_skipped_impl: bool,
 }
 
 impl UnselectedImpls {
+    /// 一致した候補から 1 つを選ぶ。選べなければその理由。
+    ///
+    /// **型変数だけを当てはめた候補が 1 つあれば、それを選ぶ。** 使用側の型変数は Sized なので
+    /// 確実に当てはまり、coherence により他の候補は当てはまらない（unsized な型の固有 impl と
+    /// 境界の無い blanket impl がどちらも一致する形）。
+    /// **具体的な型を当てはめた候補だけなら、それがちょうど 1 つで、implementation が返した
+    /// impl をすべて照合し終えたときだけ選ぶ。** 境界の無い impl にも暗黙の `Sized` があり、
+    /// unsized な型には読めなかった別の impl が共存できる。照合し終えていなければ
+    /// [`Self::reason_with`] の 0 件の理由（候補として読めない impl だけなら
+    /// `UnresolvedAssociatedType`）。
+    fn chosen_from<T>(
+        self,
+        selected: Vec<(RustImplBinding, T)>,
+    ) -> Result<(RustImplBinding, T), UnopenedReason> {
+        let (variables_only, concrete): (Vec<_>, Vec<_>) = selected
+            .into_iter()
+            .partition(|(binding, _)| !binding.binds_concrete_types());
+        let matched = variables_only.len() + concrete.len();
+        if let Ok([chosen]) = <[_; 1]>::try_from(variables_only) {
+            return Ok(chosen);
+        }
+        if matched != concrete.len() {
+            return Err(self.reason_with(matched));
+        }
+        match <[_; 1]>::try_from(concrete) {
+            Ok([chosen]) if self.is_complete() => Ok(chosen),
+            Ok(_) => Err(self.reason_with(0)),
+            Err(_) => Err(self.reason_with(matched)),
+        }
+    }
+
+    /// implementation が返した impl を、すべて読んで照合し終えたか。
+    ///
+    /// 対象型の末尾の名前が違う impl は照合し終えた側に数える（別名で書いた本物の impl を
+    /// 取りこぼす緩みは残る）。
+    fn is_complete(&self) -> bool {
+        let incomplete = self.untraced.is_some()
+            || self.has_unreadable_file
+            || self.has_unreadable_site
+            || self.has_skipped_impl;
+        !incomplete
+    }
+
     /// 一致した候補の数から理由を決める。
     ///
     /// **2 つ以上一致したら、材料に関わらず `UnresolvedAssociatedType`。** coherence が
@@ -1082,6 +1170,7 @@ mod tests {
             untraced: Some(UnopenedReason::NoDefinitionSite),
             has_unreadable_file: true,
             has_unreadable_site: true,
+            has_skipped_impl: true,
         };
         assert_eq!(unselected.reason_with(0), UnopenedReason::NoDefinitionSite);
     }
@@ -1104,6 +1193,122 @@ mod tests {
         assert_eq!(
             unselected.reason_with(0),
             UnopenedReason::UnreadableImplementation
+        );
+    }
+
+    #[test]
+    fn test_unselected_impls_are_complete_only_without_any_impl_left_unmatched() {
+        assert!(UnselectedImpls::default().is_complete(), "対照");
+        for incomplete in [
+            UnselectedImpls {
+                untraced: Some(UnopenedReason::UnopenableAlias),
+                ..UnselectedImpls::default()
+            },
+            UnselectedImpls {
+                has_unreadable_file: true,
+                ..UnselectedImpls::default()
+            },
+            UnselectedImpls {
+                has_unreadable_site: true,
+                ..UnselectedImpls::default()
+            },
+            UnselectedImpls {
+                has_skipped_impl: true,
+                ..UnselectedImpls::default()
+            },
+        ] {
+            assert!(!incomplete.is_complete(), "{incomplete:?}");
+        }
+    }
+
+    /// 使用側 `used` の投影について、候補 `candidates` を束縛した結果（どれも一致した扱い）。
+    fn bindings_of(used: &str, candidates: &[&str]) -> Vec<(RustImplBinding, usize)> {
+        let position = used
+            .find("<Self")
+            .map(|start| {
+                let name = start + used[start..].find(">::").expect("投影がある") + 3;
+                SourcePosition::from_preceding_text(
+                    crate::line_number::LineNumber::from_index(0),
+                    &used[..name],
+                )
+            })
+            .expect("投影がある");
+        let projection = RustQualifiedProjection::from_source(used, position).expect("読める");
+        candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let candidate = RustImplCandidate::candidates_of(candidate)
+                    .pop()
+                    .expect("候補を読める");
+                (
+                    candidate.binding_with(&projection).expect("一致する"),
+                    index,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_unselected_impls_choose_the_variables_only_match_over_a_blanket_impl() {
+        let selected = bindings_of(
+            "impl Bytes { fn f(x: <Self as Every>::Out) {} }",
+            &[
+                "impl<T> Every for T { type Out = u8; }",
+                "impl Every for Bytes { type Out = u16; }",
+            ],
+        );
+        let (_, chosen) = UnselectedImpls {
+            has_skipped_impl: true,
+            ..UnselectedImpls::default()
+        }
+        .chosen_from(selected)
+        .expect("型変数だけの当てはめは確実に当てはまる");
+        assert_eq!(chosen, 1);
+    }
+
+    #[test]
+    fn test_unselected_impls_choose_a_concrete_match_only_when_every_impl_was_matched() {
+        let used = "impl Holder<u8> { fn f(x: <Self as Other>::Item) {} }";
+        let candidate = ["impl<X> Other for Holder<X> { type Item = X; }"];
+        assert!(
+            UnselectedImpls::default()
+                .chosen_from(bindings_of(used, &candidate))
+                .is_ok(),
+            "対照"
+        );
+        assert_eq!(
+            UnselectedImpls {
+                has_skipped_impl: true,
+                ..UnselectedImpls::default()
+            }
+            .chosen_from(bindings_of(used, &candidate))
+            .err(),
+            Some(UnopenedReason::UnresolvedAssociatedType)
+        );
+        assert_eq!(
+            UnselectedImpls {
+                has_unreadable_file: true,
+                ..UnselectedImpls::default()
+            }
+            .chosen_from(bindings_of(used, &candidate))
+            .err(),
+            Some(UnopenedReason::UnreadableDeclaringDocument)
+        );
+    }
+
+    #[test]
+    fn test_unselected_impls_with_two_variables_only_matches_are_unresolved() {
+        let selected = bindings_of(
+            "impl<T> Holder<T> { fn f(x: <Self as Other>::Item) {} }",
+            &[
+                "impl<X> Other for Holder<X> { type Item = X; }",
+                "impl<Y> Other for Holder<Y> { type Item = u8; }",
+            ],
+        );
+        assert_eq!(
+            UnselectedImpls::default().chosen_from(selected).err(),
+            Some(UnopenedReason::UnresolvedAssociatedType)
         );
     }
 
