@@ -303,9 +303,12 @@ pub(crate) enum RustTypeResolution {
     Declared(String),
     Unresolved,
     Generic(RustGenericAlias),
+    /// 関連型の RHS。型引数は captures（使用側の型変数名）→ RHS の Self → GAT の順に当てる。
     Associated {
         alias: RustGenericAlias,
         captures: Vec<RustCapture>,
+        /// RHS に単独の Self があり、使用側の impl の対象型を当てるか。
+        substitutes_self: bool,
     },
     NotAnAlias,
     Unopenable,
@@ -1282,14 +1285,32 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
             RustTypeResolution::Generic(alias) => {
                 alias.instantiated(arguments, self.spelling_limit)
             }
-            RustTypeResolution::Associated { alias, captures } => captures
-                .iter()
-                .map(|capture| self.capture_spelling_of(capture))
-                .collect::<Result<Vec<_>, _>>()
-                .and_then(|mut captured| {
+            RustTypeResolution::Associated {
+                alias,
+                captures,
+                substitutes_self,
+            } => {
+                let mut captured = captures
+                    .iter()
+                    .map(|capture| self.capture_spelling_of(capture))
+                    .collect::<Result<Vec<_>, _>>();
+                // Why: RHS を書いた impl の対象型に captures を当てはめたものは、使用側の対象型と
+                // 構造が一致する（直接囲む impl はそれ自身、別の impl は束縛と宣言元の照合で
+                // 確かめてある。blanket impl では型変数が Self 全体に当たる）。
+                if substitutes_self {
+                    let target = self
+                        .self_spelling()
+                        .ok_or(AliasInstantiationError::Unopenable);
+                    captured = captured.and_then(|mut captured| {
+                        captured.push(target?);
+                        Ok(captured)
+                    });
+                }
+                captured.and_then(|mut captured| {
                     captured.extend_from_slice(arguments);
                     alias.instantiated(&captured, self.spelling_limit)
-                }),
+                })
+            }
             RustTypeResolution::ExpansionLimit => Err(AliasInstantiationError::ExpansionLimit),
             RustTypeResolution::NotAnAlias
             | RustTypeResolution::Unresolved
@@ -1472,6 +1493,11 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
     /// 別のモジュールの同名の型と重なる。
     fn scoped_type_spelling_of(&mut self, node: Node<'_>) -> Option<String> {
         if contains_self_type(node, self.source) {
+            // Why: RHS の Self は hover 側で対象型として綴られる。RHS はここでは分からないので、
+            // 使わない回も含めて投影ごとに対象型の型名を尋ねる（同じ綴りは 1 回）。
+            if !self.from_hover && self.self_type.is_some() {
+                self.self_spelling()?;
+            }
             let name = projection_name_of(node, self.source)?;
             if let Some(resolved) = (self.type_of)(&name)
                 .filter(|resolution| !matches!(resolution, RustTypeResolution::Unresolved))

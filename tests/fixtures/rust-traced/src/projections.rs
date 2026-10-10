@@ -51,12 +51,24 @@ impl<T> Holder<T> {
 pub trait Limited {
     type Item;
     type Borrow<'a> where Self: 'a;
-    fn unsupported(value: Self::Item) -> Self::Item;
+    type Pair<U>;
+    type Again;
+    fn itself(value: Self::Item) -> Self::Item;
+    fn itself_plain(value: Self) -> Self;
+    fn paired<U>(value: Self::Pair<U>) -> Self::Pair<U>;
+    fn paired_plain<U>(value: (Self, U)) -> (Self, U) where Self: Sized;
+    fn again(value: Self::Again) -> Self::Again;
     fn borrowed<'a>(value: Self::Borrow<'a>) -> Self::Borrow<'a> where Self: 'a;
 }
 impl<T> Limited for Holder<T> {
     type Item = Self;
     type Borrow<'a> = &'a T where Self: 'a;
-    fn unsupported(value: Self::Item) -> Self::Item { value }
+    type Pair<U> = (Self, U);
+    type Again = Self::Item;
+    fn itself(value: Self::Item) -> Self::Item { value }
+    fn itself_plain(value: Holder<T>) -> Holder<T> { value }
+    fn paired<U>(value: Self::Pair<U>) -> Self::Pair<U> { value }
+    fn paired_plain<U>(value: (Holder<T>, U)) -> (Holder<T>, U) { value }
+    fn again(value: Self::Again) -> Self::Again { value }
     fn borrowed<'a>(value: Self::Borrow<'a>) -> Self::Borrow<'a> where Self: 'a { value }
 }

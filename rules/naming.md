@@ -113,6 +113,7 @@ if structurally_similar && domains_differ { ... }
 | `callee domain` | 呼び出し先が属する `domain`。ドメインごとの件数を持つ |
 | `progress` | サーバが自分で始めた作業（プロジェクトの読み込みなど）。作成の要求と、終わりの通知で挟まれる |
 | `silence limit` | サーバから何も届かないまま待つ上限。**要求ごとの合計時間ではなく、受け取った分を読み終えて待ち始めてから何も届かない時間**で数える。超えたサーバは kill し、以後は送らずに断る |
+| `intake limit` | こちらが送ったものを、サーバが受け取らないまま待つ上限。`silence limit` の書き込み側で、**フレーム全体ではなく、書き込みの 1 塊（パイプのバッファより小さい）が受け取られないまま待つ時間**で数える。超えたサーバは kill し、書き口が以後の書き込みを待たずに断る（`lsp::child_input` の `IntakeLimitedWriter`） |
 | `source position` | ファイルの中の 1 点。行と、**UTF-16 のコード単位で数えた**列 |
 | `signature text` | hover に由来する型の綴り。Rust の配列長をソースから復元した後も含み、引数名・型変数名などの**型構造の正規化前** |
 | `type spelling` | 型 1 つ分の綴り。`signature text` を割った先の 1 つ（引数の型・戻り値の型・制約） |
@@ -126,7 +127,7 @@ if structurally_similar && domains_differ { ... }
 | `annotatable position` | チャンクの宣言が `type annotation` を省ける位置。**`value type` 1 つと、引数ごとに 1 つ**。引数は既定値を書くと省ける |
 | `value type annotation` | `value type` の位置の `type annotation` |
 | `parameter annotation` | 引数 1 つ分の `type annotation`。**引数ごとに答えが違う** |
-| `site-dependent spelling` | **型名にならないのに、指す先が書かれた場所で決まる**綴り（`typeof localValue` / `{ [key]: string }` / `import("./local").T` / `this`）。型名のノードにならないので、尋ねる位置そのものを作れない。**Rust では直接囲む impl で置換できない Self を数える**。Self を含む関連型は末尾の位置を尋ね、解決できなければその理由を出す。impl の対象型へ置換できた Self / レシーバと、展開できた関連型は数えない |
+| `site-dependent spelling` | **型名にならないのに、指す先が書かれた場所で決まる**綴り（`typeof localValue` / `{ [key]: string }` / `import("./local").T` / `this`）。型名のノードにならないので、尋ねる位置そのものを作れない。**Rust では直接囲む impl で置換できない Self を数える**。Self を含む関連型は末尾の位置を尋ね、解決できなければその理由を出す。impl の対象型へ置換できた Self / レシーバ（関連型 RHS の Self を含む）と、展開できた関連型は数えない |
 | `bound value name` | そのシグネチャの引数が束縛した値の名前。`typeof x` の `x` がこれなら、指す先は**書かれた場所ではなくシグネチャ**が決める。**比較に残る形には持ち込まない**（引数の名前は型を変えない） |
 | `type structure` | `type spelling` を構文木から読んだ形。**書かれ方の違い**（括弧・引数名・タプルのラベル・共用体の並び）を落としてある |
 | `callable` | 呼べる型（関数型・構築型）1 つ分の `type structure`。型変数・引数・戻り値を持つ |
