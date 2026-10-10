@@ -933,7 +933,11 @@ fn test_rust_associated_types_match_their_instantiated_right_hand_sides() {
         "foreign",
         "foreign_plain",
         "outside_plain",
-        "unsupported",
+        "itself",
+        "itself_plain",
+        "paired",
+        "paired_plain",
+        "again",
         "borrowed",
     ] {
         let index = source
@@ -963,6 +967,9 @@ fn test_rust_associated_types_match_their_instantiated_right_hand_sides() {
         ("qualified", "plain"),
         ("wrapped", "wrap_plain"),
         ("named", "named_plain"),
+        // RHS の Self は、使用側の impl の対象型（`Holder<T>`）として展開する
+        ("itself", "itself_plain"),
+        ("paired", "paired_plain"),
     ] {
         let TypeSignatureOutcome::Normalized(left) = &outcomes[first] else {
             panic!("{first}: {:?}", outcomes[first]);
@@ -994,15 +1001,19 @@ fn test_rust_associated_types_match_their_instantiated_right_hand_sides() {
             reason: UnopenedReason::UnresolvedAssociatedType
         }
     );
-    for name in ["unsupported", "borrowed"] {
-        assert_eq!(
-            outcomes[name],
-            TypeSignatureOutcome::UnopenedTypeName {
-                reason: UnopenedReason::UnopenableAssociatedType
-            },
-            "{name}"
-        );
-    }
+    assert_eq!(
+        outcomes["borrowed"],
+        TypeSignatureOutcome::UnopenedTypeName {
+            reason: UnopenedReason::UnopenableAssociatedType
+        }
+    );
+    // RHS の中の投影（`type Again = Self::Item`）は再帰して解決しない
+    assert_eq!(
+        outcomes["again"],
+        TypeSignatureOutcome::UnopenedTypeName {
+            reason: UnopenedReason::UnresolvedAssociatedType
+        }
+    );
 }
 
 #[test]
@@ -1035,6 +1046,8 @@ fn test_rust_qualified_self_projections_select_the_impl_matching_target_and_trai
         "shown_plain",
         "owned",
         "owned_plain",
+        "echoed",
+        "echoed_plain",
         "bounded",
         "concrete",
         "blanket",
@@ -1076,6 +1089,8 @@ fn test_rust_qualified_self_projections_select_the_impl_matching_target_and_trai
         ("distant", "distant_plain", true),
         ("shown", "shown_plain", true),
         ("owned", "owned_plain", true),
+        // 選んだ impl の RHS の Self は、receiver の無い inherent impl の対象型になる
+        ("echoed", "echoed_plain", true),
         // 同じ trait の別の trait 引数の impl を選んでいない
         ("inherent", "sixteen_plain", false),
         // 同名の別 trait の impl を選んでいない
