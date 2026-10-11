@@ -159,13 +159,12 @@ LSP が起動しない・`callHierarchy` が使えない・チャンクが切り
 `typeDefinition` の空の応答だけでは、別のプリミティブへのエイリアスを除外できない。
 循環は declaration site の組で検出して `CyclicAlias`、エイリアスの展開が 32 段を
 超える、または展開した右辺が 64 KiB を超えると `AliasExpansionLimit` を返す。
-ソースと再帰しない終端だけをキャッシュし、
-展開済みの連鎖や深さに依存する失敗はキャッシュしない。
-**このキャッシュ（ソース・impl 候補の構文解析・再帰しない終端・trait の宣言位置ごとの
-implementation の応答）は `semantics::resolved_type::RustDeclarationCache` が持ち、
+展開済みの連鎖や深さに依存する失敗はキャッシュしない。キャッシュするのはソースと
+再帰しない終端（と、下の完全修飾形の impl 選択が使う impl 候補の構文解析・implementation の応答）で、
+**型名解決のキャッシュは `semantics::resolved_type::RustDeclarationCache` が持ち、
 `pipeline` がセッション 1 つにつき 1 つ作ってチャンクのあいだで共有する**
 （下の「ファイル単位で決まる答えをチャンク単位で問い合わせない」）。展開中の連鎖だけは
-チャンクごとに持つ。implementation は `Answered` だけを覚え、読み込み前にも返る空は覚えない。
+チャンクごとに持つ。配列長の評価器のソースはまだ共有していない（Issue #335）。
 
 **通常の型エイリアスのジェネリック宣言の右辺・既定値は、プリミティブと束縛された型パラメータに閉じるものに限る。**
 型引数は使用側で正規化してから当てはめ、入れ子と既定値（先行する型パラメータ参照を含む）を
@@ -247,6 +246,8 @@ Self を含む投影を歩くときに対象型の型名を尋ねる位置とし
   使用側の対象が**境界つきの型変数そのもの**の形（`impl<T: Other> Show for T`。境界が Self への
   param-env の候補で、supertrait 経由でも投影の trait を含みうる）、
   短縮形・入れ子の投影（Issue #327）
+- **implementation の応答は trait の宣言位置ごとに 1 回だけ尋ねる**（`RustDeclarationCache`）。
+  覚えるのは `Answered` だけで、読み込み前にも返る空は覚えない
 - **理由**: implementation を提供しない・空は `ImplementationNotProvided` /
   `NoImplementationSite`。一致が 2 つ以上なら `UnresolvedAssociatedType`。0 件なら、照合まで
   進めたが辿れなかった候補の理由 → 候補のファイルを読めない（`UnreadableDeclaringDocument`）→
@@ -437,7 +438,7 @@ pr-155 と同じ形だと自己申告している）。
 |---|---|
 | チャンクごとに `is_file` で祖先を辿り `project marker` を探す | ファイルごとに 1 回だけ辿り、同じファイルのチャンクへ配る |
 | チャンクごとに `project membership` を尋ねる | ファイルごとに 1 回だけ尋ね、同じファイルのチャンクへ配る |
-| チャンクごとに Rust の宣言側のソースを読み、同じ trait に implementation を尋ねる | `RustDeclarationCache` をセッションごとに 1 つ作り、ファイル・trait の宣言位置をキーに共有する |
+| チャンクごとに Rust の型名解決が宣言側のソースを読み、同じ trait に implementation を尋ねる | `RustDeclarationCache` をセッションごとに 1 つ作り、ファイル・trait の宣言位置をキーに共有する |
 
 **Why**: LSP への問い合わせは同期的な往復を伴うプロセス外呼び出しで、
 `project marker` 探索も印が無い木では毎回ファイルシステムの根まで辿る。
