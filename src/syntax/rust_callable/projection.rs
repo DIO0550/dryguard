@@ -10,14 +10,15 @@ pub(crate) struct RustProjectionSource {
 }
 
 impl RustProjectionSource {
-    /// 使用位置と直接の trait impl が対応する関連型定義を読む。
-    /// 別 impl の選択（[`super::RustQualifiedProjection`]）、入れ子の投影、
-    /// 条件付き・複数の定義は `None`。
+    /// 使用位置と直接の trait impl が対応する関連型定義を読む。使用位置はメソッドの
+    /// シグネチャか、impl の関連型 RHS（[`member_of`]）。
+    /// 別 impl の選択（[`super::RustQualifiedProjection`]）、入れ子の投影
+    /// （[`super::RustNestedProjection`]）、条件付き・複数の定義は `None`。
     pub(crate) fn from_source(source: &str, position: SourcePosition) -> Option<Self> {
         let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
         let projection = projection_at(&tree, source, position)?;
-        let function = ancestor_of_kind(projection, "function_item")?;
-        let implementation = enclosing_impl_of(function)?;
+        let member = member_of(projection)?;
+        let implementation = enclosing_impl_of(member)?;
         if signature_has_error(implementation) {
             return None;
         }
@@ -59,12 +60,14 @@ impl RustProjectionSource {
 ///
 /// **captures は使用側で代入するもの。** 直接囲む impl では impl 自身の型変数名、
 /// 別の impl を選んだときは束縛で写した使用側の型変数か具体的な型（[`Self::with_captures`]）。
-/// RHS の単独の Self は captures に入れず、使用側の impl の対象型を当てる。
+/// RHS の Self（単独の Self と、Self を含む投影が開いた先の Self）は captures に入れず、
+/// 使用側の impl の対象型を当てる。
 pub(crate) struct RustAssociatedDefinition {
     declaration: String,
     captures: Vec<RustCapture>,
-    /// RHS の単独の Self を、impl の型パラメータの直後の型パラメータへ書き換えたか。
-    substitutes_self: bool,
+    /// RHS の Self を受ける、impl の型パラメータの直後の型パラメータの名前。
+    /// RHS が単独の Self も Self を含む投影も持たなければ `None`。
+    self_parameter: Option<String>,
     references: Vec<TypeReference>,
 }
 
@@ -118,16 +121,18 @@ impl RustAssociatedDefinition {
             .map(RustCapture::Variable)
             .collect();
         let right = alias.child_by_field_name("type")?;
-        let self_parameter = fresh_parameter_name_of(source);
         let positions = self_positions_of(right, source);
         let right_text = match positions.is_empty() {
             true => source.get(right.byte_range())?.to_owned(),
-            false => {
-                parameter_texts.push(self_parameter.clone());
-                replaced(source, right, &positions, &self_parameter)?
-            }
+            false => replaced(source, right, &positions, &fresh_parameter_name_of(source))?,
         };
-        let substitutes_self = parameter_texts.contains(&self_parameter);
+        // Why: RHS の中の投影（`Self::Other`）は、開くと RHS を書いた impl の Self を含みうる。
+        // その Self も使用側の対象型なので、単独の Self と同じ型パラメータで受ける。
+        let self_parameter = contains_self_type(right, source).then(|| {
+            let name = fresh_parameter_name_of(source);
+            parameter_texts.push(name.clone());
+            name
+        });
         if let Some(parameters) = alias.child_by_field_name("type_parameters") {
             spelling.declared_type_parameters_of(parameters)?;
             parameter_texts.extend(parameter_names_of(parameters, source, true)?);
@@ -141,7 +146,7 @@ impl RustAssociatedDefinition {
         Some(Self {
             declaration,
             captures,
-            substitutes_self,
+            self_parameter,
             references: spelling.references,
         })
     }
@@ -185,24 +190,33 @@ impl RustAssociatedDefinition {
             });
         };
         let right = alias.child_by_field_name("type")?;
-        let alias =
-            RustGenericAlias::from_nodes_with(parameters, right, &self.declaration, type_of)?;
+        let alias = RustGenericAlias::from_nodes_with(
+            parameters,
+            right,
+            &self.declaration,
+            type_of,
+            self.self_parameter.as_deref(),
+        )?;
         Some(RustTypeResolution::Associated {
             alias,
             captures: self.captures.clone(),
-            substitutes_self: self.substitutes_self,
+            substitutes_self: self.self_parameter.is_some(),
         })
     }
 }
 
 /// RHS の中の単独の Self（`type_identifier`）の位置。
 ///
-/// 投影のパスの Self（`Self::Other`）は `identifier` なので含まない。中の投影は書かれた
-/// 綴りのまま尋ねる型名になり、意味情報の側が `UnresolvedAssociatedType` で止める。
+/// **投影の中の Self は含めない**（`Self::Other` / `<Self as Other>::Out`）。中の投影は
+/// 書かれた綴りのまま尋ねる型名になり、意味情報の側が RHS を書いた impl の位置から
+/// 再帰して辿る。書き換えると、尋ねた綴りと RHS の綴りが食い違って解決を引けない。
 fn self_positions_of(right: Node<'_>, source: &str) -> Vec<std::ops::Range<usize>> {
     let mut positions = Vec::new();
     let mut pending = vec![right];
     while let Some(node) = pending.pop() {
+        if node.kind() == "scoped_type_identifier" {
+            continue;
+        }
         let is_self =
             node.kind() == "type_identifier" && source.get(node.byte_range()) == Some(SELF_TYPE);
         if is_self {
@@ -281,9 +295,13 @@ pub(crate) fn associated_owner_position_of(
     source_position_of(owner.child_by_field_name("name")?, source)
 }
 
-pub(super) fn ancestor_of_kind<'tree>(mut node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+/// 投影を書いたメンバー。最も近いメソッドか、関連型の定義（`type_item`）。
+///
+/// 関連型の定義は impl の本体に直接書かれたものだけが使用位置になる（[`enclosing_impl_of`]）。
+pub(super) fn member_of(projection: Node<'_>) -> Option<Node<'_>> {
+    let mut node = projection;
     while let Some(parent) = node.parent() {
-        if parent.kind() == kind {
+        if matches!(parent.kind(), "function_item" | "type_item") {
             return Some(parent);
         }
         node = parent;

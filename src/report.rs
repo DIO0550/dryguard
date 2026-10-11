@@ -553,10 +553,10 @@ fn unopened_text_of(reason: UnopenedReason) -> &'static str {
             "測れない (比較に残る型名を開けない: エイリアスの右辺を差し込める形にできない)"
         }
         UnopenedReason::CyclicAlias => {
-            "測れない (比較に残る型名を開けない: エイリアスの宣言が循環している)"
+            "測れない (比較に残る型名を開けない: エイリアスの宣言か関連型の投影が循環している)"
         }
         UnopenedReason::AliasExpansionLimit => {
-            "測れない (比較に残る型名を開けない: エイリアスの展開上限に達した)"
+            "測れない (比較に残る型名を開けない: エイリアスか関連型の投影の展開上限に達した)"
         }
         UnopenedReason::UnresolvedAssociatedType => {
             "測れない (関連型の具体的な impl 定義を一意に選べない)"
@@ -1586,11 +1586,11 @@ mod tests {
         for (reason, explanation) in [
             (
                 UnopenedReason::CyclicAlias,
-                "エイリアスの宣言が循環している",
+                "エイリアスの宣言か関連型の投影が循環している",
             ),
             (
                 UnopenedReason::AliasExpansionLimit,
-                "エイリアスの展開上限に達した",
+                "エイリアスか関連型の投影の展開上限に達した",
             ),
             (
                 UnopenedReason::UnresolvedAssociatedType,

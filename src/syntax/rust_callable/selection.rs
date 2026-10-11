@@ -12,7 +12,7 @@
 //! **型名の同一性はここでは決めない。** 対応する位置の型名の組を返し、
 //! 宣言元の照合は `semantics::resolved_type` が両側のソースの位置から行う。
 
-use super::projection::{ancestor_of_kind, has_attribute, projection_at, terminal_name_of};
+use super::projection::{has_attribute, member_of, projection_at, terminal_name_of};
 use super::*;
 use crate::source_position::SourcePosition;
 
@@ -28,8 +28,9 @@ pub(crate) struct RustQualifiedProjection {
 }
 
 impl RustQualifiedProjection {
-    /// 使用位置の投影を読む。次のどれかなら `None`:
+    /// 使用位置（メソッドのシグネチャか、impl の関連型 RHS）の投影を読む。次のどれかなら `None`:
     /// - 対象が `Self` 自体でない・短縮形（`Self::Name`）・入れ子の投影
+    ///   （入れ子は [`RustNestedProjection`] が読む）
     /// - 直接囲む impl が同じ trait パスの impl（直接の impl の経路が答える）
     /// - impl / メソッドの where 句に、左辺が型変数そのものでない述語がある（`Self` や
     ///   対象型を左辺に持つ param-env の候補は impl より優先され、rustc も投影を正規化しない）
@@ -50,7 +51,9 @@ impl RustQualifiedProjection {
             return None;
         }
         let projected_trait = qualified.child_by_field_name("alias")?;
-        let function = ancestor_of_kind(projection, "function_item")?;
+        // Why: 関連型 RHS の中の投影は、RHS を書いた impl を使用側として選ぶ。
+        // 関連型の型変数（GAT）は、メソッドの型変数と同じく使用側の impl のスコープで綴れない。
+        let function = member_of(projection)?;
         let implementation = enclosing_impl_of(function)?;
         if signature_has_error(implementation) || signature_has_error(function) {
             return None;
@@ -134,6 +137,98 @@ impl RustQualifiedProjection {
     }
 }
 
+/// 使用側の `<X as Trait>::Name` のうち、`X` が Self を含む投影のもの（入れ子の投影）。
+///
+/// **2 段目の impl は、型パラメータを持たず対象型が `X` の解決と同じ型を指すものだけを選ぶ**
+/// （[`RustImplCandidate::closed_target`]）。`X` の構文は 1 段目の RHS を書いたファイルにあり、
+/// trait 引数は使用側のファイルにあるので、[`RustImplCandidate::binding_with`] のように
+/// 両方の構文を並行に歩けない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RustNestedProjection {
+    inner: TypeReference,
+    associated_name: String,
+    trait_position: SourcePosition,
+}
+
+impl RustNestedProjection {
+    /// 使用位置（メソッドのシグネチャか、impl の関連型 RHS）の入れ子の投影を読む。
+    /// 次のどれかなら `None`:
+    /// - `X` が Self を含む投影（`<Self as T>::Item` / `Self::Item`）でない
+    /// - `X` が型引数を取る（`<Self as T>::Wrap<u8>`）
+    /// - 外側の trait が型引数を持つ（2 段目の選択で trait 引数を照合しない）
+    pub(crate) fn from_source(source: &str, position: SourcePosition) -> Option<Self> {
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
+        let projection = projection_at(&tree, source, position)?;
+        let path = projection.child_by_field_name("path")?;
+        if path.kind() != "bracketed_type" {
+            return None;
+        }
+        let qualified = named_children_of(path)
+            .next()
+            .filter(|node| node.kind() == "qualified_type")?;
+        let inner = qualified.child_by_field_name("type")?;
+        let projected_trait = qualified.child_by_field_name("alias")?;
+        let projects_self =
+            inner.kind() == "scoped_type_identifier" && contains_self_type(inner, source);
+        if !projects_self || projected_trait.kind() == "generic_type" {
+            return None;
+        }
+        let member = member_of(projection)?;
+        let implementation = enclosing_impl_of(member)?;
+        if signature_has_error(implementation) || signature_has_error(member) {
+            return None;
+        }
+        Some(Self {
+            inner: TypeReference::new(
+                projection_name_of(inner, source)?,
+                source_position_of(inner.child_by_field_name("name")?, source)?,
+            ),
+            associated_name: source
+                .get(projection.child_by_field_name("name")?.byte_range())?
+                .to_owned(),
+            trait_position: source_position_of(terminal_name_of(projected_trait)?, source)?,
+        })
+    }
+
+    /// `X`。使用側のソースで、Self を含む投影として辿る。
+    pub(crate) fn inner(&self) -> &TypeReference {
+        &self.inner
+    }
+
+    /// 投影の末尾の関連型の名前（`Out`）。
+    pub(crate) fn associated_name(&self) -> &str {
+        &self.associated_name
+    }
+
+    /// 外側の trait パスの末尾の名前。implementation と definition をここへ尋ねる。
+    pub(crate) fn trait_position(&self) -> SourcePosition {
+        self.trait_position
+    }
+}
+
+/// 型パラメータを持たない impl の対象型。使用側の文脈なしで 1 つの型に決まる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RustClosedTarget {
+    text: String,
+    references: Vec<TypeReference>,
+}
+
+impl RustClosedTarget {
+    /// 対象型に書かれた型名。どれも候補のソースの問い合わせ位置を持つ。
+    pub(crate) fn references(&self) -> &[TypeReference] {
+        &self.references
+    }
+
+    /// 型名に `type_of`（候補のソースの位置から辿った解決）を差し込んだ綴り。
+    /// [`RustTypeResolution::closed_spelling`] と同じ形で、辿れない型名を含めば `None`。
+    pub(crate) fn spelling_with(
+        &self,
+        type_of: &dyn Fn(&str) -> Option<RustTypeResolution>,
+    ) -> Option<String> {
+        RustGenericAlias::captured_of(&[], &self.text, type_of).map(|alias| alias.right)
+    }
+}
+
 /// implementation が返した impl 1 つの、照合に使う構文。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RustImplCandidate {
@@ -208,6 +303,36 @@ impl RustImplCandidate {
     /// implementation が返す位置（対象型の始まり）。
     pub(crate) fn target_position(&self) -> SourcePosition {
         self.target_position
+    }
+
+    /// 型パラメータも trait 引数も持たない impl の対象型。どちらかを持つ・対象型が
+    /// `'static` 以外のライフタイムか関数型を含むなら `None`。
+    ///
+    /// **Why（これだけで入れ子の 2 段目を選んでよい）**: 型パラメータの無い impl は対象型と
+    /// 同じ型にだけ当てはまり、同じ型に当てはまる impl が他にあれば重なるので coherence が
+    /// 禁じる（一致した 1 つの外に impl が残っていても選び直さない）。
+    ///
+    /// **Why not（ライフタイム・関数型を含む対象型も読む）**: 綴りは `'static` 以外の
+    /// ライフタイムを落とすので、`fn(&u8)`（任意の寿命）と `fn(&'a u8)` が同じ綴りになり、
+    /// 当てはまらない impl を選びうる（偽陽性）。
+    pub(crate) fn closed_target(&self) -> Option<RustClosedTarget> {
+        let [target] = self.shapes.as_slice() else {
+            return None;
+        };
+        if !self.parameters.is_empty() || mentions_erased_lifetimes(target) {
+            return None;
+        }
+        let walk = BindingWalk {
+            candidate_parameters: &[],
+            use_parameters: &[],
+            method_parameters: &[],
+            bound: Vec::new(),
+            names: Vec::new(),
+        };
+        match walk.concrete_of(target)? {
+            BoundType::Concrete { text, references } => Some(RustClosedTarget { text, references }),
+            BoundType::Variable(_) => None,
+        }
     }
 
     /// 対象型の末尾の名前が使用側と同じか、対象が型変数そのものか。
@@ -563,6 +688,17 @@ impl BindingWalk<'_> {
                 .try_for_each(|child| self.concrete_references_of(child, references)),
             TypeShape::Token { .. } | TypeShape::Lifetime { .. } => Some(()),
         }
+    }
+}
+
+/// 綴りが落とすライフタイム（`'static` 以外）か、省略した寿命を持ちうる関数型を含むか。
+fn mentions_erased_lifetimes(shape: &TypeShape) -> bool {
+    match shape {
+        TypeShape::Lifetime { is_static } => !is_static,
+        TypeShape::Node { kind, children, .. } => {
+            kind == "function_type" || children.iter().any(mentions_erased_lifetimes)
+        }
+        TypeShape::Name(_) | TypeShape::Token { .. } => false,
     }
 }
 

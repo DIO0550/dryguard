@@ -29,7 +29,7 @@ use crate::lsp::{
 use crate::source_position::SourcePosition;
 use crate::syntax::rust_callable::{
     RustAliasSource, RustAssociatedDefinition, RustImplBinding, RustImplCandidate, RustImplTarget,
-    RustProjectionSource, RustQualifiedProjection, RustTypeResolution,
+    RustNestedProjection, RustProjectionSource, RustQualifiedProjection, RustTypeResolution,
     associated_owner_position_of, primitive_references_of_alias, primitive_spelling_of,
 };
 use crate::syntax::type_reference::TypeReference;
@@ -170,9 +170,13 @@ pub enum UnopenedReason {
     /// 要るライフタイム・const 引数や未対応の型構文など）なので、開く先が無い `interface` / `class` とは
     /// 分けて出す。
     UnopenableAlias,
-    /// 同じ宣言元へ戻る型エイリアスの連鎖。
+    /// 同じ宣言元へ戻る型エイリアスの連鎖か、同じ位置へ戻る関連型 RHS の中の投影の連鎖。
+    ///
+    /// **投影の循環に別のバリアントを立てない。** rustc はどちらも拒否する形で、利用者が
+    /// 次にすること（宣言を直す）も同じ。
     CyclicAlias,
-    /// 型エイリアスの連鎖の深さ、または展開した右辺の大きさが上限に達した。
+    /// 型エイリアスと関連型の投影を合わせた連鎖の深さ、または展開した右辺の大きさが
+    /// 上限に達した。
     AliasExpansionLimit,
     /// 関連型の具体的な impl 定義を一意に選べなかった。
     UnresolvedAssociatedType,
@@ -352,7 +356,8 @@ pub(crate) fn rust_traced_type_names_of(
     Ok(traced)
 }
 
-/// 再帰展開できるエイリアスの宣言数。循環はこの上限とは別に検出する。
+/// 再帰展開できるエイリアスの宣言と、関連型の投影を合わせた数。
+/// 循環はこの上限とは別に検出する。
 const MAXIMUM_ALIAS_DEPTH: usize = 32;
 
 /// 宣言側の問い合わせ、ソースと再帰を含まない終端のキャッシュ。
@@ -363,6 +368,8 @@ struct RustTypeResolver<'session> {
     targets: HashMap<std::path::PathBuf, Vec<RustImplTarget>>,
     terminals: Vec<(DeclarationSite, RustTypeResolution)>,
     active: Vec<DeclarationSite>,
+    /// 辿っている途中の投影。書かれたファイルと、尋ねる位置（末尾の名前）。
+    active_projections: Vec<(std::path::PathBuf, SourcePosition)>,
 }
 
 impl<'session> RustTypeResolver<'session> {
@@ -374,7 +381,13 @@ impl<'session> RustTypeResolver<'session> {
             targets: HashMap::new(),
             terminals: Vec::new(),
             active: Vec::new(),
+            active_projections: Vec::new(),
         }
+    }
+
+    /// 展開の途中にあるエイリアスの宣言と投影の数。
+    fn depth(&self) -> usize {
+        self.active.len() + self.active_projections.len()
     }
 
     /// ソースの位置から辿る。本物のプリミティブは宣言元を持たないので hover で確定する。
@@ -392,7 +405,19 @@ impl<'session> RustTypeResolver<'session> {
             .split(|character: char| !character.is_alphanumeric() && character != '_')
             .any(|name| name == "Self")
         {
-            return self.projection_of(document, reference);
+            // Why: 関連型 RHS の中の投影は、RHS を書いた位置から再帰して辿る。rustc は循環を
+            // E0275 で拒否するが、木の上では書けるので、エイリアスの連鎖と同じ理由で止める。
+            let key = (document.path().to_owned(), reference.position());
+            if self.active_projections.contains(&key) {
+                return Ok(Err(UnopenedReason::CyclicAlias));
+            }
+            if self.depth() >= MAXIMUM_ALIAS_DEPTH {
+                return Ok(Err(UnopenedReason::AliasExpansionLimit));
+            }
+            self.active_projections.push(key);
+            let result = self.projection_of(document, reference);
+            self.active_projections.pop();
+            return result;
         }
         let hover = match declared_spelling_of(self.session.hover(document, reference.position())?)
         {
@@ -411,7 +436,8 @@ impl<'session> RustTypeResolver<'session> {
     /// trait 宣言の同一性を確認してから、関連型 RHS を開く。
     ///
     /// 直接囲む trait impl の定義を先に試し、使えない形なら完全修飾形の trait の impl を選ぶ
-    /// （[`RustTypeResolver::selected_projection_of`]）。
+    /// （[`RustTypeResolver::selected_projection_of`]）。対象が Self を含む投影なら
+    /// 入れ子の投影として 2 段目の impl を選ぶ（[`RustTypeResolver::nested_projection_of`]）。
     ///
     /// # Errors
     ///
@@ -424,11 +450,14 @@ impl<'session> RustTypeResolver<'session> {
         let Some(projection) =
             RustProjectionSource::from_source(document.source(), reference.position())
         else {
-            return match RustQualifiedProjection::from_source(
-                document.source(),
-                reference.position(),
-            ) {
-                Some(qualified) => self.selected_projection_of(document, reference, &qualified),
+            if let Some(qualified) =
+                RustQualifiedProjection::from_source(document.source(), reference.position())
+            {
+                return self.selected_projection_of(document, reference, &qualified);
+            }
+            return match RustNestedProjection::from_source(document.source(), reference.position())
+            {
+                Some(nested) => self.nested_projection_of(document, reference, &nested),
                 None => Ok(Err(UnopenedReason::UnresolvedAssociatedType)),
             };
         };
@@ -637,6 +666,131 @@ impl<'session> RustTypeResolver<'session> {
             .ok_or(UnopenedReason::UnopenableAssociatedType))
     }
 
+    /// 入れ子の投影 `<X as Trait>::Name` の、2 段目の impl の RHS を開く。
+    ///
+    /// `X` を使用側の位置から辿り、**型変数にも Self にも依存しない綴り**に閉じたときだけ、
+    /// 型パラメータを持たない impl のうち対象型の綴りが等しいものを選ぶ
+    /// （[`RustImplCandidate::closed_target`]）。等しい impl は coherence により 1 つしか
+    /// 無いので、見つかった時点で決めてよく、読めない候補が残っていても選び直さない。
+    /// 2 段目の RHS の Self には `X` を当てる。
+    ///
+    /// `X` を辿れなければその理由。`X` が閉じない（使用側の型変数・Self に依存する）・
+    /// 選んだ impl に関連型定義が無いときは `UnresolvedAssociatedType`。等しい impl が
+    /// 無ければ、別の impl の選択と同じ 0 件の理由（[`UnselectedImpls::reason_with`]）。
+    /// RHS を開けなければ `UnopenableAssociatedType`。
+    ///
+    /// # Errors
+    ///
+    /// definition / implementation / hover / didOpen の往復が失敗したとき。
+    fn nested_projection_of(
+        &mut self,
+        document: &SourceDocument,
+        reference: &TypeReference,
+        projection: &RustNestedProjection,
+    ) -> Result<Result<RustTypeResolution, UnopenedReason>, ClientError> {
+        if let Err(reason) =
+            self.owner_matches(document, reference.position(), projection.trait_position())?
+        {
+            return Ok(Err(reason));
+        }
+        let inner = match self.reference_of(document, projection.inner())? {
+            Ok(inner) => inner,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let Some(target) = inner.closed_spelling().map(str::to_owned) else {
+            return Ok(Err(UnopenedReason::UnresolvedAssociatedType));
+        };
+        let (sites, has_unreadable) = match self
+            .session
+            .implementation(document, projection.trait_position())?
+        {
+            ImplementationOutcome::Answered {
+                sites,
+                has_unreadable,
+            } => (sites, has_unreadable),
+            ImplementationOutcome::NoAnswer => {
+                return Ok(Err(UnopenedReason::NoImplementationSite));
+            }
+            ImplementationOutcome::NotSupported => {
+                return Ok(Err(UnopenedReason::ImplementationNotProvided));
+            }
+        };
+        let mut unselected = UnselectedImpls {
+            has_unreadable_site: has_unreadable,
+            ..UnselectedImpls::default()
+        };
+        let mut chosen = None;
+        for site in &sites {
+            let source = match site.path() == document.path() {
+                true => Ok(document.source().to_owned()),
+                false => self.source_of(site.path()),
+            };
+            let Ok(source) = source else {
+                unselected.has_unreadable_file = true;
+                continue;
+            };
+            let closed = self
+                .candidates
+                .entry(site.path().to_owned())
+                .or_insert_with(|| RustImplCandidate::candidates_of(&source))
+                .iter()
+                .find(|candidate| candidate.target_position() == site.position())
+                .and_then(RustImplCandidate::closed_target);
+            let Some(closed) = closed else {
+                continue;
+            };
+            let Ok(candidate_document) = SourceDocument::new(site.path(), source) else {
+                unselected.has_unreadable_file = true;
+                continue;
+            };
+            self.session.open_document(&candidate_document)?;
+            let mut resolved = HashMap::new();
+            let mut untraced = None;
+            for name in closed.references() {
+                match self.reference_of(&candidate_document, name)? {
+                    Ok(resolution) => {
+                        resolved.insert(name.name().to_owned(), resolution);
+                    }
+                    Err(reason) => {
+                        untraced.get_or_insert(reason);
+                    }
+                }
+            }
+            if let Some(reason) = untraced {
+                unselected.untraced.get_or_insert(reason);
+                continue;
+            }
+            let spelled = closed.spelling_with(&|name| resolved.get(name).cloned());
+            if spelled.as_deref() == Some(target.as_str()) {
+                chosen = Some((site.position(), candidate_document));
+                break;
+            }
+        }
+        let Some((target_position, candidate_document)) = chosen else {
+            return Ok(Err(unselected.reason_with(0)));
+        };
+        let Some(definition) = RustAssociatedDefinition::from_impl_at(
+            candidate_document.source(),
+            target_position,
+            projection.associated_name(),
+        ) else {
+            return Ok(Err(UnopenedReason::UnresolvedAssociatedType));
+        };
+        let mut resolved = HashMap::new();
+        for reference in definition.references() {
+            match self.reference_of(&candidate_document, reference)? {
+                Ok(resolution) => {
+                    resolved.insert(reference.name().to_owned(), resolution);
+                }
+                Err(reason) => return Ok(Err(reason)),
+            }
+        }
+        Ok(definition
+            .resolution_with(&|name| resolved.get(name).cloned())
+            .and_then(|resolution| resolution.with_self_bound(&target))
+            .ok_or(UnopenedReason::UnopenableAssociatedType))
+    }
+
     /// 束縛が対応付けた型名の組が、すべて同じ型を指すか。
     ///
     /// **比べてよいのは具体的な宣言元（`Declared`）と、確かめたプリミティブ・開いた右辺
@@ -709,7 +863,7 @@ impl<'session> RustTypeResolver<'session> {
         }
         if let Some((_, terminal)) = self.terminals.iter().find(|(cached, _)| cached == site) {
             let alias_at_limit = matches!(terminal, RustTypeResolution::Generic(_))
-                && self.active.len() >= MAXIMUM_ALIAS_DEPTH;
+                && self.depth() >= MAXIMUM_ALIAS_DEPTH;
             if alias_at_limit {
                 return Ok(Err(UnopenedReason::AliasExpansionLimit));
             }
@@ -731,7 +885,7 @@ impl<'session> RustTypeResolver<'session> {
             self.terminals.push((site.clone(), terminal.clone()));
             return Ok(Ok(terminal));
         }
-        if self.active.len() >= MAXIMUM_ALIAS_DEPTH {
+        if self.depth() >= MAXIMUM_ALIAS_DEPTH {
             return Ok(Err(UnopenedReason::AliasExpansionLimit));
         }
         let source = match self.source_of(site.path()) {

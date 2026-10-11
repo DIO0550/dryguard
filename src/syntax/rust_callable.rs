@@ -24,7 +24,8 @@ pub(crate) use projection::{
 };
 mod selection;
 pub(crate) use selection::{
-    RustImplBinding, RustImplCandidate, RustImplTarget, RustQualifiedProjection,
+    RustImplBinding, RustImplCandidate, RustImplTarget, RustNestedProjection,
+    RustQualifiedProjection,
 };
 mod array_length;
 pub(crate) use array_length::{
@@ -307,7 +308,7 @@ pub(crate) enum RustTypeResolution {
     Associated {
         alias: RustGenericAlias,
         captures: Vec<RustCapture>,
-        /// RHS に単独の Self があり、使用側の impl の対象型を当てるか。
+        /// RHS に Self（単独の Self か、Self を含む投影）があり、使用側の impl の対象型を当てるか。
         substitutes_self: bool,
     },
     NotAnAlias,
@@ -332,6 +333,45 @@ pub(crate) enum RustCapture {
 const MAXIMUM_ALIAS_SPELLING_BYTES: usize = 64 * 1024;
 
 impl RustTypeResolution {
+    /// 型変数にも Self にも依存しない、使用側の文脈なしで決まる綴り。
+    ///
+    /// 関連型 RHS は、型引数（captures・Self・GAT）を右辺で 1 つも使わないときだけ閉じる。
+    /// 宣言元の印と確かめたプリミティブで綴られているので、綴りが等しければ同じ型を指す。
+    /// 開けなかった・ジェネリックなエイリアスは `None`。
+    pub(crate) fn closed_spelling(&self) -> Option<&str> {
+        match self {
+            Self::Opened(spelling) | Self::Declared(spelling) => Some(spelling),
+            Self::Associated { alias, .. } => alias.is_closed().then_some(alias.right.as_str()),
+            Self::Unresolved
+            | Self::Generic(_)
+            | Self::NotAnAlias
+            | Self::Unopenable
+            | Self::ExpansionLimit => None,
+        }
+    }
+
+    /// 関連型 RHS の Self に、使用側の impl の対象型ではなく `target`（閉じた綴り）を当てた形。
+    /// Self を当てない解決はそのまま返す。綴りが上限を超えれば `None`。
+    ///
+    /// **Why**: 入れ子の投影の 2 段目の RHS が書いた Self は、2 段目の impl の対象型
+    /// （1 段目の RHS）で、使用側の impl の対象型ではない。
+    pub(crate) fn with_self_bound(self, target: &str) -> Option<Self> {
+        let Self::Associated {
+            alias,
+            captures,
+            substitutes_self: true,
+        } = self
+        else {
+            return Some(self);
+        };
+        let alias = alias.bound_at(captures.len(), target)?;
+        Some(Self::Associated {
+            alias,
+            captures,
+            substitutes_self: false,
+        })
+    }
+
     /// 可視性を含む宣言から、展開候補の右辺を正規化する。
     /// プリミティブの綴りが指す実際の型の確認は、呼び出し側が意味情報から行う。
     /// ライフタイム・const 引数、および未知の型構文は開かない。
@@ -476,7 +516,8 @@ pub(crate) fn primitive_spelling_of(spelling: &str) -> Option<String> {
     (right.kind() == "primitive_type").then(|| source[right.byte_range()].to_owned())
 }
 
-/// 名前は宣言側で解決できたものだけ許可する。定数式や関連型の選択は許可しない。
+/// 名前は宣言側で解決できたものだけ許可する。定数式は許可しない。関連型は、Self を含む
+/// 投影を宣言側で解決できたときだけ許可する。
 fn is_resolved_type_syntax(
     node: Node<'_>,
     source: &str,
@@ -486,6 +527,11 @@ fn is_resolved_type_syntax(
         "type_identifier" => source
             .get(node.byte_range())
             .is_some_and(|name| name != SELF_TYPE && type_of(name).is_some()),
+        // Why: `<Self::Item as Deep>::Out` のパスは型の構文なので、下の通常のパスに当たらない。
+        // Self を含む投影は、ソースと同じ綴り（`projection_name_of`）で解決を引く。
+        "scoped_type_identifier" if contains_self_type(node, source) => {
+            projection_name_of(node, source).is_some_and(|name| type_of(&name).is_some())
+        }
         "scoped_type_identifier" => {
             let ordinary_path = node.child_by_field_name("path").is_some_and(|path| {
                 matches!(
@@ -538,14 +584,17 @@ impl RustGenericAlias {
         if !is_openable_type_syntax(right, source, &names?) {
             return None;
         }
-        Self::from_nodes_with(parameters, right, source, &|_| None)
+        Self::from_nodes_with(parameters, right, source, &|_| None, None)
     }
 
+    /// `self_parameter` は、右辺の中の投影が代入する Self を綴る型パラメータの名前
+    /// （関連型 RHS の `SelfTarget`）。エイリアスの宣言では `None`。
     fn from_nodes_with(
         parameters: Node<'_>,
         right: Node<'_>,
         source: &str,
         type_of: &dyn Fn(&str) -> Option<RustTypeResolution>,
+        self_parameter: Option<&str>,
     ) -> Option<Self> {
         let mut names = Vec::new();
         let mut parsed = Vec::new();
@@ -589,6 +638,8 @@ impl RustGenericAlias {
         let mut spelling = Spelling::new(source);
         spelling.type_of = &free_type;
         spelling.spelling_limit = Some(MAXIMUM_ALIAS_SPELLING_BYTES);
+        spelling.alias_parameters = names.clone();
+        spelling.self_parameter = self_parameter.map(str::to_owned);
         let right = spelling.spelling_of(right)??;
         if spelling.unopenable_alias {
             return None;
@@ -632,7 +683,48 @@ impl RustGenericAlias {
             });
         };
         let right = alias.child_by_field_name("type")?;
-        Self::from_nodes_with(parameters, right, &declaration, type_of)
+        Self::from_nodes_with(parameters, right, &declaration, type_of, None)
+    }
+
+    /// 右辺が型パラメータを 1 つも使わないか。既定値は当てはめても右辺に現れない。
+    fn is_closed(&self) -> bool {
+        self.parameters.iter().all(|parameter| {
+            let marker = format!("%{}", parameter.name);
+            substituted(
+                &self.right,
+                &[(parameter.name.as_str(), marker)],
+                Some(MAXIMUM_ALIAS_SPELLING_BYTES),
+            )
+            .is_ok_and(|right| right == self.right)
+        })
+    }
+
+    /// `index` 番目の型パラメータだけに `argument` を当て、残りの型パラメータを保つ。
+    /// 後ろの既定値も同じく当てる。綴りが上限を超えれば `None`。
+    fn bound_at(&self, index: usize, argument: &str) -> Option<Self> {
+        let bound = self.parameters.get(index)?;
+        let substitutions = [(bound.name.as_str(), argument.to_owned())];
+        let limit = Some(MAXIMUM_ALIAS_SPELLING_BYTES);
+        let parameters = self
+            .parameters
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| *position != index)
+            .map(|(_, parameter)| {
+                let default = match &parameter.default {
+                    Some(default) => Some(substituted(default, &substitutions, limit).ok()?),
+                    None => None,
+                };
+                Some(AliasParameter {
+                    name: parameter.name.clone(),
+                    default,
+                })
+            })
+            .collect::<Option<_>>()?;
+        Some(Self {
+            parameters,
+            right: substituted(&self.right, &substitutions, limit).ok()?,
+        })
     }
 
     /// 正規化した型引数を当てはめる。既定値の置換も、右辺と同じ上限で組み立てる。
@@ -886,6 +978,14 @@ struct Spelling<'source, 'tree> {
     unopenable_associated_type: bool,
     spelling_limit: Option<usize>,
     expansion_limit_reached: bool,
+    /// 綴りのまま残すエイリアスの型パラメータの名前。当てはめは
+    /// [`RustGenericAlias::instantiated`] が名前で置換する。
+    ///
+    /// **右辺の中の投影の captures もこの名前で綴る。** 関連型 RHS の中の投影は、RHS を
+    /// 書いた impl を使用側として解いてあるので、captures はその impl の型変数の名前を指す。
+    alias_parameters: Vec<String>,
+    /// impl の対象型が無いところで Self を綴る型パラメータの名前。
+    self_parameter: Option<String>,
 }
 
 impl<'source, 'tree> Spelling<'source, 'tree> {
@@ -906,6 +1006,8 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
             unopenable_associated_type: false,
             spelling_limit: None,
             expansion_limit_reached: false,
+            alias_parameters: Vec::new(),
+            self_parameter: None,
         }
     }
 
@@ -1339,18 +1441,29 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
     ) -> Result<String, AliasInstantiationError> {
         match capture {
             RustCapture::Variable(name) => self
-                .variable_spelling_of(name)
+                .captured_variable_spelling_of(name)
                 .ok_or(AliasInstantiationError::Unopenable),
             RustCapture::Concrete(template) => {
                 let arguments = template
                     .parameters
                     .iter()
-                    .map(|parameter| self.variable_spelling_of(&parameter.name))
+                    .map(|parameter| self.captured_variable_spelling_of(&parameter.name))
                     .collect::<Option<Vec<_>>>()
                     .ok_or(AliasInstantiationError::Unopenable)?;
                 template.instantiated(&arguments, self.spelling_limit)
             }
         }
+    }
+
+    /// captures が指す型変数 1 つの綴り。付け替えた型変数か、綴りのまま残す
+    /// エイリアスの型パラメータ。どちらでもなければ `None`。
+    fn captured_variable_spelling_of(&mut self, name: &str) -> Option<String> {
+        self.variable_spelling_of(name).or_else(|| {
+            self.alias_parameters
+                .iter()
+                .any(|parameter| parameter == name)
+                .then(|| name.to_owned())
+        })
     }
 
     /// 名前付きの子を 1 つずつ綴り、落ちたものを除いて返す。読めなければ `None`。
@@ -1569,9 +1682,12 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
     }
 
     /// impl の対象を、メソッドの型変数に捕捉されないスコープで綴る。
-    /// 対象が分からなければ場所依存のまま残す。
+    /// 対象が分からなければ、Self を綴る型パラメータ（関連型 RHS）か、場所依存のまま残す。
     fn self_spelling(&mut self) -> Option<String> {
         let Some(target) = self.self_type.take() else {
+            if let Some(parameter) = &self.self_parameter {
+                return Some(parameter.clone());
+            }
             self.refers_to_self = true;
             return Some(SELF_TYPE.to_owned());
         };
