@@ -360,6 +360,9 @@ pub(crate) fn rust_traced_type_names_of(
 /// 循環はこの上限とは別に検出する。
 const MAXIMUM_ALIAS_DEPTH: usize = 32;
 
+/// 入れ子の投影の 2 段目の候補の場所。implementation が返したファイルと対象型の位置。
+type ClosedTargetSite = (std::path::PathBuf, SourcePosition);
+
 /// 宣言側の問い合わせ、ソースと再帰を含まない終端のキャッシュ。
 struct RustTypeResolver<'session> {
     session: &'session mut Session,
@@ -370,6 +373,10 @@ struct RustTypeResolver<'session> {
     active: Vec<DeclarationSite>,
     /// 辿っている途中の投影。書かれたファイルと、尋ねる位置（末尾の名前）。
     active_projections: Vec<(std::path::PathBuf, SourcePosition)>,
+    /// 入れ子の投影の 2 段目の候補ごとの、対象型の綴り（[`RustImplCandidate::closed_target`]）。
+    /// 使用側に依存しないので、1 つのシグネチャに入れ子の投影が 2 つ以上ある（引数と戻り値）
+    /// ときに使い回す。綴りにできなければ `Ok(None)`、型名を辿れなければその理由。
+    closed_targets: Vec<(ClosedTargetSite, Result<Option<String>, UnopenedReason>)>,
 }
 
 impl<'session> RustTypeResolver<'session> {
@@ -382,6 +389,7 @@ impl<'session> RustTypeResolver<'session> {
             terminals: Vec::new(),
             active: Vec::new(),
             active_projections: Vec::new(),
+            closed_targets: Vec::new(),
         }
     }
 
@@ -733,10 +741,23 @@ impl<'session> RustTypeResolver<'session> {
                 unselected.has_unreadable_file = true;
                 continue;
             };
-            self.session.open_document(&candidate_document)?;
-            let spelled = self
-                .resolutions_of(&candidate_document, closed.references())?
-                .map(|resolved| closed.spelling_with(&|name| resolved.get(name).cloned()));
+            let key = (site.path().to_owned(), site.position());
+            let cached = self
+                .closed_targets
+                .iter()
+                .find(|(cached, _)| *cached == key)
+                .map(|(_, spelled)| spelled.clone());
+            let spelled = match cached {
+                Some(spelled) => spelled,
+                None => {
+                    self.session.open_document(&candidate_document)?;
+                    let spelled = self
+                        .resolutions_of(&candidate_document, closed.references())?
+                        .map(|resolved| closed.spelling_with(&|name| resolved.get(name).cloned()));
+                    self.closed_targets.push((key, spelled.clone()));
+                    spelled
+                }
+            };
             match spelled {
                 Ok(spelled) if spelled.as_deref() == Some(target.as_str()) => {
                     chosen = Some((site.position(), candidate_document));
