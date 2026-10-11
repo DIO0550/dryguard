@@ -23,7 +23,9 @@ pub(crate) use projection::{
     RustAssociatedDefinition, RustProjectionSource, associated_owner_position_of,
 };
 mod selection;
-pub(crate) use selection::{RustImplBinding, RustImplCandidate, RustQualifiedProjection};
+pub(crate) use selection::{
+    RustImplBinding, RustImplCandidate, RustImplTarget, RustQualifiedProjection,
+};
 mod array_length;
 pub(crate) use array_length::{
     ArithmeticOperator, ConstSyntaxError, RustArrayLengths, RustConstExpression, RustConstSource,
@@ -304,13 +306,26 @@ pub(crate) enum RustTypeResolution {
     /// 関連型の RHS。型引数は captures（使用側の型変数名）→ RHS の Self → GAT の順に当てる。
     Associated {
         alias: RustGenericAlias,
-        captures: Vec<String>,
+        captures: Vec<RustCapture>,
         /// RHS に単独の Self があり、使用側の impl の対象型を当てるか。
         substitutes_self: bool,
     },
     NotAnAlias,
     Unopenable,
     ExpansionLimit,
+}
+
+/// 関連型 RHS の impl 型変数 1 つに、使用側で代入するもの。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RustCapture {
+    /// 使用側の impl の型変数名。
+    Variable(String),
+    /// 使用側の具体的な型。使用側の impl の型変数を引数に取るテンプレートで、
+    /// 型名は使用側のソースの位置から辿った解決を差し込んである。
+    ///
+    /// **Why（綴った文字列にしない）**: hover の綴りを読むときに型変数へ振る番号は
+    /// 読んだ順で決まるので、前もって綴ると hover の中の番号と食い違う。
+    Concrete(RustGenericAlias),
 }
 
 /// 展開する右辺の上限。深さだけではタプルで倍増する連鎖を抑えられない。
@@ -582,6 +597,42 @@ impl RustGenericAlias {
             parameters: parsed,
             right,
         })
+    }
+
+    /// 使用側の型 1 つ（`text`）を、使用側の impl の型変数（`parameters`）を引数に取る
+    /// テンプレートにする。型名は `type_of` の解決を差し込む。
+    ///
+    /// 辿れない型名・ライフタイム・未知の型構文を含めば `None`。
+    pub(crate) fn captured_of(
+        parameters: &[String],
+        text: &str,
+        type_of: &dyn Fn(&str) -> Option<RustTypeResolution>,
+    ) -> Option<Self> {
+        let declaration = match parameters.is_empty() {
+            true => format!("type Capture = {text};"),
+            false => format!("type Capture<{}> = {text};", parameters.join(", ")),
+        };
+        let tree = SyntaxTree::from_source(&declaration, Grammar::Rust).ok()?;
+        if tree.has_error() {
+            return None;
+        }
+        let alias = tree
+            .named_descendants()
+            .into_iter()
+            .find(|node| node.kind() == "type_item")?;
+        let Some(parameters) = alias.child_by_field_name("type_parameters") else {
+            let RustTypeResolution::Opened(right) =
+                RustTypeResolution::from_spelling_with(&declaration, type_of)
+            else {
+                return None;
+            };
+            return Some(Self {
+                parameters: Vec::new(),
+                right,
+            });
+        };
+        let right = alias.child_by_field_name("type")?;
+        Self::from_nodes_with(parameters, right, &declaration, type_of)
     }
 
     /// 正規化した型引数を当てはめる。既定値の置換も、右辺と同じ上限で組み立てる。
@@ -1239,26 +1290,26 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
                 captures,
                 substitutes_self,
             } => {
-                let mut captured: Option<Vec<_>> = captures
+                let mut captured = captures
                     .iter()
-                    .map(|name| self.variable_spelling_of(name))
-                    .collect();
-                // Why: RHS を書いた impl の対象型は、使用側の対象型と型変数の付け替えだけで一致する
-                // （直接囲む impl はそれ自身、別の impl は束縛と宣言元の照合で確かめてある）。
+                    .map(|capture| self.capture_spelling_of(capture))
+                    .collect::<Result<Vec<_>, _>>();
+                // Why: RHS を書いた impl の対象型に captures を当てはめたものは、使用側の対象型と
+                // 構造が一致する（直接囲む impl はそれ自身、別の impl は束縛と宣言元の照合で
+                // 確かめてある。blanket impl では型変数が Self 全体に当たる）。
                 if substitutes_self {
-                    let target = self.self_spelling();
-                    captured = captured.zip(target).map(|(mut captured, target)| {
-                        captured.push(target);
-                        captured
+                    let target = self
+                        .self_spelling()
+                        .ok_or(AliasInstantiationError::Unopenable);
+                    captured = captured.and_then(|mut captured| {
+                        captured.push(target?);
+                        Ok(captured)
                     });
                 }
-                match captured {
-                    Some(mut captured) => {
-                        captured.extend_from_slice(arguments);
-                        alias.instantiated(&captured, self.spelling_limit)
-                    }
-                    None => Err(AliasInstantiationError::Unopenable),
-                }
+                captured.and_then(|mut captured| {
+                    captured.extend_from_slice(arguments);
+                    alias.instantiated(&captured, self.spelling_limit)
+                })
             }
             RustTypeResolution::ExpansionLimit => Err(AliasInstantiationError::ExpansionLimit),
             RustTypeResolution::NotAnAlias
@@ -1276,6 +1327,28 @@ impl<'source, 'tree> Spelling<'source, 'tree> {
                 self.expansion_limit_reached = true;
                 self.unopenable_alias = true;
                 String::new()
+            }
+        }
+    }
+
+    /// 関連型 RHS の impl 型変数 1 つに代入する綴り。使用側の型変数は impl の名前空間で
+    /// 付け替え、具体的な型はテンプレートにその付け替えを当てはめる。
+    fn capture_spelling_of(
+        &mut self,
+        capture: &RustCapture,
+    ) -> Result<String, AliasInstantiationError> {
+        match capture {
+            RustCapture::Variable(name) => self
+                .variable_spelling_of(name)
+                .ok_or(AliasInstantiationError::Unopenable),
+            RustCapture::Concrete(template) => {
+                let arguments = template
+                    .parameters
+                    .iter()
+                    .map(|parameter| self.variable_spelling_of(&parameter.name))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(AliasInstantiationError::Unopenable)?;
+                template.instantiated(&arguments, self.spelling_limit)
             }
         }
     }

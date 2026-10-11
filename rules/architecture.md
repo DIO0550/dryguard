@@ -193,8 +193,8 @@ LSP が起動しない・`callHierarchy` が使えない・チャンクが切り
 hover に具体的な整数が残る場合は評価値との一致も確認し、未知の式は印として扱わない。
 対応できなければ `UnmatchedArrayLength`、未評価の式は綴りで比較しない。
 
-**Self を含む関連型は、直接囲む trait impl の定義か、型変数の付け替えだけで一致する impl の
-定義に限って展開する。**
+**Self を含む関連型は、直接囲む trait impl の定義か、型変数に使用側の型を当てはめるだけで
+一致する impl の定義に限って展開する。**
 `syntax::rust_callable::RustProjectionSource` が投影の末尾の位置と直接の impl から
 一意な関連型定義を読み、`semantics::resolved_type` が definition の返した trait メンバーの
 所有 trait と impl の実装 trait の宣言位置を照合する。完全修飾形は対象が Self 自体で、
@@ -212,23 +212,44 @@ Self を含む投影を歩くときに対象型の型名を尋ねる位置とし
 **直接囲む impl が別 trait の impl・inherent impl なら、完全修飾形の trait の impl を選ぶ。**
 `syntax::rust_callable::RustQualifiedProjection` が使用側の trait 引数と対象型を、
 `RustImplCandidate` が `implementation` の返した impl を読み、`binding_with` が
-**候補の型変数を使用側の impl の型変数へ付け替えるだけで構文が揃うか**を確かめて、
-同じ位置の型名の組を返す。組は `semantics::resolved_type` が両側のソースの位置から辿り、
-具体的な宣言元か確かめたプリミティブ・開いた右辺が等しいときだけ一致にする（綴りでは比べない）。
-一致する候補がちょうど 1 つのときだけ、その RHS を候補側のソースで解決して展開する。
+**候補の型変数に使用側の型を当てはめるだけで構文が揃うか**を確かめて、
+同じ位置の型名の組と、型変数ごとの束縛を返す。組は `semantics::resolved_type` が
+両側のソースの位置から辿り、具体的な宣言元か確かめたプリミティブ・開いた右辺が等しいときだけ
+一致にする（綴りでは比べない）。一致する候補がちょうど 1 つのときだけ、その RHS を候補側の
+ソースで解決して展開する。
 
-- **選んでよい根拠は coherence。** 付け替えで一致し境界を持たない impl があれば、他の impl は
-  重ならない。だから blanket impl を含む残りの候補を数えず、読めない候補も飛ばしてよい
-- **選ばないもの**（偽陰性側）: 型変数が具体的な型に当たる候補・境界や where 句・const 引数を
-  持つ候補・blanket impl（Issue #318）、属性（`cfg` など）付きの候補と `default impl`、
+- **当てはめる型は、使用側の impl の型変数か具体的な型**（`syntax::rust_callable::RustCapture`）。
+  具体的な型（型変数を含む部分型を含む）は、その型名を使用側の位置から辿り、使用側の impl の
+  型変数を引数に取るテンプレートにして代入する。型変数の番号は hover を読む順で決まるので、
+  前もって綴った文字列にはしない。境界の無い blanket impl（`impl<T> Trait for T`）は
+  `T` に Self 全体を当てはめる
+- **選んでよい根拠は coherence。** 当てはめで一致し境界を持たない impl があれば、他の impl は
+  重ならない。だから残りの候補を数えず、読めない候補も飛ばしてよい
+- **型変数だけを当てはめた候補が一致すれば、それを選ぶ。具体的な型を当てはめた候補は、
+  implementation が返した impl をすべて読んで照合し終えたときだけ選ぶ**（`semantics::resolved_type`
+  の `UnselectedImpls::chosen_from`）。境界の無い impl にも暗黙の `Sized` があり、unsized な型
+  （`str`・スライス・unsized な構造体）には別の impl が共存できる。使用側の型変数は Sized なので、
+  型変数だけの当てはめは確実に当てはまり、unsized な型の固有 impl と blanket impl が両方
+  一致しても固有 impl を選べる。対象型の末尾の名前が違う impl（候補として読めない impl を含む）は
+  照合し終えた側に数えるので、別名で書いた impl を取りこぼす緩みは残る
+- **選ばないもの**（偽陰性側）: 境界や where 句・const 引数を持つ候補（blanket impl を含む。
+  境界を満たさない型には別の impl が共存できるので coherence では 1 つに決まらず、
+  trait 解決が要る）、同じ型変数が 2 回以上現れて具体的な型に当たる候補（2 つが同じ型かを
+  綴りでしか比べられない）、型変数がメソッドの型変数を含む型・型変数を先頭に持つパス・
+  ライフタイムに当たる候補、属性（`cfg` など）付きの候補と `default impl`、
   使用側の where 句に**左辺が型変数そのものでない述語**がある形（Self や対象型を別の綴りで
   書いた param-env の候補でありうる。rustc も param-env を優先して正規化しない）、
+  使用側の対象が**境界つきの型変数そのもの**の形（`impl<T: Other> Show for T`。境界が Self への
+  param-env の候補で、supertrait 経由でも投影の trait を含みうる）、
   短縮形・入れ子の投影（Issue #327）
 - **理由**: implementation を提供しない・空は `ImplementationNotProvided` /
   `NoImplementationSite`。一致が 2 つ以上なら `UnresolvedAssociatedType`。0 件なら、照合まで
   進めたが辿れなかった候補の理由 → 候補のファイルを読めない（`UnreadableDeclaringDocument`）→
   URI を読めない（`UnreadableImplementation`）→ `UnresolvedAssociatedType` の順
-  （`semantics::resolved_type` の `UnselectedImpls`）
+  （`semantics::resolved_type` の `UnselectedImpls`）。具体的な型を当てはめた候補が照合し終える前に
+  1 つ残ったときも 0 件と同じ順で決める（候補として読めない impl だけなら
+  `UnresolvedAssociatedType`）。選んだ候補に当てはめる具体的な型は、
+  型名を辿れなければその理由、テンプレートにできなければ `UnopenableAssociatedType`
 - **`const trait` は読めない。** tree-sitter-rust が `pub const trait` を構文エラーにするので、
   std の多くの trait（`Iterator` / `Deref` など）は所有 trait を照合できず
   `UnresolvedAssociatedType` に倒れる

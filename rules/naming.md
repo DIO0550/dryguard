@@ -101,7 +101,8 @@ if structurally_similar && domains_differ { ... }
 | `type definition` | ソースの 1 点を指して、そこに書かれた型がどこで宣言されているかを尋ねる問い合わせ。**名前ではなく、その名前が指す型の宣言**を返す（Rust のエイリアスには空を返す） |
 | `definition` | ソースの 1 点を指して、**そこに書かれた名前**がどこで宣言されているかを尋ねる問い合わせ。Rust の型名はこちらで辿る（TypeScript では輸入した名前が import 文へ戻るので使わない） |
 | `implementation` | ソースの 1 点（trait パスの末尾の名前）を指して、その trait の impl を尋ねる問い合わせ。rust-analyzer は impl ごとに**対象型の範囲**を返し、全件を候補として持つ（先頭の 1 件に絞らない） |
-| `impl candidate` | `implementation` が返した impl 1 つ。**型変数の付け替えだけで**使用側の対象型・trait 引数と一致し、同じ位置の型名が同じ型（宣言元・確かめたプリミティブ・開いた右辺のどれか）を指すときだけ選ぶ（`syntax::rust_callable::RustImplCandidate`） |
+| `impl candidate` | `implementation` が返した impl 1 つ。境界を持たず、**型変数に使用側の型（型変数か具体的な型）を当てはめるだけで**使用側の対象型・trait 引数と一致し、同じ位置の型名が同じ型（宣言元・確かめたプリミティブ・開いた右辺のどれか）を指すときだけ選ぶ（`syntax::rust_callable::RustImplCandidate`） |
+| `capture` | 選んだ impl の関連型 RHS で、impl の型変数 1 つに使用側で代入するもの。使用側の impl の型変数か、使用側の具体的な型（使用側の impl の型変数を引数に取るテンプレート。`generic alias` と同じ型 `RustGenericAlias` で持つが、エイリアスの宣言ではない）のどちらか（`syntax::rust_callable::RustCapture`） |
 | `declaration site` | `type definition` / `definition` が返す宣言の場所。ファイルと、その中の 1 点 |
 | `references` | ソースの 1 点を指して、そこにある名前を使っているところを尋ねる問い合わせ |
 | `reference` | `references` が返す 1 件。**その名前を使っている側**のファイルの位置 |

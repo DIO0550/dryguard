@@ -1050,7 +1050,19 @@ fn test_rust_qualified_self_projections_select_the_impl_matching_target_and_trai
         "echoed_plain",
         "bounded",
         "concrete",
+        "concrete_plain",
+        "eight",
+        "eight_plain",
+        "nested",
+        "nested_plain",
+        "declared",
+        "declared_plain",
         "blanket",
+        "anything",
+        "anything_plain",
+        "every",
+        "slice",
+        "slice_plain",
     ] {
         // trait の宣言（本体なし）より後ろにある実装メソッドを採る
         let index = source
@@ -1089,6 +1101,15 @@ fn test_rust_qualified_self_projections_select_the_impl_matching_target_and_trai
         ("distant", "distant_plain", true),
         ("shown", "shown_plain", true),
         ("owned", "owned_plain", true),
+        // 候補の型変数が使用側の具体的な型・型変数を含む部分型に当たる impl を選ぶ
+        ("concrete", "concrete_plain", true),
+        ("eight", "eight_plain", true),
+        ("nested", "nested_plain", true),
+        ("declared", "declared_plain", true),
+        // 境界の無い blanket impl は、型変数が Self 全体に当たる
+        ("anything", "anything_plain", true),
+        // unsized な型の固有 impl は、blanket impl と両方一致しても型変数だけの当てはめを選ぶ
+        ("slice", "slice_plain", true),
         // 選んだ impl の RHS の Self は、receiver の無い inherent impl の対象型になる
         ("echoed", "echoed_plain", true),
         // 同じ trait の別の trait 引数の impl を選んでいない
@@ -1102,7 +1123,9 @@ fn test_rust_qualified_self_projections_select_the_impl_matching_target_and_trai
             "{first} / {second}"
         );
     }
-    for name in ["bounded", "concrete", "blanket"] {
+    // 境界を持つ blanket impl は、境界の充足を確かめられないので選ばない。
+    // `every` は unsized な Self に共存する属性付きの impl を読めないので、blanket impl を選ばない
+    for name in ["bounded", "blanket", "every"] {
         assert_eq!(
             outcomes[name],
             TypeSignatureOutcome::UnopenedTypeName {
