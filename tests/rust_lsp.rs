@@ -1277,3 +1277,114 @@ fn test_rust_array_lengths_compare_values_in_declaration_scope() {
         TypeSignatureOutcome::UnreadableSignature
     );
 }
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_declaration_cache_shared_across_chunks_keeps_each_chunk_outcome() {
+    for (relative_path, names) in [
+        (
+            "src/alias_scope.rs",
+            vec![
+                "cyclic",
+                "limit",
+                "boundary",
+                "raw",
+                "warm_limit",
+                "cold_limit",
+                "size_limit",
+            ],
+        ),
+        (
+            "src/selections.rs",
+            vec![
+                "inherent",
+                "inherent_plain",
+                "sixteen",
+                "renamed",
+                "concrete",
+                "concrete_plain",
+                "anything",
+                "slice",
+                "bounded",
+                "every",
+            ],
+        ),
+    ] {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rust-traced")
+            .join(relative_path);
+        let source = source_of(&path).expect("フィクスチャを読める");
+        let tree = SyntaxTree::from_source(&source, Grammar::Rust).expect("木にできる");
+        let document = SourceDocument::new(&path, source.clone()).expect("ドキュメントを作れる");
+        let root = WorkspaceRoot::enclosing(std::slice::from_ref(&path)).expect("根がある");
+        let mut session = Client::start(&ServerCommand::rust())
+            .expect("サーバを起動できる")
+            .handshake(&root)
+            .expect("握手できる");
+        session.open_document(&document).expect("開ける");
+        let mut outcome_of = |name: &str, cache: &mut RustDeclarationCache| {
+            // trait の宣言（本体なし）より後ろにある実装メソッドを採る
+            let index = source
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| {
+                    line.contains(&format!("fn {name}(")) || line.contains(&format!("fn {name}<"))
+                })
+                .map(|(index, _)| index)
+                .last()
+                .expect("関数がある");
+            let location = Location::new(path.clone(), LineNumber::from_index(index));
+            let chunk = Chunk::find_enclosing(&location, &tree).expect("チャンクがある");
+            rust_type_signature_outcome_of(
+                &mut session,
+                &document,
+                chunk.name_position().expect("名前がある"),
+                chunk.type_references(),
+                chunk.rust_impl_header(),
+                cache,
+            )
+            .expect("問い合わせ成功")
+        };
+
+        let fresh: Vec<TypeSignatureOutcome> = names
+            .iter()
+            .map(|name| outcome_of(name, &mut RustDeclarationCache::default()))
+            .collect();
+        // 逆順にすると、後に尋ねていたチャンクが温めた宣言を、先に尋ねていたチャンクが引く
+        let mut shared_cache = RustDeclarationCache::default();
+        let mut shared: Vec<TypeSignatureOutcome> = names
+            .iter()
+            .rev()
+            .map(|name| outcome_of(name, &mut shared_cache))
+            .collect();
+        shared.reverse();
+        session.shutdown().expect("終了できる");
+
+        for ((name, fresh), shared) in names.iter().zip(&fresh).zip(&shared) {
+            assert_eq!(shared, fresh, "{relative_path} の {name}");
+        }
+        // 比べた答えが、どれも同じ失敗に倒れていないこと
+        let reached = |name: &str| &fresh[names.iter().position(|n| *n == name).expect("尋ねた")];
+        match relative_path {
+            "src/alias_scope.rs" => {
+                for name in ["warm_limit", "cold_limit"] {
+                    assert_eq!(
+                        reached(name),
+                        &TypeSignatureOutcome::UnopenedTypeName {
+                            reason: UnopenedReason::AliasExpansionLimit
+                        },
+                        "{name}"
+                    );
+                }
+                assert!(matches!(
+                    reached("boundary"),
+                    TypeSignatureOutcome::Normalized(_)
+                ));
+            }
+            _ => assert!(matches!(
+                reached("inherent"),
+                TypeSignatureOutcome::Normalized(_)
+            )),
+        }
+    }
+}
