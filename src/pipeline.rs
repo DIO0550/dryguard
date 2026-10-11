@@ -670,7 +670,6 @@ fn asked_semantics_of(
     // **型シグネチャを先に尋ねる。** 走査側と同じ順で、[`asked_semantics_of_outcomes`] が
     // 型シグネチャの失敗を先に採るのと揃える。所属を先に尋ねると、そこで接続が切れた
     // ときに**後から落ちた hover の失敗が報告される**。
-    // 宣言側の答えは 2 つのチャンクで共有する（[`RustDeclarationCache`]）。
     let mut declarations_cache = RustDeclarationCache::default();
     let signature_a = resolved_type_signature_outcome_of(
         session,
@@ -1954,7 +1953,6 @@ fn asked_scan_semantics_of(
     }
 
     let askable = askable_chunks_of(chunks, asked, documents);
-    // 宣言側の答えは走査の全チャンクで共有する（[`RustDeclarationCache`]）。
     let mut declarations_cache = RustDeclarationCache::default();
     let signatures: Vec<Result<TypeSignatureOutcome, ClientError>> = askable
         .iter()

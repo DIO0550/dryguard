@@ -682,7 +682,8 @@ impl<'session> RustTypeResolver<'session> {
     /// ので、空を使い回すと後のチャンクが尋ね直せば取れた答えを落とす。
     /// 届いた答えを落ち着いたものとして扱えるのは、同じチャンクの hover が読み込みの
     /// 落ち着きを待った後にだけここへ来るから（`semantics::type_signature` の
-    /// `rust_type_signature_outcome_of`）。
+    /// `rust_type_signature_outcome_of`）。**落ち着いた後なら件数も揃う、は確かめていない** —
+    /// 件数の欠けた途中の答えが返れば、その後のチャンクにも同じ答えを使う緩みが残る。
     ///
     /// # Errors
     ///
