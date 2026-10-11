@@ -1047,6 +1047,8 @@ fn test_rust_nested_and_right_hand_side_projections_resolve_recursively() {
         "open",
         "cycle",
         "chain",
+        "chain_fits",
+        "chain_plain",
     ] {
         // trait の宣言（本体なし）より後ろにある実装メソッドを採る
         let index = source
@@ -1091,6 +1093,8 @@ fn test_rust_nested_and_right_hand_side_projections_resolve_recursively() {
         ("twice", "twice_plain", true),
         ("through", "through_plain", true),
         ("again", "again_plain", true),
+        // 使用側の投影と RHS の中の投影を合わせてちょうど 32 段なら開く（33 段の `chain` の対照）
+        ("chain_fits", "chain_plain", true),
     ] {
         assert_eq!(
             normalized(first).is_unifiable_with(&normalized(second)),

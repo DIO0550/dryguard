@@ -149,4 +149,6 @@ impl<T> Holder<T> {
     pub fn open(value: <<Self as Open>::Item as Deep>::Out) {}
     pub fn cycle(value: <Self as Cycle>::First) {}
     pub fn chain(value: <Self as Chain>::C0) {}
+    pub fn chain_fits(value: <Self as Chain>::C1) -> u8 { value }
+    pub fn chain_plain(value: u8) -> u8 { value }
 }
