@@ -1,3 +1,5 @@
+pub mod far;
+
 pub struct Holder<T>(pub T);
 pub struct Leaf;
 pub struct Branch;
@@ -31,6 +33,7 @@ pub trait Show {
     type Echo;
     type Through;
     type Generic;
+    type Away;
     fn again(value: Self::Again) -> Self::Again;
     fn again_plain(value: Leaf) -> Leaf;
 }
@@ -43,6 +46,7 @@ impl<T> Show for Holder<T> {
     type Echo = Self;
     type Through = (<Self as Show>::Item, Self);
     type Generic = Holder<u8>;
+    type Away = far::Remote;
     fn again(value: Self::Again) -> Self::Again { value }
     fn again_plain(value: Leaf) -> Leaf { value }
 }
@@ -149,6 +153,8 @@ impl<T> Holder<T> {
     pub fn open(value: <<Self as Open>::Item as Deep>::Out) {}
     pub fn cycle(value: <Self as Cycle>::First) {}
     pub fn chain(value: <Self as Chain>::C0) {}
+    pub fn away(value: <<Self as Show>::Away as Deep>::Out) -> i32 { value }
+    pub fn away_plain(value: i32) -> i32 { value }
     pub fn chain_fits(value: <Self as Chain>::C1) -> u8 { value }
     pub fn chain_plain(value: u8) -> u8 { value }
 }
