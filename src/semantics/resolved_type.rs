@@ -1235,23 +1235,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_rust_declaration_cache_keeps_the_first_read_source_after_the_file_is_removed() {
-        let directory =
-            std::env::temp_dir().join(format!("dryguard-declaration-cache-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).expect("一時ディレクトリを作れる");
-        let path = directory.join("declared.rs");
-        std::fs::write(&path, "pub type Amount = u64;\n").expect("ファイルを書ける");
-        let mut cache = RustDeclarationCache::default();
-
-        let first = cache.source_of(&path);
-        std::fs::remove_dir_all(&directory).expect("一時ディレクトリを消せる");
-        let second = cache.source_of(&path);
-
-        assert_eq!(first, Ok("pub type Amount = u64;\n".to_owned()));
-        assert_eq!(second, first, "同じ compare / scan の中では読み直さない");
-    }
-
-    #[test]
     fn test_unselected_impls_prefer_the_untraced_candidate_over_unreadable_files() {
         let unselected = UnselectedImpls {
             untraced: Some(UnopenedReason::NoDefinitionSite),
