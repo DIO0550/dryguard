@@ -121,17 +121,17 @@ impl RustAssociatedDefinition {
             .map(RustCapture::Variable)
             .collect();
         let right = alias.child_by_field_name("type")?;
+        let self_name = fresh_parameter_name_of(source);
         let positions = self_positions_of(right, source);
         let right_text = match positions.is_empty() {
             true => source.get(right.byte_range())?.to_owned(),
-            false => replaced(source, right, &positions, &fresh_parameter_name_of(source))?,
+            false => replaced(source, right, &positions, &self_name)?,
         };
         // Why: RHS の中の投影（`Self::Other`）は、開くと RHS を書いた impl の Self を含みうる。
         // その Self も使用側の対象型なので、単独の Self と同じ型パラメータで受ける。
         let self_parameter = contains_self_type(right, source).then(|| {
-            let name = fresh_parameter_name_of(source);
-            parameter_texts.push(name.clone());
-            name
+            parameter_texts.push(self_name.clone());
+            self_name
         });
         if let Some(parameters) = alias.child_by_field_name("type_parameters") {
             spelling.declared_type_parameters_of(parameters)?;

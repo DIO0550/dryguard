@@ -23,7 +23,8 @@ pub(crate) struct RustQualifiedProjection {
     trait_position: SourcePosition,
     target_name: String,
     parameters: Vec<String>,
-    method_parameters: Vec<String>,
+    /// 使用位置のメンバー（メソッドか関連型の定義）が束縛した型変数。
+    member_parameters: Vec<String>,
     shapes: Vec<TypeShape>,
 }
 
@@ -53,9 +54,9 @@ impl RustQualifiedProjection {
         let projected_trait = qualified.child_by_field_name("alias")?;
         // Why: 関連型 RHS の中の投影は、RHS を書いた impl を使用側として選ぶ。
         // 関連型の型変数（GAT）は、メソッドの型変数と同じく使用側の impl のスコープで綴れない。
-        let function = member_of(projection)?;
-        let implementation = enclosing_impl_of(function)?;
-        if signature_has_error(implementation) || signature_has_error(function) {
+        let member = member_of(projection)?;
+        let implementation = enclosing_impl_of(member)?;
+        if signature_has_error(implementation) || signature_has_error(member) {
             return None;
         }
         let same_trait_as_enclosing =
@@ -70,11 +71,11 @@ impl RustQualifiedProjection {
         }
         let target = implementation.child_by_field_name("type")?;
         let parameters = type_parameter_names_of(implementation, source)?;
-        let method_parameters = type_parameter_names_of(function, source)?;
+        let member_parameters = type_parameter_names_of(member, source)?;
         // Why: 左辺が型変数そのもの以外の述語は、Self や対象型を別の綴り（パス・エイリアス）で
         // 書いた param-env の候補でありうる。綴りの一覧で弾くと漏れが選ぶ側へ倒れるので、
         // 型変数そのものだけを通す許可リストにする。
-        let only_variables_constrained = [function, implementation]
+        let only_variables_constrained = [member, implementation]
             .into_iter()
             .flat_map(where_predicate_lefts_of)
             .all(|left| {
@@ -82,7 +83,7 @@ impl RustQualifiedProjection {
                     && source.get(left.byte_range()).is_some_and(|name| {
                         parameters
                             .iter()
-                            .chain(&method_parameters)
+                            .chain(&member_parameters)
                             .any(|parameter| parameter == name)
                     })
             });
@@ -104,7 +105,7 @@ impl RustQualifiedProjection {
                                 == Some(variable)
                     })
                 });
-            let where_bound = [function, implementation]
+            let where_bound = [member, implementation]
                 .into_iter()
                 .flat_map(where_predicate_lefts_of)
                 .any(|left| source.get(left.byte_range()) == Some(variable));
@@ -121,7 +122,7 @@ impl RustQualifiedProjection {
             trait_position: source_position_of(terminal_name_of(projected_trait)?, source)?,
             target_name: terminal_name_text_of(target, source)?,
             parameters,
-            method_parameters,
+            member_parameters,
             shapes,
         })
     }
@@ -325,7 +326,7 @@ impl RustImplCandidate {
         let walk = BindingWalk {
             candidate_parameters: &[],
             use_parameters: &[],
-            method_parameters: &[],
+            member_parameters: &[],
             bound: Vec::new(),
             names: Vec::new(),
         };
@@ -350,7 +351,7 @@ impl RustImplCandidate {
     /// 束縛と型名の組を返す。
     ///
     /// 一致しなければ `None`。束縛が食い違う、束縛されない型変数が残る、構文の形が違う、
-    /// 候補の型変数がライフタイム・メソッドの型変数を含む型・型変数を先頭に持つパスに当たる、
+    /// 候補の型変数がライフタイム・メンバー（メソッドか関連型の定義）の型変数を含む型・型変数を先頭に持つパスに当たる、
     /// のどれか。**同じ候補の型変数が 2 回以上現れ、どちらかが具体的な型に当たる**ときも
     /// 一致にしない — 2 つが同じ型かを確かめるには使用側どうしの宣言元の照合が要り、
     /// 綴りで比べると別モジュールの同名の型を取り違える（偽陰性側）。
@@ -365,7 +366,7 @@ impl RustImplCandidate {
         let mut walk = BindingWalk {
             candidate_parameters: &self.parameters,
             use_parameters: &projection.parameters,
-            method_parameters: &projection.method_parameters,
+            member_parameters: &projection.member_parameters,
             bound: vec![None; self.parameters.len()],
             names: Vec::new(),
         };
@@ -567,7 +568,7 @@ impl TypeShape {
 struct BindingWalk<'a> {
     candidate_parameters: &'a [String],
     use_parameters: &'a [String],
-    method_parameters: &'a [String],
+    member_parameters: &'a [String],
     bound: Vec<Option<BoundType>>,
     names: Vec<(TypeReference, TypeReference)>,
 }
@@ -651,7 +652,7 @@ impl BindingWalk<'_> {
 impl BindingWalk<'_> {
     /// 候補の型変数に当たった、使用側の型変数でない型。
     ///
-    /// ライフタイム、メソッドの型変数を含む型（使用側の impl のスコープでは綴れない）、
+    /// ライフタイム、メンバー（メソッドか関連型の定義）の型変数を含む型（使用側の impl のスコープでは綴れない）、
     /// 型変数を先頭に持つパス（`T::Out`。関連型の投影で、型名として辿れない）は `None`。
     fn concrete_of(&self, used: &TypeShape) -> Option<BoundType> {
         let text = match used {
@@ -673,7 +674,7 @@ impl BindingWalk<'_> {
             TypeShape::Name(name) => {
                 let head = name.name().split("::").next().unwrap_or_default();
                 let is_variable = |parameter: &String| parameter == head;
-                if self.method_parameters.iter().any(is_variable) {
+                if self.member_parameters.iter().any(is_variable) {
                     return None;
                 }
                 if self.use_parameters.iter().any(is_variable) {

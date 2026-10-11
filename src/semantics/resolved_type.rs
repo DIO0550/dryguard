@@ -468,15 +468,10 @@ impl<'session> RustTypeResolver<'session> {
         )? {
             return Ok(Err(reason));
         }
-        let mut resolved = HashMap::new();
-        for reference in projection.references() {
-            match self.reference_of(document, reference)? {
-                Ok(resolution) => {
-                    resolved.insert(reference.name().to_owned(), resolution);
-                }
-                Err(reason) => return Ok(Err(reason)),
-            }
-        }
+        let resolved = match self.resolutions_of(document, projection.references())? {
+            Ok(resolved) => resolved,
+            Err(reason) => return Ok(Err(reason)),
+        };
         Ok(projection
             .resolution_with(&|name| resolved.get(name).cloned())
             .ok_or(UnopenedReason::UnopenableAssociatedType))
@@ -652,15 +647,10 @@ impl<'session> RustTypeResolver<'session> {
         else {
             return Ok(Err(UnopenedReason::UnopenableAssociatedType));
         };
-        let mut resolved = HashMap::new();
-        for reference in definition.references() {
-            match self.reference_of(&candidate_document, reference)? {
-                Ok(resolution) => {
-                    resolved.insert(reference.name().to_owned(), resolution);
-                }
-                Err(reason) => return Ok(Err(reason)),
-            }
-        }
+        let resolved = match self.resolutions_of(&candidate_document, definition.references())? {
+            Ok(resolved) => resolved,
+            Err(reason) => return Ok(Err(reason)),
+        };
         Ok(definition
             .resolution_with(&|name| resolved.get(name).cloned())
             .ok_or(UnopenedReason::UnopenableAssociatedType))
@@ -744,31 +734,24 @@ impl<'session> RustTypeResolver<'session> {
                 continue;
             };
             self.session.open_document(&candidate_document)?;
-            let mut resolved = HashMap::new();
-            let mut untraced = None;
-            for name in closed.references() {
-                match self.reference_of(&candidate_document, name)? {
-                    Ok(resolution) => {
-                        resolved.insert(name.name().to_owned(), resolution);
-                    }
-                    Err(reason) => {
-                        untraced.get_or_insert(reason);
-                    }
+            let spelled = self
+                .resolutions_of(&candidate_document, closed.references())?
+                .map(|resolved| closed.spelling_with(&|name| resolved.get(name).cloned()));
+            match spelled {
+                Ok(spelled) if spelled.as_deref() == Some(target.as_str()) => {
+                    chosen = Some((site.position(), candidate_document));
+                    break;
                 }
-            }
-            if let Some(reason) = untraced {
-                unselected.untraced.get_or_insert(reason);
-                continue;
-            }
-            let spelled = closed.spelling_with(&|name| resolved.get(name).cloned());
-            if spelled.as_deref() == Some(target.as_str()) {
-                chosen = Some((site.position(), candidate_document));
-                break;
+                Ok(_) => {}
+                Err(reason) => {
+                    unselected.untraced.get_or_insert(reason);
+                }
             }
         }
         let Some((target_position, candidate_document)) = chosen else {
             return Ok(Err(unselected.reason_with(0)));
         };
+        self.session.open_document(&candidate_document)?;
         let Some(definition) = RustAssociatedDefinition::from_impl_at(
             candidate_document.source(),
             target_position,
@@ -776,15 +759,10 @@ impl<'session> RustTypeResolver<'session> {
         ) else {
             return Ok(Err(UnopenedReason::UnresolvedAssociatedType));
         };
-        let mut resolved = HashMap::new();
-        for reference in definition.references() {
-            match self.reference_of(&candidate_document, reference)? {
-                Ok(resolution) => {
-                    resolved.insert(reference.name().to_owned(), resolution);
-                }
-                Err(reason) => return Ok(Err(reason)),
-            }
-        }
+        let resolved = match self.resolutions_of(&candidate_document, definition.references())? {
+            Ok(resolved) => resolved,
+            Err(reason) => return Ok(Err(reason)),
+        };
         Ok(definition
             .resolution_with(&|name| resolved.get(name).cloned())
             .and_then(|resolution| resolution.with_self_bound(&target))
@@ -837,6 +815,29 @@ impl<'session> RustTypeResolver<'session> {
             }
         }
         Ok(NamesAgree::Yes)
+    }
+
+    /// `references` をそれぞれ `document` の位置から辿り、綴りから解決を引く表にする。
+    /// 1 つでも辿れなければ、最初の理由。
+    ///
+    /// # Errors
+    ///
+    /// hover / definition の往復が失敗したとき。
+    fn resolutions_of(
+        &mut self,
+        document: &SourceDocument,
+        references: &[TypeReference],
+    ) -> Result<Result<HashMap<String, RustTypeResolution>, UnopenedReason>, ClientError> {
+        let mut resolved = HashMap::new();
+        for reference in references {
+            match self.reference_of(document, reference)? {
+                Ok(resolution) => {
+                    resolved.insert(reference.name().to_owned(), resolution);
+                }
+                Err(reason) => return Ok(Err(reason)),
+            }
+        }
+        Ok(Ok(resolved))
     }
 
     /// 宣言側のソース。読めなかった理由もファイルごとに 1 回だけ覚える。
@@ -925,15 +926,10 @@ impl<'session> RustTypeResolver<'session> {
         document: &SourceDocument,
         body: &RustAliasSource,
     ) -> Result<Result<RustTypeResolution, UnopenedReason>, ClientError> {
-        let mut resolved = HashMap::new();
-        for reference in body.references() {
-            match self.reference_of(document, reference)? {
-                Ok(alias) => {
-                    resolved.insert(reference.name().to_owned(), alias);
-                }
-                Err(reason) => return Ok(Err(reason)),
-            }
-        }
+        let resolved = match self.resolutions_of(document, body.references())? {
+            Ok(resolved) => resolved,
+            Err(reason) => return Ok(Err(reason)),
+        };
         let spelling =
             match evaluated_array_spelling_of(self.session, document, body.array_lengths())? {
                 Ok(spelling) => spelling,
