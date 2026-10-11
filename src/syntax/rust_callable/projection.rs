@@ -377,6 +377,73 @@ pub(super) fn has_attribute(node: Node<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::line_number::LineNumber;
+
+    /// 1 行のソースで、`needle` が最後に現れる位置。
+    fn last_position_of(source: &str, needle: &str) -> SourcePosition {
+        let offset = source.rfind(needle).expect("ソースにある");
+        SourcePosition::from_preceding_text(LineNumber::from_index(0), &source[..offset])
+    }
+
+    #[test]
+    fn test_rhs_projection_is_read_with_the_impl_that_wrote_the_rhs() {
+        let source =
+            "impl<T> Show for Holder<T> { type Item = Leaf; type Again = (Self::Item, T); }";
+        let position = last_position_of(source, "Item");
+        let projection = RustProjectionSource::from_source(source, position)
+            .expect("impl の関連型 RHS も使用位置にする");
+        let leaf =
+            |name: &str| (name == "Leaf").then(|| RustTypeResolution::Declared("@leaf".into()));
+        let resolution = projection.resolution_with(&leaf).unwrap();
+        assert_eq!(resolution.closed_spelling(), Some("@leaf"));
+        let free = "type Again = (Self::Item, u8);";
+        assert!(
+            RustProjectionSource::from_source(free, last_position_of(free, "Item")).is_none(),
+            "対照: impl の外の宣言は使用位置にしない"
+        );
+    }
+
+    #[test]
+    fn test_rhs_with_self_projections_substitutes_self_through_their_resolutions() {
+        let source = "impl<T> Show for Holder<T> { type Echo = Self; type Twice = (Self::Echo, <Self as Show>::Echo, T); fn f(x: Self::Twice) {} }";
+        let header = Some("impl<T> Show for Holder<T>");
+        let echo = RustProjectionSource::from_source(source, last_position_of(source, "Echo, T"))
+            .unwrap()
+            .resolution_with(&|_| None)
+            .unwrap();
+        let twice =
+            RustProjectionSource::from_source(source, last_position_of(source, "Twice")).unwrap();
+        // 投影の中の Self は書き換えず、書かれた綴りで尋ねる
+        let names: Vec<_> = twice.references().iter().map(TypeReference::name).collect();
+        assert_eq!(names, ["Self::Echo", "<Self as Show>::Echo"]);
+        let inner = |name: &str| names.contains(&name).then(|| echo.clone());
+        let twice = twice.resolution_with(&inner).unwrap();
+        assert_eq!(twice.closed_spelling(), None, "Self に依存する");
+        let actual = RustCallable::from_spelling(
+            "fn f(x: Self::Twice)",
+            &|name| (name == "Self::Twice").then(|| twice.clone()),
+            header,
+        )
+        .unwrap();
+        let explicit =
+            RustCallable::from_spelling("fn f(x: (Holder<T>, Holder<T>, T))", &|_| None, header)
+                .unwrap();
+        assert_eq!(actual, explicit);
+    }
+
+    #[test]
+    fn test_closed_spelling_requires_a_right_hand_side_without_type_parameters() {
+        let source = "impl<T> Show for Holder<T> { type Item = T; type Fixed = u8; }";
+        let target = last_position_of(source, "Holder<T>");
+        let resolution_of = |name: &str| {
+            RustAssociatedDefinition::from_impl_at(source, target, name)
+                .unwrap()
+                .resolution_with(&|_| None)
+                .unwrap()
+        };
+        assert_eq!(resolution_of("Fixed").closed_spelling(), Some("u8"));
+        assert_eq!(resolution_of("Item").closed_spelling(), None);
+    }
 
     #[test]
     fn test_associated_gat_captures_impl_parameters_without_capturing_method_parameters() {
@@ -671,7 +738,7 @@ mod tests {
             .find(|reference| reference.name() == "Self::Item")
             .unwrap();
         let projection = RustProjectionSource::from_source(source, reference.position()).unwrap();
-        // 中の投影は書かれた綴りで尋ね、意味情報の側が辿る（今は理由付きで止まる）
+        // 中の投影は書かれた綴りで尋ね、意味情報の側が RHS を書いた impl の位置から辿る
         assert!(
             projection
                 .references()

@@ -784,6 +784,96 @@ mod tests {
         RustQualifiedProjection::from_source(source, reference.position())
     }
 
+    /// 1 行のソースで、`needle` が最後に現れる位置。
+    fn last_position_of(source: &str, needle: &str) -> SourcePosition {
+        let offset = source.rfind(needle).expect("ソースにある");
+        SourcePosition::from_preceding_text(
+            crate::line_number::LineNumber::from_index(0),
+            &source[..offset],
+        )
+    }
+
+    #[test]
+    fn test_nested_projection_reads_the_inner_projection_and_the_outer_trait() {
+        for (source, inner) in [
+            (
+                "impl<T> Holder<T> { fn f(x: <<Self as Show>::Item as Deep>::Out) {} }",
+                "<Self as Show>::Item",
+            ),
+            (
+                "impl<T> Show for Holder<T> { type Next = <Self::Item as Deep>::Out; }",
+                "Self::Item",
+            ),
+        ] {
+            let nested = RustNestedProjection::from_source(source, last_position_of(source, "Out"))
+                .unwrap_or_else(|| panic!("{source}"));
+            assert_eq!(nested.inner().name(), inner);
+            assert_eq!(nested.associated_name(), "Out");
+            assert_eq!(nested.trait_position(), last_position_of(source, "Deep"));
+        }
+        for source in [
+            "impl<T> Holder<T> { fn f(x: <<Self as Show>::Item as Deep<u8>>::Out) {} }",
+            "impl<T> Holder<T> { fn f(x: <<Self as Show>::Wrap<u8> as Deep>::Out) {} }",
+            "impl<T> Holder<T> { fn f(x: <Leaf as Deep>::Out) {} }",
+            "impl<T> Holder<T> { fn f(x: <Self as Deep>::Out) {} }",
+            "fn f(x: <<Self as Show>::Item as Deep>::Out) {}",
+        ] {
+            assert_eq!(
+                RustNestedProjection::from_source(source, last_position_of(source, "Out")),
+                None,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_closed_target_reads_only_impls_without_parameters_trait_arguments_or_erased_lifetimes()
+    {
+        let closed = only_candidate_of("impl Deep for Holder<&'static Leaf> {}")
+            .and_then(|candidate| candidate.closed_target())
+            .expect("型パラメータの無い impl の対象型");
+        let names: Vec<_> = closed
+            .references()
+            .iter()
+            .map(TypeReference::name)
+            .collect();
+        assert_eq!(names, ["Holder", "Leaf"]);
+        let declared = |name: &str| Some(RustTypeResolution::Declared(format!("@{name}")));
+        assert_eq!(
+            closed.spelling_with(&declared).as_deref(),
+            Some("@Holder<& 'static @Leaf>")
+        );
+        for source in [
+            "impl<T> Deep for Holder<T> {}",
+            "impl Deep<u8> for Leaf {}",
+            "impl<'a> Deep for Holder<'a> {}",
+            "impl Deep for Holder<fn(&u8)> {}",
+        ] {
+            let candidate = only_candidate_of(source).unwrap_or_else(|| panic!("{source}"));
+            assert_eq!(candidate.closed_target(), None, "{source}");
+        }
+    }
+
+    #[test]
+    fn test_qualified_projection_in_an_rhs_keeps_the_where_clause_check() {
+        let bounded =
+            "impl<T> Show for Holder<T> { type Next<'a> = <Self as Other>::Item where Self: 'a; }";
+        assert_eq!(
+            RustQualifiedProjection::from_source(bounded, last_position_of(bounded, "Item")),
+            None
+        );
+        for plain in [
+            "impl<T> Show for Holder<T> { type Next = <Self as Other>::Item; }",
+            "impl<T> Show for Holder<T> { type Next<'a> = <Self as Other>::Item where T: 'a; }",
+        ] {
+            assert!(
+                RustQualifiedProjection::from_source(plain, last_position_of(plain, "Item"))
+                    .is_some(),
+                "対照: 関連型 RHS も別の impl を選ぶ使用位置にする: {plain}"
+            );
+        }
+    }
+
     fn only_candidate_of(source: &str) -> Option<RustImplCandidate> {
         let mut candidates = RustImplCandidate::candidates_of(source);
         assert!(candidates.len() <= 1, "{source}");
