@@ -35,6 +35,8 @@ const STDERR_TAIL_BYTES: usize = 4 * 1024;
 ///
 /// **Why not（要求ごとの合計時間で切る）**: 落ち着くまでの合計はワークスペースの大きさで
 /// 伸びる（dryguard 自身で 6.6〜24.4 秒）。合計で切ると、正常に遅いサーバを殺す側に倒れる。
+/// 合計の上限（`settle limit`）は、通知だけが届き続けて終わらない形を有限にする安全網として
+/// 別に置き（[`super::connection::Connection`]）、実測より桁違いに広く取る。
 #[derive(Debug)]
 pub(super) struct SilenceLimitedReader {
     chunks: Receiver<io::Result<Vec<u8>>>,
