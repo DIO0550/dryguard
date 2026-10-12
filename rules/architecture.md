@@ -272,8 +272,9 @@ trait 宣言の supertrait（境界と `where Self:` の述語）と宣言して
 supertrait の閉包を definition で辿り、implementation を**その supertrait を書いた trait 宣言の
 位置**へ尋ねて、以降は上の完全修飾形と同じ選択（`selected_impl_projection_of`）で RHS を開く。
 
-- **definition が返した所有 trait だけでは決めない。** 閉包の中で `Name` を宣言する trait が
-  ちょうど 1 つで、それが所有 trait のときだけ選ぶ。rust-analyzer は同名の関連型を持つ
+- **definition が返した所有 trait だけでは決めない。** 閉包の中で読めた trait 宣言のうち、
+  所有 trait 以外に `Name` を宣言するものが無いときだけ選ぶ（所有 trait は definition で
+  確かめてあるので、宣言を読めなくても数える）。rust-analyzer は同名の関連型を持つ
   supertrait が 2 つある形（rustc は E0221）でも片方を返す
 - **読めない trait 宣言（`const trait` など）は閉包から外して辿り続ける。** 外して困るのは
   同名の関連型を読み落とすことだけで、それは rustc が拒否する形に限られる。読めないことを理由に
@@ -286,7 +287,7 @@ supertrait の閉包を definition で辿り、implementation を**その supert
 - **閉包の答えはチャンクをまたいで共有する**（`RustDeclarationCache` の `supertrait_owners`）。
   キーは実装している trait と関連型の宣言の組で、覚えるのは選べた答えだけ
 - **理由**: 所有 trait に届かなければ、辿れなかった supertrait の最初の理由、無ければ
-  `UnresolvedAssociatedType`。宣言する trait が 0 個・2 個以上・型引数付きの supertrait も
+  `UnresolvedAssociatedType`。所有 trait 以外にも宣言する trait がある・型引数付きの supertrait も
   `UnresolvedAssociatedType`。impl を選べなかったときは上の完全修飾形と同じ順
 - **inherent impl・`Name` を持たない trait の impl の中の短縮形は扱わない。** rustc が
   E0223 / E0220 で拒否する形

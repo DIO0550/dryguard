@@ -17,7 +17,11 @@ use super::projection::{has_attribute, member_of, projection_at, terminal_name_o
 use super::*;
 use crate::source_position::SourcePosition;
 
-/// 使用側の `<Self as Trait<Args>>::Name` と、直接囲む impl の文脈。
+/// 使用側の `<Self as Trait<Args>>::Name`、または trait impl の中の短縮形 `Self::Name` と、
+/// 直接囲む impl の文脈。
+///
+/// **短縮形では trait 引数を持たない。** どの supertrait を指すかは使用側に書かれていないので、
+/// 型引数付きの supertrait は `semantics::resolved_type` が選ばない（形が空でも取り違えない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RustQualifiedProjection {
     associated_name: String,
@@ -34,6 +38,7 @@ impl RustQualifiedProjection {
     /// - 対象が `Self` 自体でない・短縮形（`Self::Name`。[`Self::from_shorthand`] が読む）・
     ///   入れ子の投影（[`RustNestedProjection`] が読む）
     /// - 直接囲む impl が同じ trait パスの impl（直接の impl の経路が答える）
+    /// - trait 引数に関連型の束縛や `Self` がある
     /// - [`Self::from_context`] が読めない文脈
     pub(crate) fn from_source(source: &str, position: SourcePosition) -> Option<Self> {
         let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
@@ -108,8 +113,7 @@ impl RustQualifiedProjection {
     /// 投影を書いたメンバー（`member`）と直接囲む impl の文脈を読む。次のどれかなら `None`:
     /// - impl / メソッドの where 句に、左辺が型変数そのものでない述語がある（`Self` や
     ///   対象型を左辺に持つ param-env の候補は impl より優先され、rustc も投影を正規化しない）
-    /// - 対象が境界つきの型変数そのもの・impl が const 引数を持つ・trait 引数に関連型の束縛や
-    ///   `Self` がある
+    /// - 対象が境界つきの型変数そのもの・impl が const 引数を持つ
     fn from_context(
         projection: Node<'_>,
         member: Node<'_>,
