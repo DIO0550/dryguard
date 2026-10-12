@@ -367,10 +367,11 @@ const MAXIMUM_ALIAS_DEPTH: usize = 32;
 /// 入れ子の投影の 2 段目の候補の場所。implementation が返したファイルと対象型の位置。
 type ClosedTargetSite = (std::path::PathBuf, SourcePosition);
 
-/// compare / scan の間だけ共有する、Rust の型名の宣言側の答え。
+/// compare / scan の間だけ共有する、Rust の型名・定数の宣言側の答え。
 ///
 /// 宣言側のソース・impl 候補の構文解析・再帰を含まない終端・trait ごとの implementation の
-/// 応答を持つ。**どれもチャンクではなく、宣言のファイル・位置か trait で決まる**ので、
+/// 応答を持つ。宣言側のソースは型名解決と配列長の評価器（`array_length`）が引く。
+/// **どれもチャンクではなく、宣言のファイル・位置か trait で決まる**ので、
 /// チャンクごとに作り直すと同じファイルを読み直し、同じ trait に尋ね直す
 /// （`rules/architecture.md`「ファイル単位で決まる答えをチャンク単位で問い合わせない」）。
 ///
@@ -1025,11 +1026,15 @@ impl<'session> RustTypeResolver<'session> {
             Ok(resolved) => resolved,
             Err(reason) => return Ok(Err(reason)),
         };
-        let spelling =
-            match evaluated_array_spelling_of(self.session, document, body.array_lengths())? {
-                Ok(spelling) => spelling,
-                Err(reason) => return Ok(Err(reason)),
-            };
+        let spelling = match evaluated_array_spelling_of(
+            self.session,
+            self.cache,
+            document,
+            body.array_lengths(),
+        )? {
+            Ok(spelling) => spelling,
+            Err(reason) => return Ok(Err(reason)),
+        };
         let alias =
             RustTypeResolution::from_spelling_with(&spelling, &|name| resolved.get(name).cloned());
         match alias {

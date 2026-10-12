@@ -369,6 +369,7 @@ pub fn rust_type_signature_outcome_of(
     let traced = rust_traced_type_names_of(session, document, type_references, cache)?;
     let signature_text = match super::resolved_type::restored_array_spelling_of(
         session,
+        cache,
         document,
         position,
         &signature_text,
