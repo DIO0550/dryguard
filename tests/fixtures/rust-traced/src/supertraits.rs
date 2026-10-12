@@ -152,6 +152,24 @@ pub trait Picky: Defaulted<u16> {
 impl Picky for Leaf {
     fn picky(value: Self::Out) -> u8 { value as u8 }
 }
+// 既定の型引数の supertrait を型引数なしで書くと、型引数なしで書いた impl（`Defaulted<u8>`）を選ぶ
+pub trait Plain: Defaulted {
+    fn plain(value: Self::Out) -> u8;
+    fn plain_plain(value: u32) -> u8;
+}
+impl Plain for Leaf {
+    fn plain(value: Self::Out) -> u8 { value as u8 }
+    fn plain_plain(value: u32) -> u8 { value as u8 }
+}
+// Why: 同じ trait に型引数なしと型引数付きの 2 通りで届く。rustc は E0221 で拒否する（意図した形）
+pub trait Mid: Defaulted<u16> {}
+pub trait TwoPaths: Defaulted + Mid {
+    fn two_paths(value: Self::Out) -> u8;
+}
+impl Mid for Leaf {}
+impl TwoPaths for Leaf {
+    fn two_paths(value: Self::Out) -> u8 { let _ = value; 0 }
+}
 // Why: 同名の関連型を持つ supertrait が 2 つある。rustc は E0221 で拒否する（意図した形）
 pub trait Both: Show + Other {
     fn both(value: Self::Item) -> u8;

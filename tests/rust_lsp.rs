@@ -1193,6 +1193,9 @@ fn test_rust_shorthand_projections_of_supertrait_associated_types_select_the_sup
         "typed",
         "picky",
         "both",
+        "plain",
+        "plain_plain",
+        "two_paths",
     ] {
         // trait の宣言（本体なし）より後ろにある実装メソッドを採る
         let index = source
@@ -1228,8 +1231,10 @@ fn test_rust_shorthand_projections_of_supertrait_associated_types_select_the_sup
         ("shown", "shown_plain", true),
         // 同名の関連型を持つ別 trait（`Other`）の impl を選んでいない
         ("shown", "other_plain", false),
-        // 短縮形の後に同じ supertrait を完全修飾形で尋ねても、implementation の答えを取り違えない
+        // 短縮形と同じ supertrait を完全修飾形で尋ねても同じ型になる
         ("qualified", "shown_plain", true),
+        // 既定の型引数の supertrait を型引数なしで書くと、型引数なしの impl（`Defaulted<u8>`）を選ぶ
+        ("plain", "plain_plain", true),
         // 閉包に読めない trait（`Clone`）があっても、所有 trait へ届けば選ぶ
         ("cloned", "cloned_plain", true),
         // 関連型 RHS の中の短縮形
@@ -1254,8 +1259,9 @@ fn test_rust_shorthand_projections_of_supertrait_associated_types_select_the_sup
     // supertrait の impl が境界を持つ（`guarded`）・supertrait に型引数を書いた（`typed` /
     // `picky`。`picky` は既定の型引数の impl と形が揃う）・同名の関連型を持つ supertrait が
     // 2 つある（`both`。rustc は E0221）・所有 trait が `const trait`（`counted` の `Iterator`。
-    // 関連型の所有 trait を構文木で読めない）だと選ばない
-    for name in ["guarded", "typed", "picky", "both", "counted"] {
+    // 関連型の所有 trait を構文木で読めない）・型引数なしと型引数付きの 2 通りで所有 trait へ
+    // 届く（`two_paths`。rustc は E0221）だと選ばない
+    for name in ["guarded", "typed", "picky", "both", "counted", "two_paths"] {
         assert_eq!(
             outcomes[name],
             TypeSignatureOutcome::UnopenedTypeName {
@@ -1543,10 +1549,11 @@ fn test_rust_declaration_cache_shared_across_chunks_keeps_each_chunk_outcome() {
                 "every",
             ],
         ),
-        // 短縮形の supertrait の閉包と、同じ supertrait への完全修飾形が implementation を共有する
+        // 短縮形の supertrait の閉包と、同じ supertrait への完全修飾形が implementation を共有する。
+        // 逆順で後に回る both / picky は、shown が温めた閉包の答えを引かない
         (
             "rust-traced/src/supertraits.rs",
-            vec!["shown", "qualified", "chained", "diamond", "both", "picky"],
+            vec!["both", "picky", "shown", "qualified", "chained", "diamond"],
         ),
         // 連鎖と評価量の上限を共有すると、逆順で後に回る chain_boundary が上限に当たる
         (
