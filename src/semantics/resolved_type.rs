@@ -858,9 +858,12 @@ impl<'session> RustTypeResolver<'session> {
         let mut untraced = None;
         let mut owner = None;
         while let Some(site) = pending.pop() {
-            let Ok(source) = self.cache.source_of(site.path()) else {
-                untraced.get_or_insert(UnopenedReason::UnreadableDeclaringDocument);
-                continue;
+            let source = match self.cache.source_of(site.path()) {
+                Ok(source) => source,
+                Err(reason) => {
+                    untraced.get_or_insert(reason);
+                    continue;
+                }
             };
             let Some(declaration) = RustTraitDeclaration::from_source(&source, site.position())
             else {
