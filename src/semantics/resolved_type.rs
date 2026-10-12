@@ -322,6 +322,9 @@ pub fn traced_type_names_of(
 /// 非ジェネリック宣言の配列長は元の式を宣言側で評価する。
 /// ジェネリック宣言の自由な名前と定数式は `UnopenableAlias` のままにする。
 ///
+/// `cache` は compare / scan の 1 回（= 1 セッション）で共有する宣言側の答え
+/// （[`RustDeclarationCache`]）。
+///
 /// # Errors
 ///
 /// そのドキュメントを開かせていないとき、往復が失敗したとき。
@@ -329,8 +332,9 @@ pub(crate) fn rust_traced_type_names_of(
     session: &mut Session,
     document: &SourceDocument,
     type_references: &[TypeReference],
+    cache: &mut RustDeclarationCache,
 ) -> Result<TracedTypeNames, ClientError> {
-    let mut resolver = RustTypeResolver::new(session);
+    let mut resolver = RustTypeResolver::new(session, cache);
     let mut traced = TracedTypeNames::default();
     for reference in type_references {
         let resolution = resolver.reference_of(document, reference)?;
@@ -363,33 +367,60 @@ const MAXIMUM_ALIAS_DEPTH: usize = 32;
 /// 入れ子の投影の 2 段目の候補の場所。implementation が返したファイルと対象型の位置。
 type ClosedTargetSite = (std::path::PathBuf, SourcePosition);
 
-/// 宣言側の問い合わせ、ソースと再帰を含まない終端のキャッシュ。
-struct RustTypeResolver<'session> {
-    session: &'session mut Session,
+/// compare / scan の間だけ共有する、Rust の型名の宣言側の答え。
+///
+/// 宣言側のソース・impl 候補の構文解析・再帰を含まない終端・trait ごとの implementation の
+/// 応答を持つ。**どれもチャンクではなく、宣言のファイル・位置か trait で決まる**ので、
+/// チャンクごとに作り直すと同じファイルを読み直し、同じ trait に尋ね直す
+/// （`rules/architecture.md`「ファイル単位で決まる答えをチャンク単位で問い合わせない」）。
+///
+/// **1 つのセッションより長く持たない。** implementation の答えはサーバに見せた
+/// ワークスペースで決まる。持ち主は `pipeline` の、セッション 1 つに 1 回の問い合わせの手順。
+#[derive(Debug, Default)]
+pub struct RustDeclarationCache {
     sources: HashMap<std::path::PathBuf, Result<String, UnopenedReason>>,
     candidates: HashMap<std::path::PathBuf, Vec<RustImplCandidate>>,
     targets: HashMap<std::path::PathBuf, Vec<RustImplTarget>>,
     terminals: Vec<(DeclarationSite, RustTypeResolution)>,
+    /// trait の宣言位置ごとの implementation の応答。`Answered` だけを持つ。
+    implementations: Vec<(DeclarationSite, ImplementationOutcome)>,
+    /// 入れ子の投影の 2 段目の候補ごとの、対象型の綴り（[`RustImplCandidate::closed_target`]）。
+    /// 綴りにできなければ `None`。**型名を辿れた答えだけを持つ。** 辿れなかった理由には
+    /// 読み込み前の答え（`ServerStillWorking` など）が混じり、後のチャンクなら辿れうる。
+    closed_targets: Vec<(ClosedTargetSite, Option<String>)>,
+}
+
+impl RustDeclarationCache {
+    /// 宣言側のソース。読めなかった理由もファイルごとに 1 回だけ覚える。
+    fn source_of(&mut self, path: &std::path::Path) -> Result<String, UnopenedReason> {
+        self.sources
+            .entry(path.to_owned())
+            .or_insert_with(|| {
+                source_of(path).map_err(|_| UnopenedReason::UnreadableDeclaringDocument)
+            })
+            .clone()
+    }
+}
+
+/// 1 チャンクの型名を宣言側まで辿る手順。
+///
+/// **展開中の連鎖（`active` / `active_projections`）だけは共有しない。** 循環と展開の上限はその連鎖の中でだけ
+/// 意味を持ち、そこから出る答え（`CyclicAlias` / `AliasExpansionLimit`）はキャッシュに入れない。
+struct RustTypeResolver<'session> {
+    session: &'session mut Session,
+    cache: &'session mut RustDeclarationCache,
     active: Vec<DeclarationSite>,
     /// 辿っている途中の投影。書かれたファイルと、尋ねる位置（末尾の名前）。
     active_projections: Vec<(std::path::PathBuf, SourcePosition)>,
-    /// 入れ子の投影の 2 段目の候補ごとの、対象型の綴り（[`RustImplCandidate::closed_target`]）。
-    /// 使用側に依存しないので、1 つのシグネチャに入れ子の投影が 2 つ以上ある（引数と戻り値）
-    /// ときに使い回す。綴りにできなければ `Ok(None)`、型名を辿れなければその理由。
-    closed_targets: Vec<(ClosedTargetSite, Result<Option<String>, UnopenedReason>)>,
 }
 
 impl<'session> RustTypeResolver<'session> {
-    fn new(session: &'session mut Session) -> Self {
+    fn new(session: &'session mut Session, cache: &'session mut RustDeclarationCache) -> Self {
         Self {
             session,
-            sources: HashMap::new(),
-            candidates: HashMap::new(),
-            targets: HashMap::new(),
-            terminals: Vec::new(),
+            cache,
             active: Vec::new(),
             active_projections: Vec::new(),
-            closed_targets: Vec::new(),
         }
     }
 
@@ -469,7 +500,7 @@ impl<'session> RustTypeResolver<'session> {
                 None => Ok(Err(UnopenedReason::UnresolvedAssociatedType)),
             };
         };
-        if let Err(reason) = self.owner_matches(
+        if let Err(reason) = self.owning_trait_of(
             document,
             reference.position(),
             projection.implemented_trait().position(),
@@ -485,25 +516,27 @@ impl<'session> RustTypeResolver<'session> {
             .ok_or(UnopenedReason::UnopenableAssociatedType))
     }
 
-    /// 関連型の名前（`member`）の宣言が、`trait_position` に書かれた trait のメンバーか確かめる。
+    /// 関連型の名前（`member`）の宣言が `trait_position` に書かれた trait のメンバーなら、
+    /// その trait の宣言位置。
     ///
-    /// 同名の別 trait や supertrait の同名メンバーを、書かれた trait の関連型として扱わない。
+    /// 同名の別 trait や supertrait の同名メンバーを、書かれた trait の関連型として扱わない
+    /// （`UnresolvedAssociatedType`）。
     ///
     /// # Errors
     ///
     /// definition の往復が失敗したとき。
-    fn owner_matches(
+    fn owning_trait_of(
         &mut self,
         document: &SourceDocument,
         member: SourcePosition,
         trait_position: SourcePosition,
-    ) -> Result<Result<(), UnopenedReason>, ClientError> {
+    ) -> Result<Result<DeclarationSite, UnopenedReason>, ClientError> {
         let query = DeclarationQuery::Definition;
         let member = match query.site_of(self.session, document, member)? {
             Ok(site) => site,
             Err(reason) => return Ok(Err(reason)),
         };
-        let source = match self.source_of(member.path()) {
+        let source = match self.cache.source_of(member.path()) {
             Ok(source) => source,
             Err(reason) => return Ok(Err(reason)),
         };
@@ -516,7 +549,7 @@ impl<'session> RustTypeResolver<'session> {
         };
         let same_trait = implemented.path() == member.path() && implemented.position() == owner;
         Ok(match same_trait {
-            true => Ok(()),
+            true => Ok(implemented),
             false => Err(UnopenedReason::UnresolvedAssociatedType),
         })
     }
@@ -544,26 +577,27 @@ impl<'session> RustTypeResolver<'session> {
         reference: &TypeReference,
         projection: &RustQualifiedProjection,
     ) -> Result<Result<RustTypeResolution, UnopenedReason>, ClientError> {
-        if let Err(reason) =
-            self.owner_matches(document, reference.position(), projection.trait_position())?
-        {
-            return Ok(Err(reason));
-        }
-        let (sites, has_unreadable) = match self
-            .session
-            .implementation(document, projection.trait_position())?
-        {
-            ImplementationOutcome::Answered {
-                sites,
-                has_unreadable,
-            } => (sites, has_unreadable),
-            ImplementationOutcome::NoAnswer => {
-                return Ok(Err(UnopenedReason::NoImplementationSite));
-            }
-            ImplementationOutcome::NotSupported => {
-                return Ok(Err(UnopenedReason::ImplementationNotProvided));
-            }
+        let owner = match self.owning_trait_of(
+            document,
+            reference.position(),
+            projection.trait_position(),
+        )? {
+            Ok(owner) => owner,
+            Err(reason) => return Ok(Err(reason)),
         };
+        let (sites, has_unreadable) =
+            match self.implementation_of(document, projection.trait_position(), &owner)? {
+                ImplementationOutcome::Answered {
+                    sites,
+                    has_unreadable,
+                } => (sites, has_unreadable),
+                ImplementationOutcome::NoAnswer => {
+                    return Ok(Err(UnopenedReason::NoImplementationSite));
+                }
+                ImplementationOutcome::NotSupported => {
+                    return Ok(Err(UnopenedReason::ImplementationNotProvided));
+                }
+            };
         let mut unselected = UnselectedImpls {
             has_unreadable_site: has_unreadable,
             ..UnselectedImpls::default()
@@ -573,7 +607,7 @@ impl<'session> RustTypeResolver<'session> {
         for site in &sites {
             let source = match site.path() == document.path() {
                 true => Ok(document.source().to_owned()),
-                false => self.source_of(site.path()),
+                false => self.cache.source_of(site.path()),
             };
             let source = match source {
                 Ok(source) => source,
@@ -583,6 +617,7 @@ impl<'session> RustTypeResolver<'session> {
                 }
             };
             let candidate = self
+                .cache
                 .candidates
                 .entry(site.path().to_owned())
                 .or_insert_with(|| RustImplCandidate::candidates_of(&source))
@@ -593,6 +628,7 @@ impl<'session> RustTypeResolver<'session> {
                 // Why: 対象型の名前が違う impl は Self に当てはまらないので、照合し終えた側に数える。
                 // 位置に impl が無い（マクロ生成など）なら何に当てはまるか分からない。
                 let may_apply = self
+                    .cache
                     .targets
                     .entry(site.path().to_owned())
                     .or_insert_with(|| RustImplTarget::targets_of(&source))
@@ -686,11 +722,14 @@ impl<'session> RustTypeResolver<'session> {
         reference: &TypeReference,
         projection: &RustNestedProjection,
     ) -> Result<Result<RustTypeResolution, UnopenedReason>, ClientError> {
-        if let Err(reason) =
-            self.owner_matches(document, reference.position(), projection.trait_position())?
-        {
-            return Ok(Err(reason));
-        }
+        let owner = match self.owning_trait_of(
+            document,
+            reference.position(),
+            projection.trait_position(),
+        )? {
+            Ok(owner) => owner,
+            Err(reason) => return Ok(Err(reason)),
+        };
         let inner = match self.reference_of(document, projection.inner())? {
             Ok(inner) => inner,
             Err(reason) => return Ok(Err(reason)),
@@ -698,21 +737,19 @@ impl<'session> RustTypeResolver<'session> {
         let Some(target) = inner.closed_spelling().map(str::to_owned) else {
             return Ok(Err(UnopenedReason::UnresolvedAssociatedType));
         };
-        let (sites, has_unreadable) = match self
-            .session
-            .implementation(document, projection.trait_position())?
-        {
-            ImplementationOutcome::Answered {
-                sites,
-                has_unreadable,
-            } => (sites, has_unreadable),
-            ImplementationOutcome::NoAnswer => {
-                return Ok(Err(UnopenedReason::NoImplementationSite));
-            }
-            ImplementationOutcome::NotSupported => {
-                return Ok(Err(UnopenedReason::ImplementationNotProvided));
-            }
-        };
+        let (sites, has_unreadable) =
+            match self.implementation_of(document, projection.trait_position(), &owner)? {
+                ImplementationOutcome::Answered {
+                    sites,
+                    has_unreadable,
+                } => (sites, has_unreadable),
+                ImplementationOutcome::NoAnswer => {
+                    return Ok(Err(UnopenedReason::NoImplementationSite));
+                }
+                ImplementationOutcome::NotSupported => {
+                    return Ok(Err(UnopenedReason::ImplementationNotProvided));
+                }
+            };
         let mut unselected = UnselectedImpls {
             has_unreadable_site: has_unreadable,
             ..UnselectedImpls::default()
@@ -721,13 +758,14 @@ impl<'session> RustTypeResolver<'session> {
         for site in &sites {
             let source = match site.path() == document.path() {
                 true => Ok(document.source().to_owned()),
-                false => self.source_of(site.path()),
+                false => self.cache.source_of(site.path()),
             };
             let Ok(source) = source else {
                 unselected.has_unreadable_file = true;
                 continue;
             };
             let closed = self
+                .cache
                 .candidates
                 .entry(site.path().to_owned())
                 .or_insert_with(|| RustImplCandidate::candidates_of(&source))
@@ -743,18 +781,21 @@ impl<'session> RustTypeResolver<'session> {
             };
             let key = (site.path().to_owned(), site.position());
             let cached = self
+                .cache
                 .closed_targets
                 .iter()
                 .find(|(cached, _)| *cached == key)
                 .map(|(_, spelled)| spelled.clone());
             let spelled = match cached {
-                Some(spelled) => spelled,
+                Some(spelled) => Ok(spelled),
                 None => {
                     self.session.open_document(&candidate_document)?;
                     let spelled = self
                         .resolutions_of(&candidate_document, closed.references())?
                         .map(|resolved| closed.spelling_with(&|name| resolved.get(name).cloned()));
-                    self.closed_targets.push((key, spelled.clone()));
+                    if let Ok(spelled) = &spelled {
+                        self.cache.closed_targets.push((key, spelled.clone()));
+                    }
                     spelled
                 }
             };
@@ -788,6 +829,44 @@ impl<'session> RustTypeResolver<'session> {
             .resolution_with(&|name| resolved.get(name).cloned())
             .and_then(|resolution| resolution.with_self_bound(&target))
             .ok_or(UnopenedReason::UnopenableAssociatedType))
+    }
+
+    /// `trait_position` に書かれた trait（宣言位置は `owner`）の impl の場所。
+    ///
+    /// **キーは問い合わせた位置ではなく trait の宣言位置。** 答えは trait で決まるので、
+    /// 別のチャンク・別のファイルから同じ trait を尋ねても尋ね直さない。
+    /// **`Answered` だけを覚える。** 読み込み前にも空が返る（[`ImplementationOutcome::NoAnswer`]）
+    /// ので、空を使い回すと後のチャンクが尋ね直せば取れた答えを落とす。
+    /// 届いた答えを落ち着いたものとして扱えるのは、同じチャンクの hover が読み込みの
+    /// 落ち着きを待った後にだけここへ来るから（`semantics::type_signature` の
+    /// `rust_type_signature_outcome_of`）。**落ち着いた後なら件数も揃う、は確かめていない** —
+    /// 件数の欠けた途中の答えが返れば、その後のチャンクにも同じ答えを使う緩みが残る。
+    ///
+    /// # Errors
+    ///
+    /// implementation の往復が失敗したとき。
+    fn implementation_of(
+        &mut self,
+        document: &SourceDocument,
+        trait_position: SourcePosition,
+        owner: &DeclarationSite,
+    ) -> Result<ImplementationOutcome, ClientError> {
+        let cached = self
+            .cache
+            .implementations
+            .iter()
+            .find(|(site, _)| site == owner)
+            .map(|(_, outcome)| outcome.clone());
+        if let Some(outcome) = cached {
+            return Ok(outcome);
+        }
+        let outcome = self.session.implementation(document, trait_position)?;
+        if let ImplementationOutcome::Answered { .. } = outcome {
+            self.cache
+                .implementations
+                .push((owner.clone(), outcome.clone()));
+        }
+        Ok(outcome)
     }
 
     /// 束縛が対応付けた型名の組が、すべて同じ型を指すか。
@@ -861,16 +940,6 @@ impl<'session> RustTypeResolver<'session> {
         Ok(Ok(resolved))
     }
 
-    /// 宣言側のソース。読めなかった理由もファイルごとに 1 回だけ覚える。
-    fn source_of(&mut self, path: &std::path::Path) -> Result<String, UnopenedReason> {
-        self.sources
-            .entry(path.to_owned())
-            .or_insert_with(|| {
-                source_of(path).map_err(|_| UnopenedReason::UnreadableDeclaringDocument)
-            })
-            .clone()
-    }
-
     /// 宣言元をキーに循環を検出する。展開済みの連鎖をキャッシュしないので上限は順序に依存しない。
     ///
     /// # Errors
@@ -883,7 +952,12 @@ impl<'session> RustTypeResolver<'session> {
         if self.active.contains(site) {
             return Ok(Err(UnopenedReason::CyclicAlias));
         }
-        if let Some((_, terminal)) = self.terminals.iter().find(|(cached, _)| cached == site) {
+        if let Some((_, terminal)) = self
+            .cache
+            .terminals
+            .iter()
+            .find(|(cached, _)| cached == site)
+        {
             let alias_at_limit = matches!(terminal, RustTypeResolution::Generic(_))
                 && self.depth() >= MAXIMUM_ALIAS_DEPTH;
             if alias_at_limit {
@@ -904,13 +978,13 @@ impl<'session> RustTypeResolver<'session> {
                 site.position().character()
             );
             let terminal = RustTypeResolution::Declared(identity);
-            self.terminals.push((site.clone(), terminal.clone()));
+            self.cache.terminals.push((site.clone(), terminal.clone()));
             return Ok(Ok(terminal));
         }
         if self.depth() >= MAXIMUM_ALIAS_DEPTH {
             return Ok(Err(UnopenedReason::AliasExpansionLimit));
         }
-        let source = match self.source_of(site.path()) {
+        let source = match self.cache.source_of(site.path()) {
             Ok(source) => source,
             Err(reason) => return Ok(Err(reason)),
         };
@@ -921,7 +995,7 @@ impl<'session> RustTypeResolver<'session> {
             {
                 return Ok(Err(reason));
             }
-            self.terminals.push((site.clone(), alias.clone()));
+            self.cache.terminals.push((site.clone(), alias.clone()));
             return Ok(Ok(alias));
         }
         let Some(body) = RustAliasSource::from_source(&source, site.position()) else {

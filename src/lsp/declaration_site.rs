@@ -119,7 +119,7 @@ pub(super) fn unique_outcome_of(answered: &GotoDefinitionResponse) -> UniqueDecl
 ///
 /// **先頭の 1 件に絞らない。** rust-analyzer は trait の impl ごとに**対象型の範囲**を返し
 /// （2026-09-21 版で実測）、どれを選ぶかは対象型と trait 引数を照合する側が決める。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ImplementationOutcome {
     /// 1 件以上が返った。
     Answered {
