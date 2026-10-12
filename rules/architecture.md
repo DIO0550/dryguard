@@ -158,9 +158,11 @@ LSP が起動しない・`callHierarchy` が使えない・チャンクが切り
 ソースを読めない・問い合わせ未提供・読めない応答は既存の理由を保持する。
 `typeDefinition` の空の応答だけでは、別のプリミティブへのエイリアスを除外できない。
 循環は declaration site の組で検出して `CyclicAlias`、エイリアスの展開が 32 段を
-超える、または展開した右辺が 64 KiB を超えると `AliasExpansionLimit` を返す。
+超える、または展開した右辺が 64 KiB を超えると `AliasExpansionLimit` を返す
+（関連型 RHS の中の投影の再帰も同じ 2 つで止める。下の「関連型 RHS の中の投影は…」）。
 展開済みの連鎖や深さに依存する失敗はキャッシュしない。キャッシュするのはソースと
-再帰しない終端（と、下の完全修飾形の impl 選択が使う impl 候補の構文解析・implementation の応答）で、
+再帰しない終端（と、下の完全修飾形の impl 選択が使う impl 候補の構文解析・implementation の応答、
+入れ子の投影の 2 段目の候補の対象型の綴り）で、
 **型名解決のキャッシュは `semantics::resolved_type::RustDeclarationCache` が持ち、
 `pipeline` がセッション 1 つにつき 1 つ作ってチャンクのあいだで共有する**
 （下の「ファイル単位で決まる答えをチャンク単位で問い合わせない」）。展開中の連鎖だけは
@@ -209,7 +211,7 @@ RHS の名前は定義側の位置から辿り、impl 型変数と GAT の型引
 直接囲む impl ならそれ自身、選んだ impl なら束縛と宣言元の照合で使用側の対象型と
 一致を確かめてあるので、候補側の構文から綴り直さない。そのため使用側のソースも、
 Self を含む投影を歩くときに対象型の型名を尋ねる位置として集める。
-条件付き・複数の定義、入れ子の投影・RHS の中の投影（`type Item = Self::Other`。Issue #327）は
+条件付き・複数の定義は
 `UnresolvedAssociatedType`、未対応の RHS・ライフタイム GAT・型引数の不一致は
 `UnopenableAssociatedType`。具体的な型は関連型の名前や宣言元ではなく、展開した RHS で比べる。
 
@@ -245,7 +247,7 @@ Self を含む投影を歩くときに対象型の型名を尋ねる位置とし
   書いた param-env の候補でありうる。rustc も param-env を優先して正規化しない）、
   使用側の対象が**境界つきの型変数そのもの**の形（`impl<T: Other> Show for T`。境界が Self への
   param-env の候補で、supertrait 経由でも投影の trait を含みうる）、
-  短縮形・入れ子の投影（Issue #327）
+  短縮形（supertrait の関連型を指す形は Issue #337。入れ子の投影は下の別の経路で選ぶ）
 - **implementation の応答は trait の宣言位置ごとに 1 回だけ尋ねる**（`RustDeclarationCache`）。
   覚えるのは `Answered` だけで、読み込み前にも返る空は覚えない
 - **理由**: implementation を提供しない・空は `ImplementationNotProvided` /
@@ -259,6 +261,41 @@ Self を含む投影を歩くときに対象型の型名を尋ねる位置とし
 - **`const trait` は読めない。** tree-sitter-rust が `pub const trait` を構文エラーにするので、
   std の多くの trait（`Iterator` / `Deref` など）は所有 trait を照合できず
   `UnresolvedAssociatedType` に倒れる
+
+**関連型 RHS の中の投影は、RHS を書いた impl を使用側として再帰して開く。**
+`syntax::rust_callable::RustProjectionSource` / `RustQualifiedProjection` は、メソッドの
+シグネチャだけでなく impl の本体に直接書かれた関連型の定義も使用位置として読む
+（`member_of`）。関連型の型変数（GAT）はメソッドの型変数と同じく使用側の impl のスコープで
+綴れないものとして扱い、where 句の検査も同じ規則で行う。RHS の中の投影は**書かれた綴りの
+まま尋ね**（中の Self を書き換えると、尋ねた綴りと RHS の綴りが食い違う）、開いた先の Self と
+captures は**外側の RHS の型パラメータとして綴る**（`Spelling` の `self_parameter` /
+`alias_parameters`）。外側を使用側で当てはめると、使用側の対象型と型変数が入る。
+再帰は投影を書いたファイルと位置の組で追い、同じ組へ戻れば `CyclicAlias`、エイリアスの連鎖と
+合わせて 32 段を超えれば `AliasExpansionLimit`（rustc はどちらも拒否する形なので、
+別の理由を立てない）。
+
+**入れ子の投影 `<X as Trait>::Name`（`X` が Self を含む投影）は、`X` が閉じたときだけ
+2 段目の impl を選ぶ。** `syntax::rust_callable::RustNestedProjection` が `X` と外側の trait を
+読み、`semantics::resolved_type` の `nested_projection_of` が `X` を辿る。`X` の解決が
+型変数にも Self にも依存しない綴り（`RustTypeResolution::closed_spelling`）なら、
+implementation の候補のうち対象型の綴りが等しい impl（`RustImplCandidate::closed_target`）を
+選ぶ。2 段目の RHS の Self には、使用側の impl の対象型ではなく `X` を当てる
+（`RustTypeResolution::with_self_bound`）。
+
+- **選んでよい根拠は重なりの禁止。** 型パラメータの無い impl は対象型と同じ型にだけ当てはまり、
+  同じ型に当てはまる impl が他にあれば coherence が禁じる。だから一致した時点で決め、
+  読めない候補が残っていても選び直さない（上の「型変数だけの当てはめは確実に当てはまる」とは
+  別の根拠）
+- **選ばないもの**（偽陰性側）: `X` が型変数・Self に依存する形（`type Item = T` /
+  `type Item = Self`。RHS を書いた impl の対象型が具体的な型でも、Self は閉じない側に数える。
+  1 段目で選んだ impl の型変数に使用側の具体的な型を当てはめれば閉じる形も、当てはめる前の
+  右辺で判定するので閉じない側に倒れる）、
+  型パラメータか trait 引数を持つ 2 段目の impl（具体化が要る）、外側の trait が型引数を持つ形、
+  `X` が型引数を取る形（`<Self as T>::Wrap<u8>`）、`'static` 以外のライフタイムか関数型を含む
+  対象型（綴りがライフタイムを落とすので、`fn(&u8)` と `fn(&'a u8)` が同じ綴りになる）
+- **理由**: `X` を辿れなければその理由、`X` が閉じなければ `UnresolvedAssociatedType`、
+  等しい impl が無ければ上の 0 件と同じ順（`UnselectedImpls::reason_with`）
+- **短縮形の入れ子（`Self::Item::Out`）は扱わない。** rustc が E0223 で拒否する形
 
 **書かれた型名がここに来ることはある。** `syntax` が集めた型名は必ず尋ねる（TypeScript は
 `pipeline`、Rust は hover の後に `semantics::type_signature` が尋ねる）が、

@@ -127,3 +127,5 @@ pub mod alias_scope;
 pub mod projections;
 
 pub mod selections;
+
+pub mod nested;

@@ -986,6 +986,8 @@ fn test_rust_associated_types_match_their_instantiated_right_hand_sides() {
         // RHS の Self は、使用側の impl の対象型（`Holder<T>`）として展開する
         ("itself", "itself_plain"),
         ("paired", "paired_plain"),
+        // RHS の中の投影（`type Again = Self::Item`）は、RHS を書いた impl で再帰して開く
+        ("again", "itself_plain"),
     ] {
         let TypeSignatureOutcome::Normalized(left) = &outcomes[first] else {
             panic!("{first}: {:?}", outcomes[first]);
@@ -1023,11 +1025,128 @@ fn test_rust_associated_types_match_their_instantiated_right_hand_sides() {
             reason: UnopenedReason::UnopenableAssociatedType
         }
     );
-    // RHS の中の投影（`type Again = Self::Item`）は再帰して解決しない
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_nested_and_right_hand_side_projections_resolve_recursively() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust-traced/src/nested.rs");
+    let source = source_of(&path).expect("フィクスチャを読める");
+    let tree = SyntaxTree::from_source(&source, Grammar::Rust).expect("木にできる");
+    let document = SourceDocument::new(&path, source.clone()).expect("ドキュメントを作れる");
+    let root = WorkspaceRoot::enclosing(std::slice::from_ref(&path)).expect("根がある");
+    let mut session = Client::start(&ServerCommand::rust())
+        .expect("サーバを起動できる")
+        .handshake(&root)
+        .expect("握手できる");
+    session.open_document(&document).expect("開ける");
+    let mut declarations_cache = RustDeclarationCache::default();
+    let mut outcomes = std::collections::BTreeMap::new();
+    for name in [
+        "nested",
+        "nested_plain",
+        "branch_plain",
+        "me",
+        "me_plain",
+        "wrap",
+        "wrap_plain",
+        "next",
+        "pair",
+        "pair_plain",
+        "twice",
+        "twice_plain",
+        "through",
+        "through_plain",
+        "generic",
+        "again",
+        "again_plain",
+        "open",
+        "cycle",
+        "chain",
+        "chain_fits",
+        "chain_plain",
+        "away",
+        "away_plain",
+    ] {
+        // trait の宣言（本体なし）より後ろにある実装メソッドを採る
+        let index = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.contains(&format!("fn {name}(")) || line.contains(&format!("fn {name}<"))
+            })
+            .map(|(index, _)| index)
+            .last()
+            .expect("メソッドがある");
+        let location = Location::new(path.clone(), LineNumber::from_index(index));
+        let chunk = Chunk::find_enclosing(&location, &tree).expect("チャンクがある");
+        let outcome = rust_type_signature_outcome_of(
+            &mut session,
+            &document,
+            chunk.name_position().expect("名前がある"),
+            chunk.type_references(),
+            chunk.rust_impl_header(),
+            &mut declarations_cache,
+        )
+        .expect("問い合わせ成功");
+        outcomes.insert(name, outcome);
+    }
+    session.shutdown().expect("終了できる");
+    let normalized = |name: &str| {
+        let TypeSignatureOutcome::Normalized(signature) = &outcomes[name] else {
+            panic!("{name}: {:?}", outcomes[name]);
+        };
+        signature.clone()
+    };
+    for (first, second, expected) in [
+        // 入れ子の投影は、1 段目の RHS（`Leaf`）の impl を選んで 2 段目の RHS を開く
+        ("nested", "nested_plain", true),
+        ("nested", "branch_plain", false),
+        // 2 段目の RHS の Self は、使用側の impl の対象型ではなく 1 段目の RHS（`Leaf`）
+        ("me", "me_plain", true),
+        // 2 段目の GAT の型引数は、Self を当てた後も RHS の順に当てはめる
+        ("wrap", "wrap_plain", true),
+        // RHS の中の投影（入れ子・短縮形・Self を含む RHS）を、RHS を書いた impl で再帰して開く
+        ("next", "nested_plain", true),
+        ("pair", "pair_plain", true),
+        ("twice", "twice_plain", true),
+        ("through", "through_plain", true),
+        ("again", "again_plain", true),
+        // 使用側の投影と RHS の中の投影を合わせてちょうど 32 段なら開く（33 段の `chain` の対照）
+        ("chain_fits", "chain_plain", true),
+        // 2 段目の impl が別のファイルにあっても、対象型の宣言元の印で比べて選ぶ
+        ("away", "away_plain", true),
+        ("away", "nested_plain", false),
+    ] {
+        assert_eq!(
+            normalized(first).is_unifiable_with(&normalized(second)),
+            expected,
+            "{first} / {second}"
+        );
+    }
+    // 1 段目の RHS が使用側の型変数に依存する（`open`）・2 段目に当てはまる impl が
+    // 型パラメータを持つ（`generic`）と、2 段目の impl を選ばない
+    for name in ["open", "generic"] {
+        assert_eq!(
+            outcomes[name],
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::UnresolvedAssociatedType
+            },
+            "{name}"
+        );
+    }
+    // 循環する RHS の投影・深すぎる RHS の投影は、エイリアスの連鎖と同じ理由で止まる
     assert_eq!(
-        outcomes["again"],
+        outcomes["cycle"],
         TypeSignatureOutcome::UnopenedTypeName {
-            reason: UnopenedReason::UnresolvedAssociatedType
+            reason: UnopenedReason::CyclicAlias
+        }
+    );
+    assert_eq!(
+        outcomes["chain"],
+        TypeSignatureOutcome::UnopenedTypeName {
+            reason: UnopenedReason::AliasExpansionLimit
         }
     );
 }
