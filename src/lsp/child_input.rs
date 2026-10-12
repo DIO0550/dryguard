@@ -244,21 +244,38 @@ mod tests {
         let _ = stalled.wait();
     }
 
+    /// 入力を閉じた子プロセスの代わり。書き込みは必ず `BrokenPipe` で失敗する。
+    ///
+    /// **Why not（実際の子プロセスの閉じたパイプへ書く）**: 並行に走る他のテストの fork が
+    /// exec の前に読み口を複製していると、その間は書き込みが通ってしまう。
+    struct ClosedPeer;
+
+    /// [`ClosedPeer`] が返す失敗の文言。決め打ちの `BrokenPipe` と見分けるための印。
+    const CLOSED_PEER_CAUSE: &str = "相手が入力を閉じた";
+
+    impl Write for ClosedPeer {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, CLOSED_PEER_CAUSE))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
-    #[cfg(unix)]
     fn test_intake_limited_writer_to_a_closed_peer_reports_a_broken_pipe() {
         // 握手の失敗を「接続を閉じた」と見分けるのに、`BrokenPipe` の種類が要る
-        let mut exited = Command::new("true")
-            .stdin(Stdio::piped())
-            .spawn()
-            .expect("true を起動できる");
-        let stdin = exited.stdin.take().expect("stdin をパイプにした");
-        let _ = exited.wait();
         let mut writer =
-            IntakeLimitedWriter::spawn(stdin, GENEROUS_LIMIT).expect("スレッドを作れる");
+            IntakeLimitedWriter::spawn(ClosedPeer, GENEROUS_LIMIT).expect("スレッドを作れる");
 
         let error = writer.write_all(b"x").expect_err("閉じた相手には書けない");
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            error.to_string(),
+            CLOSED_PEER_CAUSE,
+            "書き口が受けた原因のまま"
+        );
     }
 }
