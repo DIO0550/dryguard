@@ -29,8 +29,9 @@ use crate::lsp::{
 use crate::source_position::SourcePosition;
 use crate::syntax::rust_callable::{
     RustAliasSource, RustAssociatedDefinition, RustImplBinding, RustImplCandidate, RustImplTarget,
-    RustNestedProjection, RustProjectionSource, RustQualifiedProjection, RustTypeResolution,
-    associated_owner_position_of, primitive_references_of_alias, primitive_spelling_of,
+    RustNestedProjection, RustProjectionSource, RustQualifiedProjection, RustTraitDeclaration,
+    RustTypeResolution, associated_owner_position_of, primitive_references_of_alias,
+    primitive_spelling_of,
 };
 use crate::syntax::type_reference::TypeReference;
 
@@ -389,6 +390,19 @@ pub struct RustDeclarationCache {
     /// 綴りにできなければ `None`。**型名を辿れた答えだけを持つ。** 辿れなかった理由には
     /// 読み込み前の答え（`ServerStillWorking` など）が混じり、後のチャンクなら辿れうる。
     closed_targets: Vec<(ClosedTargetSite, Option<String>)>,
+    /// 短縮形の投影が指す supertrait。キーは実装している trait と関連型の宣言の位置。
+    /// **選べた答えだけを持つ。** 辿れなかった理由には読み込み前の答えが混じる。
+    supertrait_owners: Vec<((DeclarationSite, DeclarationSite), SupertraitOwner)>,
+}
+
+/// 短縮形の投影が指す supertrait（所有 trait）と、それを supertrait として書いた位置。
+#[derive(Debug, Clone)]
+struct SupertraitOwner {
+    /// 所有 trait の宣言位置。
+    site: DeclarationSite,
+    /// 所有 trait の名前を supertrait として書いた trait 宣言のファイルと位置。
+    /// implementation をここへ尋ねる。
+    written_in: (std::path::PathBuf, SourcePosition),
 }
 
 impl RustDeclarationCache {
@@ -478,6 +492,8 @@ impl<'session> RustTypeResolver<'session> {
     /// 直接囲む trait impl の定義を先に試し、使えない形なら完全修飾形の trait の impl を選ぶ
     /// （[`RustTypeResolver::selected_projection_of`]）。対象が Self を含む投影なら
     /// 入れ子の投影として 2 段目の impl を選ぶ（[`RustTypeResolver::nested_projection_of`]）。
+    /// 直接囲む impl に定義の無い短縮形は、supertrait の impl を選ぶ
+    /// （[`RustTypeResolver::supertrait_projection_of`]）。
     ///
     /// # Errors
     ///
@@ -495,9 +511,16 @@ impl<'session> RustTypeResolver<'session> {
             {
                 return self.selected_projection_of(document, reference, &qualified);
             }
-            return match RustNestedProjection::from_source(document.source(), reference.position())
+            if let Some(nested) =
+                RustNestedProjection::from_source(document.source(), reference.position())
             {
-                Some(nested) => self.nested_projection_of(document, reference, &nested),
+                return self.nested_projection_of(document, reference, &nested);
+            }
+            return match RustQualifiedProjection::from_shorthand(
+                document.source(),
+                reference.position(),
+            ) {
+                Some(shorthand) => self.supertrait_projection_of(document, reference, &shorthand),
                 None => Ok(Err(UnopenedReason::UnresolvedAssociatedType)),
             };
         };
@@ -586,8 +609,34 @@ impl<'session> RustTypeResolver<'session> {
             Ok(owner) => owner,
             Err(reason) => return Ok(Err(reason)),
         };
+        self.selected_impl_projection_of(
+            document,
+            projection,
+            &owner,
+            document,
+            projection.trait_position(),
+        )
+    }
+
+    /// `owner` の trait の impl から、型変数に使用側の型を当てはめるだけで一致する 1 つを
+    /// 選んで RHS を開く（[`RustTypeResolver::selected_projection_of`] の選択の部分）。
+    ///
+    /// implementation は `trait_document` の `trait_position`（`owner` の trait 名を書いた位置）
+    /// へ尋ねる。完全修飾形では使用側の位置、短縮形では supertrait を書いた trait 宣言の位置。
+    ///
+    /// # Errors
+    ///
+    /// implementation / hover / definition / didOpen の往復が失敗したとき。
+    fn selected_impl_projection_of(
+        &mut self,
+        document: &SourceDocument,
+        projection: &RustQualifiedProjection,
+        owner: &DeclarationSite,
+        trait_document: &SourceDocument,
+        trait_position: SourcePosition,
+    ) -> Result<Result<RustTypeResolution, UnopenedReason>, ClientError> {
         let (sites, has_unreadable) =
-            match self.implementation_of(document, projection.trait_position(), &owner)? {
+            match self.implementation_of(trait_document, trait_position, owner)? {
                 ImplementationOutcome::Answered {
                     sites,
                     has_unreadable,
@@ -699,6 +748,170 @@ impl<'session> RustTypeResolver<'session> {
         Ok(definition
             .resolution_with(&|name| resolved.get(name).cloned())
             .ok_or(UnopenedReason::UnopenableAssociatedType))
+    }
+
+    /// trait impl の中の短縮形 `Self::Name` の `Name` が、直接囲む impl の trait の
+    /// supertrait の関連型なら、その supertrait の impl を選んで RHS を開く。
+    ///
+    /// 直接囲む impl の trait から supertrait の閉包を definition で辿り
+    /// （[`RustTypeResolver::supertrait_owner_of`]）、**`Name` の関連型を宣言する trait が
+    /// 閉包の中で `Name` の definition の所有 trait だけ**のときに、完全修飾形と同じ規則で
+    /// impl を選ぶ（[`RustTypeResolver::selected_impl_projection_of`]）。
+    /// 閉包の答えは実装している trait と関連型の宣言の組ごとに覚え、チャンクをまたいで使い回す。
+    ///
+    /// **definition が返した所有 trait だけでは決めない。** rust-analyzer は同名の関連型を持つ
+    /// supertrait が 2 つある形（rustc は E0221）でも片方を返す。
+    /// **読めない trait 宣言（std の `const trait` など）は閉包から外して辿り続ける。**
+    /// 外して困るのは同名の関連型を読み落とすことだけで、それは rustc が拒否する形に限られる。
+    ///
+    /// 所有 trait 以外にも宣言する trait がある、所有 trait が supertrait として現れない、所有 trait を
+    /// 型引数付きで書いた supertrait があるときは `UnresolvedAssociatedType`。所有 trait に
+    /// 届かず、辿れなかった supertrait があればその最初の理由。
+    ///
+    /// # Errors
+    ///
+    /// definition / implementation / hover / didOpen の往復が失敗したとき。
+    fn supertrait_projection_of(
+        &mut self,
+        document: &SourceDocument,
+        reference: &TypeReference,
+        projection: &RustQualifiedProjection,
+    ) -> Result<Result<RustTypeResolution, UnopenedReason>, ClientError> {
+        let query = DeclarationQuery::Definition;
+        let member = match query.site_of(self.session, document, reference.position())? {
+            Ok(site) => site,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let member_source = match self.cache.source_of(member.path()) {
+            Ok(source) => source,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let Some(owner_position) = associated_owner_position_of(&member_source, member.position())
+        else {
+            return Ok(Err(UnopenedReason::UnresolvedAssociatedType));
+        };
+        let implemented =
+            match query.site_of(self.session, document, projection.trait_position())? {
+                Ok(site) => site,
+                Err(reason) => return Ok(Err(reason)),
+            };
+        let key = (implemented.clone(), member.clone());
+        let cached = self
+            .cache
+            .supertrait_owners
+            .iter()
+            .find(|(cached, _)| *cached == key)
+            .map(|(_, owner)| owner.clone());
+        let owner = match cached {
+            Some(owner) => owner,
+            None => {
+                let owner = match self.supertrait_owner_of(
+                    implemented,
+                    &member,
+                    owner_position,
+                    projection.associated_name(),
+                )? {
+                    Ok(owner) => owner,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+                self.cache.supertrait_owners.push((key, owner.clone()));
+                owner
+            }
+        };
+        let source = match self.cache.source_of(&owner.written_in.0) {
+            Ok(source) => source,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let Ok(trait_document) = SourceDocument::new(&owner.written_in.0, source) else {
+            return Ok(Err(UnopenedReason::UnreadableDeclaringDocument));
+        };
+        self.session.open_document(&trait_document)?;
+        self.selected_impl_projection_of(
+            document,
+            projection,
+            &owner.site,
+            &trait_document,
+            owner.written_in.1,
+        )
+    }
+
+    /// `implemented` の trait から supertrait の閉包を辿り、所有 trait（宣言位置は `member` の
+    /// ファイルの `owner_position`）を supertrait として書いた位置を返す。
+    ///
+    /// **所有 trait は `name` を宣言している側に、宣言を読めなくても数える。** definition が
+    /// 関連型の宣言に届いた時点で確かめてある。読めた他の trait が `name` を宣言していれば曖昧。
+    ///
+    /// # Errors
+    ///
+    /// definition / didOpen の往復が失敗したとき。
+    fn supertrait_owner_of(
+        &mut self,
+        implemented: DeclarationSite,
+        member: &DeclarationSite,
+        owner_position: SourcePosition,
+        name: &str,
+    ) -> Result<Result<SupertraitOwner, UnopenedReason>, ClientError> {
+        let query = DeclarationQuery::Definition;
+        let mut visited = vec![implemented.clone()];
+        let mut pending = vec![implemented];
+        let mut declaring = Vec::new();
+        let mut untraced = None;
+        let mut owner = None;
+        while let Some(site) = pending.pop() {
+            let Ok(source) = self.cache.source_of(site.path()) else {
+                untraced.get_or_insert(UnopenedReason::UnreadableDeclaringDocument);
+                continue;
+            };
+            let Some(declaration) = RustTraitDeclaration::from_source(&source, site.position())
+            else {
+                continue;
+            };
+            if declaration.declares(name) {
+                declaring.push(site.clone());
+            }
+            if declaration.supertraits().is_empty() {
+                continue;
+            }
+            let Ok(trait_document) = SourceDocument::new(site.path(), source) else {
+                untraced.get_or_insert(UnopenedReason::UnreadableDeclaringDocument);
+                continue;
+            };
+            self.session.open_document(&trait_document)?;
+            for supertrait in declaration.supertraits() {
+                let named =
+                    match query.site_of(self.session, &trait_document, supertrait.position())? {
+                        Ok(named) => named,
+                        Err(reason) => {
+                            untraced.get_or_insert(reason);
+                            continue;
+                        }
+                    };
+                let names_owner =
+                    named.path() == member.path() && named.position() == owner_position;
+                if names_owner && supertrait.has_arguments() {
+                    return Ok(Err(UnopenedReason::UnresolvedAssociatedType));
+                }
+                if names_owner && owner.is_none() {
+                    owner = Some(SupertraitOwner {
+                        site: named.clone(),
+                        written_in: (site.path().to_owned(), supertrait.position()),
+                    });
+                }
+                if !visited.contains(&named) {
+                    visited.push(named.clone());
+                    pending.push(named);
+                }
+            }
+        }
+        let Some(owner) = owner else {
+            return Ok(Err(
+                untraced.unwrap_or(UnopenedReason::UnresolvedAssociatedType)
+            ));
+        };
+        if declaring.iter().any(|declared| *declared != owner.site) {
+            return Ok(Err(UnopenedReason::UnresolvedAssociatedType));
+        }
+        Ok(Ok(owner))
     }
 
     /// 入れ子の投影 `<X as Trait>::Name` の、2 段目の impl の RHS を開く。
