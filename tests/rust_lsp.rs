@@ -17,7 +17,7 @@ use dryguard::lsp::{
 };
 use dryguard::pipeline::{chunk_pair_of, measured_pair_of, scan_of_language};
 use dryguard::report::{Explanation, scan_text_of};
-use dryguard::semantics::resolved_type::UnopenedReason;
+use dryguard::semantics::resolved_type::{RustDeclarationCache, UnopenedReason};
 use dryguard::semantics::type_signature::{
     TypeSignatureOutcome, UntracedReason, rust_type_signature_outcome_of,
 };
@@ -167,6 +167,7 @@ fn test_rust_analyzer_signatures_compare_through_where_clauses_and_lifetimes() {
 
     let client = Client::start(&ServerCommand::rust()).expect("rust-analyzer を起動できる");
     let mut session = client.handshake(&root).expect("握手できる");
+    let mut declarations_cache = RustDeclarationCache::default();
     session.open_document(&document).expect("ファイルを開ける");
 
     // 型名を渡さない（辿った記録が無い）。比べ方（境界・ライフタイムの書き分け）だけを見る
@@ -177,8 +178,15 @@ fn test_rust_analyzer_signatures_compare_through_where_clauses_and_lifetimes() {
             .position(|line| line.starts_with(&format!("pub fn {name}")))
             .expect("フィクスチャにその関数がある");
         let position = SourcePosition::from_preceding_text(LineNumber::from_index(line), "pub fn ");
-        rust_type_signature_outcome_of(&mut session, &document, position, &type_references, None)
-            .expect("hover を尋ねられる")
+        rust_type_signature_outcome_of(
+            &mut session,
+            &document,
+            position,
+            &type_references,
+            None,
+            &mut declarations_cache,
+        )
+        .expect("hover を尋ねられる")
     };
 
     let normalized = |outcome: TypeSignatureOutcome| match outcome {
@@ -425,6 +433,7 @@ fn test_rust_impl_signatures_preserve_target_receiver_bounds_and_binding_scopes(
         .expect("握手できる");
     session.open_document(&document).expect("開ける");
     let mut outcomes = std::collections::BTreeMap::new();
+    let mut declarations_cache = RustDeclarationCache::default();
     for name in [
         "wrap_a",
         "wrap_b",
@@ -453,6 +462,7 @@ fn test_rust_impl_signatures_preserve_target_receiver_bounds_and_binding_scopes(
             chunk.name_position().expect("名前がある"),
             chunk.type_references(),
             chunk.rust_impl_header(),
+            &mut declarations_cache,
         )
         .expect("問い合わせ成功");
         let TypeSignatureOutcome::Normalized(signature) = outcome else {
@@ -475,6 +485,7 @@ fn test_rust_impl_signatures_preserve_target_receiver_bounds_and_binding_scopes(
         access.name_position().expect("名前がある"),
         access.type_references(),
         access.rust_impl_header(),
+        &mut declarations_cache,
     )
     .expect("問い合わせ成功");
     assert!(
@@ -496,6 +507,7 @@ fn test_rust_impl_signatures_preserve_target_receiver_bounds_and_binding_scopes(
         projected.name_position().expect("名前がある"),
         projected.type_references(),
         projected.rust_impl_header(),
+        &mut declarations_cache,
     )
     .expect("問い合わせ成功");
     assert!(
@@ -542,6 +554,7 @@ fn test_rust_type_references_of_a_chunk_are_the_type_names_of_its_hover() {
     session.open_document(&document).expect("ファイルを開ける");
 
     let mut outcomes = Vec::new();
+    let mut declarations_cache = RustDeclarationCache::default();
     for function in ["audited_count", "displayed_len", "charged"] {
         let location = traced_fixture("src/lib.rs", function);
         let chunk = Chunk::find_enclosing(&location, &tree).expect("関数を切り出せる");
@@ -552,6 +565,7 @@ fn test_rust_type_references_of_a_chunk_are_the_type_names_of_its_hover() {
             position,
             chunk.type_references(),
             chunk.rust_impl_header(),
+            &mut declarations_cache,
         )
         .expect("hover と definition を尋ねられる");
         outcomes.push((function, outcome));
@@ -919,6 +933,7 @@ fn test_rust_associated_types_match_their_instantiated_right_hand_sides() {
         .expect("握手できる");
     session.open_document(&document).expect("開ける");
     let mut outcomes = std::collections::BTreeMap::new();
+    let mut declarations_cache = RustDeclarationCache::default();
     for name in [
         "short",
         "qualified",
@@ -957,6 +972,7 @@ fn test_rust_associated_types_match_their_instantiated_right_hand_sides() {
             chunk.name_position().expect("名前がある"),
             chunk.type_references(),
             chunk.rust_impl_header(),
+            &mut declarations_cache,
         )
         .expect("問い合わせ成功");
         outcomes.insert(name, outcome);
@@ -1031,6 +1047,7 @@ fn test_rust_qualified_self_projections_select_the_impl_matching_target_and_trai
         .expect("握手できる");
     session.open_document(&document).expect("開ける");
     let mut outcomes = std::collections::BTreeMap::new();
+    let mut declarations_cache = RustDeclarationCache::default();
     for name in [
         "inherent",
         "inherent_plain",
@@ -1082,6 +1099,7 @@ fn test_rust_qualified_self_projections_select_the_impl_matching_target_and_trai
             chunk.name_position().expect("名前がある"),
             chunk.type_references(),
             chunk.rust_impl_header(),
+            &mut declarations_cache,
         )
         .expect("問い合わせ成功");
         outcomes.insert(name, outcome);
@@ -1155,6 +1173,7 @@ fn test_rust_array_lengths_compare_values_in_declaration_scope() {
         .expect("握手できる");
     session.open_document(&document).expect("ソースを開ける");
     let mut outcomes = std::collections::BTreeMap::new();
+    let mut declarations_cache = RustDeclarationCache::default();
     for (index, line) in source.lines().enumerate() {
         let Some(function) = line.trim_start().strip_prefix("pub fn ") else {
             continue;
@@ -1168,6 +1187,7 @@ fn test_rust_array_lengths_compare_values_in_declaration_scope() {
             chunk.name_position().expect("関数の位置"),
             chunk.type_references(),
             chunk.rust_impl_header(),
+            &mut declarations_cache,
         )
         .expect("LSP 問い合わせに成功する");
         outcomes.insert(name, outcome);
@@ -1256,4 +1276,115 @@ fn test_rust_array_lengths_compare_values_in_declaration_scope() {
         outcomes["generic"],
         TypeSignatureOutcome::UnreadableSignature
     );
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_declaration_cache_shared_across_chunks_keeps_each_chunk_outcome() {
+    for (relative_path, names) in [
+        (
+            "src/alias_scope.rs",
+            vec![
+                "cyclic",
+                "limit",
+                "boundary",
+                "raw",
+                "warm_limit",
+                "cold_limit",
+                "size_limit",
+            ],
+        ),
+        (
+            "src/selections.rs",
+            vec![
+                "inherent",
+                "inherent_plain",
+                "sixteen",
+                "renamed",
+                "concrete",
+                "concrete_plain",
+                "anything",
+                "slice",
+                "bounded",
+                "every",
+            ],
+        ),
+    ] {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rust-traced")
+            .join(relative_path);
+        let source = source_of(&path).expect("フィクスチャを読める");
+        let tree = SyntaxTree::from_source(&source, Grammar::Rust).expect("木にできる");
+        let document = SourceDocument::new(&path, source.clone()).expect("ドキュメントを作れる");
+        let root = WorkspaceRoot::enclosing(std::slice::from_ref(&path)).expect("根がある");
+        let mut session = Client::start(&ServerCommand::rust())
+            .expect("サーバを起動できる")
+            .handshake(&root)
+            .expect("握手できる");
+        session.open_document(&document).expect("開ける");
+        let mut outcome_of = |name: &str, cache: &mut RustDeclarationCache| {
+            // trait の宣言（本体なし）より後ろにある実装メソッドを採る
+            let index = source
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| {
+                    line.contains(&format!("fn {name}(")) || line.contains(&format!("fn {name}<"))
+                })
+                .map(|(index, _)| index)
+                .last()
+                .expect("関数がある");
+            let location = Location::new(path.clone(), LineNumber::from_index(index));
+            let chunk = Chunk::find_enclosing(&location, &tree).expect("チャンクがある");
+            rust_type_signature_outcome_of(
+                &mut session,
+                &document,
+                chunk.name_position().expect("名前がある"),
+                chunk.type_references(),
+                chunk.rust_impl_header(),
+                cache,
+            )
+            .expect("問い合わせ成功")
+        };
+
+        let fresh: Vec<TypeSignatureOutcome> = names
+            .iter()
+            .map(|name| outcome_of(name, &mut RustDeclarationCache::default()))
+            .collect();
+        // 逆順にすると、後に尋ねていたチャンクが温めた宣言を、先に尋ねていたチャンクが引く
+        let mut shared_cache = RustDeclarationCache::default();
+        let mut shared: Vec<TypeSignatureOutcome> = names
+            .iter()
+            .rev()
+            .map(|name| outcome_of(name, &mut shared_cache))
+            .collect();
+        shared.reverse();
+        session.shutdown().expect("終了できる");
+
+        for ((name, fresh), shared) in names.iter().zip(&fresh).zip(&shared) {
+            assert_eq!(shared, fresh, "{relative_path} の {name}");
+        }
+        // 比べた答えが、どれも同じ失敗に倒れていないこと
+        let reached = |name: &str| &fresh[names.iter().position(|n| *n == name).expect("尋ねた")];
+        match relative_path {
+            "src/alias_scope.rs" => {
+                for name in ["warm_limit", "cold_limit"] {
+                    assert_eq!(
+                        reached(name),
+                        &TypeSignatureOutcome::UnopenedTypeName {
+                            reason: UnopenedReason::AliasExpansionLimit
+                        },
+                        "{name}"
+                    );
+                }
+                assert!(matches!(
+                    reached("boundary"),
+                    TypeSignatureOutcome::Normalized(_)
+                ));
+            }
+            _ => assert!(matches!(
+                reached("inherent"),
+                TypeSignatureOutcome::Normalized(_)
+            )),
+        }
+    }
 }

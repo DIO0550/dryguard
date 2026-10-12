@@ -33,7 +33,8 @@ use crate::semantics::caller_domain::{
     CallerDomainsOutcome, ReferenceSources, caller_domains_outcome_of,
 };
 use crate::semantics::resolved_type::{
-    TypeDeclaration, UnopenedReason, UnopenedTypeName, opened_type_names_of, traced_type_names_of,
+    RustDeclarationCache, TypeDeclaration, UnopenedReason, UnopenedTypeName, opened_type_names_of,
+    traced_type_names_of,
 };
 use crate::semantics::type_signature::{
     TypeSignatureOutcome, UntracedReason, rust_type_signature_outcome_of, type_signature_outcome_of,
@@ -669,8 +670,21 @@ fn asked_semantics_of(
     // **型シグネチャを先に尋ねる。** 走査側と同じ順で、[`asked_semantics_of_outcomes`] が
     // 型シグネチャの失敗を先に採るのと揃える。所属を先に尋ねると、そこで接続が切れた
     // ときに**後から落ちた hover の失敗が報告される**。
-    let signature_a = resolved_type_signature_outcome_of(session, chunk_a, document_a, position_a);
-    let signature_b = resolved_type_signature_outcome_of(session, chunk_b, document_b, position_b);
+    let mut declarations_cache = RustDeclarationCache::default();
+    let signature_a = resolved_type_signature_outcome_of(
+        session,
+        chunk_a,
+        document_a,
+        position_a,
+        &mut declarations_cache,
+    );
+    let signature_b = resolved_type_signature_outcome_of(
+        session,
+        chunk_b,
+        document_b,
+        position_b,
+        &mut declarations_cache,
+    );
 
     // 所属はファイルごとに 1 度だけ確かめる（走査側と同じ形。[`AskedMembership`]）。
     let mut membership_a = AskedMembership::ask(session, root, document_a);
@@ -714,6 +728,11 @@ fn asked_semantics_of(
 /// 集める。** 順序は `semantics::type_signature::rust_type_signature_outcome_of` が
 /// 中に持つ（読み込み前の definition は空を返すので、hover が落ち着くのを先に待つ）。
 ///
+/// `declarations_cache` は同じセッションで尋ねるチャンクのあいだで共有する、Rust の
+/// 宣言側の答え。**チャンクごとに作らない** — 答えはチャンクではなく宣言のファイルと
+/// trait で決まる（`rules/architecture.md`「ファイル単位で決まる答えをチャンク単位で
+/// 問い合わせない」）。
+///
 /// # Errors
 ///
 /// 往復が失敗したとき。
@@ -722,6 +741,7 @@ fn resolved_type_signature_outcome_of(
     chunk: &Chunk,
     document: &SourceDocument,
     position: SourcePosition,
+    declarations_cache: &mut RustDeclarationCache,
 ) -> Result<TypeSignatureOutcome, ClientError> {
     if chunk.grammar() == Grammar::Rust {
         return rust_type_signature_outcome_of(
@@ -730,6 +750,7 @@ fn resolved_type_signature_outcome_of(
             position,
             chunk.type_references(),
             chunk.rust_impl_header(),
+            declarations_cache,
         );
     }
 
@@ -1932,6 +1953,7 @@ fn asked_scan_semantics_of(
     }
 
     let askable = askable_chunks_of(chunks, asked, documents);
+    let mut declarations_cache = RustDeclarationCache::default();
     let signatures: Vec<Result<TypeSignatureOutcome, ClientError>> = askable
         .iter()
         .map(|askable| {
@@ -1940,6 +1962,7 @@ fn asked_scan_semantics_of(
                 &chunks[askable.index].chunk,
                 askable.document,
                 askable.position,
+                &mut declarations_cache,
             )
         })
         .collect();

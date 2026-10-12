@@ -18,7 +18,8 @@ use std::num::NonZeroUsize;
 
 use crate::lsp::{ClientError, HoverOutcome, Session, SignatureText, SourceDocument};
 use crate::semantics::resolved_type::{
-    ResolvedTypes, TracedTypeNames, TypeDeclaration, UnopenedReason, rust_traced_type_names_of,
+    ResolvedTypes, RustDeclarationCache, TracedTypeNames, TypeDeclaration, UnopenedReason,
+    rust_traced_type_names_of,
 };
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{AnnotatedPositions, OverloadDeclaration, TypeAnnotation};
@@ -334,6 +335,8 @@ fn overload_set_outcome_of(
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
 /// `Chunk::name_position` が指す識別子の位置、`type_references` は
 /// `Chunk::type_references` が集めた型名。`impl_header` は `Chunk::rust_impl_header`。
+/// `cache` は同じセッションで尋ねるチャンクのあいだで共有する宣言側の答え
+/// （[`RustDeclarationCache`]）。
 ///
 /// **注釈の有無もオーバーロードも見ない。** Rust の関数は引数と戻り値の型を省けず
 /// （省いた戻り値は `()`）、同じ名前で複数のシグネチャを持てない。
@@ -356,13 +359,14 @@ pub fn rust_type_signature_outcome_of(
     position: SourcePosition,
     type_references: &[TypeReference],
     impl_header: Option<&str>,
+    cache: &mut RustDeclarationCache,
 ) -> Result<TypeSignatureOutcome, ClientError> {
     let signature_text = match asked_signature_text_of(session, document, position)? {
         Ok(signature_text) => signature_text,
         Err(outcome) => return Ok(outcome),
     };
 
-    let traced = rust_traced_type_names_of(session, document, type_references)?;
+    let traced = rust_traced_type_names_of(session, document, type_references, cache)?;
     let signature_text = match super::resolved_type::restored_array_spelling_of(
         session,
         document,
