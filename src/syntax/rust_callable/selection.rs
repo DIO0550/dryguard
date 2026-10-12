@@ -1,4 +1,5 @@
-//! Self を直接の対象にした完全修飾形の関連型について、別の impl を選ぶための構文情報。
+//! Self を直接の対象にした完全修飾形の関連型と、supertrait の関連型を指す短縮形について、
+//! 別の impl を選ぶための構文情報。
 //!
 //! **選ぶのは、候補 impl の型変数に使用側の型を当てはめるだけで、trait 引数と対象型が
 //! 一致し、境界も where 句も持たない impl だけ。** 当てはめる型は使用側の impl の型変数か、
@@ -30,12 +31,10 @@ pub(crate) struct RustQualifiedProjection {
 
 impl RustQualifiedProjection {
     /// 使用位置（メソッドのシグネチャか、impl の関連型 RHS）の投影を読む。次のどれかなら `None`:
-    /// - 対象が `Self` 自体でない・短縮形（`Self::Name`）・入れ子の投影
-    ///   （入れ子は [`RustNestedProjection`] が読む）
+    /// - 対象が `Self` 自体でない・短縮形（`Self::Name`。[`Self::from_shorthand`] が読む）・
+    ///   入れ子の投影（[`RustNestedProjection`] が読む）
     /// - 直接囲む impl が同じ trait パスの impl（直接の impl の経路が答える）
-    /// - impl / メソッドの where 句に、左辺が型変数そのものでない述語がある（`Self` や
-    ///   対象型を左辺に持つ param-env の候補は impl より優先され、rustc も投影を正規化しない）
-    /// - impl が const 引数を持つ・trait 引数に関連型の束縛や `Self` がある
+    /// - [`Self::from_context`] が読めない文脈
     pub(crate) fn from_source(source: &str, position: SourcePosition) -> Option<Self> {
         let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
         let projection = projection_at(&tree, source, position)?;
@@ -56,9 +55,6 @@ impl RustQualifiedProjection {
         // 関連型の型変数（GAT）は、メソッドの型変数と同じく使用側の impl のスコープで綴れない。
         let member = member_of(projection)?;
         let implementation = enclosing_impl_of(member)?;
-        if signature_has_error(implementation) || signature_has_error(member) {
-            return None;
-        }
         let same_trait_as_enclosing =
             implementation
                 .child_by_field_name("trait")
@@ -67,6 +63,62 @@ impl RustQualifiedProjection {
                         == projection_name_of(projected_trait, source)
                 });
         if same_trait_as_enclosing {
+            return None;
+        }
+        let trait_shapes = trait_argument_shapes_of(projected_trait, source)?;
+        Self::from_context(projection, member, projected_trait, trait_shapes, source)
+    }
+
+    /// trait impl の中の短縮形 `Self::Name` を、直接囲む impl の trait の supertrait の
+    /// 投影として読む。次のどれかなら `None`:
+    /// - 短縮形でない・直接囲む impl が trait impl でない（inherent impl の短縮形は E0223）
+    /// - 直接囲む impl に同名の関連型定義がある（直接の impl の経路が答える）
+    /// - [`Self::from_context`] が読めない文脈
+    ///
+    /// **trait 引数は持たない。** どの supertrait を指すかは使用側のソースに書かれていないので、
+    /// trait パスの位置（[`Self::trait_position`]）は直接囲む impl の trait 名を指す。
+    /// 型引数を取る supertrait は選ばない（`semantics::resolved_type` が型引数の有無を確かめる）。
+    pub(crate) fn from_shorthand(source: &str, position: SourcePosition) -> Option<Self> {
+        let tree = SyntaxTree::from_source(source, Grammar::Rust).ok()?;
+        let projection = projection_at(&tree, source, position)?;
+        let path = projection.child_by_field_name("path")?;
+        if source.get(path.byte_range()) != Some(SELF_TYPE) {
+            return None;
+        }
+        let member = member_of(projection)?;
+        let implementation = enclosing_impl_of(member)?;
+        let implemented = implementation.child_by_field_name("trait")?;
+        // Why: 直接囲む impl に同名の定義があれば、短縮形はその定義を指す。読めない定義
+        // （属性付き・複数）でも supertrait の impl へ取り違えない
+        let name = projection.child_by_field_name("name")?;
+        let defined_here =
+            named_children_of(implementation.child_by_field_name("body")?).any(|item| {
+                item.kind() == "type_item"
+                    && item
+                        .child_by_field_name("name")
+                        .and_then(|defined| source.get(defined.byte_range()))
+                        == source.get(name.byte_range())
+            });
+        if defined_here {
+            return None;
+        }
+        Self::from_context(projection, member, implemented, Vec::new(), source)
+    }
+
+    /// 投影を書いたメンバー（`member`）と直接囲む impl の文脈を読む。次のどれかなら `None`:
+    /// - impl / メソッドの where 句に、左辺が型変数そのものでない述語がある（`Self` や
+    ///   対象型を左辺に持つ param-env の候補は impl より優先され、rustc も投影を正規化しない）
+    /// - 対象が境界つきの型変数そのもの・impl が const 引数を持つ・trait 引数に関連型の束縛や
+    ///   `Self` がある
+    fn from_context(
+        projection: Node<'_>,
+        member: Node<'_>,
+        projected_trait: Node<'_>,
+        mut shapes: Vec<TypeShape>,
+        source: &str,
+    ) -> Option<Self> {
+        let implementation = enclosing_impl_of(member)?;
+        if signature_has_error(implementation) || signature_has_error(member) {
             return None;
         }
         let target = implementation.child_by_field_name("type")?;
@@ -113,7 +165,6 @@ impl RustQualifiedProjection {
                 return None;
             }
         }
-        let mut shapes = trait_argument_shapes_of(projected_trait, source)?;
         shapes.push(TypeShape::from_node(target, source)?);
         Some(Self {
             associated_name: source
@@ -132,7 +183,8 @@ impl RustQualifiedProjection {
         &self.associated_name
     }
 
-    /// trait パスの末尾の名前。implementation と definition をここへ尋ねる。
+    /// trait パスの末尾の名前。完全修飾形では書かれた trait で、implementation と definition を
+    /// ここへ尋ねる。短縮形では直接囲む impl の trait で、ここから supertrait を辿る。
     pub(crate) fn trait_position(&self) -> SourcePosition {
         self.trait_position
     }

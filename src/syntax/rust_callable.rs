@@ -27,6 +27,8 @@ pub(crate) use selection::{
     RustImplBinding, RustImplCandidate, RustImplTarget, RustNestedProjection,
     RustQualifiedProjection,
 };
+mod supertrait;
+pub(crate) use supertrait::RustTraitDeclaration;
 mod array_length;
 pub(crate) use array_length::{
     ArithmeticOperator, ConstSyntaxError, RustArrayLengths, RustConstExpression, RustConstSource,
