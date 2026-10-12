@@ -55,7 +55,7 @@ use crate::source_position::SourcePosition;
 use crate::syntax::tree::Grammar;
 use child_input::IntakeLimitedWriter;
 use child_output::{SilenceLimitedReader, StderrTail};
-use connection::Connection;
+use connection::{Awaited, Connection};
 
 // 開かせるドキュメントとワークスペースの根は、呼ぶ側が組み立てて渡す。
 pub use document::{DocumentError, SourceDocument};
@@ -102,8 +102,8 @@ const RUST_PROJECT_MARKERS: [&str; 1] = ["Cargo.toml"];
 
 /// サーバが何も送ってこないまま待つ上限。
 ///
-/// **固まったサーバを捉える主な期限はこれ。** 通知だけが届き続ける形は
-/// [`SETTLE_LIMIT`] が安全網として受け持つ。
+/// **固まったサーバを捉える主な期限はこれ。** 応答以外のものだけが届き続ける形は
+/// [`STREAMING_LIMIT`] が安全網として受け持つ。
 ///
 /// rust-analyzer（2026-09-21 リリース）で dryguard 自身を初回に読ませたときの、
 /// フレームの間の最長の沈黙が 6.69 秒（typescript-language-server は 0.63 秒）。
@@ -123,13 +123,13 @@ const INTAKE_LIMIT: Duration = SILENCE_LIMIT;
 /// rust-analyzer（2026-09-21 リリース）に冷えた状態で読ませたとき、1 回の待ちの最長は
 /// dryguard 自身で 15.2 秒、tokio 1.40.0（依存 214 パッケージ）で 29.03 秒だった。
 /// **ワークスペースの大きさで伸びる**ので、tokio の 10 倍規模と遅いマシンが重なっても
-/// 届かない側へ広く取る。役目は「通知だけが届き続けて終わらない」を有限にすることだけで、
+/// 届かない側へ広く取る。役目は「応答以外のものだけが届き続けて終わらない」を有限にすることだけで、
 /// 狭く取ると正常に遅いサーバを殺す側に倒れる。
 ///
 /// **尋ね直しの全体ではなく、1 回の待ちごとに数える。** 全体に当てると、ワークスペースの
 /// 大きさ × 尋ね直す回数で伸びる。そのぶん問い合わせ 1 つの最悪は上限 × 回数になるが、
 /// 超えたサーバは kill して以後を断るので、待ち切るのは最初の 1 回だけ。
-const SETTLE_LIMIT: Duration = Duration::from_secs(30 * 60);
+const STREAMING_LIMIT: Duration = Duration::from_secs(30 * 60);
 
 /// `exit` を送ってから、子プロセスが終わるのを待つ上限。
 ///
@@ -157,7 +157,7 @@ struct WaitLimits {
     /// 送ったものが受け取られないまま待つ上限。
     intake: Duration,
     /// 要求 1 本の応答・作業の終わりを待つ合計の上限。
-    settle: Duration,
+    streaming: Duration,
     /// `exit` の後に終了を待つ上限。
     exit: Duration,
 }
@@ -166,7 +166,7 @@ impl WaitLimits {
     const HARDCODED: Self = Self {
         silence: SILENCE_LIMIT,
         intake: INTAKE_LIMIT,
-        settle: SETTLE_LIMIT,
+        streaming: STREAMING_LIMIT,
         exit: EXIT_LIMIT,
     };
 }
@@ -342,7 +342,7 @@ impl Client {
             child,
             connection: Connection::new(BufReader::new(output), input)
                 .with_language(command.language)
-                .with_settle_limit(command.wait_limits.settle),
+                .with_streaming_limit(command.wait_limits.streaming),
             stderr,
             program: command.program.clone(),
             wait_limits: command.wait_limits,
@@ -362,8 +362,8 @@ impl Client {
     ///
     /// 往復が失敗したとき。サーバが答えないまま接続を閉じた場合は
     /// [`ClientError::ServerClosedDuringHandshake`]、何も送ってこないまま期限を過ぎた場合は
-    /// [`ClientError::ServerUnresponsive`]、通知だけを送り続けて答えない場合は
-    /// [`ClientError::ServerNeverSettled`]、送ったものを受け取らないまま期限を過ぎた場合は
+    /// [`ClientError::ServerUnresponsive`]、応答以外のものだけを送り続けて答えない場合は
+    /// [`ClientError::ServerKeptStreaming`]、送ったものを受け取らないまま期限を過ぎた場合は
     /// [`ClientError::ServerNotReading`]。抜けた [`Client`] は `Drop` が kill する。
     pub fn handshake(mut self, root: &WorkspaceRoot) -> Result<Session, ClientError> {
         let capabilities = match self.connection.handshake(root) {
@@ -413,14 +413,14 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// 既に黙り込んだと分かっているとき、往復が失敗したとき。
+    /// 既に見限ったサーバのとき（最初の理由を返す）、往復が失敗したとき。
     fn converse<T>(
         &mut self,
         exchange: impl FnOnce(
             &mut Connection<BufReader<SilenceLimitedReader>, IntakeLimitedWriter>,
         ) -> Result<T, ConnectionError>,
     ) -> Result<T, ClientError> {
-        if let Some(abandonment) = self.abandoned {
+        if let Some(abandonment) = &self.abandoned {
             return Err(self.abandoned_error(abandonment));
         }
 
@@ -433,9 +433,10 @@ impl Client {
     /// `Drop` まで残る。
     fn conversation_error_of(&mut self, cause: ConnectionError) -> ClientError {
         if let Some(abandonment) = Abandonment::of(&cause) {
+            let error = self.abandoned_error(&abandonment);
             self.abandoned = Some(abandonment);
             self.terminate();
-            return self.abandoned_error(abandonment);
+            return error;
         }
 
         if is_intake_exceeded(&cause) {
@@ -449,15 +450,16 @@ impl Client {
         ClientError::Conversation(cause)
     }
 
-    fn abandoned_error(&self, abandonment: Abandonment) -> ClientError {
+    fn abandoned_error(&self, abandonment: &Abandonment) -> ClientError {
         match abandonment {
             Abandonment::Silent => ClientError::ServerUnresponsive {
                 program: self.program.clone(),
                 silence: self.wait_limits.silence,
             },
-            Abandonment::NeverSettled => ClientError::ServerNeverSettled {
+            Abandonment::KeptStreaming { awaited } => ClientError::ServerKeptStreaming {
                 program: self.program.clone(),
-                waited: self.wait_limits.settle,
+                awaited: awaited.clone(),
+                waited: self.wait_limits.streaming,
             },
         }
     }
@@ -922,12 +924,15 @@ fn is_connection_closed(cause: &ConnectionError) -> bool {
 /// サーバを見限った上限のうち、`Client` が覚えて後続を断るもの。
 ///
 /// 受け取りの上限は入れない。書き口が自分で後続を断る（[`Client`] の `abandoned` の doc）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Abandonment {
     /// 何も届かないまま、沈黙の上限を超えた。
     Silent,
-    /// 通知だけが届き続け、待つ合計の上限を超えた。
-    NeverSettled,
+    /// 応答以外のものだけが届き続け、待つ合計の上限を超えた。
+    KeptStreaming {
+        /// そのとき待っていたもの。後続を断るときにも同じものを出す。
+        awaited: Awaited,
+    },
 }
 
 impl Abandonment {
@@ -942,7 +947,9 @@ impl Abandonment {
             {
                 Some(Self::Silent)
             }
-            ConnectionError::SettleLimitExceeded { .. } => Some(Self::NeverSettled),
+            ConnectionError::StreamingLimitExceeded { awaited, .. } => Some(Self::KeptStreaming {
+                awaited: awaited.clone(),
+            }),
             _ => None,
         }
     }
@@ -1010,14 +1017,16 @@ pub enum ClientError {
         /// 待った長さ。
         silence: Duration,
     },
-    /// 通知だけを送り続け、待っている応答・作業の終わりが合計の上限までに届かなかった。
-    /// サーバは kill 済み。
+    /// 通知・サーバの要求だけを送り続け、待っている応答・作業の終わりが合計の上限までに
+    /// 届かなかった。サーバは kill 済み。
     ///
     /// **`ServerUnresponsive` と分ける。** 何かは届き続けているので「何も送ってこない」とは
     /// 違い、利用者が見るべきはサーバのログ（何を繰り返しているか）になる。
-    ServerNeverSettled {
+    ServerKeptStreaming {
         /// 終わらなかった実行ファイル名。
         program: String,
+        /// 待っていたもの。サーバのログで何を繰り返していたかを読む手掛かりになる。
+        awaited: Awaited,
         /// 待った合計の長さ。
         waited: Duration,
     },
@@ -1082,9 +1091,13 @@ impl fmt::Display for ClientError {
                 "LSP サーバ ({program}) が {} 秒のあいだ何も送ってこないため、止めました",
                 silence.as_secs_f64()
             ),
-            Self::ServerNeverSettled { program, waited } => write!(
+            Self::ServerKeptStreaming {
+                program,
+                awaited,
+                waited,
+            } => write!(
                 formatter,
-                "LSP サーバ ({program}) が {} 秒のあいだ通知だけを送り続けて答えないため、止めました",
+                "LSP サーバ ({program}) が {awaited} を返さないまま {} 秒のあいだ応答以外のものだけを送り続けたため、止めました",
                 waited.as_secs_f64()
             ),
             Self::ServerNotReading { program, waited } => write!(
@@ -1123,7 +1136,7 @@ impl Error for ClientError {
             | Self::PipesNotWired
             | Self::ServerClosedDuringHandshake { .. }
             | Self::ServerUnresponsive { .. }
-            | Self::ServerNeverSettled { .. }
+            | Self::ServerKeptStreaming { .. }
             | Self::ServerNotReading { .. }
             | Self::ExitTimedOut { .. }
             | Self::AbnormalExit { .. } => None,
@@ -1145,6 +1158,7 @@ mod tests {
     use crate::codebase;
     use crate::test_support::{line, repository_path, signature_text};
     use lsp_types::HoverProviderCapability;
+    use lsp_types::request::{HoverRequest, Initialize, Request as _};
 
     /// 候補ペアのファイルとして開かせる fixture。
     const A_CANDIDATE_PAIR_FILE: &str = "tests/fixtures/billing/discount.ts";
@@ -1494,7 +1508,7 @@ mod tests {
     const GENEROUS_LIMITS: WaitLimits = WaitLimits {
         silence: GENEROUS_LIMIT,
         intake: GENEROUS_LIMIT,
-        settle: GENEROUS_LIMIT,
+        streaming: GENEROUS_LIMIT,
         exit: GENEROUS_LIMIT,
     };
 
@@ -1660,12 +1674,44 @@ mod tests {
     /// **`exec yes` で子プロセスを増やさない。** `yes` が付ける改行は本文の末尾に数えて
     /// `Content-Length` に入れる（JSON の後ろの空白は読める）。
     fn streaming_notifications_after_handshake() -> String {
+        format!(
+            "{}; {}",
+            printed_frame(INITIALIZE_RESPONSE),
+            streaming_notifications()
+        )
+    }
+
+    /// `window/logMessage` を際限なく流し続ける台本。
+    fn streaming_notifications() -> String {
         let notification = r#"{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":4,"message":"indexing"}}"#;
         format!(
-            "{}; exec yes \"$(printf 'Content-Length: {}\\r\\n\\r\\n%s' '{notification}')\"",
-            printed_frame(INITIALIZE_RESPONSE),
+            "exec yes \"$(printf 'Content-Length: {}\\r\\n\\r\\n%s' '{notification}')\"",
             notification.len() + 1
         )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_client_handshake_with_a_server_that_only_streams_notifications_reports_it() {
+        // `initialize` に答えず通知だけを流すサーバ。握手の失敗も、接続が閉じた場合以外は
+        // 往復の失敗と同じ直し方を通る
+        let limits = WaitLimits {
+            streaming: SHORT_LIMIT,
+            ..GENEROUS_LIMITS
+        };
+
+        let started = Instant::now();
+        let error = handshake_with(&streaming_notifications(), limits).expect_err("握手に答えない");
+
+        assert!(
+            matches!(
+                &error,
+                ClientError::ServerKeptStreaming { awaited: Awaited::Response { method }, .. }
+                    if method == Initialize::METHOD
+            ),
+            "{error:?}"
+        );
+        assert!(started.elapsed() < GENEROUS_LIMIT, "期限で戻る");
     }
 
     #[test]
@@ -1674,7 +1720,7 @@ mod tests {
         // 通知だけを流し続け、応答を返さないサーバ。何かは届き続けるので沈黙の上限では切れず、
         // 期限が無ければ応答を待って回り続ける
         let limits = WaitLimits {
-            settle: SHORT_LIMIT,
+            streaming: SHORT_LIMIT,
             ..GENEROUS_LIMITS
         };
         let mut session =
@@ -1691,8 +1737,8 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ClientError::ServerNeverSettled { program, waited }
-                    if program == "sh" && *waited == SHORT_LIMIT
+                ClientError::ServerKeptStreaming { program, awaited: Awaited::Response { method }, waited }
+                    if program == "sh" && method == HoverRequest::METHOD && *waited == SHORT_LIMIT
             ),
             "{error:?}"
         );
@@ -1701,11 +1747,11 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_session_after_the_server_never_settled_refuses_with_the_same_reason() {
+    fn test_session_after_the_server_kept_streaming_refuses_with_the_same_reason() {
         // kill した後に送り直すと「接続が閉じた」と出て理由が変わる。`pipeline` は 1 つが
         // 落ちても残りを尋ねるので、後続にも最初の理由を出す
         let limits = WaitLimits {
-            settle: SHORT_LIMIT,
+            streaming: SHORT_LIMIT,
             ..GENEROUS_LIMITS
         };
         let mut session =
@@ -1719,13 +1765,13 @@ mod tests {
         let second = session.hover(&document, position);
 
         assert!(
-            matches!(second, Err(ClientError::ServerNeverSettled { .. })),
+            matches!(second, Err(ClientError::ServerKeptStreaming { .. })),
             "{second:?}"
         );
         assert!(started.elapsed() < SHORT_LIMIT, "2 度目は待たずに断る");
         let shutdown = session.shutdown();
         assert!(
-            matches!(shutdown, Err(ClientError::ServerNeverSettled { .. })),
+            matches!(shutdown, Err(ClientError::ServerKeptStreaming { .. })),
             "{shutdown:?}"
         );
     }

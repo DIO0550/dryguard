@@ -92,7 +92,7 @@ pub struct Connection<R: BufRead, W: Write> {
     ///
     /// **既定は無し。** 子プロセスを起動する側（[`super::Client`]）だけが渡す。バイト列で
     /// 組んだ往復は尽きれば終わるので、時間に触れずに確かめられる。
-    settle_limit: Option<Duration>,
+    streaming_limit: Option<Duration>,
 }
 
 impl<R: BufRead, W: Write> Connection<R, W> {
@@ -107,13 +107,13 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             running_progress: Vec::new(),
             noticed_progress_count: 0,
             language: ServerLanguage::TypeScript,
-            settle_limit: None,
+            streaming_limit: None,
         }
     }
 
     /// 要求 1 本の応答・始まった作業の終わりを待つ合計の上限を付ける。
-    pub(super) fn with_settle_limit(mut self, limit: Duration) -> Self {
-        self.settle_limit = Some(limit);
+    pub(super) fn with_streaming_limit(mut self, limit: Duration) -> Self {
+        self.streaming_limit = Some(limit);
         self
     }
 
@@ -843,7 +843,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
                 break;
             }
 
-            self.check_settle_limit(started, SettleTarget::RunningProgress)?;
+            self.check_streaming_limit(started, || Awaited::RunningProgress)?;
         }
 
         Ok(())
@@ -885,12 +885,9 @@ impl<R: BufRead, W: Write> Connection<R, W> {
 
         loop {
             let Some((responded, outcome)) = self.handled_message()? else {
-                self.check_settle_limit(
-                    started,
-                    SettleTarget::Response {
-                        method: method.to_owned(),
-                    },
-                )?;
+                self.check_streaming_limit(started, || Awaited::Response {
+                    method: method.to_owned(),
+                })?;
                 continue;
             };
 
@@ -919,13 +916,14 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     ///
     /// # Errors
     ///
-    /// 上限を超えていたとき。`target` は何を待っていたかを出すために持つ。
-    fn check_settle_limit(
+    /// 上限を超えていたとき。`awaited` は何を待っていたかを、超えたときにだけ組み立てる
+    /// （通知 1 通ごとに呼ばれるので、超えていないうちは作らない）。
+    fn check_streaming_limit(
         &self,
         started: Instant,
-        target: SettleTarget,
+        awaited: impl FnOnce() -> Awaited,
     ) -> Result<(), ConnectionError> {
-        let Some(limit) = self.settle_limit else {
+        let Some(limit) = self.streaming_limit else {
             return Ok(());
         };
 
@@ -933,8 +931,8 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             return Ok(());
         }
 
-        Err(ConnectionError::SettleLimitExceeded {
-            target,
+        Err(ConnectionError::StreamingLimitExceeded {
+            awaited: awaited(),
             waited: limit,
         })
     }
@@ -1096,7 +1094,7 @@ fn not_serializable_error_of(
 /// **Why not（要求のメソッド名の文字列 1 つで持つ）**: 作業の終わりは要求ではなく通知で
 /// 知らされるので、メソッド名の欄に `$/progress` を入れると、名前と実体が食い違う。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SettleTarget {
+pub enum Awaited {
     /// こちらが送った要求への応答。
     Response {
         /// 待っていた要求のメソッド名。
@@ -1106,10 +1104,10 @@ pub enum SettleTarget {
     RunningProgress,
 }
 
-impl fmt::Display for SettleTarget {
+impl fmt::Display for Awaited {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Response { method } => write!(formatter, " {method} の応答"),
+            Self::Response { method } => write!(formatter, "{method} の応答"),
             Self::RunningProgress => write!(formatter, "作業の終わり"),
         }
     }
@@ -1139,12 +1137,12 @@ pub enum ConnectionError {
         failure: ResponseFailure,
     },
     /// 通知・サーバの要求が届き続け、待っている応答・作業の終わりが合計の上限までに
-    /// 届かなかった。
+    /// 届かなかった。待っていたものは [`super::ClientError::ServerKeptStreaming`] まで運ぶ。
     ///
     /// **沈黙の上限と分ける。** 何かは届き続けているので、「何も送ってこない」とは違う。
-    SettleLimitExceeded {
-        /// 待っていたもの。
-        target: SettleTarget,
+    StreamingLimitExceeded {
+        /// 待っていたもの。サーバのログで何を繰り返していたかを読む手掛かりになる。
+        awaited: Awaited,
         /// 待った合計の長さ。
         waited: Duration,
     },
@@ -1208,9 +1206,9 @@ impl fmt::Display for ConnectionError {
             Self::ServerFailure { method, failure } => {
                 write!(formatter, "LSP サーバが {method} を拒みました: {failure}")
             }
-            Self::SettleLimitExceeded { target, waited } => write!(
+            Self::StreamingLimitExceeded { awaited, waited } => write!(
                 formatter,
-                "LSP サーバの{target}を {} 秒待ちましたが、通知だけが届き続けて終わりませんでした",
+                "LSP サーバの {awaited} を {} 秒待ちましたが、応答以外のものだけが届き続けて終わりませんでした",
                 waited.as_secs_f64()
             ),
             Self::UnrequestedResponse { received } => {
@@ -1245,7 +1243,7 @@ impl Error for ConnectionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::UnexpectedResponse { .. }
-            | Self::SettleLimitExceeded { .. }
+            | Self::StreamingLimitExceeded { .. }
             | Self::UnrequestedResponse { .. }
             | Self::ServerFailure { .. }
             | Self::DocumentNotOpen { .. }
@@ -1383,14 +1381,14 @@ mod tests {
     }
 
     #[test]
-    fn test_request_past_the_settle_limit_between_notifications_reports_it() {
+    fn test_request_past_the_streaming_limit_between_notifications_reports_it() {
         // 対照は `test_request_skips_notifications_arriving_before_the_response`。期限が無ければ
         // 同じ並びで応答を受け取れる。期限を 0 にすると、通知を 1 通捌いた時点で超えている
         let server_output = frames_of(&[
             r#"{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":3}}"#,
             r#"{"jsonrpc":"2.0","id":1,"result":{"a":1}}"#,
         ]);
-        let mut connection = connection_over(&server_output).with_settle_limit(Duration::ZERO);
+        let mut connection = connection_over(&server_output).with_streaming_limit(Duration::ZERO);
 
         let error = connection
             .request(HoverRequest::METHOD, None)
@@ -1399,7 +1397,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ConnectionError::SettleLimitExceeded { target: SettleTarget::Response { method }, waited }
+                ConnectionError::StreamingLimitExceeded { awaited: Awaited::Response { method }, waited }
                     if method == HoverRequest::METHOD && *waited == Duration::ZERO
             ),
             "{error:?}"
@@ -1407,11 +1405,11 @@ mod tests {
     }
 
     #[test]
-    fn test_request_answered_first_is_not_cut_by_the_settle_limit() {
+    fn test_request_answered_first_is_not_cut_by_the_streaming_limit() {
         // 期限を確かめるのは、待っている応答でないものを捌いた後だけ。最初に届いた応答まで
         // 期限で落とすと、期限の長さに関わらず速いサーバを殺す
         let server_output = frames_of(&[r#"{"jsonrpc":"2.0","id":1,"result":{"a":1}}"#]);
-        let mut connection = connection_over(&server_output).with_settle_limit(Duration::ZERO);
+        let mut connection = connection_over(&server_output).with_streaming_limit(Duration::ZERO);
 
         let result = connection
             .request(HoverRequest::METHOD, None)
@@ -1941,16 +1939,16 @@ mod tests {
     }
 
     #[test]
-    fn test_waiting_for_running_progress_past_the_settle_limit_reports_it() {
+    fn test_waiting_for_running_progress_past_the_streaming_limit_reports_it() {
         // 途中経過だけを流し続けて終わりを送らないサーバ。期限が無ければ回り続ける。
-        // 公開の問い合わせからは届かない（始まりの通知も応答待ちの間に届き、そちらが先に
-        // 期限で落ちる）ので、作業を待つ口を直接呼ぶ
+        // 期限 0 では公開の問い合わせから届かない（始まりの通知も応答待ちの間に届き、
+        // そちらが先に期限で落ちる）ので、作業を待つ口を直接呼ぶ
         let server_output = frames_of(&[
             &progress_begin_notification("indexing"),
             &progress_report_notification("indexing"),
             &progress_end_notification("indexing"),
         ]);
-        let mut connection = connection_over(&server_output).with_settle_limit(Duration::ZERO);
+        let mut connection = connection_over(&server_output).with_streaming_limit(Duration::ZERO);
         connection.handled_message().expect("始まりの通知を読める");
 
         let error = connection
@@ -1960,7 +1958,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ConnectionError::SettleLimitExceeded { target: SettleTarget::RunningProgress, waited }
+                ConnectionError::StreamingLimitExceeded { awaited: Awaited::RunningProgress, waited }
                     if *waited == Duration::ZERO
             ),
             "{error:?}"
@@ -1968,14 +1966,14 @@ mod tests {
     }
 
     #[test]
-    fn test_waiting_for_running_progress_that_ends_is_not_cut_by_the_settle_limit() {
+    fn test_waiting_for_running_progress_that_ends_is_not_cut_by_the_streaming_limit() {
         // 待っていた終わりは「待っているもの」。捌いた直後に期限を確かめると、期限の長さに
         // 関わらず、間に合った作業まで落とす
         let server_output = frames_of(&[
             &progress_begin_notification("indexing"),
             &progress_end_notification("indexing"),
         ]);
-        let mut connection = connection_over(&server_output).with_settle_limit(Duration::ZERO);
+        let mut connection = connection_over(&server_output).with_streaming_limit(Duration::ZERO);
         connection.handled_message().expect("始まりの通知を読める");
 
         connection
@@ -1984,7 +1982,7 @@ mod tests {
     }
 
     #[test]
-    fn test_waiting_for_running_progress_without_a_settle_limit_reaches_the_end() {
+    fn test_waiting_for_running_progress_without_a_streaming_limit_reaches_the_end() {
         // 対照は上のテスト。同じ並びでも、期限が無ければ終わりの通知まで読み進める
         let server_output = frames_of(&[
             &progress_begin_notification("indexing"),
