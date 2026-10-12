@@ -55,7 +55,7 @@ use crate::source_position::SourcePosition;
 use crate::syntax::tree::Grammar;
 use child_input::IntakeLimitedWriter;
 use child_output::{SilenceLimitedReader, StderrTail};
-use connection::{Awaited, Connection};
+use connection::Connection;
 
 // 開かせるドキュメントとワークスペースの根は、呼ぶ側が組み立てて渡す。
 pub use document::{DocumentError, SourceDocument};
@@ -76,7 +76,7 @@ pub(crate) use workspace::ProjectRoot;
 
 // 失敗を読むための型だけを外へ出す。[`ClientError`] が抱えている以上、
 // 外から名前を呼べないと `source()` をたどっても中身を見分けられない。
-pub use connection::ConnectionError;
+pub use connection::{Awaited, ConnectionError};
 pub use framing::FramingError;
 pub use message::{MessageError, RequestId, ResponseFailure};
 pub use uri::{PathUriError, UriPathError};
