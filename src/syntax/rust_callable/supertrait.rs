@@ -112,3 +112,63 @@ impl RustSupertrait {
         self.has_arguments
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::line_number::LineNumber;
+
+    /// 1 行のソースで、`needle` が最初に現れる位置。
+    fn first_position_of(source: &str, needle: &str) -> SourcePosition {
+        let offset = source.find(needle).expect("ソースにある");
+        SourcePosition::from_preceding_text(LineNumber::from_index(0), &source[..offset])
+    }
+
+    #[test]
+    fn test_trait_declaration_reads_supertraits_from_bounds_and_self_predicates() {
+        let source = "pub trait Sub<T>: Show + far::Other + Convert<u8> + ?Sized + 'static where Self: Third, T: Fourth { type Item; fn f(); }";
+        let declaration =
+            RustTraitDeclaration::from_source(source, first_position_of(source, "Sub"))
+                .expect("読める");
+        let read: Vec<_> = declaration
+            .supertraits()
+            .iter()
+            .map(|supertrait| (supertrait.position(), supertrait.has_arguments()))
+            .collect();
+        // 型変数への述語（`T: Fourth`）は supertrait ではない
+        assert_eq!(
+            read,
+            [
+                (first_position_of(source, "Show"), false),
+                (first_position_of(source, "Other"), false),
+                (first_position_of(source, "Convert"), true),
+                (first_position_of(source, "Third"), false),
+            ]
+        );
+        assert!(declaration.declares("Item"));
+        assert!(!declaration.declares("f"), "メソッドは関連型ではない");
+    }
+
+    #[test]
+    fn test_trait_declaration_with_a_higher_ranked_bound_is_not_read() {
+        let source = "trait Sub: Show + for<'a> Life<'a> {}";
+        assert_eq!(
+            RustTraitDeclaration::from_source(source, first_position_of(source, "Sub")),
+            None
+        );
+        let plain = "trait Sub: Show {}";
+        assert!(
+            RustTraitDeclaration::from_source(plain, first_position_of(plain, "Sub")).is_some(),
+            "対照: 読める境界だけなら読む"
+        );
+    }
+
+    #[test]
+    fn test_trait_declaration_is_read_only_at_the_trait_name() {
+        let source = "trait Show { type Item; } impl Show for Leaf { type Item = u8; }";
+        assert_eq!(
+            RustTraitDeclaration::from_source(source, first_position_of(source, "Leaf")),
+            None
+        );
+    }
+}

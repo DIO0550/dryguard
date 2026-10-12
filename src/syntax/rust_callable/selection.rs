@@ -1265,6 +1265,50 @@ mod tests {
         );
     }
 
+    /// 使用側のソースの、最初の短縮形の投影を読む。
+    fn shorthand_of(source: &str) -> Option<RustQualifiedProjection> {
+        RustQualifiedProjection::from_shorthand(source, last_position_of(source, "Item"))
+    }
+
+    #[test]
+    fn test_shorthand_projection_in_a_trait_impl_is_read_with_the_implemented_trait() {
+        let source = "impl<T> Sub for Holder<T> { fn f(x: Self::Item) {} }";
+        let used = shorthand_of(source).expect("trait impl の短縮形を読む");
+        assert_eq!(used.associated_name(), "Item");
+        assert_eq!(used.trait_position(), last_position_of(source, "Sub"));
+        let candidate = only_candidate_of("impl<Y> Show for Holder<Y> { type Item = Y; }").unwrap();
+        let binding = candidate
+            .binding_with(&used)
+            .expect("trait 引数の無い supertrait の impl と照合できる");
+        assert_eq!(binding.captures_with(&|_| None), Some(variables(&["T"])));
+    }
+
+    #[test]
+    fn test_shorthand_projection_rejects_forms_outside_trait_impls_and_param_env_targets() {
+        for source in [
+            // inherent impl の短縮形は E0223
+            "impl<T> Holder<T> { fn f(x: Self::Item) {} }",
+            // 完全修飾形は from_source が読む
+            "impl<T> Sub for Holder<T> { fn f(x: <Self as Show>::Item) {} }",
+            "impl<T: Show> Sub for T { fn f(x: Self::Item) {} }",
+            "impl<T> Sub for Holder<T> where Holder<T>: Show { fn f(x: Self::Item) {} }",
+            // 直接囲む impl の定義（属性付きで読めなくても）を指す
+            "impl<T> Sub for Holder<T> { #[cfg(test)] type Item = T; fn f(x: Self::Item) {} }",
+        ] {
+            assert_eq!(shorthand_of(source), None, "{source}");
+        }
+        assert!(
+            shorthand_of("impl<T> Sub for T { fn f(x: Self::Item) {} }").is_some(),
+            "対照: 境界の無い型変数の Self"
+        );
+        let shorthand = "impl<T> Sub for Holder<T> { fn f(x: Self::Item) {} }";
+        assert_eq!(
+            RustQualifiedProjection::from_source(shorthand, last_position_of(shorthand, "Item")),
+            None,
+            "完全修飾形の経路は短縮形を読まない"
+        );
+    }
+
     #[test]
     fn test_candidates_skip_bounded_impls_and_targets_other_than_type_names_or_variables() {
         let source = "impl<T: Clone> Other for Holder<T> { type Item = T; }
