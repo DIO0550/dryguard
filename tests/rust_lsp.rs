@@ -1402,7 +1402,7 @@ fn test_rust_array_lengths_compare_values_in_declaration_scope() {
 fn test_rust_declaration_cache_shared_across_chunks_keeps_each_chunk_outcome() {
     for (relative_path, names) in [
         (
-            "src/alias_scope.rs",
+            "rust-traced/src/alias_scope.rs",
             vec![
                 "cyclic",
                 "limit",
@@ -1414,7 +1414,7 @@ fn test_rust_declaration_cache_shared_across_chunks_keeps_each_chunk_outcome() {
             ],
         ),
         (
-            "src/selections.rs",
+            "rust-traced/src/selections.rs",
             vec![
                 "inherent",
                 "inherent_plain",
@@ -1428,9 +1428,27 @@ fn test_rust_declaration_cache_shared_across_chunks_keeps_each_chunk_outcome() {
                 "every",
             ],
         ),
+        // 連鎖と評価量の上限を共有すると、逆順で後に回る chain_boundary が上限に当たる
+        (
+            "rust-array-lengths/src/lib.rs",
+            vec![
+                "literal",
+                "imported",
+                "different",
+                "nested",
+                "cyclic",
+                "limited",
+                "cyclic_alias",
+                "chain_boundary",
+                "chain_limit",
+                "work_limit",
+                "expression_limit",
+                "maximum",
+            ],
+        ),
     ] {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/rust-traced")
+            .join("tests/fixtures")
             .join(relative_path);
         let source = source_of(&path).expect("フィクスチャを読める");
         let tree = SyntaxTree::from_source(&source, Grammar::Rust).expect("木にできる");
@@ -1485,7 +1503,7 @@ fn test_rust_declaration_cache_shared_across_chunks_keeps_each_chunk_outcome() {
         // 比べた答えが、どれも同じ失敗に倒れていないこと
         let reached = |name: &str| &fresh[names.iter().position(|n| *n == name).expect("尋ねた")];
         match relative_path {
-            "src/alias_scope.rs" => {
+            "rust-traced/src/alias_scope.rs" => {
                 for name in ["warm_limit", "cold_limit"] {
                     assert_eq!(
                         reached(name),
@@ -1499,6 +1517,26 @@ fn test_rust_declaration_cache_shared_across_chunks_keeps_each_chunk_outcome() {
                     reached("boundary"),
                     TypeSignatureOutcome::Normalized(_)
                 ));
+            }
+            "rust-array-lengths/src/lib.rs" => {
+                for (name, reason) in [
+                    ("cyclic", UnopenedReason::CyclicArrayLength),
+                    ("chain_limit", UnopenedReason::ArrayLengthEvaluationLimit),
+                    ("work_limit", UnopenedReason::ArrayLengthEvaluationLimit),
+                ] {
+                    assert_eq!(
+                        reached(name),
+                        &TypeSignatureOutcome::UnopenedTypeName { reason },
+                        "{name}"
+                    );
+                }
+                for name in ["imported", "chain_boundary"] {
+                    assert!(
+                        matches!(reached(name), TypeSignatureOutcome::Normalized(_)),
+                        "{name}: {:?}",
+                        reached(name)
+                    );
+                }
             }
             _ => assert!(matches!(
                 reached("inherent"),

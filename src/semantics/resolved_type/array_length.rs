@@ -1,10 +1,6 @@
 //! 宣言側の位置から配列長を評価し、hover が落とした式をソースへ対応させる。
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-
-use super::{UnopenedReason, declared_spelling_of};
-use crate::codebase::source_of;
+use super::{RustDeclarationCache, UnopenedReason, declared_spelling_of};
 use crate::lsp::{
     ClientError, DeclarationSite, DeclarationSiteOutcome, Session, SignatureText, SourceDocument,
     UniqueDeclarationSiteOutcome,
@@ -25,11 +21,15 @@ const MAXIMUM_EVALUATION_STEPS: usize = 1024;
 
 /// 関数ソースと hover の構造が対応するときだけ、元の式の値を差し込む。
 ///
+/// `cache` は同じセッションで尋ねるチャンクのあいだで共有する宣言側の答え
+/// （[`RustDeclarationCache`]）。定数の宣言側のソースをそこから引く。
+///
 /// # Errors
 ///
 /// LSP の往復に失敗したとき。評価不能の理由は内側の Err に残す。
 pub(crate) fn restored_array_spelling_of(
     session: &mut Session,
+    cache: &mut RustDeclarationCache,
     document: &SourceDocument,
     position: SourcePosition,
     hover: &SignatureText,
@@ -51,7 +51,7 @@ pub(crate) fn restored_array_spelling_of(
         Ok(correspondence) => correspondence,
         Err(reason) => return Ok(Err(reason)),
     };
-    let mut evaluator = ArrayLengthEvaluator::new(session);
+    let mut evaluator = ArrayLengthEvaluator::new(session, cache);
     let values = match evaluator.values_of(document, &correspondence.source)? {
         Ok(values) => values,
         Err(reason) => return Ok(Err(reason)),
@@ -123,15 +123,18 @@ fn array_positions_match(
 
 /// エイリアスの配列長は、その宣言の元の位置で評価する。
 ///
+/// `cache` は [`restored_array_spelling_of`] と同じ。
+///
 /// # Errors
 ///
 /// LSP の往復に失敗したとき。評価不能の理由は内側の Err に残す。
 pub(crate) fn evaluated_array_spelling_of(
     session: &mut Session,
+    cache: &mut RustDeclarationCache,
     document: &SourceDocument,
     lengths: &RustArrayLengths,
 ) -> Result<Result<String, UnopenedReason>, ClientError> {
-    let mut evaluator = ArrayLengthEvaluator::new(session);
+    let mut evaluator = ArrayLengthEvaluator::new(session, cache);
     let values = match evaluator.values_of(document, lengths)? {
         Ok(values) => values,
         Err(reason) => return Ok(Err(reason)),
@@ -141,18 +144,23 @@ pub(crate) fn evaluated_array_spelling_of(
         .ok_or(UnopenedReason::UnmatchedArrayLength))
 }
 
+/// 1 つの配列長の並びを宣言側で評価する手順。
+///
+/// **宣言側のソースだけを共有し、連鎖（`active`）と評価量（`remaining_steps`）は共有しない。**
+/// 循環と上限はその評価の中でだけ意味を持ち、そこから出る答え（`CyclicArrayLength` /
+/// `ArrayLengthEvaluationLimit`）はキャッシュに入れない。
 struct ArrayLengthEvaluator<'session> {
     session: &'session mut Session,
-    sources: HashMap<PathBuf, Result<String, UnopenedReason>>,
+    cache: &'session mut RustDeclarationCache,
     active: Vec<DeclarationSite>,
     remaining_steps: usize,
 }
 
 impl<'session> ArrayLengthEvaluator<'session> {
-    fn new(session: &'session mut Session) -> Self {
+    fn new(session: &'session mut Session, cache: &'session mut RustDeclarationCache) -> Self {
         Self {
             session,
-            sources: HashMap::new(),
+            cache,
             active: Vec::new(),
             remaining_steps: MAXIMUM_EVALUATION_STEPS,
         }
@@ -244,14 +252,7 @@ impl<'session> ArrayLengthEvaluator<'session> {
         if self.active.len() >= MAXIMUM_CONSTANT_DEPTH {
             return Ok(Err(UnopenedReason::ArrayLengthEvaluationLimit));
         }
-        let source = self
-            .sources
-            .entry(site.path().to_owned())
-            .or_insert_with(|| {
-                source_of(site.path()).map_err(|_| UnopenedReason::UnreadableDeclaringDocument)
-            })
-            .clone();
-        let source = match source {
+        let source = match self.cache.source_of(site.path()) {
             Ok(source) => source,
             Err(reason) => return Ok(Err(reason)),
         };
