@@ -129,3 +129,4 @@ pub mod projections;
 pub mod selections;
 
 pub mod nested;
+pub mod supertraits;

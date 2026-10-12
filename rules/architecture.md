@@ -205,7 +205,8 @@ hover に具体的な整数が残る場合は評価値との一致も確認し�
 `syntax::rust_callable::RustProjectionSource` が投影の末尾の位置と直接の impl から
 一意な関連型定義を読み、`semantics::resolved_type` が definition の返した trait メンバーの
 所有 trait と impl の実装 trait の宣言位置を照合する。完全修飾形は対象が Self 自体で、
-trait と型引数が同じソースの束縛環境で一致するものに限る。
+trait と型引数が同じソースの束縛環境で一致するものに限る。trait impl の中の短縮形が
+supertrait の関連型を指す形も、後者の選択で開く（下の「trait impl の中の短縮形…」）。
 RHS の名前は定義側の位置から辿り、impl 型変数と GAT の型引数はそれぞれの束縛元を保って
 正規化した後に代入する。**RHS の単独の Self は使用側の impl の対象型を代入する**
 （`RustTypeResolution::Associated` の `substitutes_self`）。RHS を書いた impl の対象型は、
@@ -248,7 +249,7 @@ Self を含む投影を歩くときに対象型の型名を尋ねる位置とし
   書いた param-env の候補でありうる。rustc も param-env を優先して正規化しない）、
   使用側の対象が**境界つきの型変数そのもの**の形（`impl<T: Other> Show for T`。境界が Self への
   param-env の候補で、supertrait 経由でも投影の trait を含みうる）、
-  短縮形（supertrait の関連型を指す形は Issue #337。入れ子の投影は下の別の経路で選ぶ）
+  短縮形（supertrait の関連型を指す形と入れ子の投影は、下の別の経路で選ぶ）
 - **implementation の応答は trait の宣言位置ごとに 1 回だけ尋ねる**（`RustDeclarationCache`）。
   覚えるのは `Answered` だけで、読み込み前にも返る空は覚えない
 - **理由**: implementation を提供しない・空は `ImplementationNotProvided` /
@@ -262,6 +263,34 @@ Self を含む投影を歩くときに対象型の型名を尋ねる位置とし
 - **`const trait` は読めない。** tree-sitter-rust が `pub const trait` を構文エラーにするので、
   std の多くの trait（`Iterator` / `Deref` など）は所有 trait を照合できず
   `UnresolvedAssociatedType` に倒れる
+
+**trait impl の中の短縮形 `Self::Name` が、直接囲む impl に定義が無く supertrait の関連型を
+指すなら、その supertrait の impl を選ぶ。** `syntax::rust_callable::RustQualifiedProjection` の
+`from_shorthand` が使用側の対象型と型変数を読み（trait 引数は空）、`RustTraitDeclaration` が
+trait 宣言の supertrait（境界と `where Self:` の述語）と宣言している関連型の名前を読む。
+`semantics::resolved_type` の `supertrait_projection_of` が直接囲む impl の trait から
+supertrait の閉包を definition で辿り、implementation を**その supertrait を書いた trait 宣言の
+位置**へ尋ねて、以降は上の完全修飾形と同じ選択（`selected_impl_projection_of`）で RHS を開く。
+
+- **definition が返した所有 trait だけでは決めない。** 閉包の中で読めた trait 宣言のうち、
+  所有 trait 以外に `Name` を宣言するものが無いときだけ選ぶ（所有 trait は definition で
+  確かめてあるので、宣言を読めなくても数える）。rust-analyzer は同名の関連型を持つ
+  supertrait が 2 つある形（rustc は E0221）でも片方を返す
+- **読めない trait 宣言（`const trait` など）は閉包から外して辿り続ける。** 外して困るのは
+  同名の関連型を読み落とすことだけで、それは rustc が拒否する形に限られる。読めないことを理由に
+  測れないにすると、`trait Sub: Show + Clone` のような普通の形がまとめて落ちる
+- **選ばないもの**（偽陰性側）: 所有 trait を型引数付きで書いた supertrait（`trait Sub: Convert<u8>`。
+  trait 引数を照合しないので、既定の型引数の impl と形が揃って取り違える）、上の完全修飾形で
+  選ばない形すべて。既定の型引数を持つ supertrait を型引数なしで書いた形（`trait Sub: Show`
+  と `trait Show<T = u8>`）は、型引数なしで書いた impl とだけ照合する（`impl Show<u8> for X` は
+  形が揃わず選ばない）
+- **閉包の答えはチャンクをまたいで共有する**（`RustDeclarationCache` の `supertrait_owners`）。
+  キーは実装している trait と関連型の宣言の組で、覚えるのは選べた答えだけ
+- **理由**: 所有 trait に届かなければ、辿れなかった supertrait の最初の理由、無ければ
+  `UnresolvedAssociatedType`。所有 trait 以外にも宣言する trait がある・型引数付きの supertrait も
+  `UnresolvedAssociatedType`。impl を選べなかったときは上の完全修飾形と同じ順
+- **inherent impl・`Name` を持たない trait の impl の中の短縮形は扱わない。** rustc が
+  E0223 / E0220 で拒否する形
 
 **関連型 RHS の中の投影は、RHS を書いた impl を使用側として再帰して開く。**
 `syntax::rust_callable::RustProjectionSource` / `RustQualifiedProjection` は、メソッドの
@@ -477,6 +506,7 @@ pr-155 と同じ形だと自己申告している）。
 | チャンクごとに `is_file` で祖先を辿り `project marker` を探す | ファイルごとに 1 回だけ辿り、同じファイルのチャンクへ配る |
 | チャンクごとに `project membership` を尋ねる | ファイルごとに 1 回だけ尋ね、同じファイルのチャンクへ配る |
 | チャンクごとに Rust の型名解決・配列長の評価器が宣言側のソースを読み、同じ trait に implementation を尋ねる | `RustDeclarationCache` をセッションごとに 1 つ作り、ファイル・trait の宣言位置をキーに共有する |
+| チャンクごとに短縮形の投影の supertrait の閉包を definition で辿る | 実装している trait と関連型の宣言の組をキーに、`RustDeclarationCache` で共有する |
 
 **Why**: LSP への問い合わせは同期的な往復を伴うプロセス外呼び出しで、
 `project marker` 探索も印が無い木では毎回ファイルシステムの根まで辿る。

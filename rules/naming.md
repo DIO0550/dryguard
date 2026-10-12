@@ -104,6 +104,7 @@ if structurally_similar && domains_differ { ... }
 | `impl candidate` | `implementation` が返した impl 1 つ。境界を持たず、**型変数に使用側の型（型変数か具体的な型）を当てはめるだけで**使用側の対象型・trait 引数と一致し、同じ位置の型名が同じ型（宣言元・確かめたプリミティブ・開いた右辺のどれか）を指すときだけ選ぶ（`syntax::rust_callable::RustImplCandidate`） |
 | `capture` | 選んだ impl の関連型 RHS で、impl の型変数 1 つに使用側で代入するもの。使用側の impl の型変数か、使用側の具体的な型（使用側の impl の型変数を引数に取るテンプレート。`generic alias` と同じ型 `RustGenericAlias` で持つが、エイリアスの宣言ではない）のどちらか（`syntax::rust_callable::RustCapture`）。関連型 RHS の中の投影が開いた先では、外側の RHS の型パラメータの名前のまま綴る |
 | `nested projection` | 対象が Self を含む投影になっている完全修飾形の投影（`<<Self as Show>::Item as Deep>::Out`）。内側が `closed spelling` に閉じたときだけ 2 段目の impl を選ぶ（`syntax::rust_callable::RustNestedProjection`） |
+| `supertrait closure` | 実装している trait 自身と、そこから supertrait（境界と `where Self:` の述語）を辿って届く trait の集まり。trait impl の中の短縮形 `Self::Name` は、この中で読めた宣言のうち `Name` を宣言するものが definition の所有 trait だけのときにその impl を選ぶ（`syntax::rust_callable::RustTraitDeclaration` が宣言を読み、`semantics::resolved_type` の `supertrait_owner_of` が辿る） |
 | `closed spelling` | 型変数にも Self にも依存しない解決の綴り。等しければ同じ型を指す（`RustTypeResolution::closed_spelling`）。`nested projection` の 2 段目は、型パラメータ・trait 引数・`'static` 以外のライフタイム・関数型を持たない impl の対象型の綴り（`RustImplCandidate::closed_target`）がこれと等しいものを選ぶ |
 | `declaration site` | `type definition` / `definition` が返す宣言の場所。ファイルと、その中の 1 点 |
 | `references` | ソースの 1 点を指して、そこにある名前を使っているところを尋ねる問い合わせ |
