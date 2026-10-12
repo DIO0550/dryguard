@@ -1153,6 +1153,121 @@ fn test_rust_nested_and_right_hand_side_projections_resolve_recursively() {
 
 #[test]
 #[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
+fn test_rust_shorthand_projections_of_supertrait_associated_types_select_the_supertrait_impl() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/rust-traced/src/supertraits.rs");
+    let source = source_of(&path).expect("フィクスチャを読める");
+    let tree = SyntaxTree::from_source(&source, Grammar::Rust).expect("木にできる");
+    let document = SourceDocument::new(&path, source.clone()).expect("ドキュメントを作れる");
+    let root = WorkspaceRoot::enclosing(std::slice::from_ref(&path)).expect("根がある");
+    let mut session = Client::start(&ServerCommand::rust())
+        .expect("サーバを起動できる")
+        .handshake(&root)
+        .expect("握手できる");
+    session.open_document(&document).expect("開ける");
+    let mut declarations_cache = RustDeclarationCache::default();
+    let mut outcomes = std::collections::BTreeMap::new();
+    for name in [
+        "shown",
+        "shown_plain",
+        "other_plain",
+        "qualified",
+        "cloned",
+        "cloned_plain",
+        "counted",
+        "rhs",
+        "rhs_plain",
+        "chained",
+        "chained_plain",
+        "viewed",
+        "viewed_plain",
+        "diamond",
+        "diamond_plain",
+        "distant",
+        "distant_plain",
+        "mixed",
+        "mixed_plain",
+        "held",
+        "held_plain",
+        "guarded",
+        "typed",
+        "picky",
+        "both",
+    ] {
+        // trait の宣言（本体なし）より後ろにある実装メソッドを採る
+        let index = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(&format!("fn {name}(")))
+            .map(|(index, _)| index)
+            .last()
+            .expect("メソッドがある");
+        let location = Location::new(path.clone(), LineNumber::from_index(index));
+        let chunk = Chunk::find_enclosing(&location, &tree).expect("チャンクがある");
+        let outcome = rust_type_signature_outcome_of(
+            &mut session,
+            &document,
+            chunk.name_position().expect("名前がある"),
+            chunk.type_references(),
+            chunk.rust_impl_header(),
+            &mut declarations_cache,
+        )
+        .expect("問い合わせ成功");
+        outcomes.insert(name, outcome);
+    }
+    session.shutdown().expect("終了できる");
+    let normalized = |name: &str| {
+        let TypeSignatureOutcome::Normalized(signature) = &outcomes[name] else {
+            panic!("{name}: {:?}", outcomes[name]);
+        };
+        signature.clone()
+    };
+    // 比べる相手（`*_plain`）は同じ trait の impl に置く。impl の実装 trait も比較に入る
+    for (first, second, expected) in [
+        // 実装している trait の supertrait の関連型を、supertrait の impl から開く
+        ("shown", "shown_plain", true),
+        // 同名の関連型を持つ別 trait（`Other`）の impl を選んでいない
+        ("shown", "other_plain", false),
+        // 短縮形の後に同じ supertrait を完全修飾形で尋ねても、implementation の答えを取り違えない
+        ("qualified", "shown_plain", true),
+        // 閉包に読めない trait（`Clone`）があっても、所有 trait へ届けば選ぶ
+        ("cloned", "cloned_plain", true),
+        // 関連型 RHS の中の短縮形
+        ("rhs", "rhs_plain", true),
+        // supertrait の連鎖・where 句の `Self: Show`・同じ supertrait へ 2 通りに届く形
+        ("chained", "chained_plain", true),
+        ("viewed", "viewed_plain", true),
+        ("diamond", "diamond_plain", true),
+        // 実装している trait の宣言が別のファイルにあっても、その supertrait を辿る
+        ("distant", "distant_plain", true),
+        // supertrait が 2 つあっても、その名前の関連型を持つのが 1 つなら選ぶ
+        ("mixed", "mixed_plain", true),
+        // supertrait の impl の型変数には、使用側の impl の型変数を当てはめる
+        ("held", "held_plain", true),
+    ] {
+        assert_eq!(
+            normalized(first).is_unifiable_with(&normalized(second)),
+            expected,
+            "{first} / {second}"
+        );
+    }
+    // supertrait の impl が境界を持つ（`guarded`）・supertrait に型引数を書いた（`typed` /
+    // `picky`。`picky` は既定の型引数の impl と形が揃う）・同名の関連型を持つ supertrait が
+    // 2 つある（`both`。rustc は E0221）・所有 trait が `const trait`（`counted` の `Iterator`。
+    // 関連型の所有 trait を構文木で読めない）だと選ばない
+    for name in ["guarded", "typed", "picky", "both", "counted"] {
+        assert_eq!(
+            outcomes[name],
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::UnresolvedAssociatedType
+            },
+            "{name}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "rust-analyzer が要る。CI では入れて --ignored で走らせる"]
 fn test_rust_qualified_self_projections_select_the_impl_matching_target_and_trait_arguments() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/rust-traced/src/selections.rs");
@@ -1428,6 +1543,11 @@ fn test_rust_declaration_cache_shared_across_chunks_keeps_each_chunk_outcome() {
                 "every",
             ],
         ),
+        // 短縮形の supertrait の閉包と、同じ supertrait への完全修飾形が implementation を共有する
+        (
+            "rust-traced/src/supertraits.rs",
+            vec!["shown", "qualified", "chained", "diamond", "both", "picky"],
+        ),
         // 連鎖と評価量の上限を共有すると、逆順で後に回る chain_boundary が上限に当たる
         (
             "rust-array-lengths/src/lib.rs",
@@ -1531,6 +1651,15 @@ fn test_rust_declaration_cache_shared_across_chunks_keeps_each_chunk_outcome() {
                     );
                 }
                 for name in ["imported", "chain_boundary"] {
+                    assert!(
+                        matches!(reached(name), TypeSignatureOutcome::Normalized(_)),
+                        "{name}: {:?}",
+                        reached(name)
+                    );
+                }
+            }
+            "rust-traced/src/supertraits.rs" => {
+                for name in ["shown", "qualified", "chained", "diamond"] {
                     assert!(
                         matches!(reached(name), TypeSignatureOutcome::Normalized(_)),
                         "{name}: {:?}",
