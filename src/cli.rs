@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::classification::verdict::Verdict;
+use crate::codebase::diff::{DEFAULT_DIFF_BASE, DiffBase};
 use crate::location::Location;
 use crate::threshold::Threshold;
 
@@ -24,10 +25,6 @@ pub struct Cli {
 }
 
 /// サブコマンド。
-///
-/// `check --diff` は Phase 5 で足す。**受け取るだけで何もしない
-/// サブコマンドを先に生やさない** — 実行できるのに結果が出ないコマンドは、
-/// 使う側が「壊れている」と「未実装」を区別できない。
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// 特定の 2 関数を比較する
@@ -45,6 +42,22 @@ pub enum Command {
         // 既定で外すのは、テスト関数どうしが `fn()` の型シグネチャと呼び出し元の無さで
         // 空の一致を作り、本番コードの候補ペアを埋もれさせるため。`compare` は位置を
         // 名指しするので、このオプションを持たない（global にしない）
+        /// Rust のテスト属性付き関数・TypeScript のテストコールバックも比較する
+        #[arg(long)]
+        include_tests: bool,
+    },
+    /// git の差分に含まれるチャンクを起点に、カレントディレクトリ以下の全体から候補ペアを探す
+    Check {
+        // `--diff` を省けないのは、計画の綴り（`check --diff`）に合わせつつ、
+        // 比べるリビジョンを同じオプションで受けるため
+        /// 作業ツリーと比べるリビジョン。値を省くと HEAD
+        #[arg(
+            long,
+            value_name = "REVISION",
+            num_args = 0..=1,
+            default_missing_value = DEFAULT_DIFF_BASE
+        )]
+        diff: DiffBase,
         /// Rust のテスト属性付き関数・TypeScript のテストコールバックも比較する
         #[arg(long)]
         include_tests: bool,
