@@ -564,3 +564,287 @@ fn git_output_of(root: &Path, arguments: &[&str]) -> Result<GitOutput, DiffError
         stderr: output.stderr,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::line;
+
+    fn lines(start: usize, end: usize) -> LineRange {
+        LineRange::new(line(start), line(end)).expect("テストが渡す範囲は前後が揃っている")
+    }
+
+    fn changed_lines_of(diff: &str) -> ChangedLines {
+        ChangedLines::from_diff(diff.as_bytes()).expect("テストが渡す差分は読める")
+    }
+
+    const MODIFIED: &str = "\
+diff --git a/src/a.ts b/src/a.ts
+index 1111111..2222222 100644
+--- a/src/a.ts
++++ b/src/a.ts
+@@ -12,2 +12,3 @@ function a() {
+-  old();
+-  older();
++  new();
++  newer();
++  newest();
+";
+
+    #[test]
+    fn test_changed_lines_of_a_modified_hunk_touches_a_chunk_overlapping_the_new_lines() {
+        let changed = changed_lines_of(MODIFIED);
+
+        assert!(changed.touches(Path::new("src/a.ts"), lines(10, 12)));
+        assert!(changed.touches(Path::new("src/a.ts"), lines(14, 20)));
+    }
+
+    #[test]
+    fn test_changed_lines_of_a_modified_hunk_does_not_touch_a_chunk_outside_the_new_lines() {
+        // 対照は上のテスト。足した行は 12-14 で、15 から始まるチャンクには届かない
+        let changed = changed_lines_of(MODIFIED);
+
+        assert!(!changed.touches(Path::new("src/a.ts"), lines(15, 20)));
+        assert!(!changed.touches(Path::new("src/a.ts"), lines(1, 11)));
+    }
+
+    #[test]
+    fn test_changed_lines_of_a_modified_hunk_does_not_touch_another_file() {
+        let changed = changed_lines_of(MODIFIED);
+
+        assert!(!changed.touches(Path::new("src/b.ts"), lines(1, 100)));
+    }
+
+    #[test]
+    fn test_changed_lines_of_a_count_omitted_header_reads_it_as_one_line() {
+        let changed = changed_lines_of(
+            "\
++++ b/a.rs
+@@ -3 +3 @@
+-x
++y
+",
+        );
+
+        assert!(changed.touches(Path::new("a.rs"), lines(3, 3)));
+        assert!(!changed.touches(Path::new("a.rs"), lines(4, 9)));
+    }
+
+    const DELETION: &str = "\
++++ b/a.rs
+@@ -6,2 +5,0 @@ fn a() {
+-    gone();
+-    gone_too();
+";
+
+    #[test]
+    fn test_changed_lines_of_a_deletion_touches_a_chunk_spanning_the_deleted_point() {
+        // 5 行目と 6 行目の間で消えた。両方を含むチャンクの中身が変わった
+        let changed = changed_lines_of(DELETION);
+
+        assert!(changed.touches(Path::new("a.rs"), lines(1, 6)));
+    }
+
+    #[test]
+    fn test_changed_lines_of_a_deletion_does_not_touch_a_chunk_on_either_side_of_the_point() {
+        // 対照は上のテスト。消した点の手前で終わるチャンクも、直後から始まるチャンクも
+        // 中身は変わっていない
+        let changed = changed_lines_of(DELETION);
+
+        assert!(!changed.touches(Path::new("a.rs"), lines(1, 5)));
+        assert!(!changed.touches(Path::new("a.rs"), lines(6, 9)));
+    }
+
+    #[test]
+    fn test_changed_lines_of_a_deleted_file_has_nothing_to_touch() {
+        let changed = changed_lines_of(
+            "\
+diff --git a/gone.ts b/gone.ts
+deleted file mode 100644
+--- a/gone.ts
++++ /dev/null
+@@ -1,2 +0,0 @@
+-a
+-b
+",
+        );
+
+        assert!(
+            changed.is_empty(),
+            "消したファイルは作業ツリーに無い: {changed:?}"
+        );
+    }
+
+    #[test]
+    fn test_changed_lines_of_a_renamed_file_is_keyed_by_the_new_path() {
+        let changed = changed_lines_of(
+            "\
+diff --git a/old.ts b/new.ts
+similarity index 90%
+rename from old.ts
+rename to new.ts
+--- a/old.ts
++++ b/new.ts
+@@ -2 +2 @@
+-a
++b
+",
+        );
+
+        assert!(changed.touches(Path::new("new.ts"), lines(1, 3)));
+        assert!(!changed.touches(Path::new("old.ts"), lines(1, 3)));
+    }
+
+    #[test]
+    fn test_changed_lines_of_a_path_with_a_space_drops_the_trailing_tab() {
+        let changed = changed_lines_of("+++ b/sub/x y.ts\t\n@@ -2 +2 @@\n-b\n+B\n");
+
+        assert!(changed.touches(Path::new("sub/x y.ts"), lines(2, 2)));
+    }
+
+    #[test]
+    fn test_changed_lines_of_an_added_line_spelled_like_a_header_is_read_as_content() {
+        // 足した行の中身が `++ b/other.ts` なので、本文の行は `+++ b/other.ts` になる。
+        // 行数で読まずに見出しを探すと、後ろの hunk が other.ts に付く
+        let changed = changed_lines_of(
+            "\
++++ b/a.ts
+@@ -1,0 +2,1 @@
++++ b/other.ts
+@@ -9 +10 @@
+-x
++y
+",
+        );
+
+        assert!(changed.touches(Path::new("a.ts"), lines(10, 10)));
+        assert!(!changed.touches(Path::new("other.ts"), lines(1, 100)));
+    }
+
+    #[test]
+    fn test_changed_lines_of_a_hunk_without_newline_at_end_skips_the_marker() {
+        let changed = changed_lines_of(
+            "\
++++ b/a.ts
+@@ -3 +3 @@
+-x
+\\ No newline at end of file
++y
+\\ No newline at end of file
++++ b/b.ts
+@@ -1 +1 @@
+-p
++q
+",
+        );
+
+        assert!(changed.touches(Path::new("a.ts"), lines(3, 3)));
+        assert!(changed.touches(Path::new("b.ts"), lines(1, 1)));
+    }
+
+    #[test]
+    fn test_changed_lines_of_a_quoted_path_reads_it_with_the_escapes_undone() {
+        // `q"z.ts` は git が `"b/q\"z.ts"` と引用する。読まずに止めると、対象外の
+        // ファイル 1 つで check 全体が止まる
+        let changed = changed_lines_of("+++ \"b/q\\\"z\\tw.ts\"\n@@ -1 +1 @@\n-a\n+b\n");
+
+        assert!(changed.touches(Path::new("q\"z\tw.ts"), lines(1, 1)));
+    }
+
+    #[test]
+    fn test_changed_lines_of_a_quoted_path_with_an_octal_escape_reads_the_byte() {
+        let changed = changed_lines_of("+++ \"b/a\\001b.ts\"\n@@ -1 +1 @@\n-a\n+b\n");
+
+        assert!(changed.touches(Path::new("a\u{1}b.ts"), lines(1, 1)));
+    }
+
+    #[test]
+    fn test_changed_lines_of_an_unclosed_quoted_path_is_rejected() {
+        let result = ChangedLines::from_diff(b"+++ \"b/q.ts\n@@ -1 +1 @@\n-a\n+b\n");
+
+        assert!(
+            matches!(result, Err(DiffParseError::MalformedQuotedPath(_))),
+            "閉じていない引用を推測で読まない: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_changed_lines_of_a_truncated_hunk_is_rejected() {
+        let result = ChangedLines::from_diff(b"+++ b/a.ts\n@@ -1,2 +1,2 @@\n-a\n+b\n");
+
+        assert_eq!(result, Err(DiffParseError::TruncatedHunk));
+    }
+
+    #[test]
+    fn test_changed_lines_of_a_malformed_hunk_header_is_rejected() {
+        let result = ChangedLines::from_diff(b"+++ b/a.ts\n@@@ -1 -1 +1 @@@\n");
+
+        assert!(matches!(
+            result,
+            Err(DiffParseError::MalformedHunkHeader(_))
+        ));
+    }
+
+    #[test]
+    fn test_changed_lines_with_untracked_files_touches_every_line_of_them() {
+        let mut changed = changed_lines_of(MODIFIED);
+
+        changed
+            .add_untracked(b"src/new.ts\0src/other new.ts\0")
+            .expect("UTF-8 のパスは読める");
+
+        assert!(changed.touches(Path::new("src/new.ts"), lines(1, 1)));
+        assert!(changed.touches(Path::new("src/other new.ts"), lines(400, 500)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_changed_lines_of_a_non_utf8_path_keeps_its_bytes() {
+        // Latin-1 の名前の画像 1 つで check 全体を止めない
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut changed = changed_lines_of("+++ b/caf\u{e9}.ts\n@@ -1 +1 @@\n-a\n+b\n");
+        changed
+            .add_untracked(b"img/caf\xe9.png\0")
+            .expect("unix ではバイト列のままパスにできる");
+
+        let latin1 = Path::new(std::ffi::OsStr::from_bytes(b"img/caf\xe9.png"));
+        assert!(changed.touches(latin1, lines(1, 1)));
+    }
+
+    #[test]
+    fn test_changed_lines_rooted_at_a_directory_is_keyed_by_the_joined_path() {
+        let changed = changed_lines_of(MODIFIED).rooted_at(Path::new("."));
+
+        assert!(changed.touches(&Path::new(".").join("src/a.ts"), lines(12, 12)));
+    }
+
+    #[test]
+    fn test_diff_base_of_a_revision_keeps_its_spelling() {
+        let base: DiffBase = "main~2".parse().expect("リビジョンの綴りは受け付ける");
+
+        assert_eq!(base.as_str(), "main~2");
+    }
+
+    #[test]
+    fn test_diff_base_of_a_leading_dash_is_rejected() {
+        let result = "--output=x".parse::<DiffBase>();
+
+        assert_eq!(
+            result,
+            Err(DiffBaseError::LeadingDash("--output=x".to_owned()))
+        );
+    }
+
+    #[test]
+    fn test_diff_base_of_a_range_is_rejected() {
+        let result = "main...HEAD".parse::<DiffBase>();
+
+        assert_eq!(result, Err(DiffBaseError::Range("main...HEAD".to_owned())));
+    }
+
+    #[test]
+    fn test_diff_base_of_an_empty_spelling_is_rejected() {
+        assert_eq!("".parse::<DiffBase>(), Err(DiffBaseError::Empty));
+    }
+}
