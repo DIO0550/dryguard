@@ -229,9 +229,16 @@ fn listed_block_of(heading: &str, items: impl Iterator<Item = String>) -> Option
 /// 比べたペアの内訳（長さの上限だけで確定した数）も出す。省いた数が読めないと、
 /// 同じ「比較 N ペア」がどれだけの突き合わせを指すのかが回ごとに変わって見える。
 /// 同じ理由で、比べなかった関数（`test function` と `undersized chunk`）の数も出す。
+///
+/// `check --diff` のときは、変わった行を含むチャンクの数も出す。比べた数はその起点を含む組だけを
+/// 数えたもので、**変更が無かったのか、変えたが似たコードが無かったのか**はこの数で読み分ける。
 fn walked_text_of(scan: &Scan) -> String {
+    let changed = scan
+        .changed_chunk_count()
+        .map(|count| format!(" / 変更を含むチャンク {count} 件"))
+        .unwrap_or_default();
     format!(
-        "対象 {} ファイル / チャンク {} 件{} / 比較 {} ペア（うち長さで確定 {} ペア）/ 候補 {} ペア",
+        "対象 {} ファイル / チャンク {} 件{}{changed} / 比較 {} ペア（うち長さで確定 {} ペア）/ 候補 {} ペア",
         scan.file_count(),
         scan.chunk_count(),
         left_out_text_of(scan),
