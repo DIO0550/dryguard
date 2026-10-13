@@ -832,7 +832,9 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         let started = Instant::now();
 
         while !self.running_progress.is_empty() {
-            if let Some(responded) = self.handled_message()? {
+            if let Some(responded) =
+                self.handled_message_within(started, || Awaited::RunningProgress)?
+            {
                 return Err(ConnectionError::UnrequestedResponse {
                     received: responded.0,
                 });
@@ -882,12 +884,13 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     /// サーバが error を返したとき、応答を待つ合計の上限を超えたとき。
     fn response_of(&mut self, id: RequestId, method: &str) -> Result<Value, ConnectionError> {
         let started = Instant::now();
+        let awaited = || Awaited::Response {
+            method: method.to_owned(),
+        };
 
         loop {
-            let Some((responded, outcome)) = self.handled_message()? else {
-                self.check_streaming_limit(started, || Awaited::Response {
-                    method: method.to_owned(),
-                })?;
+            let Some((responded, outcome)) = self.handled_message_within(started, awaited)? else {
+                self.check_streaming_limit(started, awaited)?;
                 continue;
             };
 
@@ -912,7 +915,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     ///
     /// **待っているものでない 1 通を捌いた後にだけ呼ぶ。** 何も届かない形は読み口の
     /// 沈黙の上限が受け持つ。最初に届いた応答まで落とすと、期限の長さに関わらず
-    /// 速いサーバを殺す。
+    /// 速いサーバを殺す。1 通の途中で待つ形は [`Self::handled_message_within`] が受け持つ。
     ///
     /// # Errors
     ///
@@ -934,7 +937,43 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         Err(ConnectionError::StreamingLimitExceeded {
             awaited: awaited(),
             waited: limit,
+            streamed: Streamed::OtherMessages,
         })
+    }
+
+    /// 次の 1 通を、`started` から数えた待つ合計の上限までに読み終わる形で読み、
+    /// 応答でなければその場で捌く。
+    ///
+    /// **1 通の途中でも期限を見る。** 1 フレームを少しずつ送り続けるサーバの前では、
+    /// 1 通を捌いた後の確認（[`Self::check_streaming_limit`]）まで届かない。
+    ///
+    /// そのぶん、上限をまたいで届いた待っている応答のフレームも落とす（フレームの種類は、
+    /// 読み終わるまで分からない）。上限は実測より桁違いに広く、1 回で揃う速い応答は落とさないので、
+    /// 速いサーバを殺さないという [`Self::check_streaming_limit`] の考え方とはぶつからない。
+    ///
+    /// # Errors
+    ///
+    /// [`Self::handled_message`] と同じ場合。フレームを読み終わる前に上限を過ぎたときは、
+    /// 読み取りの失敗ではなく上限を超えたこととして返す。
+    fn handled_message_within(
+        &mut self,
+        started: Instant,
+        awaited: impl FnOnce() -> Awaited,
+    ) -> Result<Option<(RequestId, ResponseOutcome)>, ConnectionError> {
+        let Some(limit) = self.streaming_limit else {
+            return self.handled_message(None);
+        };
+
+        match self.handled_message(started.checked_add(limit)) {
+            Err(ConnectionError::Framing(FramingError::UnfinishedByDeadline)) => {
+                Err(ConnectionError::StreamingLimitExceeded {
+                    awaited: awaited(),
+                    waited: limit,
+                    streamed: Streamed::UnfinishedFrame,
+                })
+            }
+            handled => handled,
+        }
     }
 
     /// 次の 1 通を読み、応答でなければその場で捌く。
@@ -943,9 +982,14 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     ///
     /// # Errors
     ///
-    /// 読み取りが失敗したとき、中身を解釈できないとき、要求への返信を書き出せないとき。
-    fn handled_message(&mut self) -> Result<Option<(RequestId, ResponseOutcome)>, ConnectionError> {
-        let payload = framing::payload_of(&mut self.reader).map_err(ConnectionError::Framing)?;
+    /// 読み取りが失敗したとき（`deadline` までに読み終わらないときを含む）、中身を解釈できないとき、
+    /// 要求への返信を書き出せないとき。
+    fn handled_message(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<Option<(RequestId, ResponseOutcome)>, ConnectionError> {
+        let payload =
+            framing::payload_of(&mut self.reader, deadline).map_err(ConnectionError::Framing)?;
         let message = ServerMessage::from_payload(&payload).map_err(ConnectionError::Message)?;
 
         match message {
@@ -1104,6 +1148,18 @@ pub enum Awaited {
     RunningProgress,
 }
 
+/// 待つ合計の上限を超えるまで、届き続けていたもの。
+///
+/// **Why not（別のバリアントに分ける）**: 期限も、超えたサーバを kill して後続を断る扱いも同じで、
+/// 違うのは利用者に出す文だけ。バリアントを割ると、後続を断る経路が 2 つになる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Streamed {
+    /// 応答以外のもの（通知・サーバの要求）。
+    OtherMessages,
+    /// 1 フレームの続き。少しずつ届き続け、読み終わらなかった。
+    UnfinishedFrame,
+}
+
 impl fmt::Display for Awaited {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1136,8 +1192,9 @@ pub enum ConnectionError {
         /// サーバが返した内容。
         failure: ResponseFailure,
     },
-    /// 通知・サーバの要求が届き続け、待っている応答・作業の終わりが合計の上限までに
-    /// 届かなかった。待っていたものは [`super::ClientError::ServerKeptStreaming`] まで運ぶ。
+    /// 応答以外のもの・1 フレームの続きが届き続け、待っている応答・作業の終わりが合計の
+    /// 上限までに届かなかった。待っていたものと届き続けたものは
+    /// [`super::ClientError::ServerKeptStreaming`] まで運ぶ。
     ///
     /// **沈黙の上限と分ける。** 何かは届き続けているので、「何も送ってこない」とは違う。
     StreamingLimitExceeded {
@@ -1145,6 +1202,8 @@ pub enum ConnectionError {
         awaited: Awaited,
         /// 待った合計の長さ。
         waited: Duration,
+        /// 届き続けていたもの。
+        streamed: Streamed,
     },
     /// 要求していない応答が届いた。
     ///
@@ -1206,9 +1265,22 @@ impl fmt::Display for ConnectionError {
             Self::ServerFailure { method, failure } => {
                 write!(formatter, "LSP サーバが {method} を拒みました: {failure}")
             }
-            Self::StreamingLimitExceeded { awaited, waited } => write!(
+            Self::StreamingLimitExceeded {
+                awaited,
+                waited,
+                streamed: Streamed::OtherMessages,
+            } => write!(
                 formatter,
                 "LSP サーバの {awaited} を {} 秒待ちましたが、応答以外のものだけが届き続けて終わりませんでした",
+                waited.as_secs_f64()
+            ),
+            Self::StreamingLimitExceeded {
+                awaited,
+                waited,
+                streamed: Streamed::UnfinishedFrame,
+            } => write!(
+                formatter,
+                "LSP サーバの {awaited} を {} 秒待ちましたが、1 通のフレームが少しずつ届き続けて読み終わりませんでした",
                 waited.as_secs_f64()
             ),
             Self::UnrequestedResponse { received } => {
@@ -1290,7 +1362,7 @@ mod tests {
         let mut reader = written;
         let mut payloads = Vec::new();
 
-        while let Ok(payload) = framing::payload_of(&mut reader) {
+        while let Ok(payload) = framing::payload_of(&mut reader, None) {
             payloads.push(serde_json::from_str(payload.as_str()).expect("送った payload は JSON"));
         }
 
@@ -1397,17 +1469,62 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ConnectionError::StreamingLimitExceeded { awaited: Awaited::Response { method }, waited }
-                    if method == HoverRequest::METHOD && *waited == Duration::ZERO
+                ConnectionError::StreamingLimitExceeded {
+                    awaited: Awaited::Response { method },
+                    waited,
+                    streamed: Streamed::OtherMessages,
+                } if method == HoverRequest::METHOD && *waited == Duration::ZERO
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// 応答のフレームを 2 回に分けて渡す読み口。2 回目は、1 回目を読み切ってから届く。
+    fn response_arriving_in_two_pieces() -> io::Chain<&'static [u8], &'static [u8]> {
+        let first: &'static [u8] = b"Content-Length: 41\r\n\r\n{\"jsonrpc\":\"2.0\",";
+        let second: &'static [u8] = br#""id":1,"result":{"a":1}}"#;
+        io::Read::chain(first, second)
+    }
+
+    #[test]
+    fn test_request_whose_response_frame_is_unfinished_past_the_streaming_limit_reports_it() {
+        // 1 フレームを少しずつ送り続けるサーバ。フレームを読み終わる前に期限を見なければ、
+        // 1 通を捌いた後の確認まで届かない
+        let mut connection = Connection::new(response_arriving_in_two_pieces(), Vec::new())
+            .with_streaming_limit(Duration::ZERO);
+
+        let error = connection
+            .request(HoverRequest::METHOD, None)
+            .expect_err("フレームを読み終わる前に期限を過ぎる");
+
+        assert!(
+            matches!(
+                &error,
+                ConnectionError::StreamingLimitExceeded {
+                    awaited: Awaited::Response { method },
+                    waited,
+                    streamed: Streamed::UnfinishedFrame,
+                } if method == HoverRequest::METHOD && *waited == Duration::ZERO
             ),
             "{error:?}"
         );
     }
 
     #[test]
+    fn test_request_without_a_streaming_limit_reads_a_response_frame_arriving_in_pieces() {
+        let mut connection = Connection::new(response_arriving_in_two_pieces(), Vec::new());
+
+        let result = connection
+            .request(HoverRequest::METHOD, None)
+            .expect("応答を受け取れる");
+
+        assert_eq!(result, json!({"a": 1}));
+    }
+
+    #[test]
     fn test_request_answered_first_is_not_cut_by_the_streaming_limit() {
-        // 期限を確かめるのは、待っている応答でないものを捌いた後だけ。最初に届いた応答まで
-        // 期限で落とすと、期限の長さに関わらず速いサーバを殺す
+        // 期限を確かめるのは、待っている応答でないものを捌いた後と、フレームの途中で続きを
+        // 待った後だけ。1 回で揃った最初の応答まで期限で落とすと、期限の長さに関わらず速いサーバを殺す
         let server_output = frames_of(&[r#"{"jsonrpc":"2.0","id":1,"result":{"a":1}}"#]);
         let mut connection = connection_over(&server_output).with_streaming_limit(Duration::ZERO);
 
@@ -1949,7 +2066,9 @@ mod tests {
             &progress_end_notification("indexing"),
         ]);
         let mut connection = connection_over(&server_output).with_streaming_limit(Duration::ZERO);
-        connection.handled_message().expect("始まりの通知を読める");
+        connection
+            .handled_message(None)
+            .expect("始まりの通知を読める");
 
         let error = connection
             .wait_for_running_progress()
@@ -1958,8 +2077,11 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ConnectionError::StreamingLimitExceeded { awaited: Awaited::RunningProgress, waited }
-                    if *waited == Duration::ZERO
+                ConnectionError::StreamingLimitExceeded {
+                    awaited: Awaited::RunningProgress,
+                    waited,
+                    streamed: Streamed::OtherMessages,
+                } if *waited == Duration::ZERO
             ),
             "{error:?}"
         );
@@ -1974,7 +2096,9 @@ mod tests {
             &progress_end_notification("indexing"),
         ]);
         let mut connection = connection_over(&server_output).with_streaming_limit(Duration::ZERO);
-        connection.handled_message().expect("始まりの通知を読める");
+        connection
+            .handled_message(None)
+            .expect("始まりの通知を読める");
 
         connection
             .wait_for_running_progress()
@@ -1990,7 +2114,9 @@ mod tests {
             &progress_end_notification("indexing"),
         ]);
         let mut connection = connection_over(&server_output);
-        connection.handled_message().expect("始まりの通知を読める");
+        connection
+            .handled_message(None)
+            .expect("始まりの通知を読める");
 
         connection
             .wait_for_running_progress()

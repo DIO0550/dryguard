@@ -4,6 +4,9 @@
 //! 区切りを付けて 1 本のストリームに並べる。ここが持つのはその区切りだけで、
 //! 中身が JSON として何であるかは [`super::message`] の担当。
 //!
+//! **1 フレームを読み終わる期限もここで見る。** 期限の長さを決めるのは呼び出し側だが、
+//! フレームの途中で続きを待っているかを知っているのは、区切りを読んでいるここだけ。
+//!
 //! **読み取りを `BufRead` で受けるのは、サーバ無しで確かめられる形にするため**
 //! (rules/tdd.md「`lsp` は『応答を受け取ってから先』を切り出す」)。
 
@@ -12,6 +15,7 @@ use std::fmt;
 // `Read` は `take` を `&mut R` の側で解決させるために要る。入れないと型引数の側
 // （`R: BufRead` の supertrait）で解決し、借りているはずの読み口ごと動かそうとする。
 use std::io::{self, BufRead, Read};
+use std::time::Instant;
 
 use super::message::Payload;
 
@@ -49,13 +53,40 @@ pub fn framed_bytes_of(payload: &Payload) -> Vec<u8> {
 /// 次の 1 フレームを読み、その payload を返す。
 ///
 /// `reader` は読み進める位置を保つので、続けて呼べば次のフレームが返る。
+/// `deadline` があれば、それを過ぎても読み終わらないフレームを諦める。
+///
+/// **期限を見るのは、フレームの途中で続きを待った後だけ。** フレームの最初のバイトを待つ間は
+/// 読み口の沈黙の上限の持ち場で、揃っている分を読む間は待っていない。続きを 1 回受け取るごとに
+/// 時刻を見るので、期限を過ぎてから戻るまでは、フレームの最初のバイトと続き 1 回分の受け取り
+/// （それぞれ沈黙の上限まで）に収まる。
+///
+/// **Why（続きが届いた後に見る）**: 届く前に見ると、期限を過ぎた後に入力が尽きた形まで
+/// [`FramingError::UnfinishedByDeadline`] になる。尽きたのは [`FramingError::TruncatedFrame`] で、
+/// 直し先が違う。
 ///
 /// # Errors
 ///
 /// フレームの切れ目で入力が尽きた（サーバが終了した）とき、フレームの途中で尽きたとき、
 /// `Content-Length` が無い / 数として読めない / 上限を超えるとき、payload が UTF-8 でないとき、
-/// 読み取り自体が失敗したとき。
-pub fn payload_of<R: BufRead>(reader: &mut R) -> Result<Payload, FramingError> {
+/// 読み取り自体が失敗したとき、フレームの途中で続きを受け取った時に `deadline` を過ぎていたとき。
+pub fn payload_of<R: BufRead>(
+    reader: &mut R,
+    deadline: Option<Instant>,
+) -> Result<Payload, FramingError> {
+    let Some(deadline) = deadline else {
+        return framed_payload_of(reader);
+    };
+
+    let mut watched = DeadlineWatchedReader::new(reader, deadline);
+    let read = framed_payload_of(&mut watched);
+    if watched.deadline_passed {
+        return Err(FramingError::UnfinishedByDeadline);
+    }
+    read
+}
+
+/// 1 フレームを読む本体。期限は読み口の側が持つ。
+fn framed_payload_of<R: BufRead>(reader: &mut R) -> Result<Payload, FramingError> {
     let length = content_length_of(reader)?;
 
     // 確保する前に見る。確保してからでは、失敗が `Result` ではなくプロセスの死で返る。
@@ -144,6 +175,76 @@ fn content_length_of<R: BufRead>(reader: &mut R) -> Result<usize, FramingError> 
     length.ok_or(FramingError::MissingContentLength)
 }
 
+/// 1 フレームを読む間、続きを待った後に期限を見る読み口。
+///
+/// **Why not（`read_line` / `read_exact` を `fill_buf` のループに書き直して時刻を見る）**:
+/// ヘッダの上限と EOF の分け方を全部やり直すことになる。包めば、読む側は今のまま使える。
+struct DeadlineWatchedReader<'r, R> {
+    inner: &'r mut R,
+    deadline: Instant,
+    /// 直前の `fill_buf` が返した分のうち、まだ `consume` されていない量。
+    ///
+    /// **0 のまま `fill_buf` を呼ばれたら、次は待って受け取る。** `BufReader` なら内側の
+    /// バッファが空で、読み口からの受け取りになる。
+    unconsumed: usize,
+    /// フレームの最初のバイトを受け取ったか。
+    frame_started: bool,
+    /// 期限を過ぎてから続きを受け取ったか。読み取りの失敗を、期限の理由へ直すのに使う。
+    deadline_passed: bool,
+}
+
+impl<'r, R: BufRead> DeadlineWatchedReader<'r, R> {
+    fn new(inner: &'r mut R, deadline: Instant) -> Self {
+        Self {
+            inner,
+            deadline,
+            unconsumed: 0,
+            frame_started: false,
+            deadline_passed: false,
+        }
+    }
+}
+
+impl<R: BufRead> BufRead for DeadlineWatchedReader<'_, R> {
+    /// # Errors
+    ///
+    /// 読み取り自体が失敗したとき、フレームの途中で続きを受け取った時に期限を過ぎていたとき。
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        let waited_mid_frame = self.frame_started && self.unconsumed == 0;
+        let received = self.inner.fill_buf()?.len();
+
+        if received > 0 {
+            let past_deadline = waited_mid_frame && Instant::now() >= self.deadline;
+            if past_deadline {
+                self.deadline_passed = true;
+                // `Interrupted` は読む側が読み直し、`TimedOut` は沈黙の上限と同じ種類になる。
+                // どちらでもない種類で返し、理由はフラグで運ぶ。
+                return Err(io::Error::other("フレームを読み終わる前に期限を過ぎました"));
+            }
+            self.frame_started = true;
+        }
+        self.unconsumed = received;
+
+        // 揃っている分を返し直すだけで、待たない。
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.unconsumed = self.unconsumed.saturating_sub(amount);
+        self.inner.consume(amount);
+    }
+}
+
+impl<R: BufRead> Read for DeadlineWatchedReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let available = self.fill_buf()?;
+        let copied = available.len().min(buffer.len());
+        buffer[..copied].copy_from_slice(&available[..copied]);
+        self.consume(copied);
+        Ok(copied)
+    }
+}
+
 /// ヘッダ 1 行が `Content-Length` なら、その値の文字列を返す。
 ///
 /// 他のヘッダ（`Content-Type` など）は仕様上並びうるので、`None` で読み飛ばさせる。
@@ -180,6 +281,8 @@ pub enum FramingError {
     DuplicateContentLength,
     /// ヘッダ部が上限を超えても空行に届かない。
     HeaderTooLong,
+    /// フレームの続きが少しずつ届き続け、期限までに読み終わらない。
+    UnfinishedByDeadline,
     /// payload を UTF-8 として解釈できない。
     NotUtf8,
     /// 読み取り自体が失敗した。
@@ -211,6 +314,10 @@ impl fmt::Display for FramingError {
                 formatter,
                 "LSP サーバの応答のヘッダが {MAX_HEADER_BYTES} バイトを超えても終わりません"
             ),
+            Self::UnfinishedByDeadline => write!(
+                formatter,
+                "LSP サーバの応答のフレームが少しずつ届き続け、期限までに読み終わりません"
+            ),
             Self::NotUtf8 => write!(formatter, "LSP サーバの応答が UTF-8 ではありません"),
             Self::Read(cause) => write!(formatter, "LSP サーバの応答を読めません: {cause}"),
         }
@@ -227,6 +334,7 @@ impl Error for FramingError {
             | Self::PayloadTooLarge { .. }
             | Self::DuplicateContentLength
             | Self::HeaderTooLong
+            | Self::UnfinishedByDeadline
             | Self::NotUtf8 => None,
             Self::Read(cause) => Some(cause),
         }
@@ -238,7 +346,7 @@ mod tests {
     use super::*;
 
     fn read_payload(framed: &str) -> Result<Payload, FramingError> {
-        payload_of(&mut framed.as_bytes())
+        payload_of(&mut framed.as_bytes(), None)
     }
 
     #[test]
@@ -280,10 +388,10 @@ mod tests {
         let framed = "Content-Length: 7\r\n\r\n{\"a\":1}Content-Length: 7\r\n\r\n{\"b\":2}";
         let mut reader = framed.as_bytes();
 
-        payload_of(&mut reader).expect("1 フレーム目は読める");
+        payload_of(&mut reader, None).expect("1 フレーム目は読める");
 
         assert_eq!(
-            payload_of(&mut reader)
+            payload_of(&mut reader, None)
                 .expect("2 フレーム目も読める")
                 .as_str(),
             r#"{"b":2}"#
@@ -402,8 +510,72 @@ mod tests {
         let mut framed = b"Content-Length: 2\r\n\r\n".to_vec();
         framed.extend_from_slice(&[0xff, 0xfe]);
 
-        let error = payload_of(&mut framed.as_slice()).expect_err("読めない");
+        let error = payload_of(&mut framed.as_slice(), None).expect_err("読めない");
 
         assert!(matches!(error, FramingError::NotUtf8));
+    }
+
+    /// 1 フレームを、2 回の受け取りに分けて渡す読み口。2 回目は、1 回目を読み切ってから届く。
+    fn arriving_in_two_pieces<'a>(first: &'a str, second: &'a str) -> impl BufRead + 'a {
+        first.as_bytes().chain(second.as_bytes())
+    }
+
+    #[test]
+    fn test_payload_of_a_frame_still_arriving_past_the_deadline_reports_it() {
+        // 本文の続きが少しずつ届き続けるサーバ。期限を見なければ、読み切るまで返らない
+        let mut reader = arriving_in_two_pieces("Content-Length: 7\r\n\r\n{\"a\"", ":1}");
+
+        let error = payload_of(&mut reader, Some(Instant::now())).expect_err("読み切れない");
+
+        assert!(matches!(error, FramingError::UnfinishedByDeadline));
+    }
+
+    #[test]
+    fn test_payload_of_headers_still_arriving_past_the_deadline_reports_it() {
+        // ヘッダは `read_line`、本文は `read_exact` と読み方が違う。どちらの途中でも期限を見る
+        let mut reader = arriving_in_two_pieces("Content-Len", "gth: 7\r\n\r\n{\"a\":1}");
+
+        let error = payload_of(&mut reader, Some(Instant::now())).expect_err("読み切れない");
+
+        assert!(matches!(error, FramingError::UnfinishedByDeadline));
+    }
+
+    #[test]
+    fn test_payload_of_without_a_deadline_reads_a_frame_arriving_in_pieces() {
+        let mut reader = arriving_in_two_pieces("Content-Length: 7\r\n\r\n{\"a\"", ":1}");
+
+        let payload = payload_of(&mut reader, None).expect("読める");
+
+        assert_eq!(payload.as_str(), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn test_payload_of_a_frame_that_arrived_at_once_is_not_cut_by_a_passed_deadline() {
+        // 揃っている分を読む間は待っていない。ここで期限を見ると、速いサーバの応答まで落とす
+        let mut reader = "Content-Length: 7\r\nContent-Type: x\r\n\r\n{\"a\":1}".as_bytes();
+
+        let payload = payload_of(&mut reader, Some(Instant::now())).expect("読める");
+
+        assert_eq!(payload.as_str(), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn test_payload_of_the_wait_for_the_first_byte_is_not_cut_by_a_passed_deadline() {
+        // フレームの最初のバイトを待つのは沈黙の上限の持ち場。前のフレームとの間を期限で切らない
+        let mut reader = arriving_in_two_pieces("", "Content-Length: 7\r\n\r\n{\"a\":1}");
+
+        let payload = payload_of(&mut reader, Some(Instant::now())).expect("読める");
+
+        assert_eq!(payload.as_str(), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn test_payload_of_input_ending_mid_frame_past_the_deadline_reports_a_truncated_frame() {
+        // 続きが届かずに尽きたのは、少しずつ届き続けたのとは別物。直し先が違う
+        let mut reader = "Content-Length: 7\r\n\r\n{\"a\"".as_bytes();
+
+        let error = payload_of(&mut reader, Some(Instant::now())).expect_err("読めない");
+
+        assert!(matches!(error, FramingError::TruncatedFrame));
     }
 }
