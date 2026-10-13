@@ -210,6 +210,53 @@ mod tests {
     }
 
     #[test]
+    fn test_check_with_diff_without_a_value_compares_with_head() {
+        let cli = parse(&["dryguard", "check", "--diff"]);
+
+        let Command::Check { diff, .. } = &cli.command else {
+            panic!("check を渡したので Check になる");
+        };
+        assert_eq!(diff.as_str(), "HEAD");
+    }
+
+    #[test]
+    fn test_check_with_diff_and_a_revision_compares_with_that_revision() {
+        // 既定は HEAD なので、既定と違う値を渡さないと指定が効いたか分からない
+        let cli = parse(&["dryguard", "check", "--diff", "main~2", "--format", "json"]);
+
+        let Command::Check { diff, .. } = &cli.command else {
+            panic!("check を渡したので Check になる");
+        };
+        assert_eq!(diff.as_str(), "main~2");
+        assert_eq!(cli.options.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_check_without_diff_is_rejected() {
+        // 何と比べるかを書かずに走らせない
+        let parsed = Cli::try_parse_from(["dryguard", "check"]);
+
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_check_with_a_range_as_the_diff_base_is_rejected() {
+        let parsed = Cli::try_parse_from(["dryguard", "check", "--diff", "main..HEAD"]);
+
+        assert!(parsed.is_err(), "範囲は作業ツリーと比べる形にならない");
+    }
+
+    #[test]
+    fn test_check_with_include_tests_takes_test_functions_in() {
+        let cli = parse(&["dryguard", "check", "--diff", "--include-tests"]);
+
+        let Command::Check { include_tests, .. } = &cli.command else {
+            panic!("check を渡したので Check になる");
+        };
+        assert!(include_tests);
+    }
+
+    #[test]
     fn test_compare_with_include_tests_is_rejected() {
         // `compare` は位置を名指しするので外すものが無い。受けて何もしない指定を作らない
         let parsed =
