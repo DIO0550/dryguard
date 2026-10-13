@@ -1370,6 +1370,19 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_json_of_a_whole_scan_has_no_changed_chunk_count() {
+        // 出すのは `check --diff` のときだけ（出る側は tests/check.rs）。scan で 0 を出すと
+        // 「変わったチャンクが無かった」と読める
+        let json = scan_json_of_fixture("scan");
+
+        assert!(
+            json["walked"].get("changed_chunks").is_none(),
+            "scan は差分で絞らない: {}",
+            json["walked"]
+        );
+    }
+
+    #[test]
     fn test_scan_json_of_reports_the_test_functions_it_left_out() {
         let text = scan_json_of(
             &rust_scan_of_fixture("rust-tests"),
