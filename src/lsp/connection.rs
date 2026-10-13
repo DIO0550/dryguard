@@ -947,8 +947,8 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     /// **1 通の途中でも期限を見る。** 1 フレームを少しずつ送り続けるサーバの前では、
     /// 1 通を捌いた後の確認（[`Self::check_streaming_limit`]）まで届かない。
     ///
-    /// そのぶん、上限をまたいで届いた待っている応答のフレームも落とす（フレームの種類は、
-    /// 読み終わるまで分からない）。上限は実測より桁違いに広く、1 回で揃う速い応答は落とさないので、
+    /// そのぶん、待っている応答・作業の終わりのフレームでも、上限を過ぎた後に読み口から補充すれば
+    /// 落とす（フレームの種類は、読み終わるまで分からない）。上限は実測より桁違いに広いので、
     /// 速いサーバを殺さないという [`Self::check_streaming_limit`] の考え方とはぶつからない。
     ///
     /// # Errors
@@ -1508,6 +1508,19 @@ mod tests {
             ),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn test_request_within_the_streaming_limit_reads_a_response_frame_arriving_in_pieces() {
+        // 期限を時刻と照らさず、続きを待っただけで落とすと、正常に遅いサーバを殺す
+        let mut connection = Connection::new(response_arriving_in_two_pieces(), Vec::new())
+            .with_streaming_limit(Duration::from_secs(3600));
+
+        let result = connection
+            .request(HoverRequest::METHOD, None)
+            .expect("応答を受け取れる");
+
+        assert_eq!(result, json!({"a": 1}));
     }
 
     #[test]
@@ -2103,6 +2116,39 @@ mod tests {
         connection
             .wait_for_running_progress()
             .expect("終わりの通知で抜ける");
+    }
+
+    #[test]
+    fn test_waiting_for_running_progress_whose_end_frame_is_unfinished_past_the_streaming_limit_reports_it()
+     {
+        // 作業の終わりを待つ間も、1 フレームを少しずつ送られれば 1 通を捌いた後の確認まで届かない
+        let begin = frames_of(&[&progress_begin_notification("indexing")]);
+        let end = frames_of(&[&progress_end_notification("indexing")]);
+        let (end_head, end_tail) = end.split_at(end.len() / 2);
+        let mut head = begin;
+        head.extend_from_slice(end_head);
+        let reader = io::Read::chain(head.as_slice(), end_tail);
+        let mut connection =
+            Connection::new(reader, Vec::new()).with_streaming_limit(Duration::ZERO);
+        connection
+            .handled_message(None)
+            .expect("始まりの通知を読める");
+
+        let error = connection
+            .wait_for_running_progress()
+            .expect_err("終わりのフレームを読み終わる前に期限を過ぎる");
+
+        assert!(
+            matches!(
+                &error,
+                ConnectionError::StreamingLimitExceeded {
+                    awaited: Awaited::RunningProgress,
+                    streamed: Streamed::UnfinishedFrame,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]

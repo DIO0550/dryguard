@@ -947,7 +947,7 @@ impl Abandonment {
     /// **`framing` に沈黙の専用のバリアントを置かない。** 期限は区切りの話ではなく読み口
     /// （[`SilenceLimitedReader`]）の性質で、読み取りで `TimedOut` を返すのはこの読み口だけ。
     /// 待つ合計の上限がフレームの途中で切れた形（[`FramingError::UnfinishedByDeadline`]）は
-    /// `framing` が見分けるが、フレームの途中かを知っているのが区切りを読む側だけだからで、
+    /// フレームの途中かを知っているのが区切りを読む `framing` だけなので、そこで見分け、
     /// [`Connection`] が [`ConnectionError::StreamingLimitExceeded`] へ直してからここに来る。
     fn of(cause: &ConnectionError) -> Option<Self> {
         match cause {
@@ -1122,7 +1122,7 @@ impl fmt::Display for ClientError {
                 streamed: Streamed::UnfinishedFrame,
             } => write!(
                 formatter,
-                "LSP サーバ ({program}) が {awaited} を待つ {} 秒のあいだ 1 通のフレームを少しずつ送り続けて送り終えなかったため、止めました",
+                "LSP サーバ ({program}) が {awaited} を返さないまま {} 秒のあいだ 1 通のフレームを少しずつ送り続け、送り終えなかったため、止めました",
                 waited.as_secs_f64()
             ),
             Self::ServerNotReading { program, waited } => write!(

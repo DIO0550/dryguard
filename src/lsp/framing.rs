@@ -55,9 +55,10 @@ pub fn framed_bytes_of(payload: &Payload) -> Vec<u8> {
 /// `reader` は読み進める位置を保つので、続けて呼べば次のフレームが返る。
 /// `deadline` があれば、それを過ぎても読み終わらないフレームを諦める。
 ///
-/// **期限を見るのは、フレームの途中で続きを待った後だけ。** フレームの最初のバイトを待つ間は
-/// 読み口の沈黙の上限の持ち場で、揃っている分を読む間は待っていない。続きを 1 回受け取るごとに
-/// 時刻を見るので、期限を過ぎてから戻るまでは、フレームの最初のバイトと続き 1 回分の受け取り
+/// **期限を見るのは、フレームの途中で読み口から補充した後だけ。** フレームの最初のバイトを待つ間は
+/// 読み口の沈黙の上限の持ち場で、前の補充の分を読み切るまでは補充しない。補充は届いた塊の単位
+/// なので、届いた時点で揃っていても 2 塊以上に分かれたフレーム（8 KiB を超える・ヘッダと本文を
+/// 別々に書く）は、上限を過ぎた後に届き始めたものでも落とす。補充のたびに時刻を見るので、期限を過ぎてから戻るまでは、フレームの最初のバイトと続き 1 回分の受け取り
 /// （それぞれ沈黙の上限まで）に収まる。
 ///
 /// **Why（続きが届いた後に見る）**: 届く前に見ると、期限を過ぎた後に入力が尽きた形まで
@@ -184,8 +185,8 @@ struct DeadlineWatchedReader<'r, R> {
     deadline: Instant,
     /// 直前の `fill_buf` が返した分のうち、まだ `consume` されていない量。
     ///
-    /// **0 のまま `fill_buf` を呼ばれたら、次は待って受け取る。** `BufReader` なら内側の
-    /// バッファが空で、読み口からの受け取りになる。
+    /// **0 のまま `fill_buf` を呼ばれたら、次は読み口からの補充になる。** `BufReader` なら内側の
+    /// バッファが空で、届いた次の塊を（届いていなければ待って）受け取る。
     unconsumed: usize,
     /// フレームの最初のバイトを受け取ったか。
     frame_started: bool,
@@ -210,11 +211,11 @@ impl<R: BufRead> BufRead for DeadlineWatchedReader<'_, R> {
     ///
     /// 読み取り自体が失敗したとき、フレームの途中で続きを受け取った時に期限を過ぎていたとき。
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        let waited_mid_frame = self.frame_started && self.unconsumed == 0;
+        let refilled_mid_frame = self.frame_started && self.unconsumed == 0;
         let received = self.inner.fill_buf()?.len();
 
         if received > 0 {
-            let past_deadline = waited_mid_frame && Instant::now() >= self.deadline;
+            let past_deadline = refilled_mid_frame && Instant::now() >= self.deadline;
             if past_deadline {
                 self.deadline_passed = true;
                 // `Interrupted` は読む側が読み直し、`TimedOut` は沈黙の上限と同じ種類になる。
@@ -344,6 +345,7 @@ impl Error for FramingError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn read_payload(framed: &str) -> Result<Payload, FramingError> {
         payload_of(&mut framed.as_bytes(), None)
@@ -551,7 +553,7 @@ mod tests {
 
     #[test]
     fn test_payload_of_a_frame_that_arrived_at_once_is_not_cut_by_a_passed_deadline() {
-        // 揃っている分を読む間は待っていない。ここで期限を見ると、速いサーバの応答まで落とす
+        // 前の補充の分を読み切るまでは補充しない。ここで期限を見ると、速いサーバの応答まで落とす
         let mut reader = "Content-Length: 7\r\nContent-Type: x\r\n\r\n{\"a\":1}".as_bytes();
 
         let payload = payload_of(&mut reader, Some(Instant::now())).expect("読める");
@@ -560,13 +562,30 @@ mod tests {
     }
 
     #[test]
-    fn test_payload_of_the_wait_for_the_first_byte_is_not_cut_by_a_passed_deadline() {
-        // フレームの最初のバイトを待つのは沈黙の上限の持ち場。前のフレームとの間を期限で切らない
-        let mut reader = arriving_in_two_pieces("", "Content-Length: 7\r\n\r\n{\"a\":1}");
+    fn test_payload_of_a_frame_arriving_in_pieces_before_the_deadline_reads_it() {
+        // 期限を時刻と照らさず、続きを待っただけで落とすと、正常に遅いサーバを殺す
+        let mut reader = arriving_in_two_pieces("Content-Length: 7\r\n\r\n{\"a\"", ":1}");
+        let deadline = Instant::now() + Duration::from_secs(3600);
 
-        let payload = payload_of(&mut reader, Some(Instant::now())).expect("読める");
+        let payload = payload_of(&mut reader, Some(deadline)).expect("読める");
 
         assert_eq!(payload.as_str(), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn test_payload_of_the_next_frame_after_a_wait_between_frames_is_not_cut_by_a_passed_deadline()
+    {
+        // フレームの最初のバイトを待つのは沈黙の上限の持ち場。前のフレームとの間で補充しても、
+        // 期限で切らない
+        let mut reader = arriving_in_two_pieces(
+            "Content-Length: 7\r\n\r\n{\"a\":1}",
+            "Content-Length: 7\r\n\r\n{\"b\":2}",
+        );
+        payload_of(&mut reader, None).expect("1 フレーム目は読める");
+
+        let payload = payload_of(&mut reader, Some(Instant::now())).expect("2 フレーム目も読める");
+
+        assert_eq!(payload.as_str(), r#"{"b":2}"#);
     }
 
     #[test]
