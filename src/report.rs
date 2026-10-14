@@ -554,7 +554,7 @@ fn unopened_text_of(reason: UnopenedReason) -> &'static str {
             "測れない (比較に残る型名を開けない: サーバが hover を提供していない)"
         }
         UnopenedReason::ServerStillWorking => {
-            "測れない (比較に残る型名を開けない: サーバが作業中で宣言の位置の hover の答えが落ち着かない)"
+            "測れない (比較に残る型名を開けない: サーバが作業中で hover / definition / implementation の答えが落ち着かない)"
         }
         UnopenedReason::UnopenableAlias => {
             "測れない (比較に残る型名を開けない: エイリアスの右辺を差し込める形にできない)"
@@ -1728,10 +1728,10 @@ mod tests {
     }
 
     #[test]
-    fn test_text_of_with_an_unsettled_declaration_hover_says_which_hover_did_not_settle() {
-        // 対照は 1 つ上のテスト。**落ち着かなかった hover が別**（チャンクの位置ではなく
-        // 宣言の位置）で、開く先の綴りが取れていない。1 語で出すと、どちらの往復を
-        // 待てばよいのかが読めない
+    fn test_text_of_with_an_unsettled_type_name_query_says_the_type_name_could_not_be_opened() {
+        // 対照は 1 つ上のテスト。**落ち着かなかった往復が別**（チャンクの位置の hover ではなく、
+        // 型名を開く hover / definition / implementation）で、開く先が取れていない。
+        // 1 語で出すと、どちらの往復を待てばよいのかが読めない
         let text = text_of_accidental_duplication_with_semantics(
             TypeSignatureMatch::UnopenedTypeName {
                 reason: UnopenedReason::ServerStillWorking,
@@ -1743,9 +1743,9 @@ mod tests {
 
         assert!(
             text.contains(
-                "型シグネチャ: 測れない (比較に残る型名を開けない: サーバが作業中で宣言の位置の hover の答えが落ち着かない) → どちらでもない"
+                "型シグネチャ: 測れない (比較に残る型名を開けない: サーバが作業中で hover / definition / implementation の答えが落ち着かない) → どちらでもない"
             ),
-            "宣言の位置の hover が落ち着かなかったことが出る: {text}"
+            "型名を開く往復が落ち着かなかったことが出る: {text}"
         );
     }
 
