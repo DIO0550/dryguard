@@ -1,6 +1,6 @@
-//! git の差分から、作業ツリーのどの行が変わったかを集める。
+//! git の差分から、作業ツリー（`--staged` なら index）のどの行が変わったかを集める。
 //!
-//! **git を起動するのは [`ChangedLines::of`] だけ。** 差分の文字列を読むところは
+//! **このモジュールで git を起動するのは [`ChangedLines::of`] だけ。** 差分の文字列を読むところは
 //! プロセスを要らない関数に切ってあるので、書式の扱いはリポジトリを作らずに全部テストできる
 //! （`rules/tdd.md`「`lsp` は『応答を受け取ってから先』を切り出す」と同じ形）。
 
@@ -15,10 +15,10 @@ use std::str::FromStr;
 use crate::line_number::LineNumber;
 use crate::syntax::line_range::LineRange;
 
-/// 差分を取るときに作業ツリーと比べるリビジョン（`diff base`）。
+/// 差分を取るときに [`DiffTarget`] と比べるリビジョン（`diff base`）。
 ///
-/// **作業ツリーと比べる形に閉じる。** 行番号が作業ツリーを指していないと、
-/// チャンクを切り出すファイルと行が食い違う。だから範囲（`a..b` / `a...b`）は受けない。
+/// **[`DiffTarget`] と比べる形に閉じる。** 行番号がチャンクを切り出す版を指していないと、
+/// ファイルと行が食い違う。だから範囲（`a..b` / `a...b`）は受けない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffBase(String);
 
@@ -60,6 +60,42 @@ impl fmt::Display for DiffBase {
     }
 }
 
+/// [`DiffBase`] と比べる側（`diff target`）。変わった行の行番号は、この側の版を指す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffTarget {
+    /// 作業ツリー。ステージ済みと未ステージの変更の両方が入る。
+    WorkTree,
+    /// index（`--staged`）。ステージ済みの変更だけが入る。
+    ///
+    /// **チャンクも index の版から切り出す**（`codebase::index`）。作業ツリーから切り出すと、
+    /// 部分的にステージした（`git add -p`）ファイルで行番号が食い違う。
+    Index,
+}
+
+/// 差分の両側。`check --diff [<REVISION>] [--staged]` の指定そのもの。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffSides {
+    base: DiffBase,
+    target: DiffTarget,
+}
+
+impl DiffSides {
+    /// `base` を `target` と比べる差分。
+    pub fn new(base: DiffBase, target: DiffTarget) -> Self {
+        Self { base, target }
+    }
+
+    /// 比べるリビジョン。
+    pub fn base(&self) -> &DiffBase {
+        &self.base
+    }
+
+    /// リビジョンと比べる側。
+    pub fn target(&self) -> DiffTarget {
+        self.target
+    }
+}
+
 /// [`DiffBase`] として受け付けなかった理由。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffBaseError {
@@ -67,7 +103,7 @@ pub enum DiffBaseError {
     Empty,
     /// `-` で始まる。git がリビジョンではなくオプションとして読む。
     LeadingDash(String),
-    /// 範囲の指定。作業ツリーと比べる形にならない。
+    /// 範囲の指定。作業ツリー・index と比べる形にならない。
     Range(String),
 }
 
@@ -80,7 +116,7 @@ impl fmt::Display for DiffBaseError {
             }
             Self::Range(text) => write!(
                 formatter,
-                "{text}: 範囲は受け付けません。作業ツリーと比べるリビジョンを 1 つ指定してください"
+                "{text}: 範囲は受け付けません。比べるリビジョンを 1 つ指定してください"
             ),
         }
     }
@@ -88,7 +124,7 @@ impl fmt::Display for DiffBaseError {
 
 impl Error for DiffBaseError {}
 
-/// 作業ツリーで変わった行を、ファイルごとに持つ。
+/// [`DiffTarget`] の側で変わった行を、ファイルごとに持つ。
 ///
 /// キーのパスは、[`ChangedLines::of`] に渡した根に差分の相対パスをつないだもの。
 /// **`codebase::source_paths_of` が同じ根から組み立てるパスと同じ形**になるので、
@@ -107,7 +143,7 @@ enum FileChange {
     Hunks(Vec<Hunk>),
 }
 
-/// 差分の hunk 1 つが、作業ツリー側で指す場所。
+/// 差分の hunk 1 つが、[`DiffTarget`] の側で指す場所。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Hunk {
     /// 足した・書き換えた行の範囲。
@@ -132,18 +168,19 @@ impl Hunk {
 }
 
 impl ChangedLines {
-    /// `root` の作業ツリーを `base` と比べて、変わった行を集める。
+    /// `root` の下の [`DiffTarget`] の側を `base` と比べて、変わった行を集める。
     ///
-    /// `root` の外の変更は含めない（`git diff --relative`）。まだ追跡していないファイル
-    /// （`.gitignore` で外したものを除く）は全行が変わったものとして含める。
-    /// **`git diff <base>` は新しく作ったファイルを出さない**ので、含めないと足したばかりの
-    /// 関数が対象から漏れる。
+    /// `root` の外の変更は含めない（`git diff --relative`）。作業ツリーと比べるときは、
+    /// まだ追跡していないファイル（`.gitignore` で外したものを除く）を全行が変わったものとして
+    /// 含める。**`git diff <base>` は新しく作ったファイルを出さない**ので、含めないと
+    /// 足したばかりの関数が対象から漏れる。index と比べるときは含めない（コミットに入らない）。
     ///
     /// # Errors
     ///
     /// git を起動できない、`root` が git の作業ツリーでない、`base` を解決できない、
     /// git が失敗した、差分を読み解けないとき（[`DiffError`]）。
-    pub fn of(root: &Path, base: &DiffBase) -> Result<Self, DiffError> {
+    pub fn of(root: &Path, sides: &DiffSides) -> Result<Self, DiffError> {
+        let base = sides.base();
         let inside = git_output_of(root, &["rev-parse", "--is-inside-work-tree"])?;
         if !inside.succeeded || inside.stdout.trim_ascii() != b"true" {
             return Err(DiffError::NotAWorkTree {
@@ -168,29 +205,33 @@ impl ChangedLines {
 
         // 利用者の git の設定で出力の形が変わらないよう、色・外部 diff・接頭辞・パスの
         // 引用を引数で固定する
-        let diff = git_output_of(
-            root,
-            &[
-                "-c",
-                "core.quotePath=false",
-                "diff",
-                "--no-color",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--unified=0",
-                "--relative",
-                "--src-prefix=a/",
-                "--dst-prefix=b/",
-                base.as_str(),
-                "--",
-            ],
-        )?
-        .succeeded_stdout()?;
-        let untracked = git_output_of(root, &["ls-files", "-z", "--others", "--exclude-standard"])?
-            .succeeded_stdout()?;
+        let cached = match sides.target() {
+            DiffTarget::WorkTree => None,
+            DiffTarget::Index => Some("--cached"),
+        };
+        let mut arguments = vec![
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--unified=0",
+            "--relative",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+        ];
+        arguments.extend(cached);
+        arguments.extend([base.as_str(), "--"]);
+        let diff = git_output_of(root, &arguments)?.succeeded_stdout()?;
 
         let mut changed = Self::from_diff(&diff)?;
-        changed.add_untracked(&untracked)?;
+        if sides.target() == DiffTarget::WorkTree {
+            let untracked =
+                git_output_of(root, &["ls-files", "-z", "--others", "--exclude-standard"])?
+                    .succeeded_stdout()?;
+            changed.add_untracked(&untracked)?;
+        }
         Ok(changed.rooted_at(root))
     }
 
@@ -224,7 +265,7 @@ impl ChangedLines {
 
             let header = HunkHeader::from_line(line)?;
             skip_hunk_body(&mut lines, header)?;
-            // 消したファイル（`+++ /dev/null`）の hunk は、作業ツリーに指す先が無い
+            // 消したファイル（`+++ /dev/null`）の hunk は、比べる側に指す先が無い
             let Some(path) = &current else {
                 continue;
             };
@@ -283,7 +324,7 @@ impl ChangedLines {
     }
 }
 
-/// `+++ ` の後ろから、作業ツリー側のパス。消したファイル（`/dev/null`）なら `None`。
+/// `+++ ` の後ろから、[`DiffTarget`] の側のパス。消したファイル（`/dev/null`）なら `None`。
 ///
 /// 末尾のタブは落とす。**パスに空白を含むと git が付ける**（GNU patch との互換のため）。
 fn new_side_path_of(spelled: &[u8]) -> Result<Option<PathBuf>, DiffParseError> {
@@ -352,7 +393,7 @@ fn unquoted_of(quoted: &[u8]) -> Result<Vec<u8>, DiffParseError> {
 /// unix ではバイト列のまま持つ。**UTF-8 でない名前のファイル 1 つで check 全体を止めない**
 /// （走査はそうしたファイルも `OsStr` のまま集めるので、ここで断ると取りこぼす）。
 #[cfg(unix)]
-fn path_of(bytes: &[u8]) -> Result<PathBuf, DiffParseError> {
+pub(super) fn path_of(bytes: &[u8]) -> Result<PathBuf, DiffParseError> {
     use std::os::unix::ffi::OsStrExt;
 
     Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
@@ -362,7 +403,7 @@ fn path_of(bytes: &[u8]) -> Result<PathBuf, DiffParseError> {
 ///
 /// unix 以外ではパスをバイト列から作れないので、UTF-8 でなければ断る。
 #[cfg(not(unix))]
-fn path_of(bytes: &[u8]) -> Result<PathBuf, DiffParseError> {
+pub(super) fn path_of(bytes: &[u8]) -> Result<PathBuf, DiffParseError> {
     let path = std::str::from_utf8(bytes)
         .map_err(|_| DiffParseError::NonUtf8Path(String::from_utf8_lossy(bytes).into_owned()))?;
     Ok(PathBuf::from(path))
@@ -400,7 +441,7 @@ impl HunkHeader {
         })
     }
 
-    /// 作業ツリー側で、この hunk が指す場所。
+    /// [`DiffTarget`] の側で、この hunk が指す場所。
     ///
     /// 消しただけの hunk は `+c,0` と書かれ、c は**消した点の手前の行**を指す。
     fn new_side(self) -> Hunk {
@@ -480,7 +521,7 @@ impl fmt::Display for DiffParseError {
 
 impl Error for DiffParseError {}
 
-/// 変わった行を集められなかった理由。
+/// 変わった行、または index の版を集められなかった理由。
 ///
 /// **直す先ごとに分ける**（`rules/coding.md`「エラー型は原因ごとにバリアントを分ける」）。
 #[derive(Debug)]
@@ -495,6 +536,10 @@ pub enum DiffError {
     GitFailed(String),
     /// 差分を読み解けなかった。
     Unparsable(DiffParseError),
+    /// index に未解決のマージ衝突がある。どの版を読むかが決まらない。
+    UnmergedPath { path: PathBuf },
+    /// index の一覧か中身を読み解けなかった。保持しているのは読めなかった箇所。
+    UnreadableIndex(String),
 }
 
 impl fmt::Display for DiffError {
@@ -511,6 +556,14 @@ impl fmt::Display for DiffError {
             }
             Self::GitFailed(stderr) => write!(formatter, "git が失敗しました: {stderr}"),
             Self::Unparsable(cause) => write!(formatter, "差分を読み解けません: {cause}"),
+            Self::UnmergedPath { path } => write!(
+                formatter,
+                "{}: マージの衝突が解決されていません。解決してからステージしてください",
+                path.display()
+            ),
+            Self::UnreadableIndex(spelled) => {
+                write!(formatter, "index を読み解けません: {spelled}")
+            }
         }
     }
 }
@@ -520,7 +573,11 @@ impl Error for DiffError {
         match self {
             Self::GitUnavailable(cause) => Some(cause),
             Self::Unparsable(cause) => Some(cause),
-            Self::NotAWorkTree { .. } | Self::UnknownBase { .. } | Self::GitFailed(_) => None,
+            Self::NotAWorkTree { .. }
+            | Self::UnknownBase { .. }
+            | Self::GitFailed(_)
+            | Self::UnmergedPath { .. }
+            | Self::UnreadableIndex(_) => None,
         }
     }
 }
@@ -532,7 +589,7 @@ impl From<DiffParseError> for DiffError {
 }
 
 /// git を 1 回起動した結果。
-struct GitOutput {
+pub(super) struct GitOutput {
     succeeded: bool,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -540,7 +597,7 @@ struct GitOutput {
 
 impl GitOutput {
     /// 成功していれば標準出力、失敗していれば標準エラーを持つ [`DiffError::GitFailed`]。
-    fn succeeded_stdout(self) -> Result<Vec<u8>, DiffError> {
+    pub(super) fn succeeded_stdout(self) -> Result<Vec<u8>, DiffError> {
         if !self.succeeded {
             return Err(DiffError::GitFailed(
                 String::from_utf8_lossy(&self.stderr).trim().to_owned(),
@@ -550,7 +607,7 @@ impl GitOutput {
     }
 }
 
-fn git_output_of(root: &Path, arguments: &[&str]) -> Result<GitOutput, DiffError> {
+pub(super) fn git_output_of(root: &Path, arguments: &[&str]) -> Result<GitOutput, DiffError> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)

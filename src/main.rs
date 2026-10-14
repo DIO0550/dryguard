@@ -18,7 +18,7 @@ use dryguard::classification::verdict::Verdict;
 use dryguard::classification::{ConfiguredThresholds, classification_of};
 use dryguard::cli::{Cli, Command, CommonOptions, FailOn, LanguageOption, OutputFormat};
 use dryguard::codebase::SourceLanguage;
-use dryguard::codebase::diff::DiffBase;
+use dryguard::codebase::diff::{DiffSides, DiffTarget};
 use dryguard::config::configuration_of;
 use dryguard::domain_declaration::DomainDeclarations;
 use dryguard::location::Location;
@@ -64,9 +64,10 @@ fn main() -> ExitCode {
         ),
         Command::Check {
             diff,
+            staged,
             include_tests,
         } => report_check(
-            diff,
+            &DiffSides::new(diff.clone(), diff_target_of(*staged)),
             test_functions_of(*include_tests),
             &cli.options,
             &settings,
@@ -80,6 +81,14 @@ fn test_functions_of(include_tests: bool) -> TestFunctions {
         return TestFunctions::Included;
     }
     TestFunctions::Excluded
+}
+
+/// `--staged` の有無から、リビジョンと比べる側。
+fn diff_target_of(staged: bool) -> DiffTarget {
+    if staged {
+        return DiffTarget::Index;
+    }
+    DiffTarget::WorkTree
 }
 
 /// `check --diff` が走査する根。
@@ -215,21 +224,22 @@ fn report_scan(
     report_walked(&scan, options)
 }
 
-/// `check --diff` の対象を、作業ツリーで `base` から変わったチャンクに絞って、
+/// `check --diff` の対象を、`sides` の差分が変えたチャンクに絞って、
 /// 候補ペアを理由付きで表示する。
 ///
 /// 終了コードの決め方は [`report_scan`] と同じ。差分を取れないとき（git が無い・
-/// git の作業ツリーでない・リビジョンを解決できない）も [`NOT_CLASSIFIED`] にする。
+/// git の作業ツリーでない・リビジョンを解決できない・index に未解決の衝突がある）も
+/// [`NOT_CLASSIFIED`] にする。
 /// **差分を取れないまま 0 件として成功させると、フックが「重複は無い」と読む。**
 fn report_check(
-    base: &DiffBase,
+    sides: &DiffSides,
     test_functions: TestFunctions,
     options: &CommonOptions,
     settings: &Settings<'_>,
 ) -> ExitCode {
     let scan = match check_with_language_servers(
         Path::new(CHECK_ROOT),
-        base,
+        sides,
         source_language_of(options.lang),
         test_functions,
         settings.thresholds,

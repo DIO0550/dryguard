@@ -50,7 +50,7 @@ pub enum Command {
     Check {
         // `--diff` を省けないのは、計画の綴り（`check --diff`）に合わせつつ、
         // 比べるリビジョンを同じオプションで受けるため
-        /// 作業ツリーと比べるリビジョン。値を省くと HEAD
+        /// 作業ツリー（--staged なら index）と比べるリビジョン。値を省くと HEAD
         #[arg(
             long,
             value_name = "REVISION",
@@ -58,6 +58,11 @@ pub enum Command {
             default_missing_value = DEFAULT_DIFF_BASE
         )]
         diff: DiffBase,
+        // `--diff` の値にしないのは、比べるリビジョンと比べる側を別々に指定できるようにするため
+        // （`--diff HEAD~1 --staged`）。綴りは `git diff --staged` に合わせる
+        /// 作業ツリーではなく、ステージ済みの変更（index）をリビジョンと比べる。未追跡のファイルは比べない
+        #[arg(long)]
+        staged: bool,
         /// Rust のテスト属性付き関数・TypeScript のテストコールバックも比較する
         #[arg(long)]
         include_tests: bool,
@@ -243,7 +248,39 @@ mod tests {
     fn test_check_with_a_range_as_the_diff_base_is_rejected() {
         let parsed = Cli::try_parse_from(["dryguard", "check", "--diff", "main..HEAD"]);
 
-        assert!(parsed.is_err(), "範囲は作業ツリーと比べる形にならない");
+        assert!(
+            parsed.is_err(),
+            "範囲は作業ツリー・index と比べる形にならない"
+        );
+    }
+
+    #[test]
+    fn test_check_with_staged_compares_the_index() {
+        let cli = parse(&["dryguard", "check", "--diff", "--staged"]);
+
+        let Command::Check { diff, staged, .. } = &cli.command else {
+            panic!("check を渡したので Check になる");
+        };
+        assert!(staged);
+        assert_eq!(diff.as_str(), "HEAD", "--staged を値として読まない");
+    }
+
+    #[test]
+    fn test_check_without_staged_compares_the_work_tree() {
+        let cli = parse(&["dryguard", "check", "--diff"]);
+
+        let Command::Check { staged, .. } = &cli.command else {
+            panic!("check を渡したので Check になる");
+        };
+        assert!(!staged);
+    }
+
+    #[test]
+    fn test_check_with_staged_without_diff_is_rejected() {
+        // 何と比べるかは --diff が持つ。--staged だけでは比べる相手が無い
+        let parsed = Cli::try_parse_from(["dryguard", "check", "--staged"]);
+
+        assert!(parsed.is_err());
     }
 
     #[test]
