@@ -157,11 +157,16 @@ pub enum UnopenedReason {
     NoSpellingAtDeclaration,
     /// 宣言の位置の hover の応答を `lsp` が読めなかった。
     UnreadableDeclarationHover,
-    /// 尋ねるたびにサーバが作業を始めるので、宣言の位置の hover が落ち着かなかった。
+    /// 尋ねるたびにサーバが作業を始めるので、宣言の位置の hover・definition・
+    /// implementation のどれかの答えが落ち着かなかった。
     ///
-    /// **途中の綴りを右辺として差し込まない。** 読み込み前の hover は推論された型に
-    /// `any` を綴るので、差し込むと**開けていない型名を開けたことにする**
+    /// **途中の答えを使わない。** 読み込み前の hover は推論された型に `any` を綴り、
+    /// definition / implementation はまだ見ていない宣言に空を返す。使うと**開けていない
+    /// 型名を開けたことにする**か、**宣言のある名前を宣言が無いことにする**
     /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+    ///
+    /// **問い合わせごとに分けない。** どれで落ち着かなくても、利用者が次にすることは
+    /// サーバの作業が終わってから走らせ直すことで同じ。
     ServerStillWorking,
     /// サーバが hover を提供していない。
     HoverNotProvided,
@@ -647,6 +652,9 @@ impl<'session> RustTypeResolver<'session> {
                 ImplementationOutcome::NotSupported => {
                     return Ok(Err(UnopenedReason::ImplementationNotProvided));
                 }
+                ImplementationOutcome::ServerStillWorking => {
+                    return Ok(Err(UnopenedReason::ServerStillWorking));
+                }
             };
         let mut unselected = UnselectedImpls {
             has_unreadable_site: has_unreadable,
@@ -965,6 +973,9 @@ impl<'session> RustTypeResolver<'session> {
                 }
                 ImplementationOutcome::NotSupported => {
                     return Ok(Err(UnopenedReason::ImplementationNotProvided));
+                }
+                ImplementationOutcome::ServerStillWorking => {
+                    return Ok(Err(UnopenedReason::ServerStillWorking));
                 }
             };
         let mut unselected = UnselectedImpls {
@@ -1440,6 +1451,7 @@ impl DeclarationQuery {
             DeclarationSiteOutcome::NoAnswer => Err(self.no_answer()),
             DeclarationSiteOutcome::Unreadable { .. } => Err(self.unreadable()),
             DeclarationSiteOutcome::NotSupported => Err(self.not_provided()),
+            DeclarationSiteOutcome::ServerStillWorking => Err(UnopenedReason::ServerStillWorking),
         })
     }
 
@@ -1496,6 +1508,12 @@ impl DeclarationQuery {
                 }
                 DeclarationSiteOutcome::NotSupported => {
                     unopened.push(UnopenedTypeName::new(name, self.not_provided()));
+                }
+                DeclarationSiteOutcome::ServerStillWorking => {
+                    unopened.push(UnopenedTypeName::new(
+                        name,
+                        UnopenedReason::ServerStillWorking,
+                    ));
                 }
             }
         }

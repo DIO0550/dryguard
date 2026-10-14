@@ -244,6 +244,9 @@ impl<'session> ArrayLengthEvaluator<'session> {
                 DeclarationSiteOutcome::NotSupported => {
                     return Ok(Err(UnopenedReason::DefinitionNotProvided));
                 }
+                DeclarationSiteOutcome::ServerStillWorking => {
+                    return Ok(Err(UnopenedReason::ServerStillWorking));
+                }
             },
         };
         if self.active.contains(&site) {
