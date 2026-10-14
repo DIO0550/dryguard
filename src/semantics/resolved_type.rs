@@ -1063,12 +1063,12 @@ impl<'session> RustTypeResolver<'session> {
     ///
     /// **キーは問い合わせた位置ではなく trait の宣言位置。** 答えは trait で決まるので、
     /// 別のチャンク・別のファイルから同じ trait を尋ねても尋ね直さない。
-    /// **`Answered` だけを覚える。** 読み込み前にも空が返る（[`ImplementationOutcome::NoAnswer`]）
-    /// ので、空を使い回すと後のチャンクが尋ね直せば取れた答えを落とす。
-    /// 届いた答えを落ち着いたものとして扱えるのは、同じチャンクの hover が読み込みの
-    /// 落ち着きを待った後にだけここへ来るから（`semantics::type_signature` の
-    /// `rust_type_signature_outcome_of`）。**落ち着いた後なら件数も揃う、は確かめていない** —
-    /// 件数の欠けた途中の答えが返れば、その後のチャンクにも同じ答えを使う緩みが残る。
+    /// **`Answered` だけを覚える。** 空（[`ImplementationOutcome::NoAnswer`]）や落ち着かなかった
+    /// 答え（[`ImplementationOutcome::ServerStillWorking`]）を使い回すと、後のチャンクが
+    /// 尋ね直せば取れた答えを落とす。
+    /// 届いた答えを落ち着いたものとして扱えるのは、implementation 自身が作業に触れていない
+    /// 答えだけを返すから（`lsp::Connection::implementation`）。**作業の通知を出さずに件数の
+    /// 欠けた答えを返すサーバは捉えられない** — その答えを後のチャンクにも使う緩みが残る。
     ///
     /// # Errors
     ///

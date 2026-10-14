@@ -65,6 +65,19 @@ const RUST_SETTLED_ATTEMPTS: usize = 32;
 /// LSP の `ContentModified`。rust-analyzer は読み込みが進んでいる間の要求に返す。
 const CONTENT_MODIFIED: i64 = -32801;
 
+/// 落ち着きを待って尋ねる、宣言の場所を返す問い合わせ。
+///
+/// **メソッドの名前を文字列で受けない。** `settled_outcome_of` は関数ポインタを受けるので
+/// 名前を閉じ込められず、名前から 1 往復の関数を選ぶことになる。文字列で比べると、
+/// 想定外の名前が黙って片方の要求に化ける。
+#[derive(Debug, Clone, Copy)]
+enum SettledDeclarationQuery {
+    /// `textDocument/definition`。
+    Definition,
+    /// `textDocument/implementation`。
+    Implementation,
+}
+
 /// 宣言の場所を返す問い合わせ（definition / implementation）の、落ち着きを待った答え。
 ///
 /// **null と「落ち着かなかった」を分ける。** どちらも場所を持たないが、前者はサーバの答えで、
@@ -399,7 +412,8 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         let params = self.declaration_params_of(GotoTypeDefinition::METHOD, document, position)?;
 
         // **落ち着きを待たない。** typeDefinition を尋ねるのは TypeScript だけで、読み込みの
-        // 途中に空が返る例を測っていない。待つ形にすると、1 往復で答えが返る前提の並びが崩れる。
+        // 途中に空が返る例を測っていない。途中の空を採っても「宣言の場所を答えない」（測れない）に
+        // 倒れるだけで、偽の答えにはならない。
         Ok(
             match self
                 .ask_declaration_sites_once(GotoTypeDefinition::METHOD, params)?
@@ -433,7 +447,11 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         position: SourcePosition,
     ) -> Result<DeclarationSiteOutcome, ConnectionError> {
         Ok(
-            match self.settled_declaration_sites_of(GotoDefinition::METHOD, document, position)? {
+            match self.settled_declaration_sites_of(
+                SettledDeclarationQuery::Definition,
+                document,
+                position,
+            )? {
                 SettledDeclarationSites::Answered(Some(answered)) => {
                     declaration_site::outcome_of(&answered)
                 }
@@ -463,7 +481,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     ) -> Result<ImplementationOutcome, ConnectionError> {
         Ok(
             match self.settled_declaration_sites_of(
-                GotoImplementation::METHOD,
+                SettledDeclarationQuery::Implementation,
                 document,
                 position,
             )? {
@@ -491,7 +509,11 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         position: SourcePosition,
     ) -> Result<declaration_site::UniqueDeclarationSiteOutcome, ConnectionError> {
         Ok(
-            match self.settled_declaration_sites_of(GotoDefinition::METHOD, document, position)? {
+            match self.settled_declaration_sites_of(
+                SettledDeclarationQuery::Definition,
+                document,
+                position,
+            )? {
                 SettledDeclarationSites::Answered(Some(answered)) => {
                     declaration_site::unique_outcome_of(&answered)
                 }
@@ -511,8 +533,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
 
     /// 宣言の場所を返す問い合わせを、作業に触れていない答えが返るまで尋ね直す。
     ///
-    /// `method` は definition か implementation。**要求も応答も同じ形**で、違うのは
-    /// メソッドの名前だけ。
+    /// **2 つは要求も応答も同じ形**で、違うのはメソッドの名前だけ。
     ///
     /// # Errors
     ///
@@ -520,18 +541,19 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     /// 送受信が失敗したとき、応答をその問い合わせの結果として読めないとき。
     fn settled_declaration_sites_of(
         &mut self,
-        method: &'static str,
+        query: SettledDeclarationQuery,
         document: &SourceDocument,
         position: SourcePosition,
     ) -> Result<SettledDeclarationSites, ConnectionError> {
-        let params = self.declaration_params_of(method, document, position)?;
-        // `settled_outcome_of` が受け取るのは関数ポインタなので、メソッドの名前を
-        // 閉じ込められない。名前ごとに 1 往復の関数を選ぶ。
-        let ask_once = if method == GotoImplementation::METHOD {
-            Self::ask_implementation_once
-        } else {
-            Self::ask_definition_once
+        let (method, ask_once): (_, fn(&mut Self, Value) -> _) = match query {
+            SettledDeclarationQuery::Definition => {
+                (GotoDefinition::METHOD, Self::ask_definition_once)
+            }
+            SettledDeclarationQuery::Implementation => {
+                (GotoImplementation::METHOD, Self::ask_implementation_once)
+            }
         };
+        let params = self.declaration_params_of(method, document, position)?;
 
         self.settled_outcome_of(
             params,
