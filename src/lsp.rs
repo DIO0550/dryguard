@@ -1181,7 +1181,7 @@ mod tests {
     use crate::codebase;
     use crate::test_support::{line, repository_path, signature_text};
     use lsp_types::HoverProviderCapability;
-    use lsp_types::request::{HoverRequest, Initialize, Request as _};
+    use lsp_types::request::{GotoImplementation, HoverRequest, Initialize, Request as _};
 
     /// 候補ペアのファイルとして開かせる fixture。
     const A_CANDIDATE_PAIR_FILE: &str = "tests/fixtures/billing/discount.ts";
@@ -1822,6 +1822,88 @@ mod tests {
 
         let started = Instant::now();
         let second = session.hover(&document, position);
+
+        assert!(
+            matches!(second, Err(ClientError::ServerKeptStreaming { .. })),
+            "{second:?}"
+        );
+        assert!(started.elapsed() < SHORT_LIMIT, "2 度目は待たずに断る");
+        let shutdown = session.shutdown();
+        assert!(
+            matches!(shutdown, Err(ClientError::ServerKeptStreaming { .. })),
+            "{shutdown:?}"
+        );
+    }
+
+    /// 1 通目の要求（`initialize`）への応答。implementation を提供すると答える。
+    ///
+    /// **Why**: 提供しないサーバには implementation を送らないので、期限に触れる前に返る。
+    const IMPLEMENTATION_PROVIDER_INITIALIZE_RESPONSE: &str =
+        r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"implementationProvider":true}}}"#;
+
+    /// implementation を提供すると握手で答えた後、通知だけを流し続けるサーバと握手した結果。
+    fn session_streaming_after_declaring_implementation(limits: WaitLimits) -> Session {
+        let script = format!(
+            "{}; {}",
+            printed_frame(IMPLEMENTATION_PROVIDER_INITIALIZE_RESPONSE),
+            streaming_notifications()
+        );
+        handshake_with(&script, limits).expect("握手できる")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_session_implementation_on_a_server_that_only_streams_notifications_reports_it() {
+        // hover と同じ期限の見分けを implementation も通る。往復を直に呼ぶと
+        // 期限を超えたことが `Conversation` に埋もれ、どの期限で見限ったかが出ない
+        let limits = WaitLimits {
+            streaming: SHORT_LIMIT,
+            ..GENEROUS_LIMITS
+        };
+        let mut session = session_streaming_after_declaring_implementation(limits);
+        let document = fixture_document();
+        session.open_document(&document).expect("開かせられる");
+        let position = SourcePosition::from_preceding_text(line(5), "export function ");
+
+        let started = Instant::now();
+        let error = session
+            .implementation(&document, position)
+            .expect_err("応答が届かないまま期限を過ぎる");
+
+        assert!(
+            matches!(
+                &error,
+                ClientError::ServerKeptStreaming {
+                    program,
+                    awaited: Awaited::Response { method },
+                    waited,
+                    streamed: Streamed::OtherMessages,
+                } if program == "sh"
+                    && method == GotoImplementation::METHOD
+                    && *waited == SHORT_LIMIT
+            ),
+            "{error:?}"
+        );
+        assert!(started.elapsed() < GENEROUS_LIMIT, "期限で戻る");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_session_after_implementation_kept_streaming_refuses_with_the_same_reason() {
+        // implementation で見限ったサーバも kill し、後続を送らずに断る。断らないと
+        // 流し続けるサーバへ問い合わせの数だけ送り、そのたびに期限まで待つ
+        let limits = WaitLimits {
+            streaming: SHORT_LIMIT,
+            ..GENEROUS_LIMITS
+        };
+        let mut session = session_streaming_after_declaring_implementation(limits);
+        let document = fixture_document();
+        session.open_document(&document).expect("開かせられる");
+        let position = SourcePosition::from_preceding_text(line(5), "export function ");
+        let _ = session.implementation(&document, position);
+
+        let started = Instant::now();
+        let second = session.implementation(&document, position);
 
         assert!(
             matches!(second, Err(ClientError::ServerKeptStreaming { .. })),
