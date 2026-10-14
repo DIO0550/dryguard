@@ -651,9 +651,7 @@ impl Session {
             return Ok(ImplementationOutcome::NotSupported);
         }
         self.client
-            .connection
-            .implementation(document, position)
-            .map_err(ClientError::Conversation)
+            .converse(|connection| connection.implementation(document, position))
     }
 
     /// 定数の宣言を一意に選べるかを含めて尋ねる。
