@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::classification::verdict::Verdict;
+use crate::codebase::diff::{DEFAULT_DIFF_BASE, DiffBase};
 use crate::location::Location;
 use crate::threshold::Threshold;
 
@@ -24,10 +25,6 @@ pub struct Cli {
 }
 
 /// サブコマンド。
-///
-/// `check --diff` は Phase 5 で足す。**受け取るだけで何もしない
-/// サブコマンドを先に生やさない** — 実行できるのに結果が出ないコマンドは、
-/// 使う側が「壊れている」と「未実装」を区別できない。
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// 特定の 2 関数を比較する
@@ -45,6 +42,22 @@ pub enum Command {
         // 既定で外すのは、テスト関数どうしが `fn()` の型シグネチャと呼び出し元の無さで
         // 空の一致を作り、本番コードの候補ペアを埋もれさせるため。`compare` は位置を
         // 名指しするので、このオプションを持たない（global にしない）
+        /// Rust のテスト属性付き関数・TypeScript のテストコールバックも比較する
+        #[arg(long)]
+        include_tests: bool,
+    },
+    /// git の差分に含まれるチャンクを起点に、カレントディレクトリ以下の全体から候補ペアを探す
+    Check {
+        // `--diff` を省けないのは、計画の綴り（`check --diff`）に合わせつつ、
+        // 比べるリビジョンを同じオプションで受けるため
+        /// 作業ツリーと比べるリビジョン。値を省くと HEAD
+        #[arg(
+            long,
+            value_name = "REVISION",
+            num_args = 0..=1,
+            default_missing_value = DEFAULT_DIFF_BASE
+        )]
+        diff: DiffBase,
         /// Rust のテスト属性付き関数・TypeScript のテストコールバックも比較する
         #[arg(long)]
         include_tests: bool,
@@ -192,6 +205,53 @@ mod tests {
 
         let Command::Scan { include_tests, .. } = &cli.command else {
             panic!("scan を渡したので Scan になる");
+        };
+        assert!(include_tests);
+    }
+
+    #[test]
+    fn test_check_with_diff_without_a_value_compares_with_head() {
+        let cli = parse(&["dryguard", "check", "--diff"]);
+
+        let Command::Check { diff, .. } = &cli.command else {
+            panic!("check を渡したので Check になる");
+        };
+        assert_eq!(diff.as_str(), "HEAD");
+    }
+
+    #[test]
+    fn test_check_with_diff_and_a_revision_compares_with_that_revision() {
+        // 既定は HEAD なので、既定と違う値を渡さないと指定が効いたか分からない
+        let cli = parse(&["dryguard", "check", "--diff", "main~2", "--format", "json"]);
+
+        let Command::Check { diff, .. } = &cli.command else {
+            panic!("check を渡したので Check になる");
+        };
+        assert_eq!(diff.as_str(), "main~2");
+        assert_eq!(cli.options.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_check_without_diff_is_rejected() {
+        // 何と比べるかを書かずに走らせない
+        let parsed = Cli::try_parse_from(["dryguard", "check"]);
+
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_check_with_a_range_as_the_diff_base_is_rejected() {
+        let parsed = Cli::try_parse_from(["dryguard", "check", "--diff", "main..HEAD"]);
+
+        assert!(parsed.is_err(), "範囲は作業ツリーと比べる形にならない");
+    }
+
+    #[test]
+    fn test_check_with_include_tests_takes_test_functions_in() {
+        let cli = parse(&["dryguard", "check", "--diff", "--include-tests"]);
+
+        let Command::Check { include_tests, .. } = &cli.command else {
+            panic!("check を渡したので Check になる");
         };
         assert!(include_tests);
     }

@@ -21,6 +21,7 @@ use crate::classification::signal::{
 use crate::classification::{
     Classification, ConfiguredThresholds, classification_of, is_structurally_similar,
 };
+use crate::codebase::diff::{ChangedLines, DiffBase, DiffError};
 use crate::codebase::{CodebaseError, SourceLanguage, source_of, source_paths_of};
 use crate::domain_declaration::{AmbiguousDomain, DomainDeclarations, DomainName};
 use crate::location::Location;
@@ -1225,8 +1226,11 @@ pub fn scan_of_language(
         test_functions,
         thresholds,
         declarations,
-        server,
-        None,
+        ScanServers {
+            server,
+            other_server: None,
+        },
+        ScanScope::Whole,
     )
 }
 
@@ -1250,9 +1254,85 @@ pub fn scan_with_language_servers(
         test_functions,
         thresholds,
         declarations,
-        typescript_server,
-        Some(rust_server),
+        ScanServers {
+            server: typescript_server,
+            other_server: Some(rust_server),
+        },
+        ScanScope::Whole,
     )
+}
+
+/// `root` の作業ツリーで `base` から変わったチャンクを起点に、コードベース全体から候補ペアを探す。
+///
+/// **比べるのは、少なくとも片方が変更を含むチャンクの組だけ。** 相手は変わっていない
+/// チャンクも含めた全体なので、変えた関数が既存のコードと重複していないかが分かる
+/// （変更分どうしだけでは、既存のコードとの重複を見落とす）。
+///
+/// 返す [`Scan`] は [`Scan::changed_chunk_count`] を持つ。比べた数・候補ペアの数は、
+/// 変更を含む組だけを数えた数になる。
+///
+/// # Errors
+///
+/// 差分を取れないとき（[`CheckError::Diff`]）、走査を始められないとき（[`CheckError::Scan`]）。
+pub fn check_with_language_servers(
+    root: &Path,
+    base: &DiffBase,
+    language: SourceLanguage,
+    test_functions: TestFunctions,
+    thresholds: ConfiguredThresholds,
+    declarations: &DomainDeclarations,
+    servers: LanguageServers<'_>,
+) -> Result<Scan, CheckError> {
+    let changed = ChangedLines::of(root, base).map_err(CheckError::Diff)?;
+
+    scan_with_servers(
+        root,
+        language,
+        test_functions,
+        thresholds,
+        declarations,
+        ScanServers {
+            server: servers.typescript,
+            other_server: Some(servers.rust),
+        },
+        ScanScope::Changes(&changed),
+    )
+    .map_err(CheckError::Scan)
+}
+
+/// 言語ごとに起こす LSP サーバの指定。
+#[derive(Debug, Clone, Copy)]
+pub struct LanguageServers<'a> {
+    /// TypeScript のチャンクへ尋ねるサーバ。
+    pub typescript: &'a ServerCommand,
+    /// Rust のチャンクへ尋ねるサーバ。
+    pub rust: &'a ServerCommand,
+}
+
+/// 走査が使うサーバ。`other_server` は混在走査で 2 つ目の言語に使う。
+#[derive(Clone, Copy)]
+struct ScanServers<'a> {
+    server: &'a ServerCommand,
+    other_server: Option<&'a ServerCommand>,
+}
+
+/// 比べる起点にするチャンクの範囲。
+#[derive(Clone, Copy)]
+enum ScanScope<'a> {
+    /// すべてのチャンク（`scan`）。
+    Whole,
+    /// 変わった行を含むチャンクだけ（`check --diff`）。
+    Changes(&'a ChangedLines),
+}
+
+impl ScanScope<'_> {
+    /// そのチャンクが比べる起点になるか。
+    fn targets(self, chunk: &Chunk) -> bool {
+        match self {
+            Self::Whole => true,
+            Self::Changes(changed) => changed.touches(chunk.path(), chunk.lines()),
+        }
+    }
 }
 
 fn scan_with_servers(
@@ -1261,8 +1341,8 @@ fn scan_with_servers(
     test_functions: TestFunctions,
     thresholds: ConfiguredThresholds,
     declarations: &DomainDeclarations,
-    server: &ServerCommand,
-    other_server: Option<&ServerCommand>,
+    servers: ScanServers<'_>,
+    scope: ScanScope<'_>,
 ) -> Result<Scan, ScanError> {
     let paths = source_paths_of(root, language).map_err(ScanError::Codebase)?;
     let file_count = paths.len();
@@ -1314,24 +1394,30 @@ fn scan_with_servers(
             .partition(|chunk| chunk.is_undersized());
         undersized_chunk_count += undersized.len();
         chunks.extend(comparable.into_iter().cloned().map(|chunk| ScannedChunk {
+            targeted: scope.targets(&chunk),
             chunk,
             source: Arc::clone(&chunked_file.source),
             declared: declared.clone(),
         }));
     }
 
+    let changed_chunk_count = match scope {
+        ScanScope::Whole => None,
+        ScanScope::Changes(_) => Some(chunks.iter().filter(|scanned| scanned.targeted).count()),
+    };
     Ok(scan_of_chunks(
         &chunks,
         thresholds,
         declarations,
-        server,
-        other_server,
+        servers.server,
+        servers.other_server,
         ScanInputs {
             file_count,
             skipped_files,
             unchunkable,
             excluded_test_function_count,
             undersized_chunk_count,
+            changed_chunk_count,
         },
     ))
 }
@@ -1358,6 +1444,10 @@ struct ScannedChunk {
     /// **ファイルごとに 1 度だけ引く**（`rules/architecture.md`「ファイル単位で決まる答えを
     /// チャンク単位で問い合わせない」）。ペアごとに引くと、同じ照合をチャンクの組の数だけ繰り返す。
     declared: Option<DomainName>,
+    /// 比べる起点になるか。`scan` ではすべて、`check --diff` では変わった行を含むものだけ。
+    ///
+    /// **ペアはどちらかが起点なら比べる。** 両側とも起点でない組は、類似度を測る前に飛ばす。
+    targeted: bool,
 }
 
 /// そのファイルを読んで、中にある関数・メソッドをすべて切り出す。
@@ -1408,6 +1498,7 @@ struct ScanInputs {
     unchunkable: Vec<Location>,
     excluded_test_function_count: usize,
     undersized_chunk_count: usize,
+    changed_chunk_count: Option<usize>,
 }
 
 /// 集めたチャンクを総当たりで比べ、候補ペアだけを判定する。
@@ -1488,6 +1579,7 @@ fn scan_of_chunks(
         chunk_count: chunks.len(),
         excluded_test_function_count: inputs.excluded_test_function_count,
         undersized_chunk_count: inputs.undersized_chunk_count,
+        changed_chunk_count: inputs.changed_chunk_count,
         compared_pair_count,
         pruned_pair_count,
         skipped_files: inputs.skipped_files,
@@ -1564,7 +1656,9 @@ impl ComparedPairs {
         for (offset, other) in following.iter().enumerate() {
             let other_chunk = &other.chunk;
 
-            if !chunk.grammar().same_language_as(other_chunk.grammar())
+            let neither_targeted = !scanned.targeted && !other.targeted;
+            if neither_targeted
+                || !chunk.grammar().same_language_as(other_chunk.grammar())
                 || is_nested(chunk, other_chunk)
             {
                 continue;
@@ -2145,6 +2239,7 @@ pub struct Scan {
     chunk_count: usize,
     excluded_test_function_count: usize,
     undersized_chunk_count: usize,
+    changed_chunk_count: Option<usize>,
     compared_pair_count: usize,
     pruned_pair_count: usize,
     skipped_files: Vec<SkippedFile>,
@@ -2204,7 +2299,18 @@ impl Scan {
         self.undersized_chunk_count
     }
 
+    /// 変わった行を含むチャンクの数。`check --diff` のときだけ `Some`。
+    ///
+    /// [`Scan::chunk_count`] の内訳で、小さすぎるチャンクと外したテスト関数は含まない。
+    /// **0 件を候補ペアの 0 件と区別できるように出す** — 変更が無かったのか、変えたが
+    /// 似たコードが無かったのかは、候補の数だけでは読めない。
+    pub fn changed_chunk_count(&self) -> Option<usize> {
+        self.changed_chunk_count
+    }
+
     /// 実際に比べたペアの数。入れ子の組は含まない。
+    ///
+    /// `check --diff` では、少なくとも片方が変更を含む組だけを数える。
     ///
     /// **長さの上限だけで確定したペアもここに数える**（[`Scan::pruned_pair_count`]）。
     /// 飛ばしたのではなく安く比べただけなので、比べた数からは外さない。
@@ -2323,6 +2429,36 @@ impl Error for ScanError {
         match self {
             Self::Codebase(cause) => Some(cause),
             Self::AmbiguousDomain(cause) => Some(cause),
+        }
+    }
+}
+
+/// `check --diff` を始められなかった理由。
+///
+/// [`ScanError`] にバリアントを足さないのは、`scan` が返さない git の失敗を
+/// `scan` の呼び出し側に分岐させないため。
+#[derive(Debug)]
+pub enum CheckError {
+    /// 変わった行を集められなかった。
+    Diff(DiffError),
+    /// 走査を始められなかった。
+    Scan(ScanError),
+}
+
+impl fmt::Display for CheckError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Diff(cause) => write!(formatter, "{cause}"),
+            Self::Scan(cause) => write!(formatter, "{cause}"),
+        }
+    }
+}
+
+impl Error for CheckError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Diff(cause) => Some(cause),
+            Self::Scan(cause) => Some(cause),
         }
     }
 }
@@ -3123,6 +3259,7 @@ mod tests {
                 chunk: chunk_of(path, number, &source),
                 source: Arc::clone(&source),
                 declared: None,
+                targeted: true,
             })
             .collect()
     }

@@ -18,11 +18,15 @@ use dryguard::classification::verdict::Verdict;
 use dryguard::classification::{ConfiguredThresholds, classification_of};
 use dryguard::cli::{Cli, Command, CommonOptions, FailOn, LanguageOption, OutputFormat};
 use dryguard::codebase::SourceLanguage;
+use dryguard::codebase::diff::DiffBase;
 use dryguard::config::configuration_of;
 use dryguard::domain_declaration::DomainDeclarations;
 use dryguard::location::Location;
 use dryguard::lsp::ServerCommand;
-use dryguard::pipeline::{chunk_pair_of, measured_pair_of, scan_with_language_servers};
+use dryguard::pipeline::{
+    LanguageServers, Scan, check_with_language_servers, chunk_pair_of, measured_pair_of,
+    scan_with_language_servers,
+};
 use dryguard::report::{Explanation, json_of, scan_json_of, scan_text_of, text_of};
 use dryguard::syntax::chunk::TestFunctions;
 use dryguard::syntax::tree::Grammar;
@@ -52,16 +56,37 @@ fn main() -> ExitCode {
         Command::Scan {
             path,
             include_tests,
-        } => {
-            let test_functions = if *include_tests {
-                TestFunctions::Included
-            } else {
-                TestFunctions::Excluded
-            };
-            report_scan(path, test_functions, &cli.options, &settings)
-        }
+        } => report_scan(
+            path,
+            test_functions_of(*include_tests),
+            &cli.options,
+            &settings,
+        ),
+        Command::Check {
+            diff,
+            include_tests,
+        } => report_check(
+            diff,
+            test_functions_of(*include_tests),
+            &cli.options,
+            &settings,
+        ),
     }
 }
+
+/// `--include-tests` の有無から、`test function` をチャンクにするか。
+fn test_functions_of(include_tests: bool) -> TestFunctions {
+    if include_tests {
+        return TestFunctions::Included;
+    }
+    TestFunctions::Excluded
+}
+
+/// `check --diff` が走査する根。
+///
+/// [`CONFIG_DIRECTORY`] と同じカレントディレクトリにする。差分を取る範囲と設定を探す場所が
+/// 食い違うと、変更を読んだ設定と違う設定で判定することになる。
+const CHECK_ROOT: &str = ".";
 
 /// 判定を出し終えたうえで、`--fail-on` に指定した判定が 1 件以上出た。
 ///
@@ -76,7 +101,7 @@ const NOT_CLASSIFIED: u8 = 2;
 
 /// 判定に当てる閾値と、ドメインの宣言。
 ///
-/// [`report_compare`] と [`report_scan`] の引数をまとめるためだけの型。
+/// [`report_compare`] / [`report_scan`] / [`report_check`] の引数をまとめるためだけの型。
 struct Settings<'a> {
     thresholds: ConfiguredThresholds,
     declarations: &'a DomainDeclarations,
@@ -172,14 +197,9 @@ fn report_scan(
     options: &CommonOptions,
     settings: &Settings<'_>,
 ) -> ExitCode {
-    let language = match options.lang {
-        LanguageOption::Ts => SourceLanguage::TypeScript,
-        LanguageOption::Rust => SourceLanguage::Rust,
-        LanguageOption::Auto => SourceLanguage::Auto,
-    };
     let scan = match scan_with_language_servers(
         root,
-        language,
+        source_language_of(options.lang),
         test_functions,
         settings.thresholds,
         settings.declarations,
@@ -192,6 +212,53 @@ fn report_scan(
             return ExitCode::from(NOT_CLASSIFIED);
         }
     };
+    report_walked(&scan, options)
+}
+
+/// `check --diff` の対象を、作業ツリーで `base` から変わったチャンクに絞って、
+/// 候補ペアを理由付きで表示する。
+///
+/// 終了コードの決め方は [`report_scan`] と同じ。差分を取れないとき（git が無い・
+/// git の作業ツリーでない・リビジョンを解決できない）も [`NOT_CLASSIFIED`] にする。
+/// **差分を取れないまま 0 件として成功させると、フックが「重複は無い」と読む。**
+fn report_check(
+    base: &DiffBase,
+    test_functions: TestFunctions,
+    options: &CommonOptions,
+    settings: &Settings<'_>,
+) -> ExitCode {
+    let scan = match check_with_language_servers(
+        Path::new(CHECK_ROOT),
+        base,
+        source_language_of(options.lang),
+        test_functions,
+        settings.thresholds,
+        settings.declarations,
+        LanguageServers {
+            typescript: &ServerCommand::typescript(),
+            rust: &ServerCommand::rust(),
+        },
+    ) {
+        Ok(scan) => scan,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(NOT_CLASSIFIED);
+        }
+    };
+    report_walked(&scan, options)
+}
+
+/// `--lang` から、走査するソースの言語。
+fn source_language_of(lang: LanguageOption) -> SourceLanguage {
+    match lang {
+        LanguageOption::Ts => SourceLanguage::TypeScript,
+        LanguageOption::Rust => SourceLanguage::Rust,
+        LanguageOption::Auto => SourceLanguage::Auto,
+    }
+}
+
+/// 走査した結果を出し、終了コードを決める。`scan` と `check` で共通。
+fn report_walked(scan: &Scan, options: &CommonOptions) -> ExitCode {
     for error in scan.semantics_errors() {
         // **どのシグナルが取れなかったかはここで言わない。** 候補ペアごとに
         // 効いたシグナルが違うので、数え上げると判定の根拠と食い違う。
@@ -201,8 +268,8 @@ fn report_scan(
     let explanation = explanation_of(options);
 
     let report = match options.format {
-        OutputFormat::Text => scan_text_of(&scan, explanation),
-        OutputFormat::Json => scan_json_of(&scan, explanation),
+        OutputFormat::Text => scan_text_of(scan, explanation),
+        OutputFormat::Json => scan_json_of(scan, explanation),
     };
     println!("{report}");
 

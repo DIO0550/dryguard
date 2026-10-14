@@ -64,10 +64,12 @@ if structurally_similar && domains_differ { ... }
 | `generic alias` | Rust の型パラメータ・既定値・右辺を持ち、使用側の型引数を当てはめて展開する型エイリアス |
 | `impl header` | Rust メソッドが直接所属する impl の本体より前のソース。対象型・型変数・境界・実装トレイトを、そのスコープのまま運ぶ |
 | `accessor` | プロパティのように読み書きされるメンバーを実装する関数（`get` / `set`）。**チャンクとしては関数**だが、`hover` が返すのは**メンバーとしての型** |
-| `test function` | Rust のテスト属性（パス末尾が `test`）付き関数、または TypeScript / TSX の `describe` / `it` / `test`（`.only` / `.skip` を含む）の第2引数に直接書いたアロー関数・関数式。callback 側の透過ラッパーは辿るが、spread で位置が確定しない形・別名・namespace・未知の修飾は残す。TS は呼び出し名のヒューリスティックで、同名の業務 API も対象。**`scan` は既定でチャンクにしない**（`--include-tests` で入れる）。ファイル名や囲むテストでは判定せず、印の付かないヘルパー・内部の関数は残す |
+| `test function` | Rust のテスト属性（パス末尾が `test`）付き関数、または TypeScript / TSX の `describe` / `it` / `test`（`.only` / `.skip` を含む）の第2引数に直接書いたアロー関数・関数式。callback 側の透過ラッパーは辿るが、spread で位置が確定しない形・別名・namespace・未知の修飾は残す。TS は呼び出し名のヒューリスティックで、同名の業務 API も対象。**`scan` / `check` は既定でチャンクにしない**（`--include-tests` で入れる）。ファイル名や囲むテストでは判定せず、印の付かないヘルパー・内部の関数は残す |
+| `diff base` | `check --diff` が作業ツリーと比べるリビジョン（既定は `HEAD`）。**範囲は取らない** — 行番号が作業ツリーを指さなくなる（`codebase::diff::DiffBase`） |
+| `changed chunk` | `diff base` から変わった行を含む chunk。`check --diff` が比べる起点で、**少なくとも片方がこれである pair だけ**を比べる。追跡していないファイルの chunk はすべて、消しただけの変更は消した点を内側に含む chunk だけが当たる |
 | `pair` | 比較する 2 つの chunk |
-| `undersized chunk` | 正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない chunk。**chunk ではある**が、`scan` は候補列挙に入れない（`compare` は名指しされれば比べる）。`test function` は**chunk にしない**ので別物 |
-| `candidate pair` | 構造類似度が閾値に届いた pair。**両側とも `undersized chunk` でない**。`scan` が判定して出すのはこれだけ |
+| `undersized chunk` | 正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない chunk。**chunk ではある**が、`scan` / `check` は候補列挙に入れない（`compare` は名指しされれば比べる）。`test function` は**chunk にしない**ので別物 |
+| `candidate pair` | 構造類似度が閾値に届いた pair。**両側とも `undersized chunk` でない**。`scan` / `check` が判定して出すのはこれだけ |
 | `gram` | 構造類似度を測るときに突き合わせる、正規化トークンの並び 1 つ分 |
 | `leaf divergence` | 正規化トークン列が**完全に一致する** 2 つのチャンクで、同じ位置の葉（名前・リテラル・子を持たない構文ノード）の綴りが違うこと。**チャンクが束縛した名前の一貫した付け替えと、チャンク自身のシグネチャに書かれた型は数えない**。列が揃わなければ比べない（`syntax::leaf_divergence`） |
 | `divergent leaf` | `leaf divergence` の 1 組。同じ位置にあった両側の綴り |

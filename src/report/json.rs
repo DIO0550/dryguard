@@ -150,15 +150,22 @@ fn scan_value_of(scan: &Scan, explanation: Explanation) -> Value {
 /// **候補ペアの数はここに入れない。** `candidate_pairs` の要素数がそのまま答えで、
 /// 同じ数を 2 箇所に置くと片方だけ直したときに食い違う（text が併記しているのは、
 /// 読む側が並んだペアを数え直さずに済ませるため）。
+///
+/// `changed_chunks` は `check --diff` のときだけ出す。`scan` で `null` や 0 を出すと、
+/// 差分で絞ったかどうかを読む側が値で見分けることになる。
 fn walked_value_of(scan: &Scan) -> Value {
-    json!({
+    let mut walked = json!({
         "files": scan.file_count(),
         "chunks": scan.chunk_count(),
         "excluded_test_functions": scan.excluded_test_function_count(),
         "undersized_chunks": scan.undersized_chunk_count(),
         "compared_pairs": scan.compared_pair_count(),
         "pruned_pairs": scan.pruned_pair_count(),
-    })
+    });
+    if let Some(count) = scan.changed_chunk_count() {
+        walked["changed_chunks"] = json!(count);
+    }
+    walked
 }
 
 /// ファイルと行。
@@ -1360,6 +1367,19 @@ mod tests {
         assert_eq!(walked["chunks"], 6);
         assert_eq!(walked["compared_pairs"], 14);
         assert_eq!(walked["pruned_pairs"], 3);
+    }
+
+    #[test]
+    fn test_scan_json_of_a_whole_scan_has_no_changed_chunk_count() {
+        // 出すのは `check --diff` のときだけ（出る側は tests/check.rs）。scan で 0 を出すと
+        // 「変わったチャンクが無かった」と読める
+        let json = scan_json_of_fixture("scan");
+
+        assert!(
+            json["walked"].get("changed_chunks").is_none(),
+            "scan は差分で絞らない: {}",
+            json["walked"]
+        );
     }
 
     #[test]

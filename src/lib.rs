@@ -9,8 +9,8 @@
 //! | `semantics` | 意味情報収集（LSP への問い合わせと結果の正規化） | Stage 2 |
 //! | `classification` | 分類（シグナルの統合と判定・理由の組み立て） | Stage 3 |
 //!
-//! CLI の受け口（`compare` と `scan`）、`codebase` の対象ファイル
-//! 収集、`syntax` のチャンク化・構造類似度・import 収集、`classification` の 3 ラベルの判定、
+//! CLI の受け口（`compare` / `scan` / `check --diff`）、`codebase` の対象ファイル
+//! 収集と git の差分からの変更行の収集、`syntax` のチャンク化・構造類似度・import 収集、`classification` の 3 ラベルの判定、
 //! `report` の理由付き出力までがある。判定に当てる閾値は `--threshold` >
 //! `config` が読む `dryguard.toml` > 既定値の順に決まる。`dryguard.toml` の `[domains]` が
 //! 宣言したドメイン（`domain_declaration`）は、ディレクトリからの推定に勝つ。
