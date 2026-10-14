@@ -2515,7 +2515,7 @@ impl Error for ScanError {
 /// `scan` の呼び出し側に分岐させないため。
 #[derive(Debug)]
 pub enum CheckError {
-    /// 変わった行を集められなかった。
+    /// 変わった行、または index の版を集められなかった。
     Diff(DiffError),
     /// 走査を始められなかった。
     Scan(ScanError),

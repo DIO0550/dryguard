@@ -538,8 +538,13 @@ pub enum DiffError {
     Unparsable(DiffParseError),
     /// index に未解決のマージ衝突がある。どの版を読むかが決まらない。
     UnmergedPath { path: PathBuf },
-    /// index の一覧か中身を読み解けなかった。保持しているのは読めなかった箇所。
+    /// index の一覧か中身を読み解けなかった。保持しているのは読めなかった箇所か、
+    /// 頼んだ件数と返った件数の食い違い。
     UnreadableIndex(String),
+    /// 起動した git との標準入出力のやり取りに失敗した。
+    ///
+    /// [`DiffError::GitUnavailable`] と分けるのは、git は入っていて起動もできているため。
+    GitPipeFailed(io::Error),
 }
 
 impl fmt::Display for DiffError {
@@ -564,6 +569,9 @@ impl fmt::Display for DiffError {
             Self::UnreadableIndex(spelled) => {
                 write!(formatter, "index を読み解けません: {spelled}")
             }
+            Self::GitPipeFailed(cause) => {
+                write!(formatter, "git とのやり取りに失敗しました: {cause}")
+            }
         }
     }
 }
@@ -571,7 +579,7 @@ impl fmt::Display for DiffError {
 impl Error for DiffError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::GitUnavailable(cause) => Some(cause),
+            Self::GitUnavailable(cause) | Self::GitPipeFailed(cause) => Some(cause),
             Self::Unparsable(cause) => Some(cause),
             Self::NotAWorkTree { .. }
             | Self::UnknownBase { .. }

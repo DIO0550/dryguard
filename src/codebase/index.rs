@@ -27,6 +27,9 @@ const REGULAR_FILE_MODES: [&str; 2] = ["100644", "100755"];
 /// 衝突していないエントリの stage。1〜3 は未解決のマージ衝突の各版。
 const MERGED_STAGE: &str = "0";
 
+/// 読み解けなかった出力のうち、エラーに持たせる長さの上限（バイト）。
+const UNREADABLE_EXCERPT_LENGTH: usize = 80;
+
 /// index にある走査対象のファイルと、その中身。
 ///
 /// キーのパスは [`IndexSources::of`] に渡した根に index の相対パスをつないだもの。
@@ -171,7 +174,8 @@ fn is_under_excluded_directory(path: &Path) -> bool {
 ///
 /// # Errors
 ///
-/// git を起動できない・失敗したとき、標準入力へ書けなかったとき。
+/// git を起動できない・失敗したとき（[`DiffError::GitUnavailable`] / [`DiffError::GitFailed`]）、
+/// 起動した git との標準入出力のやり取りに失敗したとき（[`DiffError::GitPipeFailed`]）。
 fn cat_file_output_of(root: &Path, requested: Vec<u8>) -> Result<Vec<u8>, DiffError> {
     let mut child = Command::new("git")
         .arg("-C")
@@ -190,9 +194,7 @@ fn cat_file_output_of(root: &Path, requested: Vec<u8>) -> Result<Vec<u8>, DiffEr
         Some(mut stdin) => stdin.write_all(&requested),
         None => Ok(()),
     });
-    let output = child
-        .wait_with_output()
-        .map_err(DiffError::GitUnavailable)?;
+    let output = child.wait_with_output().map_err(DiffError::GitPipeFailed)?;
     let written = writer
         .join()
         .unwrap_or_else(|_| Err(io::Error::other("標準入力へ書くスレッドが落ちました")));
@@ -202,7 +204,7 @@ fn cat_file_output_of(root: &Path, requested: Vec<u8>) -> Result<Vec<u8>, DiffEr
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ));
     }
-    written.map_err(DiffError::GitUnavailable)?;
+    written.map_err(DiffError::GitPipeFailed)?;
     Ok(output.stdout)
 }
 
@@ -220,10 +222,11 @@ fn blobs_of(output: &[u8], expected: usize) -> Result<Vec<Vec<u8>>, DiffError> {
         let unreadable = |spelled: &[u8]| {
             DiffError::UnreadableIndex(String::from_utf8_lossy(spelled).into_owned())
         };
+        // 見出しの改行が無ければ、残りは中身かもしれない。全部をエラーに持たせない
         let newline = rest
             .iter()
             .position(|byte| *byte == b'\n')
-            .ok_or_else(|| unreadable(rest))?;
+            .ok_or_else(|| unreadable(&rest[..rest.len().min(UNREADABLE_EXCERPT_LENGTH)]))?;
         let header = &rest[..newline];
         let text = std::str::from_utf8(header).map_err(|_| unreadable(header))?;
         let mut fields = text.split(' ');
