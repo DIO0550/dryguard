@@ -1361,7 +1361,7 @@ impl Error for ConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use crate::test_support::{line, repository_path, signature_text};
     use lsp_types::HoverProviderCapability;
@@ -1988,6 +1988,11 @@ mod tests {
 
     /// 参照元 1 件を返す応答。
     fn references_response(id: u64, uri: &str) -> String {
+        location_response(id, uri)
+    }
+
+    /// 場所 1 件を返す応答。references / definition / implementation が同じ形で返す。
+    fn location_response(id: u64, uri: &str) -> String {
         format!(
             r#"{{"jsonrpc":"2.0","id":{id},"result":[{{"uri":"{uri}","range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":1}}}}}}]}}"#
         )
@@ -2249,6 +2254,121 @@ mod tests {
         assert_eq!(
             sent_methods(&connection.writer).last().map(String::as_str),
             Some("textDocument/definition")
+        );
+    }
+
+    #[test]
+    fn test_definition_answered_while_the_server_is_still_working_asks_again_when_it_finished() {
+        // rust-analyzer は読み込みの途中にも definition に答え、まだ crate graph に無い
+        // std の名前には空を返す。1 通目を採ると「宣言の場所を答えない」に倒れる
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            &progress_begin_notification("loading"),
+            &no_type_definition_response(1),
+            &progress_end_notification("loading"),
+            &location_response(2, "file:///repo/src/fmt.rs"),
+        ]);
+        let mut connection = connection_over(&server_output).with_language(ServerLanguage::Rust);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .definition(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, DeclarationSiteOutcome::Answered(ref site) if site.path() == Path::new("/repo/src/fmt.rs")),
+            "読み込みが終わってから尋ね直した場所を返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_definition_that_never_settles_does_not_return_an_answer_given_while_working() {
+        // 対照は上のテスト。最後の答えも場所を持っているが、**その答えを返している間も
+        // 作業が動いている**。途中の答えを採ると、空なら宣言が無いことに、場所なら
+        // 読み込み前に見えていた宣言に倒れる
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading-first"),
+            &progress_begin_notification("loading-first"),
+            &no_type_definition_response(1),
+            &progress_end_notification("loading-first"),
+            &progress_create_request(10, "loading-next"),
+            &progress_begin_notification("loading-next"),
+            &no_type_definition_response(2),
+            &progress_end_notification("loading-next"),
+            &progress_create_request(11, "loading-more"),
+            &progress_begin_notification("loading-more"),
+            &location_response(3, "file:///repo/src/fmt.rs"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .definition(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, DeclarationSiteOutcome::ServerStillWorking),
+            "落ち着かなかったことを名前で返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_implementation_answered_while_work_ran_asks_again_when_it_finished() {
+        // 読み込みの途中の空を採ると、impl を持つ trait が「impl の場所を答えない」に倒れる
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            &progress_begin_notification("loading"),
+            &no_references_response(1),
+            &progress_end_notification("loading"),
+            &location_response(2, "file:///repo/src/show.rs"),
+        ]);
+        let mut connection = connection_over(&server_output).with_language(ServerLanguage::Rust);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .implementation(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ImplementationOutcome::Answered { ref sites, .. } if sites.len() == 1),
+            "読み込みが終わってから尋ね直した impl を返す: {outcome:?}"
+        );
+        // 尋ね直しも definition ではなく implementation で送る
+        assert_eq!(
+            sent_methods(&connection.writer)
+                .iter()
+                .filter(|method| *method == GotoImplementation::METHOD)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_implementation_that_never_settles_does_not_return_an_answer_given_while_working() {
+        // 対照は上のテスト。答えを返している間も作業が動き続ける
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading-first"),
+            &progress_begin_notification("loading-first"),
+            &no_references_response(1),
+            &progress_end_notification("loading-first"),
+            &progress_create_request(10, "loading-next"),
+            &progress_begin_notification("loading-next"),
+            &no_references_response(2),
+            &progress_end_notification("loading-next"),
+            &progress_create_request(11, "loading-more"),
+            &progress_begin_notification("loading-more"),
+            &location_response(3, "file:///repo/src/show.rs"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .implementation(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ImplementationOutcome::ServerStillWorking),
+            "落ち着かなかったことを名前で返す: {outcome:?}"
         );
     }
 
