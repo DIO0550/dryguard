@@ -2335,6 +2335,34 @@ mod tests {
     }
 
     #[test]
+    fn test_unique_definition_answered_while_the_server_is_still_working_asks_again() {
+        // 配列長の定数を辿る経路。途中の空を採ると、定数が「宣言の場所を答えない」に倒れる
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            &progress_begin_notification("loading"),
+            &no_type_definition_response(1),
+            &progress_end_notification("loading"),
+            &location_response(2, "file:///repo/src/limits.rs"),
+        ]);
+        let mut connection = connection_over(&server_output).with_language(ServerLanguage::Rust);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .unique_definition(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(
+                outcome,
+                declaration_site::UniqueDeclarationSiteOutcome::Unambiguous(
+                    DeclarationSiteOutcome::Answered(ref site)
+                ) if site.path() == Path::new("/repo/src/limits.rs")
+            ),
+            "読み込みが終わってから尋ね直した場所を返す"
+        );
+    }
+
+    #[test]
     fn test_implementation_answered_while_work_ran_asks_again_when_it_finished() {
         // 読み込みの途中の空を採ると、impl を持つ trait が「impl の場所を答えない」に倒れる
         let server_output = frames_of(&[
