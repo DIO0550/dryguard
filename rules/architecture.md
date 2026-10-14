@@ -19,7 +19,7 @@ cli → pipeline → classification(分類) → semantics(意味情報収集) �
 | `cli` | 引数の受け口と値の解釈 | 判定・I/O の手順 | — |
 | `config` | `dryguard.toml` を読んで、外から動かせる閾値とドメインの宣言にする | 判定・**既定値**・宣言の照合 | — |
 | `pipeline` | ステージを呼ぶ順序 | 判定・チャンク化 | — |
-| `codebase` | 走査対象のファイルを集めて読む・git の差分から変わった行を集める | 判定・チャンク化・順序 | — |
+| `codebase` | 走査対象のファイルを集めて読む（作業ツリーか index）・git の差分から変わった行を集める | 判定・チャンク化・順序 | — |
 | `syntax` | チャンク化・AST 正規化・類似度・import 収集 | 判定 | Stage 1 |
 | `semantics` | LSP への問い合わせと応答の正規化 | 判定 | Stage 2 |
 | `classification` | シグナルの統合と判定・理由の組み立て | I/O・LSP の呼び出し | Stage 3 |

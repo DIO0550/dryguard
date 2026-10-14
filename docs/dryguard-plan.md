@@ -155,7 +155,8 @@ inventory = ["src/inventory/**", "src/**/product*.ts"]
 ```
 dryguard compare <locA> <locB>   # 特定の2関数を比較 (file:line)   [Phase 0]
 dryguard scan [path]             # コードベース全体をスキャン       [Phase 1]
-dryguard check --diff            # git diff範囲のみ (フック用)      [Phase 5]
+dryguard check --diff [rev]      # git diff範囲のみ (フック用)      [Phase 5]
+dryguard check --diff --staged   # ステージ済みの変更だけ (pre-commit 用) [Phase 5]
 
 オプション:
   --lang ts|rust|auto
