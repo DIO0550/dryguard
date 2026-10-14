@@ -76,7 +76,7 @@ pub(crate) use workspace::ProjectRoot;
 
 // 失敗を読むための型だけを外へ出す。[`ClientError`] が抱えている以上、
 // 外から名前を呼べないと `source()` をたどっても中身を見分けられない。
-pub use connection::{Awaited, ConnectionError};
+pub use connection::{Awaited, ConnectionError, Streamed};
 pub use framing::FramingError;
 pub use message::{MessageError, RequestId, ResponseFailure};
 pub use uri::{PathUriError, UriPathError};
@@ -102,7 +102,7 @@ const RUST_PROJECT_MARKERS: [&str; 1] = ["Cargo.toml"];
 
 /// サーバが何も送ってこないまま待つ上限。
 ///
-/// **固まったサーバを捉える主な期限はこれ。** 応答以外のものだけが届き続ける形は
+/// **固まったサーバを捉える主な期限はこれ。** 応答以外のもの・1 フレームの続きだけが届き続ける形は
 /// [`STREAMING_LIMIT`] が安全網として受け持つ。
 ///
 /// rust-analyzer（2026-09-21 リリース）で dryguard 自身を初回に読ませたときの、
@@ -123,12 +123,15 @@ const INTAKE_LIMIT: Duration = SILENCE_LIMIT;
 /// rust-analyzer（2026-09-21 リリース）に冷えた状態で読ませたとき、1 回の待ちの最長は
 /// dryguard 自身で 15.2 秒、tokio 1.40.0（依存 214 パッケージ）で 29.03 秒だった。
 /// **ワークスペースの大きさで伸びる**ので、tokio の 10 倍規模と遅いマシンが重なっても
-/// 届かない側へ広く取る。役目は「応答以外のものだけが届き続けて終わらない」を有限にすることだけで、
+/// 届かない側へ広く取る。役目は「応答以外のもの・1 フレームの続きだけが届き続けて終わらない」を有限にすることだけで、
 /// 狭く取ると正常に遅いサーバを殺す側に倒れる。
 ///
 /// **尋ね直しの全体ではなく、1 回の待ちごとに数える。** 全体に当てると、ワークスペースの
 /// 大きさ × 尋ね直す回数で伸びる。そのぶん問い合わせ 1 つの最悪は上限 × 回数になるが、
 /// 超えたサーバは kill して以後を断るので、待ち切るのは最初の 1 回だけ。
+///
+/// 1 フレームの続きが少しずつ届き続ける形では、フレームの途中でも確かめる。上限を過ぎてから
+/// 戻るまでは、フレームの最初のバイトと続き 1 回分の受け取り（それぞれ [`SILENCE_LIMIT`] まで）に収まる。
 const STREAMING_LIMIT: Duration = Duration::from_secs(30 * 60);
 
 /// `exit` を送ってから、子プロセスが終わるのを待つ上限。
@@ -362,7 +365,7 @@ impl Client {
     ///
     /// 往復が失敗したとき。サーバが答えないまま接続を閉じた場合は
     /// [`ClientError::ServerClosedDuringHandshake`]、何も送ってこないまま期限を過ぎた場合は
-    /// [`ClientError::ServerUnresponsive`]、応答以外のものだけを送り続けて答えない場合は
+    /// [`ClientError::ServerUnresponsive`]、応答以外のもの・1 フレームの続きだけを送り続けて答えない場合は
     /// [`ClientError::ServerKeptStreaming`]、送ったものを受け取らないまま期限を過ぎた場合は
     /// [`ClientError::ServerNotReading`]。抜けた [`Client`] は `Drop` が kill する。
     pub fn handshake(mut self, root: &WorkspaceRoot) -> Result<Session, ClientError> {
@@ -456,10 +459,11 @@ impl Client {
                 program: self.program.clone(),
                 silence: self.wait_limits.silence,
             },
-            Abandonment::KeptStreaming { awaited } => ClientError::ServerKeptStreaming {
+            Abandonment::KeptStreaming { awaited, streamed } => ClientError::ServerKeptStreaming {
                 program: self.program.clone(),
                 awaited: awaited.clone(),
                 waited: self.wait_limits.streaming,
+                streamed: *streamed,
             },
         }
     }
@@ -928,10 +932,12 @@ fn is_connection_closed(cause: &ConnectionError) -> bool {
 enum Abandonment {
     /// 何も届かないまま、沈黙の上限を超えた。
     Silent,
-    /// 応答以外のものだけが届き続け、待つ合計の上限を超えた。
+    /// 応答以外のもの・1 フレームの続きが届き続け、待つ合計の上限を超えた。
     KeptStreaming {
         /// そのとき待っていたもの。後続を断るときにも同じものを出す。
         awaited: Awaited,
+        /// 届き続けていたもの。後続を断るときにも同じものを出す。
+        streamed: Streamed,
     },
 }
 
@@ -940,6 +946,9 @@ impl Abandonment {
     ///
     /// **`framing` に沈黙の専用のバリアントを置かない。** 期限は区切りの話ではなく読み口
     /// （[`SilenceLimitedReader`]）の性質で、読み取りで `TimedOut` を返すのはこの読み口だけ。
+    /// 待つ合計の上限がフレームの途中で切れた形（[`FramingError::UnfinishedByDeadline`]）は
+    /// フレームの途中かを知っているのが区切りを読む `framing` だけなので、そこで見分け、
+    /// [`Connection`] が [`ConnectionError::StreamingLimitExceeded`] へ直してからここに来る。
     fn of(cause: &ConnectionError) -> Option<Self> {
         match cause {
             ConnectionError::Framing(FramingError::Read(read))
@@ -947,8 +956,11 @@ impl Abandonment {
             {
                 Some(Self::Silent)
             }
-            ConnectionError::StreamingLimitExceeded { awaited, .. } => Some(Self::KeptStreaming {
+            ConnectionError::StreamingLimitExceeded {
+                awaited, streamed, ..
+            } => Some(Self::KeptStreaming {
                 awaited: awaited.clone(),
+                streamed: *streamed,
             }),
             _ => None,
         }
@@ -1017,8 +1029,8 @@ pub enum ClientError {
         /// 待った長さ。
         silence: Duration,
     },
-    /// 通知・サーバの要求だけを送り続け、待っている応答・作業の終わりが合計の上限までに
-    /// 届かなかった。サーバは kill 済み。
+    /// 通知・サーバの要求だけ、または 1 フレームの続きを少しずつ送り続け、待っている応答・
+    /// 作業の終わりが合計の上限までに届かなかった。サーバは kill 済み。
     ///
     /// **`ServerUnresponsive` と分ける。** 何かは届き続けているので「何も送ってこない」とは
     /// 違い、利用者が見るべきはサーバのログ（何を繰り返しているか）になる。
@@ -1029,6 +1041,8 @@ pub enum ClientError {
         awaited: Awaited,
         /// 待った合計の長さ。
         waited: Duration,
+        /// 送り続けていたもの。
+        streamed: Streamed,
     },
     /// 送ったものを受け取らないまま、上限を超えた。サーバは kill 済み。
     ///
@@ -1095,9 +1109,20 @@ impl fmt::Display for ClientError {
                 program,
                 awaited,
                 waited,
+                streamed: Streamed::OtherMessages,
             } => write!(
                 formatter,
                 "LSP サーバ ({program}) が {awaited} を返さないまま {} 秒のあいだ応答以外のものだけを送り続けたため、止めました",
+                waited.as_secs_f64()
+            ),
+            Self::ServerKeptStreaming {
+                program,
+                awaited,
+                waited,
+                streamed: Streamed::UnfinishedFrame,
+            } => write!(
+                formatter,
+                "LSP サーバ ({program}) が {awaited} を返さないまま {} 秒のあいだ 1 通のフレームを少しずつ送り続け、送り終えなかったため、止めました",
                 waited.as_secs_f64()
             ),
             Self::ServerNotReading { program, waited } => write!(
@@ -1716,6 +1741,38 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn test_client_handshake_with_a_server_that_trickles_one_frame_reports_it() {
+        // 1 フレームを 1 バイトずつ送り続けるサーバ。何かは届き続けるので沈黙の上限では切れず、
+        // フレームの途中で期限を見なければ、送り終わるまで（20 秒）返らない。
+        // `sh` には 1 秒未満の sleep が組み込みに無く、ループで `sleep` を呼ぶと孫プロセスに
+        // なるので、`exec perl` で 1 つのプロセスのまま送る
+        let script = "exec perl -e '$| = 1; print qq(Content-Length: 1000000\\r\\n\\r\\n); \
+                      for (1 .. 400) { print q(x); select(undef, undef, undef, 0.05) }'";
+        let limits = WaitLimits {
+            streaming: SHORT_LIMIT,
+            ..GENEROUS_LIMITS
+        };
+
+        let started = Instant::now();
+        let error = handshake_with(script, limits).expect_err("握手に答えない");
+
+        assert!(
+            matches!(
+                &error,
+                ClientError::ServerKeptStreaming {
+                    awaited: Awaited::Response { method },
+                    waited,
+                    streamed: Streamed::UnfinishedFrame,
+                    ..
+                } if method == Initialize::METHOD && *waited == SHORT_LIMIT
+            ),
+            "{error:?}"
+        );
+        assert!(started.elapsed() < GENEROUS_LIMIT, "期限で戻る");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn test_session_hover_on_a_server_that_only_streams_notifications_reports_it() {
         // 通知だけを流し続け、応答を返さないサーバ。何かは届き続けるので沈黙の上限では切れず、
         // 期限が無ければ応答を待って回り続ける
@@ -1737,8 +1794,12 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ClientError::ServerKeptStreaming { program, awaited: Awaited::Response { method }, waited }
-                    if program == "sh" && method == HoverRequest::METHOD && *waited == SHORT_LIMIT
+                ClientError::ServerKeptStreaming {
+                    program,
+                    awaited: Awaited::Response { method },
+                    waited,
+                    streamed: Streamed::OtherMessages,
+                } if program == "sh" && method == HoverRequest::METHOD && *waited == SHORT_LIMIT
             ),
             "{error:?}"
         );
