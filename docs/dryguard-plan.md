@@ -161,11 +161,11 @@ inventory = ["src/inventory/**", "src/**/product*.ts"]
 
 #### 言語を足すときに触る場所
 
-モジュールの責務の順（`rules/architecture.md`「3 ステージのパイプライン」）に並べる。**行番号ではなく関数名・定数名で指す** — 準備の Issue が入るたびに行も形も変わるため。「今の形」の欄は Issue #360 の時点（`main` 6b99873）のもので、準備が済んだ行から古くなる。
+言語ごとの作業の順（Stage 1 の `syntax` → 走査と CLI → Stage 2 の `lsp` / `semantics` / `pipeline` → CI）に、モジュールの責務（`rules/architecture.md`「3 ステージのパイプライン」）ごとにまとめて並べる。**行番号ではなく関数名・定数名で指す** — 準備の Issue が入るたびに行も形も変わるため。「今の形」の欄は Issue #360 の時点（`main` 6b99873）のもので、準備が済んだ行から古くなる。
 
 | モジュール | 場所 | 言語ごとに足すもの | 今の形 |
 |---|---|---|---|
-| `syntax::tree` | `Grammar`・`Grammar::of_path`・`Grammar::language` | variant・拡張子・tree-sitter の言語 | `language` は網羅 `match`、`of_path` は拡張子の `match`（漏れても読めないだけ） |
+| `syntax::tree` | `Grammar`・`Grammar::of_path`・`Grammar::language`、`Cargo.toml`（grammar クレートは `harness/deps/resolve.sh add` で足す） | variant・拡張子・tree-sitter の言語 | `language` は網羅 `match`、`of_path` は拡張子の `match`（漏れても読めないだけ） |
 | `syntax::tree` | `Grammar::same_language_as` | 同じ言語として比べる grammar の組 | **2 択**（`matches!`。足さないと新しい言語のチャンク同士が比べられない） |
 | `syntax::tree` | `TRANSPARENT_EXPRESSION_KINDS` | 値を通すだけの包みの種別 | 全 grammar に当たる TypeScript の表 |
 | `syntax::chunk` | `is_chunk_node`・`CHUNK_KINDS` | チャンクにするノードの種別 | **2 択**（Rust でなければ TypeScript の表） |
@@ -189,15 +189,16 @@ inventory = ["src/inventory/**", "src/**/product*.ts"]
 | `lsp::document` | `LanguageId`・`LanguageId::from_grammar` | `language id` の綴り | 網羅 `match` |
 | `lsp::hover` | `outcome_for_language` | hover のどのコードフェンスに綴りがあるか | 網羅 `match` |
 | `lsp::connection` | `outcome_untouched_by_work_of` の尋ね直しの回数 | 読み込み中の答えを捨てて尋ね直す回数 | 網羅 `match` |
-| `semantics::type_signature` | `type_signature_outcome_of` / `rust_type_signature_outcome_of` の系統、`syntax::type_spelling`・`syntax::type_structure` | hover の綴りの読み取り（Rust は `syntax::rust_callable`） | TypeScript と Rust の 2 系統。綴りの構文解析は `Grammar::TypeScript` 決め打ち |
+| `semantics::type_signature` | `type_signature_outcome_of` / `rust_type_signature_outcome_of` の系統 | hover の綴りから型シグネチャを組む系統 | TypeScript と Rust の 2 系統 |
+| `syntax::type_spelling` / `syntax::type_structure`（Rust は `syntax::rust_callable`） | 綴りを構文解析する箇所 | hover の綴りの読み取り | `Grammar::TypeScript` 決め打ち |
 | `pipeline` | `resolved_type_signature_outcome_of` | 型シグネチャの系統の振り分け | **2 択**（Rust でなければ TypeScript） |
-| `pipeline` | `LanguageServers` / `ScanServers`、`scan_of_chunks` のサーバ探し・`semantics_for_language_of` の呼び出し・チャンクへの意味情報の配り方 | 言語ごとのサーバと意味情報 | **2 本固定**。配り方は Rust でなければ TypeScript の意味情報を当てる |
-| CI | `.github/workflows/rust.yml` の「LSP サーバ」の段 | サーバの導入（npm 配布なら `harness/deps/resolve-node.sh` と `pnpm-lock.yaml`） | typescript-language-server と rust-analyzer |
-| テスト | `tests/rust_lsp.rs`・`tests/language_cli.rs`・`tests/fixtures/` | 実サーバのテスト（`#[ignore]`、CI の `cargo test -- --ignored` が走らせる）・CLI の言語の振り分け・フィクスチャ | 言語ごと |
+| `pipeline` | `LanguageServers` / `ScanServers`、`scan_with_language_servers` の引数、`scan_of_chunks` のサーバ探し・`semantics_for_language_of` の呼び出し・チャンクへの意味情報の配り方 | 言語ごとのサーバと意味情報 | **2 本固定**。配り方は Rust でなければ TypeScript の意味情報を当てる |
+| CI | `.github/workflows/rust.yml` の「LSP サーバ」「rust-analyzer」の段 | サーバの導入。npm 配布なら「LSP サーバ」の段に倣う（`harness/deps/resolve-node.sh` と `pnpm-lock.yaml`）。それ以外は「rust-analyzer」の段に倣い、版を固定して取り sha256 で確かめる | 「LSP サーバ」が `pnpm install --frozen-lockfile` で typescript-language-server、「rust-analyzer」が curl と `sha256sum --check` で rust-analyzer |
+| テスト | 実サーバのテスト（TypeScript は `tests/semantics.rs`、Rust は `tests/rust_lsp.rs`）・`tests/language_cli.rs`・`tests/fixtures/` | 実サーバのテスト（`#[ignore]`、CI の `cargo test -- --ignored` が走らせる）・CLI の言語の振り分け・フィクスチャ | 言語ごと |
 
-**触らなくてよいもの**: `semantics::caller_domain` の `ReferenceSources::is_test` は Rust 以外の参照を除かないので、新しい言語は TypeScript と同じく全部数える（上のスコープ外どおり）。テスト参照の除外を足すときの置き場所はここ。`codebase::typescript_paths_of` と `pipeline::scan_of` は名前どおり TypeScript 専用の入口で、言語を足しても黙って倒れない。
+**触らなくてよいもの**: `semantics::caller_domain` の `ReferenceSources::is_test` は Rust 以外の参照を除かないので、新しい言語は TypeScript と同じく全部数える（上のスコープ外どおり）。テスト参照の除外を足すときの置き場所はここ。`codebase::typescript_paths_of` と `pipeline::scan_of` は名前どおり TypeScript 専用の入口で、**`SourceLanguage::accepts` を網羅 `match` に直した後なら**言語を足しても黙って倒れない（直す前は `grammar != Grammar::Rust` なので、新しい言語のファイルまで拾う）。
 
-**コード以外で言語を並べている場所**も同じ回に直す: `README.md`（`--lang`・`--include-tests`・拡張子・サーバ）、この計画書の「CLI 仕様 (案)」と「技術スタック」、`rules/naming.md` の語彙表（`grammar`・`test function`・`project marker`・`language id`）。
+**コード以外で言語を並べている場所**も同じ回に直す: `README.md`（`--lang`・`--include-tests`・拡張子・サーバ）、`AGENTS.md`「プロジェクト構成」（外部依存・LSP サーバ）、この計画書の「CLI 仕様 (案)」と「技術スタック」、`rules/naming.md` の語彙表（`grammar`・`test function`・`project marker`・`language id`）。
 
 ---
 
@@ -217,7 +218,7 @@ dryguard check --diff            # git diff範囲のみ (フック用)      [Pha
   --include-tests                # scan / check のみ。Rust / TypeScript のテスト関数も比較する (既定は外す)
 ```
 
-`--lang` の値は言語を 1 つ足すたびに増える（Phase 6 で `python` などを足す）。値は enum の `LanguageOption` が持ち、**値と、それが変える走査は同じ差分に入れる**（`rules/coding.md`「値の語彙を型で閉じる」）。`--include-tests` が外す `test function` の印も、言語ごとに決めて足す。
+`--lang` の値は言語を 1 つ足すたびに増える（Phase 6 で 3 言語分。綴りは言語ごとの Issue で決める）。値は enum の `LanguageOption` が持ち、**選択肢と、それが変える振る舞いは同じ差分に入れる**（`rules/coding.md`「値の語彙を型で閉じる」）。`--include-tests` が外す `test function` の印も、言語ごとに決めて足す。
 
 出力イメージ:
 
