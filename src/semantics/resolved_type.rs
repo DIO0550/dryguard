@@ -157,11 +157,16 @@ pub enum UnopenedReason {
     NoSpellingAtDeclaration,
     /// 宣言の位置の hover の応答を `lsp` が読めなかった。
     UnreadableDeclarationHover,
-    /// 尋ねるたびにサーバが作業を始めるので、宣言の位置の hover が落ち着かなかった。
+    /// 尋ねるたびにサーバが作業を始めるので、宣言の位置の hover・definition・
+    /// implementation のどれかの答えが落ち着かなかった。
     ///
-    /// **途中の綴りを右辺として差し込まない。** 読み込み前の hover は推論された型に
-    /// `any` を綴るので、差し込むと**開けていない型名を開けたことにする**
+    /// **途中の答えを使わない。** 読み込み前の hover は推論された型に `any` を綴り、
+    /// definition / implementation はまだ見ていない宣言に空を返す。使うと**開けていない
+    /// 型名を開けたことにする**か、**宣言のある名前を宣言が無いことにする**
     /// (`rules/architecture.md`「取れなかったシグナルを既定値で埋めない」)。
+    ///
+    /// **問い合わせごとに分けない。** どれで落ち着かなくても、利用者が次にすることは
+    /// サーバの作業が終わってから走らせ直すことで同じ。
     ServerStillWorking,
     /// サーバが hover を提供していない。
     HoverNotProvided,
@@ -647,6 +652,9 @@ impl<'session> RustTypeResolver<'session> {
                 ImplementationOutcome::NotSupported => {
                     return Ok(Err(UnopenedReason::ImplementationNotProvided));
                 }
+                ImplementationOutcome::ServerStillWorking => {
+                    return Ok(Err(UnopenedReason::ServerStillWorking));
+                }
             };
         let mut unselected = UnselectedImpls {
             has_unreadable_site: has_unreadable,
@@ -966,6 +974,9 @@ impl<'session> RustTypeResolver<'session> {
                 ImplementationOutcome::NotSupported => {
                     return Ok(Err(UnopenedReason::ImplementationNotProvided));
                 }
+                ImplementationOutcome::ServerStillWorking => {
+                    return Ok(Err(UnopenedReason::ServerStillWorking));
+                }
             };
         let mut unselected = UnselectedImpls {
             has_unreadable_site: has_unreadable,
@@ -1052,12 +1063,12 @@ impl<'session> RustTypeResolver<'session> {
     ///
     /// **キーは問い合わせた位置ではなく trait の宣言位置。** 答えは trait で決まるので、
     /// 別のチャンク・別のファイルから同じ trait を尋ねても尋ね直さない。
-    /// **`Answered` だけを覚える。** 読み込み前にも空が返る（[`ImplementationOutcome::NoAnswer`]）
-    /// ので、空を使い回すと後のチャンクが尋ね直せば取れた答えを落とす。
-    /// 届いた答えを落ち着いたものとして扱えるのは、同じチャンクの hover が読み込みの
-    /// 落ち着きを待った後にだけここへ来るから（`semantics::type_signature` の
-    /// `rust_type_signature_outcome_of`）。**落ち着いた後なら件数も揃う、は確かめていない** —
-    /// 件数の欠けた途中の答えが返れば、その後のチャンクにも同じ答えを使う緩みが残る。
+    /// **`Answered` だけを覚える。** 空（[`ImplementationOutcome::NoAnswer`]）や落ち着かなかった
+    /// 答え（[`ImplementationOutcome::ServerStillWorking`]）を使い回すと、後のチャンクが
+    /// 尋ね直せば取れた答えを落とす。
+    /// 届いた答えを落ち着いたものとして扱えるのは、implementation 自身が作業に触れていない
+    /// 答えだけを返すから（`lsp::Connection::implementation`）。**作業の通知を出さずに件数の
+    /// 欠けた答えを返すサーバは捉えられない** — その答えを後のチャンクにも使う緩みが残る。
     ///
     /// # Errors
     ///
@@ -1440,6 +1451,7 @@ impl DeclarationQuery {
             DeclarationSiteOutcome::NoAnswer => Err(self.no_answer()),
             DeclarationSiteOutcome::Unreadable { .. } => Err(self.unreadable()),
             DeclarationSiteOutcome::NotSupported => Err(self.not_provided()),
+            DeclarationSiteOutcome::ServerStillWorking => Err(UnopenedReason::ServerStillWorking),
         })
     }
 
@@ -1496,6 +1508,12 @@ impl DeclarationQuery {
                 }
                 DeclarationSiteOutcome::NotSupported => {
                     unopened.push(UnopenedTypeName::new(name, self.not_provided()));
+                }
+                DeclarationSiteOutcome::ServerStillWorking => {
+                    unopened.push(UnopenedTypeName::new(
+                        name,
+                        UnopenedReason::ServerStillWorking,
+                    ));
                 }
             }
         }

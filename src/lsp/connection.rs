@@ -65,6 +65,30 @@ const RUST_SETTLED_ATTEMPTS: usize = 32;
 /// LSP の `ContentModified`。rust-analyzer は読み込みが進んでいる間の要求に返す。
 const CONTENT_MODIFIED: i64 = -32801;
 
+/// 落ち着きを待って尋ねる、宣言の場所を返す問い合わせ。
+///
+/// **メソッドの名前を文字列で受けない。** `settled_outcome_of` は関数ポインタを受けるので
+/// 名前を閉じ込められず、名前から 1 往復の関数を選ぶことになる。文字列で比べると、
+/// 想定外の名前が黙って片方の要求に化ける。
+#[derive(Debug, Clone, Copy)]
+enum SettledDeclarationQuery {
+    /// `textDocument/definition`。
+    Definition,
+    /// `textDocument/implementation`。
+    Implementation,
+}
+
+/// 宣言の場所を返す問い合わせ（definition / implementation）の、落ち着きを待った答え。
+///
+/// **null と「落ち着かなかった」を分ける。** どちらも場所を持たないが、前者はサーバの答えで、
+/// 後者は答えを採らなかったこと（`DeclarationSiteOutcome::ServerStillWorking`）。
+enum SettledDeclarationSites {
+    /// 作業に触れていない答え。null なら `None`。
+    Answered(Option<GotoDefinitionResponse>),
+    /// 上限まで尋ね直しても、作業に触れない答えが返らなかった。
+    ServerStillWorking,
+}
+
 /// LSP サーバとの往復。
 ///
 /// 1 本のストリームを要求と応答が行き来するので、id の発番と対応付けをここが持つ。
@@ -385,7 +409,20 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         document: &SourceDocument,
         position: SourcePosition,
     ) -> Result<DeclarationSiteOutcome, ConnectionError> {
-        self.declaration_site_of(GotoTypeDefinition::METHOD, document, position)
+        let params = self.declaration_params_of(GotoTypeDefinition::METHOD, document, position)?;
+
+        // **落ち着きを待たない。** typeDefinition を尋ねるのは TypeScript だけで、読み込みの
+        // 途中に空が返る例を測っていない。途中の空を採っても「宣言の場所を答えない」（測れない）に
+        // 倒れるだけで、偽の答えにはならない。
+        Ok(
+            match self
+                .ask_declaration_sites_once(GotoTypeDefinition::METHOD, params)?
+                .as_ref()
+            {
+                Some(answered) => declaration_site::outcome_of(answered),
+                None => DeclarationSiteOutcome::NoAnswer,
+            },
+        )
     }
 
     /// 開かせたファイルの、指定位置に書かれた名前が宣言されている場所を尋ねる。
@@ -397,6 +434,9 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     /// には空を、ジェネリックな型（`Option<User>`）には型引数の宣言まで並べて返す。
     /// definition は書かれた名前の宣言を 1 件返す（rust-analyzer 1.94.1 で実測）。
     ///
+    /// 答えを採るのは**サーバの作業が動いていないとき**だけ（[`Self::settled_outcome_of`]）。
+    /// 読み込みの途中に返った空を採ると、宣言のある名前が「宣言の場所を答えない」に倒れる。
+    ///
     /// # Errors
     ///
     /// そのドキュメントを開かせていないとき、パラメータを JSON にできないとき、
@@ -406,13 +446,29 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         document: &SourceDocument,
         position: SourcePosition,
     ) -> Result<DeclarationSiteOutcome, ConnectionError> {
-        self.declaration_site_of(GotoDefinition::METHOD, document, position)
+        Ok(
+            match self.settled_declaration_sites_of(
+                SettledDeclarationQuery::Definition,
+                document,
+                position,
+            )? {
+                SettledDeclarationSites::Answered(Some(answered)) => {
+                    declaration_site::outcome_of(&answered)
+                }
+                SettledDeclarationSites::Answered(None) => DeclarationSiteOutcome::NoAnswer,
+                SettledDeclarationSites::ServerStillWorking => {
+                    DeclarationSiteOutcome::ServerStillWorking
+                }
+            },
+        )
     }
 
     /// 開かせたファイルの、指定位置に書かれた trait の impl を尋ねる。
     ///
     /// `position` は trait パスの末尾の名前。rust-analyzer は impl ごとに**対象型の範囲**を
     /// 返す（2026-09-21 版で実測）。モジュール名（`other::Far` の `other`）には空を返す。
+    ///
+    /// 答えを採るのは [`Self::definition`] と同じく、サーバの作業が動いていないときだけ。
     ///
     /// # Errors
     ///
@@ -424,42 +480,25 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         position: SourcePosition,
     ) -> Result<ImplementationOutcome, ConnectionError> {
         Ok(
-            match self
-                .declaration_sites_of(GotoImplementation::METHOD, document, position)?
-                .as_ref()
-            {
-                Some(answered) => declaration_site::implementation_outcome_of(answered),
-                None => ImplementationOutcome::NoAnswer,
-            },
-        )
-    }
-
-    /// 宣言の場所を返す問い合わせ（typeDefinition / definition）を 1 往復尋ねる。
-    ///
-    /// **2 つは要求も応答も同じ形**で、違うのはメソッドの名前だけ。
-    ///
-    /// # Errors
-    ///
-    /// そのドキュメントを開かせていないとき、パラメータを JSON にできないとき、
-    /// 送受信が失敗したとき、応答をその問い合わせの結果として読めないとき。
-    fn declaration_site_of(
-        &mut self,
-        method: &'static str,
-        document: &SourceDocument,
-        position: SourcePosition,
-    ) -> Result<DeclarationSiteOutcome, ConnectionError> {
-        Ok(
-            match self
-                .declaration_sites_of(method, document, position)?
-                .as_ref()
-            {
-                Some(answered) => declaration_site::outcome_of(answered),
-                None => DeclarationSiteOutcome::NoAnswer,
+            match self.settled_declaration_sites_of(
+                SettledDeclarationQuery::Implementation,
+                document,
+                position,
+            )? {
+                SettledDeclarationSites::Answered(Some(answered)) => {
+                    declaration_site::implementation_outcome_of(&answered)
+                }
+                SettledDeclarationSites::Answered(None) => ImplementationOutcome::NoAnswer,
+                SettledDeclarationSites::ServerStillWorking => {
+                    ImplementationOutcome::ServerStillWorking
+                }
             },
         )
     }
 
     /// 複数の候補が返ったときに先頭を選ばない definition。
+    ///
+    /// 答えを採るのは [`Self::definition`] と同じく、サーバの作業が動いていないときだけ。
     ///
     /// # Errors
     ///
@@ -470,24 +509,96 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         position: SourcePosition,
     ) -> Result<declaration_site::UniqueDeclarationSiteOutcome, ConnectionError> {
         Ok(
-            match self
-                .declaration_sites_of(GotoDefinition::METHOD, document, position)?
-                .as_ref()
-            {
-                Some(answered) => declaration_site::unique_outcome_of(answered),
-                None => declaration_site::UniqueDeclarationSiteOutcome::Unambiguous(
-                    DeclarationSiteOutcome::NoAnswer,
-                ),
+            match self.settled_declaration_sites_of(
+                SettledDeclarationQuery::Definition,
+                document,
+                position,
+            )? {
+                SettledDeclarationSites::Answered(Some(answered)) => {
+                    declaration_site::unique_outcome_of(&answered)
+                }
+                SettledDeclarationSites::Answered(None) => {
+                    declaration_site::UniqueDeclarationSiteOutcome::Unambiguous(
+                        DeclarationSiteOutcome::NoAnswer,
+                    )
+                }
+                SettledDeclarationSites::ServerStillWorking => {
+                    declaration_site::UniqueDeclarationSiteOutcome::Unambiguous(
+                        DeclarationSiteOutcome::ServerStillWorking,
+                    )
+                }
             },
         )
     }
 
-    fn declaration_sites_of(
+    /// 宣言の場所を返す問い合わせを、作業に触れていない答えが返るまで尋ね直す。
+    ///
+    /// **2 つは要求も応答も同じ形**で、違うのはメソッドの名前だけ。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、パラメータを JSON にできないとき、
+    /// 送受信が失敗したとき、応答をその問い合わせの結果として読めないとき。
+    fn settled_declaration_sites_of(
         &mut self,
+        query: SettledDeclarationQuery,
+        document: &SourceDocument,
+        position: SourcePosition,
+    ) -> Result<SettledDeclarationSites, ConnectionError> {
+        let (method, ask_once): (_, fn(&mut Self, Value) -> _) = match query {
+            SettledDeclarationQuery::Definition => {
+                (GotoDefinition::METHOD, Self::ask_definition_once)
+            }
+            SettledDeclarationQuery::Implementation => {
+                (GotoImplementation::METHOD, Self::ask_implementation_once)
+            }
+        };
+        let params = self.declaration_params_of(method, document, position)?;
+
+        self.settled_outcome_of(
+            params,
+            ask_once,
+            SettledDeclarationSites::ServerStillWorking,
+        )
+    }
+
+    /// definition を 1 往復だけ尋ねる。
+    ///
+    /// # Errors
+    ///
+    /// 送受信が失敗したとき、応答を definition の結果として読めないとき。
+    fn ask_definition_once(
+        &mut self,
+        params: Value,
+    ) -> Result<SettledDeclarationSites, ConnectionError> {
+        self.ask_declaration_sites_once(GotoDefinition::METHOD, params)
+            .map(SettledDeclarationSites::Answered)
+    }
+
+    /// implementation を 1 往復だけ尋ねる。
+    ///
+    /// # Errors
+    ///
+    /// 送受信が失敗したとき、応答を implementation の結果として読めないとき。
+    fn ask_implementation_once(
+        &mut self,
+        params: Value,
+    ) -> Result<SettledDeclarationSites, ConnectionError> {
+        self.ask_declaration_sites_once(GotoImplementation::METHOD, params)
+            .map(SettledDeclarationSites::Answered)
+    }
+
+    /// 宣言の場所を返す問い合わせのパラメータ。
+    ///
+    /// # Errors
+    ///
+    /// そのドキュメントを開かせていないとき、パラメータを JSON にできないとき。
+    fn declaration_params_of(
+        &self,
         method: &'static str,
         document: &SourceDocument,
         position: SourcePosition,
-    ) -> Result<Option<GotoDefinitionResponse>, ConnectionError> {
+    ) -> Result<Value, ConnectionError> {
         // 開かせていないドキュメントへ送ると、サーバは中身を知らないまま null を返す。
         // 「宣言が無い」と「開かせ忘れ」が同じ答えになるので、送る前に断る。
         if !self.open_documents.contains(document.uri()) {
@@ -506,8 +617,19 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
-        let params = serde_json::to_value(params).map_err(not_serializable_error_of(method))?;
+        serde_json::to_value(params).map_err(not_serializable_error_of(method))
+    }
 
+    /// 宣言の場所を返す問い合わせを 1 往復だけ尋ねる。
+    ///
+    /// # Errors
+    ///
+    /// 送受信が失敗したとき、応答をその問い合わせの結果として読めないとき。
+    fn ask_declaration_sites_once(
+        &mut self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<Option<GotoDefinitionResponse>, ConnectionError> {
         let result = self.request(method, Some(params))?;
         // 宣言が無いときサーバは null を返す。`Option` で受けて、応答が読めなかった
         // 場合と分ける。
@@ -1333,7 +1455,7 @@ impl Error for ConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use crate::test_support::{line, repository_path, signature_text};
     use lsp_types::HoverProviderCapability;
@@ -2018,6 +2140,11 @@ mod tests {
 
     /// 参照元 1 件を返す応答。
     fn references_response(id: u64, uri: &str) -> String {
+        location_response(id, uri)
+    }
+
+    /// 場所 1 件を返す応答。references / definition / implementation が同じ形で返す。
+    fn location_response(id: u64, uri: &str) -> String {
         format!(
             r#"{{"jsonrpc":"2.0","id":{id},"result":[{{"uri":"{uri}","range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":1}}}}}}]}}"#
         )
@@ -2321,6 +2448,149 @@ mod tests {
         assert_eq!(
             sent_methods(&connection.writer).last().map(String::as_str),
             Some("textDocument/definition")
+        );
+    }
+
+    #[test]
+    fn test_definition_answered_while_the_server_is_still_working_asks_again_when_it_finished() {
+        // rust-analyzer は読み込みの途中にも definition に答え、まだ crate graph に無い
+        // std の名前には空を返す。1 通目を採ると「宣言の場所を答えない」に倒れる
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            &progress_begin_notification("loading"),
+            &no_type_definition_response(1),
+            &progress_end_notification("loading"),
+            &location_response(2, "file:///repo/src/fmt.rs"),
+        ]);
+        let mut connection = connection_over(&server_output).with_language(ServerLanguage::Rust);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .definition(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, DeclarationSiteOutcome::Answered(ref site) if site.path() == Path::new("/repo/src/fmt.rs")),
+            "読み込みが終わってから尋ね直した場所を返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_definition_that_never_settles_does_not_return_an_answer_given_while_working() {
+        // 対照は上のテスト。最後の答えも場所を持っているが、**その答えを返している間も
+        // 作業が動いている**。途中の答えを採ると、空なら宣言が無いことに、場所なら
+        // 読み込み前に見えていた宣言に倒れる
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading-first"),
+            &progress_begin_notification("loading-first"),
+            &no_type_definition_response(1),
+            &progress_end_notification("loading-first"),
+            &progress_create_request(10, "loading-next"),
+            &progress_begin_notification("loading-next"),
+            &no_type_definition_response(2),
+            &progress_end_notification("loading-next"),
+            &progress_create_request(11, "loading-more"),
+            &progress_begin_notification("loading-more"),
+            &location_response(3, "file:///repo/src/fmt.rs"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .definition(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, DeclarationSiteOutcome::ServerStillWorking),
+            "落ち着かなかったことを名前で返す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_unique_definition_answered_while_the_server_is_still_working_asks_again() {
+        // 配列長の定数を辿る経路。途中の空を採ると、定数が「宣言の場所を答えない」に倒れる
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            &progress_begin_notification("loading"),
+            &no_type_definition_response(1),
+            &progress_end_notification("loading"),
+            &location_response(2, "file:///repo/src/limits.rs"),
+        ]);
+        let mut connection = connection_over(&server_output).with_language(ServerLanguage::Rust);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .unique_definition(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(
+                outcome,
+                declaration_site::UniqueDeclarationSiteOutcome::Unambiguous(
+                    DeclarationSiteOutcome::Answered(ref site)
+                ) if site.path() == Path::new("/repo/src/limits.rs")
+            ),
+            "読み込みが終わってから尋ね直した場所を返す"
+        );
+    }
+
+    #[test]
+    fn test_implementation_answered_while_work_ran_asks_again_when_it_finished() {
+        // 読み込みの途中の空を採ると、impl を持つ trait が「impl の場所を答えない」に倒れる
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            &progress_begin_notification("loading"),
+            &no_references_response(1),
+            &progress_end_notification("loading"),
+            &location_response(2, "file:///repo/src/show.rs"),
+        ]);
+        let mut connection = connection_over(&server_output).with_language(ServerLanguage::Rust);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .implementation(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ImplementationOutcome::Answered { ref sites, .. } if sites.len() == 1),
+            "読み込みが終わってから尋ね直した impl を返す: {outcome:?}"
+        );
+        // 尋ね直しも definition ではなく implementation で送る
+        assert_eq!(
+            sent_methods(&connection.writer)
+                .iter()
+                .filter(|method| *method == GotoImplementation::METHOD)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_implementation_that_never_settles_does_not_return_an_answer_given_while_working() {
+        // 対照は上のテスト。答えを返している間も作業が動き続ける
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading-first"),
+            &progress_begin_notification("loading-first"),
+            &no_references_response(1),
+            &progress_end_notification("loading-first"),
+            &progress_create_request(10, "loading-next"),
+            &progress_begin_notification("loading-next"),
+            &no_references_response(2),
+            &progress_end_notification("loading-next"),
+            &progress_create_request(11, "loading-more"),
+            &progress_begin_notification("loading-more"),
+            &location_response(3, "file:///repo/src/show.rs"),
+        ]);
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .implementation(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ImplementationOutcome::ServerStillWorking),
+            "落ち着かなかったことを名前で返す: {outcome:?}"
         );
     }
 

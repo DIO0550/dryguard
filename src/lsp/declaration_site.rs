@@ -95,6 +95,12 @@ pub enum DeclarationSiteOutcome {
     },
     /// サーバがその問い合わせを提供していない。要求は送っていない。
     NotSupported,
+    /// 尋ねるたびにサーバが作業を始めるので、答えが落ち着かなかった。
+    ///
+    /// **途中の答えを採らない。** 読み込みの途中には、まだ見ていない宣言に空が返る
+    /// （rust-analyzer は crate graph を作り直している間に std の名前にも空を返しうる）。
+    /// [`DeclarationSiteOutcome::NoAnswer`] に畳むと、宣言が無いという答えと区別できない。
+    ServerStillWorking,
 }
 
 /// 定数の意味を確定するため、複数の宣言候補を選ばずに残す。
@@ -138,6 +144,10 @@ pub enum ImplementationOutcome {
     NoAnswer,
     /// サーバが implementation を提供していない。要求は送っていない。
     NotSupported,
+    /// 尋ねるたびにサーバが作業を始めるので、答えが落ち着かなかった。
+    ///
+    /// [`DeclarationSiteOutcome::ServerStillWorking`] と同じ理由で、途中の答えを採らない。
+    ServerStillWorking,
 }
 
 /// implementation の応答を、読めた件と読めない件があったかに分ける。
