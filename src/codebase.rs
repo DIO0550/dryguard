@@ -37,10 +37,14 @@ pub enum SourceLanguage {
 
 impl SourceLanguage {
     fn accepts(self, grammar: Grammar) -> bool {
-        match self {
-            Self::TypeScript => grammar != Grammar::Rust,
-            Self::Rust => grammar == Grammar::Rust,
-            Self::Auto => true,
+        // grammar 側も網羅 `match` にする。「Rust 以外」の否定で書くと、
+        // grammar を足したときに TypeScript の走査が黙って拾う。
+        match (self, grammar) {
+            (Self::Auto, Grammar::TypeScript | Grammar::Tsx | Grammar::Rust) => true,
+            (Self::TypeScript, Grammar::TypeScript | Grammar::Tsx) => true,
+            (Self::TypeScript, Grammar::Rust) => false,
+            (Self::Rust, Grammar::Rust) => true,
+            (Self::Rust, Grammar::TypeScript | Grammar::Tsx) => false,
         }
     }
 }
