@@ -21,7 +21,8 @@ use crate::classification::signal::{
 use crate::classification::{
     Classification, ConfiguredThresholds, classification_of, is_structurally_similar,
 };
-use crate::codebase::diff::{ChangedLines, DiffBase, DiffError};
+use crate::codebase::diff::{ChangedLines, DiffError, DiffSides, DiffTarget};
+use crate::codebase::index::IndexSources;
 use crate::codebase::{CodebaseError, SourceLanguage, source_of, source_paths_of};
 use crate::domain_declaration::{AmbiguousDomain, DomainDeclarations, DomainName};
 use crate::location::Location;
@@ -1262,7 +1263,7 @@ pub fn scan_with_language_servers(
     )
 }
 
-/// `root` の作業ツリーで `base` から変わったチャンクを起点に、コードベース全体から候補ペアを探す。
+/// `root` の下で `sides` の差分が変えたチャンクを起点に、コードベース全体から候補ペアを探す。
 ///
 /// **比べるのは、少なくとも片方が変更を含むチャンクの組だけ。** 相手は変わっていない
 /// チャンクも含めた全体なので、変えた関数が既存のコードと重複していないかが分かる
@@ -1271,19 +1272,33 @@ pub fn scan_with_language_servers(
 /// 返す [`Scan`] は [`Scan::changed_chunk_count`] を持つ。比べた数・候補ペアの数は、
 /// 変更を含む組だけを数えた数になる。
 ///
+/// **index と比べる（[`DiffTarget::Index`]）ときは、比べる相手も含めて全部 index の版から
+/// 切り出す。** 未追跡のファイルは入らず、作業ツリーから消しただけのファイルは入る。
+/// Stage 2 がサーバに開かせるのも同じ版だが、宣言側・参照元として読むファイルと、
+/// サーバが自分で読むファイルは作業ツリーの版のまま（`README.md` の `check --diff`）。
+///
 /// # Errors
 ///
-/// 差分を取れないとき（[`CheckError::Diff`]）、走査を始められないとき（[`CheckError::Scan`]）。
+/// 差分を取れないとき・index を読めないとき（[`CheckError::Diff`]）、
+/// 走査を始められないとき（[`CheckError::Scan`]）。
 pub fn check_with_language_servers(
     root: &Path,
-    base: &DiffBase,
+    sides: &DiffSides,
     language: SourceLanguage,
     test_functions: TestFunctions,
     thresholds: ConfiguredThresholds,
     declarations: &DomainDeclarations,
     servers: LanguageServers<'_>,
 ) -> Result<Scan, CheckError> {
-    let changed = ChangedLines::of(root, base).map_err(CheckError::Diff)?;
+    let changed = ChangedLines::of(root, sides).map_err(CheckError::Diff)?;
+    let index = match sides.target() {
+        DiffTarget::WorkTree => None,
+        DiffTarget::Index => Some(IndexSources::of(root, language).map_err(CheckError::Diff)?),
+    };
+    let tree = match &index {
+        None => SourceTree::WorkTree,
+        Some(index) => SourceTree::Index(index),
+    };
 
     scan_with_servers(
         root,
@@ -1295,7 +1310,10 @@ pub fn check_with_language_servers(
             server: servers.typescript,
             other_server: Some(servers.rust),
         },
-        ScanScope::Changes(&changed),
+        ScanScope::Changes {
+            changed: &changed,
+            tree,
+        },
     )
     .map_err(CheckError::Scan)
 }
@@ -1316,21 +1334,72 @@ struct ScanServers<'a> {
     other_server: Option<&'a ServerCommand>,
 }
 
-/// 比べる起点にするチャンクの範囲。
+/// 比べる起点にするチャンクの範囲と、チャンクを切り出す版。
 #[derive(Clone, Copy)]
 enum ScanScope<'a> {
-    /// すべてのチャンク（`scan`）。
+    /// 作業ツリーのすべてのチャンク（`scan`）。
     Whole,
     /// 変わった行を含むチャンクだけ（`check --diff`）。
-    Changes(&'a ChangedLines),
+    Changes {
+        changed: &'a ChangedLines,
+        /// 変わった行の行番号が指す版。チャンクもここから切り出す。
+        tree: SourceTree<'a>,
+    },
 }
 
-impl ScanScope<'_> {
+impl<'a> ScanScope<'a> {
     /// そのチャンクが比べる起点になるか。
     fn targets(self, chunk: &Chunk) -> bool {
         match self {
             Self::Whole => true,
-            Self::Changes(changed) => changed.touches(chunk.path(), chunk.lines()),
+            Self::Changes { changed, .. } => changed.touches(chunk.path(), chunk.lines()),
+        }
+    }
+
+    /// チャンクを切り出す版。
+    fn tree(self) -> SourceTree<'a> {
+        match self {
+            Self::Whole => SourceTree::WorkTree,
+            Self::Changes { tree, .. } => tree,
+        }
+    }
+}
+
+/// 走査するファイルの一覧と中身をどこから読むか。
+#[derive(Clone, Copy)]
+enum SourceTree<'a> {
+    /// 作業ツリーを歩いて読む。
+    WorkTree,
+    /// index から読んだ版（`check --diff --staged`）。
+    Index(&'a IndexSources),
+}
+
+impl SourceTree<'_> {
+    /// 走査対象のファイル。パス順。
+    ///
+    /// # Errors
+    ///
+    /// 作業ツリーを歩けないとき。
+    fn paths_of(
+        self,
+        root: &Path,
+        language: SourceLanguage,
+    ) -> Result<Vec<PathBuf>, CodebaseError> {
+        match self {
+            Self::WorkTree => source_paths_of(root, language),
+            Self::Index(index) => Ok(index.paths()),
+        }
+    }
+
+    /// そのファイルの中身。
+    ///
+    /// # Errors
+    ///
+    /// 開けない・読めない・UTF-8 として解釈できないとき。
+    fn source_of(self, path: &Path) -> io::Result<String> {
+        match self {
+            Self::WorkTree => source_of(path),
+            Self::Index(index) => index.source_of(path),
         }
     }
 }
@@ -1344,7 +1413,8 @@ fn scan_with_servers(
     servers: ScanServers<'_>,
     scope: ScanScope<'_>,
 ) -> Result<Scan, ScanError> {
-    let paths = source_paths_of(root, language).map_err(ScanError::Codebase)?;
+    let tree = scope.tree();
+    let paths = tree.paths_of(root, language).map_err(ScanError::Codebase)?;
     let file_count = paths.len();
     // **比べ始める前に全部確かめる。** 読めなかったファイルのように飛ばして続けると、
     // 宣言の食い違いに気づかないまま、そのファイルの無い判定が出る
@@ -1359,7 +1429,7 @@ fn scan_with_servers(
     // 逐次で回したときと変わらない
     let chunked_files: Vec<Result<ChunkedFile, SkippedFile>> = paths
         .par_iter()
-        .map(|path| file_chunks_of(path, test_functions))
+        .map(|path| file_chunks_of(path, tree, test_functions))
         .collect();
 
     let mut chunks: Vec<ScannedChunk> = Vec::new();
@@ -1403,7 +1473,7 @@ fn scan_with_servers(
 
     let changed_chunk_count = match scope {
         ScanScope::Whole => None,
-        ScanScope::Changes(_) => Some(chunks.iter().filter(|scanned| scanned.targeted).count()),
+        ScanScope::Changes { .. } => Some(chunks.iter().filter(|scanned| scanned.targeted).count()),
     };
     Ok(scan_of_chunks(
         &chunks,
@@ -1452,7 +1522,7 @@ struct ScannedChunk {
 
 /// そのファイルを読んで、中にある関数・メソッドをすべて切り出す。
 ///
-/// `path` は [`typescript_paths_of`] が集めたファイル。
+/// `path` は `tree` が集めたファイル。中身も `tree` から読む。
 ///
 /// 読んだ中身も一緒に返す。**Stage 2 で読み直さない**ため
 /// （読み直すと、間で編集されたときに構造のシグナルと意味のシグナルが別の版から出る。
@@ -1462,15 +1532,21 @@ struct ScannedChunk {
 ///
 /// 拡張子から grammar を選べない / ファイルを読めない / 構文木にできないとき。
 /// **飛ばす理由をそのまま返す**ので、呼び出し側は 1 ファイルのために走査を止めずに済む。
-fn file_chunks_of(path: &Path, test_functions: TestFunctions) -> Result<ChunkedFile, SkippedFile> {
+fn file_chunks_of(
+    path: &Path,
+    tree: SourceTree<'_>,
+    test_functions: TestFunctions,
+) -> Result<ChunkedFile, SkippedFile> {
     let grammar = Grammar::of_path(path).ok_or_else(|| SkippedFile::UnreadableExtension {
         path: path.to_path_buf(),
     })?;
 
-    let source = source_of(path).map_err(|cause| SkippedFile::SourceUnreadable {
-        path: path.to_path_buf(),
-        cause,
-    })?;
+    let source = tree
+        .source_of(path)
+        .map_err(|cause| SkippedFile::SourceUnreadable {
+            path: path.to_path_buf(),
+            cause,
+        })?;
 
     let chunks = {
         let tree = SyntaxTree::from_source(&source, grammar).map_err(|cause| {
@@ -2439,7 +2515,7 @@ impl Error for ScanError {
 /// `scan` の呼び出し側に分岐させないため。
 #[derive(Debug)]
 pub enum CheckError {
-    /// 変わった行を集められなかった。
+    /// 変わった行、または index の版を集められなかった。
     Diff(DiffError),
     /// 走査を始められなかった。
     Scan(ScanError),

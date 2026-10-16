@@ -65,8 +65,9 @@ if structurally_similar && domains_differ { ... }
 | `impl header` | Rust メソッドが直接所属する impl の本体より前のソース。対象型・型変数・境界・実装トレイトを、そのスコープのまま運ぶ |
 | `accessor` | プロパティのように読み書きされるメンバーを実装する関数（`get` / `set`）。**チャンクとしては関数**だが、`hover` が返すのは**メンバーとしての型** |
 | `test function` | Rust のテスト属性（パス末尾が `test`）付き関数、または TypeScript / TSX の `describe` / `it` / `test`（`.only` / `.skip` を含む）の第2引数に直接書いたアロー関数・関数式。callback 側の透過ラッパーは辿るが、spread で位置が確定しない形・別名・namespace・未知の修飾は残す。TS は呼び出し名のヒューリスティックで、同名の業務 API も対象。**`scan` / `check` は既定でチャンクにしない**（`--include-tests` で入れる）。ファイル名や囲むテストでは判定せず、印の付かないヘルパー・内部の関数は残す |
-| `diff base` | `check --diff` が作業ツリーと比べるリビジョン（既定は `HEAD`）。**範囲は取らない** — 行番号が作業ツリーを指さなくなる（`codebase::diff::DiffBase`） |
-| `changed chunk` | `diff base` から変わった行を含む chunk。`check --diff` が比べる起点で、**少なくとも片方がこれである pair だけ**を比べる。追跡していないファイルの chunk はすべて、消しただけの変更は消した点を内側に含む chunk だけが当たる |
+| `diff base` | `check --diff` が `diff target` と比べるリビジョン（既定は `HEAD`）。**範囲は取らない** — 行番号がチャンクを切り出す版を指さなくなる（`codebase::diff::DiffBase`） |
+| `diff target` | `diff base` と比べる側。作業ツリー（既定）か index（`--staged`）。**変わった行の行番号はこの側の版を指し、チャンクもこの側の版から切り出す**（`codebase::diff::DiffTarget`。index の版は `codebase::index`） |
+| `changed chunk` | `diff target` の側で `diff base` から変わった行を含む chunk。`check --diff` が比べる起点で、**少なくとも片方がこれである pair だけ**を比べる。作業ツリーと比べるときは追跡していないファイルの chunk はすべて当たる（index と比べるときは追跡していないファイルを読まない）。消しただけの変更は消した点を内側に含む chunk だけが当たる |
 | `pair` | 比較する 2 つの chunk |
 | `undersized chunk` | 正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない chunk。**chunk ではある**が、`scan` / `check` は候補列挙に入れない（`compare` は名指しされれば比べる）。`test function` は**chunk にしない**ので別物 |
 | `candidate pair` | 構造類似度が閾値に届いた pair。**両側とも `undersized chunk` でない**。`scan` / `check` が判定して出すのはこれだけ |

@@ -14,7 +14,7 @@ use std::process::{self, Command};
 
 use dryguard::classification::ConfiguredThresholds;
 use dryguard::codebase::SourceLanguage;
-use dryguard::codebase::diff::{DiffBase, DiffError};
+use dryguard::codebase::diff::{DiffBase, DiffError, DiffSides, DiffTarget};
 use dryguard::domain_declaration::DomainDeclarations;
 use dryguard::pipeline::{
     CandidatePair, CheckError, LanguageServers, Scan, check_with_language_servers, scan_of,
@@ -96,6 +96,14 @@ fn write_file(root: &Path, path: &str, source: &str) {
 /// 署名と作者を引数で固定する。**実行する人のグローバル設定**（コミットの署名など）で
 /// コミットが落ちると、テストの結果が環境で変わる。
 fn git(root: &Path, arguments: &[&str]) {
+    assert!(
+        git_succeeds(root, arguments),
+        "git {arguments:?} が失敗した"
+    );
+}
+
+/// テストの作業ツリーで git を走らせ、成功したか。失敗を前提にする手順（衝突するマージ）で使う。
+fn git_succeeds(root: &Path, arguments: &[&str]) -> bool {
     let status = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -112,10 +120,19 @@ fn git(root: &Path, arguments: &[&str]) {
     let Ok(status) = status else {
         panic!("テストは git を起動できる環境で走らせる");
     };
-    assert!(status.success(), "git {arguments:?} が失敗した");
+    status.success()
 }
 
 fn check_of(root: &Path, base: &str) -> Result<Scan, CheckError> {
+    check_against(root, base, DiffTarget::WorkTree)
+}
+
+/// `check --diff <base> --staged`。index を `base` と比べる。
+fn staged_check_of(root: &Path, base: &str) -> Result<Scan, CheckError> {
+    check_against(root, base, DiffTarget::Index)
+}
+
+fn check_against(root: &Path, base: &str, target: DiffTarget) -> Result<Scan, CheckError> {
     let Ok(base) = base.parse::<DiffBase>() else {
         panic!("テストが渡すリビジョンは受け付ける綴り: {base}");
     };
@@ -123,7 +140,7 @@ fn check_of(root: &Path, base: &str) -> Result<Scan, CheckError> {
 
     check_with_language_servers(
         root,
-        &base,
+        &DiffSides::new(base, target),
         SourceLanguage::TypeScript,
         TestFunctions::Excluded,
         ConfiguredThresholds::default(),
@@ -304,4 +321,204 @@ fn test_check_from_a_subdirectory_finds_the_changes_under_it() {
 
     assert_eq!(check.changed_chunk_count(), Some(1));
     assert_eq!(check.candidate_pairs().len(), 3);
+}
+
+/// 本体の前に 3 行のコメントを足した `DISCOUNT_EDITED`。構造は同じで、関数の始まりが 4 行目にずれる。
+const DISCOUNT_EDITED_SHIFTED: &str = "// 1\n// 2\n// 3\n\
+                                       export function applyDiscount(price: number, rate: number): number {\n\
+                                       \x20 const discounted = price * (1 - rate);\n\
+                                       \x20 return Math.max(discounted, 1);\n\
+                                       }\n";
+
+/// 候補ペアのうち、`file` 側の位置の行番号。
+fn lines_of(check: &Scan, file: &str) -> Vec<usize> {
+    check
+        .candidate_pairs()
+        .iter()
+        .flat_map(|pair| [pair.location_a(), pair.location_b()])
+        .filter(|location| location.path().ends_with(file))
+        .map(|location| location.line().get())
+        .collect()
+}
+
+#[test]
+fn test_check_staged_reads_chunks_from_the_index_when_the_work_tree_has_unstaged_edits_on_top() {
+    // `git add -p` の後の形。index の行番号で差分を取り、チャンクも index の版から切り出す。
+    // 作業ツリーから切り出すと、関数が 4 行目にずれて index の差分の行と食い違う
+    let root = committed_work_tree("staged-partial", &FILES);
+    write_file(&root, "src/billing/discount.ts", DISCOUNT_EDITED);
+    git(&root, &["add", "src/billing/discount.ts"]);
+    write_file(&root, "src/billing/discount.ts", DISCOUNT_EDITED_SHIFTED);
+
+    let check = staged_check_of(&root, "HEAD").expect("index の差分を取れる");
+
+    assert_eq!(check.changed_chunk_count(), Some(1));
+    assert_eq!(
+        lines_of(&check, "src/billing/discount.ts"),
+        vec![1, 1, 1],
+        "位置は index の版の行番号を指す: {:?}",
+        check.candidate_pairs()
+    );
+}
+
+#[test]
+fn test_check_staged_does_not_take_unstaged_edits_as_changed() {
+    let root = committed_work_tree("staged-unstaged", &FILES);
+    write_file(&root, "src/billing/discount.ts", DISCOUNT_EDITED);
+
+    let staged = staged_check_of(&root, "HEAD").expect("index の差分を取れる");
+    // 対照。同じ作業ツリーを `--staged` なしで比べると、変わったチャンクになる
+    let work_tree = check_of(&root, "HEAD").expect("作業ツリーの差分を取れる");
+
+    assert_eq!(staged.changed_chunk_count(), Some(0));
+    assert!(staged.candidate_pairs().is_empty());
+    assert_eq!(work_tree.changed_chunk_count(), Some(1));
+}
+
+#[test]
+fn test_check_staged_takes_a_staged_new_file_as_changed() {
+    let root = committed_work_tree("staged-new", &FILES[..2]);
+    write_file(&root, "src/shipping/fee.ts", FEE);
+    git(&root, &["add", "src/shipping/fee.ts"]);
+
+    let check = staged_check_of(&root, "HEAD").expect("index の差分を取れる");
+
+    assert_eq!(check.changed_chunk_count(), Some(1));
+    assert_eq!(check.candidate_pairs().len(), 2);
+    assert!(
+        check
+            .candidate_pairs()
+            .iter()
+            .all(|pair| includes_file(pair, "src/shipping/fee.ts")),
+        "ステージした新しいファイルの関数を起点に比べる: {:?}",
+        check.candidate_pairs()
+    );
+}
+
+#[test]
+fn test_check_staged_leaves_untracked_files_out_of_the_comparison() {
+    // 追跡していないファイルはコミットに入らないので、起点にも比べる相手にもしない
+    let root = committed_work_tree("staged-untracked", &FILES[..2]);
+    write_file(&root, "src/billing/discount.ts", DISCOUNT_EDITED);
+    git(&root, &["add", "src/billing/discount.ts"]);
+    write_file(&root, "src/shipping/fee.ts", FEE);
+
+    let check = staged_check_of(&root, "HEAD").expect("index の差分を取れる");
+
+    assert_eq!(check.changed_chunk_count(), Some(1));
+    assert_eq!(
+        check.candidate_pairs().len(),
+        1,
+        "変えた関数と、追跡しているもう 1 つとの組だけが出る: {:?}",
+        check.candidate_pairs()
+    );
+    assert!(
+        !check
+            .candidate_pairs()
+            .iter()
+            .any(|pair| includes_file(pair, "src/shipping/fee.ts")),
+        "追跡していないファイルの関数は比べない: {:?}",
+        check.candidate_pairs()
+    );
+}
+
+#[test]
+fn test_check_staged_compares_with_a_file_removed_only_from_the_work_tree() {
+    // 比べる相手も index の版から読む。作業ツリーから消しただけ（ステージしていない）の
+    // ファイルはコミットに残るので、相手に入る
+    let root = committed_work_tree("staged-removed", &FILES);
+    write_file(&root, "src/billing/discount.ts", DISCOUNT_EDITED);
+    git(&root, &["add", "src/billing/discount.ts"]);
+    fs::remove_file(root.join("src/inventory/reorder.ts")).expect("テストが作ったファイルは消せる");
+
+    let check = staged_check_of(&root, "HEAD").expect("index の差分を取れる");
+
+    assert_eq!(check.candidate_pairs().len(), 3);
+    assert!(
+        check
+            .candidate_pairs()
+            .iter()
+            .any(|pair| includes_file(pair, "src/inventory/reorder.ts")),
+        "作業ツリーに無くても index にあるファイルと比べる: {:?}",
+        check.candidate_pairs()
+    );
+}
+
+#[test]
+fn test_check_staged_with_an_unresolved_merge_conflict_reports_it() {
+    // 衝突したファイルは index に版が 3 つあり、どれを読むかが決まらない。コミットもできない
+    let root = committed_work_tree("staged-conflict", &FILES[..1]);
+    git(&root, &["checkout", "--quiet", "-b", "other"]);
+    write_file(
+        &root,
+        "src/billing/discount.ts",
+        &DISCOUNT_EDITED.replace("discounted, 1", "discounted, 2"),
+    );
+    git(&root, &["commit", "--quiet", "--all", "--message", "other"]);
+    git(&root, &["checkout", "--quiet", "-"]);
+    write_file(&root, "src/billing/discount.ts", DISCOUNT_EDITED);
+    git(&root, &["commit", "--quiet", "--all", "--message", "main"]);
+    assert!(
+        !git_succeeds(&root, &["merge", "--quiet", "other"]),
+        "同じ行を両方で変えたので衝突する"
+    );
+
+    let result = staged_check_of(&root, "HEAD");
+
+    assert!(
+        matches!(
+            result,
+            Err(CheckError::Diff(DiffError::UnmergedPath { .. }))
+        ),
+        "衝突したまま、どれかの版で比べない: {result:?}"
+    );
+}
+
+#[test]
+fn test_check_staged_does_not_compare_with_a_file_removed_from_the_index() {
+    // 対照は上のテスト。`git rm` で消したファイルはコミットに残らないので、相手に入れない
+    let root = committed_work_tree("staged-git-rm", &FILES);
+    write_file(&root, "src/billing/discount.ts", DISCOUNT_EDITED);
+    git(&root, &["add", "src/billing/discount.ts"]);
+    git(&root, &["rm", "--quiet", "src/inventory/reorder.ts"]);
+
+    let check = staged_check_of(&root, "HEAD").expect("index の差分を取れる");
+
+    assert_eq!(check.candidate_pairs().len(), 2);
+    assert!(
+        !check
+            .candidate_pairs()
+            .iter()
+            .any(|pair| includes_file(pair, "src/inventory/reorder.ts")),
+        "index から消したファイルとは比べない: {:?}",
+        check.candidate_pairs()
+    );
+}
+
+#[test]
+fn test_check_staged_from_a_subdirectory_finds_the_changes_under_it() {
+    // index のパスも根からの相対で読めているかを見る。差分のパスと揃っていなければ、
+    // 変わったチャンクが 0 件のまま成功する
+    let nested: Vec<(String, &str)> = FILES
+        .iter()
+        .map(|(path, source)| (format!("package/{path}"), *source))
+        .collect();
+    let nested: Vec<(&str, &str)> = nested
+        .iter()
+        .map(|(path, source)| (path.as_str(), *source))
+        .collect();
+    let root = committed_work_tree("staged-subdirectory", &nested);
+    write_file(&root, "package/src/billing/discount.ts", DISCOUNT_EDITED);
+    write_file(&root, "outside.ts", FEE);
+    git(&root, &["add", "--all"]);
+
+    let check = staged_check_of(&root.join("package"), "HEAD").expect("index の差分を取れる");
+
+    assert_eq!(check.changed_chunk_count(), Some(1));
+    assert_eq!(
+        check.candidate_pairs().len(),
+        3,
+        "根の外にステージしたファイルは起点にも相手にもならない: {:?}",
+        check.candidate_pairs()
+    );
 }
