@@ -2091,6 +2091,15 @@ mod tests {
     }
 
     #[test]
+    fn test_server_command_for_typescript_supports_tsx_but_not_rust() {
+        let command = ServerCommand::typescript();
+
+        assert!(command.supports(Grammar::TypeScript));
+        assert!(command.supports(Grammar::Tsx), "TSX も同じサーバに尋ねる");
+        assert!(!command.supports(Grammar::Rust));
+    }
+
+    #[test]
     fn test_server_command_without_project_markers_has_none() {
         // 対照は上のテスト。**印を持たないサーバもある**ので、
         // 印の一覧が空であることと TS の一覧を取り違えない
