@@ -136,22 +136,16 @@ impl ImportSet {
     /// 重なりは過大にも過小にも動くので、**落ちたことが構造に出ないと区別できない**
     /// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
     pub fn from_tree(tree: &SyntaxTree<'_>, importer: &Path) -> Result<Self, ImportsUnavailable> {
-        if tree.grammar() == Grammar::Rust {
-            let paths: HashSet<ModulePath> = rust_use_paths_of(tree)?
+        let paths: HashSet<ModulePath> = match tree.grammar() {
+            Grammar::TypeScript | Grammar::Tsx => specifiers_of(tree)?
+                .iter()
+                .map(|specifier| ModulePath::from_specifier(specifier, importer))
+                .collect(),
+            Grammar::Rust => rust_use_paths_of(tree)?
                 .into_iter()
                 .map(|specifier| ModulePath::from_rust_use(&specifier, importer))
-                .collect();
-            if paths.is_empty() {
-                return Err(ImportsUnavailable::NoDeclarations);
-            }
-            return Ok(Self(paths));
-        }
-
-        let specifiers = specifiers_of(tree)?;
-        let paths: HashSet<ModulePath> = specifiers
-            .iter()
-            .map(|specifier| ModulePath::from_specifier(specifier, importer))
-            .collect();
+                .collect(),
+        };
 
         if paths.is_empty() {
             return Err(ImportsUnavailable::NoDeclarations);

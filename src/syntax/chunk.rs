@@ -160,7 +160,7 @@ impl Chunk {
 
     /// チャンクのノードから組み立てる。
     ///
-    /// `node` は [`CHUNK_KINDS`] のノード、`path` は切り出したチャンクに持たせる位置、
+    /// `node` は [`is_chunk_node`] に当たるノード、`path` は切り出したチャンクに持たせる位置、
     /// `source` はそのノードを含むファイル全体のソース、`imports` はそのファイルの依存先。
     ///
     /// **持つ値をすべてこの 1 つのノードから採る。** 呼び出し側に組み立てさせると、
@@ -180,23 +180,20 @@ impl Chunk {
             grammar,
             lines,
             name_position: name_position_of(node, source),
-            annotated: if grammar == Grammar::Rust {
-                AnnotatedPositions::Declared {
+            annotated: match grammar {
+                Grammar::TypeScript | Grammar::Tsx => annotated_positions_of(node, source),
+                Grammar::Rust => AnnotatedPositions::Declared {
                     value_type: TypeAnnotation::Omitted,
                     parameters: Vec::new(),
-                }
-            } else {
-                annotated_positions_of(node, source)
+                },
             },
-            overload_declarations: if grammar == Grammar::Rust {
-                Vec::new()
-            } else {
-                overload_declarations_of(node, source)
+            overload_declarations: match grammar {
+                Grammar::TypeScript | Grammar::Tsx => overload_declarations_of(node, source),
+                Grammar::Rust => Vec::new(),
             },
-            type_references: if grammar == Grammar::Rust {
-                rust_callable::type_references_of(node, source)
-            } else {
-                chunk_type_references_of(node, source)
+            type_references: match grammar {
+                Grammar::TypeScript | Grammar::Tsx => chunk_type_references_of(node, source),
+                Grammar::Rust => rust_callable::type_references_of(node, source),
             },
             rust_impl_header: match grammar {
                 Grammar::Rust => rust_callable::impl_header_of(node, source),
@@ -463,19 +460,19 @@ impl fmt::Display for ChunkingError {
 
 impl Error for ChunkingError {}
 
-/// チャンクとして拾うノードの種別。
-///
-/// 「関数・メソッド 1 つ分」を tree-sitter の語彙に写したもの
-/// (rules/naming.md「このツールの語彙を固定する」の `chunk`)。
-/// クラスのメソッドとオブジェクトのメソッドは、grammar が同じ `method_definition` で表す。
-///
-/// `class_declaration` と Rust の `impl_item` を入れないのは、比較の単位がメソッドだから。
 /// 代入を表すノードの種別。左辺が関数の名前になる形を見分けるのに使う。
 const ASSIGNMENT_KIND: &str = "assignment_expression";
 
 /// 識別子 1 つを表すノードの種別。
 const IDENTIFIER_KIND: &str = "identifier";
 
+/// TypeScript / TSX でチャンクとして拾うノードの種別。**他の grammar には当てない。**
+///
+/// 「関数・メソッド 1 つ分」を tree-sitter の語彙に写したもの
+/// (rules/naming.md「このツールの語彙を固定する」の `chunk`)。
+/// クラスのメソッドとオブジェクトのメソッドは、grammar が同じ `method_definition` で表す。
+///
+/// `class_declaration` を入れないのは、比較の単位がメソッドだから。
 const CHUNK_KINDS: [&str; 6] = [
     "function_declaration",
     "generator_function_declaration",
@@ -485,13 +482,22 @@ const CHUNK_KINDS: [&str; 6] = [
     "method_definition",
 ];
 
-/// Rust は自由関数も `impl` / トレイト実装のメソッドも `function_item`。
-/// 本体のないトレイトの宣言 (`function_signature_item`) は比較しない。
+/// Rust でチャンクとして拾うノードの種別。
+///
+/// 自由関数も `impl` / トレイト実装のメソッドも `function_item`。`impl_item` を入れないのは、
+/// 比較の単位がメソッドだから。
+const RUST_CHUNK_KIND: &str = "function_item";
+
+/// そのノードが、grammar ごとのチャンク種別に当たるか。
+///
+/// Rust は本体のないトレイトの宣言 (`function_signature_item`) を比較しない。
 fn is_chunk_node(node: Node<'_>, grammar: Grammar) -> bool {
-    if grammar == Grammar::Rust {
-        return node.kind() == "function_item" && node.child_by_field_name("body").is_some();
+    match grammar {
+        Grammar::TypeScript | Grammar::Tsx => CHUNK_KINDS.contains(&node.kind()),
+        Grammar::Rust => {
+            node.kind() == RUST_CHUNK_KIND && node.child_by_field_name("body").is_some()
+        }
     }
-    CHUNK_KINDS.contains(&node.kind())
 }
 
 /// 属性を表すノードの種別。Rust の文法では、付けた相手の**直前の兄弟**として並ぶ。
