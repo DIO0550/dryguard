@@ -253,9 +253,13 @@ impl ServerCommand {
 
     /// このサーバで問い合わせられるソースの言語。
     pub(crate) fn supports(&self, grammar: Grammar) -> bool {
-        match self.language {
-            ServerLanguage::TypeScript => grammar != Grammar::Rust,
-            ServerLanguage::Rust => grammar == Grammar::Rust,
+        // grammar 側も網羅 `match` にする。「Rust 以外」の否定で書くと、
+        // grammar を足したときに TypeScript のサーバへ黙って流れる。
+        match (self.language, grammar) {
+            (ServerLanguage::TypeScript, Grammar::TypeScript | Grammar::Tsx) => true,
+            (ServerLanguage::TypeScript, Grammar::Rust) => false,
+            (ServerLanguage::Rust, Grammar::Rust) => true,
+            (ServerLanguage::Rust, Grammar::TypeScript | Grammar::Tsx) => false,
         }
     }
 }
@@ -2088,6 +2092,15 @@ mod tests {
         assert_eq!(command.project_markers(), ["Cargo.toml".to_owned()]);
         assert!(command.supports(Grammar::Rust));
         assert!(!command.supports(Grammar::TypeScript));
+    }
+
+    #[test]
+    fn test_server_command_for_typescript_supports_tsx_but_not_rust() {
+        let command = ServerCommand::typescript();
+
+        assert!(command.supports(Grammar::TypeScript));
+        assert!(command.supports(Grammar::Tsx), "TSX も同じサーバに尋ねる");
+        assert!(!command.supports(Grammar::Rust));
     }
 
     #[test]
