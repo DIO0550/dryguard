@@ -145,10 +145,7 @@ fn check_against(root: &Path, base: &str, target: DiffTarget) -> Result<Scan, Ch
         TestFunctions::Excluded,
         ConfiguredThresholds::default(),
         &DomainDeclarations::default(),
-        LanguageServers {
-            typescript: &server,
-            rust: &server,
-        },
+        LanguageServers::new(std::slice::from_ref(&server)),
     )
 }
 

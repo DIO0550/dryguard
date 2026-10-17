@@ -339,6 +339,33 @@ pub fn measured_pair_of(
     declarations: &DomainDeclarations,
     server: &ServerCommand,
 ) -> Result<MeasuredPair, AmbiguousDomain> {
+    measured_pair_with(pair, thresholds, declarations, Some(server))
+}
+
+/// [`measured_pair_of`] と同じく測るが、サーバはペアの grammar で `servers` から引く。
+///
+/// **対応するサーバが並びに無くても失敗にしない。** 尋ねずに
+/// [`SemanticsUnavailable::NotAsked`] として出す（走査がサーバの無い言語を扱うのと同じ）。
+///
+/// # Errors
+///
+/// [`measured_pair_of`] と同じ。
+pub fn measured_pair_with_language_servers(
+    pair: &ChunkPair,
+    thresholds: ConfiguredThresholds,
+    declarations: &DomainDeclarations,
+    servers: LanguageServers<'_>,
+) -> Result<MeasuredPair, AmbiguousDomain> {
+    let server = servers.server_for(pair.chunk_a.grammar());
+    measured_pair_with(pair, thresholds, declarations, server)
+}
+
+fn measured_pair_with(
+    pair: &ChunkPair,
+    thresholds: ConfiguredThresholds,
+    declarations: &DomainDeclarations,
+    server: Option<&ServerCommand>,
+) -> Result<MeasuredPair, AmbiguousDomain> {
     let declared_a = declared_domain_of(pair.chunk_a.path(), declarations)?;
     let declared_b = declared_domain_of(pair.chunk_b.path(), declarations)?;
     let signals = declared_signals_of(
@@ -346,17 +373,21 @@ pub fn measured_pair_of(
         (&pair.chunk_b, declared_b.as_ref()),
     );
 
-    let asked =
-        if !server.supports(pair.chunk_a.grammar()) || !server.supports(pair.chunk_b.grammar()) {
-            AskedSemantics::unavailable(SemanticsUnavailable::NotAsked, None)
-        } else if is_structurally_similar(
-            signals.structural_similarity(),
-            thresholds.structural_similarity(),
-        ) {
+    let supported = |server: &&ServerCommand| {
+        server.supports(pair.chunk_a.grammar()) && server.supports(pair.chunk_b.grammar())
+    };
+    let asked = match server.filter(supported) {
+        None => AskedSemantics::unavailable(SemanticsUnavailable::NotAsked, None),
+        Some(server)
+            if is_structurally_similar(
+                signals.structural_similarity(),
+                thresholds.structural_similarity(),
+            ) =>
+        {
             semantics_of(pair, declarations, server)
-        } else {
-            AskedSemantics::unavailable(SemanticsUnavailable::NotACandidate, None)
-        };
+        }
+        Some(_) => AskedSemantics::unavailable(SemanticsUnavailable::NotACandidate, None),
+    };
 
     Ok(MeasuredPair {
         signals: signals
@@ -745,29 +776,32 @@ fn resolved_type_signature_outcome_of(
     position: SourcePosition,
     declarations_cache: &mut RustDeclarationCache,
 ) -> Result<TypeSignatureOutcome, ClientError> {
-    if chunk.grammar() == Grammar::Rust {
-        return rust_type_signature_outcome_of(
+    // 網羅 `match` にする。「Rust でなければ TypeScript」と書くと、grammar を足したときに
+    // その言語の綴りを TypeScript の系統で読みにいく
+    match chunk.grammar() {
+        Grammar::Rust => rust_type_signature_outcome_of(
             session,
             document,
             position,
             chunk.type_references(),
             chunk.rust_impl_header(),
             declarations_cache,
-        );
+        ),
+        Grammar::TypeScript | Grammar::Tsx => {
+            let traced = traced_type_names_of(session, document, chunk.type_references())?;
+            let unopened = unopened_declaring_documents_of(session, traced.declared())?;
+            let traced = opened_type_names_of(session, traced.with_unopened(unopened))?;
+
+            type_signature_outcome_of(
+                session,
+                document,
+                position,
+                chunk.annotated_positions(),
+                chunk.overload_declarations(),
+                &traced,
+            )
+        }
     }
-
-    let traced = traced_type_names_of(session, document, chunk.type_references())?;
-    let unopened = unopened_declaring_documents_of(session, traced.declared())?;
-    let traced = opened_type_names_of(session, traced.with_unopened(unopened))?;
-
-    type_signature_outcome_of(
-        session,
-        document,
-        position,
-        chunk.annotated_positions(),
-        chunk.overload_declarations(),
-        &traced,
-    )
 }
 
 /// 型が宣言されているファイルを開かせて、開かせられなかった型名を返す。
@@ -1227,10 +1261,7 @@ pub fn scan_of_language(
         test_functions,
         thresholds,
         declarations,
-        ScanServers {
-            server,
-            other_server: None,
-        },
+        LanguageServers::new(std::slice::from_ref(server)),
         ScanScope::Whole,
     )
 }
@@ -1246,8 +1277,7 @@ pub fn scan_with_language_servers(
     test_functions: TestFunctions,
     thresholds: ConfiguredThresholds,
     declarations: &DomainDeclarations,
-    typescript_server: &ServerCommand,
-    rust_server: &ServerCommand,
+    servers: LanguageServers<'_>,
 ) -> Result<Scan, ScanError> {
     scan_with_servers(
         root,
@@ -1255,10 +1285,7 @@ pub fn scan_with_language_servers(
         test_functions,
         thresholds,
         declarations,
-        ScanServers {
-            server: typescript_server,
-            other_server: Some(rust_server),
-        },
+        servers,
         ScanScope::Whole,
     )
 }
@@ -1306,10 +1333,7 @@ pub fn check_with_language_servers(
         test_functions,
         thresholds,
         declarations,
-        ScanServers {
-            server: servers.typescript,
-            other_server: Some(servers.rust),
-        },
+        servers,
         ScanScope::Changes {
             changed: &changed,
             tree,
@@ -1318,20 +1342,32 @@ pub fn check_with_language_servers(
     .map_err(CheckError::Scan)
 }
 
-/// 言語ごとに起こす LSP サーバの指定。
+/// 言語ごとに起こす LSP サーバの並び。
+///
+/// **grammar からサーバを引く。** 言語ごとのフィールドで持つと、言語を足すたびに
+/// この型と、サーバを探して意味情報を配る側（[`scan_of_chunks`]）の両方を触ることになる。
+///
+/// Why not（`BTreeMap<Grammar, &ServerCommand>`）: TS と TSX が同じサーバを指すので
+/// 同じ言語を 2 つのキーで登録することになり、`.tsx` だけ登録し忘れてもコンパイルが通る。
 #[derive(Debug, Clone, Copy)]
-pub struct LanguageServers<'a> {
-    /// TypeScript のチャンクへ尋ねるサーバ。
-    pub typescript: &'a ServerCommand,
-    /// Rust のチャンクへ尋ねるサーバ。
-    pub rust: &'a ServerCommand,
-}
+pub struct LanguageServers<'a>(&'a [ServerCommand]);
 
-/// 走査が使うサーバ。`other_server` は混在走査で 2 つ目の言語に使う。
-#[derive(Clone, Copy)]
-struct ScanServers<'a> {
-    server: &'a ServerCommand,
-    other_server: Option<&'a ServerCommand>,
+impl<'a> LanguageServers<'a> {
+    /// `servers` を並びの順に引く。同じ grammar に対応するサーバが 2 つあれば先のほうを使う。
+    pub fn new(servers: &'a [ServerCommand]) -> Self {
+        Self(servers)
+    }
+
+    /// `grammar` のチャンクへ尋ねるサーバ。並びの中で最初に対応するもの。
+    /// 対応するサーバが並びに無ければ `None`。
+    pub fn server_for(self, grammar: Grammar) -> Option<&'a ServerCommand> {
+        self.0.iter().find(|server| server.supports(grammar))
+    }
+
+    /// 並びの中での `grammar` のサーバの位置。[`Self::server_for`] と同じものを指す。
+    fn position_for(self, grammar: Grammar) -> Option<usize> {
+        self.0.iter().position(|server| server.supports(grammar))
+    }
 }
 
 /// 比べる起点にするチャンクの範囲と、チャンクを切り出す版。
@@ -1410,7 +1446,7 @@ fn scan_with_servers(
     test_functions: TestFunctions,
     thresholds: ConfiguredThresholds,
     declarations: &DomainDeclarations,
-    servers: ScanServers<'_>,
+    servers: LanguageServers<'_>,
     scope: ScanScope<'_>,
 ) -> Result<Scan, ScanError> {
     let tree = scope.tree();
@@ -1479,8 +1515,7 @@ fn scan_with_servers(
         &chunks,
         thresholds,
         declarations,
-        servers.server,
-        servers.other_server,
+        servers,
         ScanInputs {
             file_count,
             skipped_files,
@@ -1590,8 +1625,7 @@ fn scan_of_chunks(
     chunks: &[ScannedChunk],
     thresholds: ConfiguredThresholds,
     declarations: &DomainDeclarations,
-    server: &ServerCommand,
-    other_server: Option<&ServerCommand>,
+    servers: LanguageServers<'_>,
     inputs: ScanInputs,
 ) -> Scan {
     let compared: Vec<ComparedPairs> = chunks
@@ -1616,38 +1650,21 @@ fn scan_of_chunks(
         .collect();
 
     let asked = asked_chunk_indices_of(&candidates);
-    let typescript_server = [Some(server), other_server]
-        .into_iter()
-        .flatten()
-        .find(|server| server.supports(Grammar::TypeScript));
-    let rust_server = [Some(server), other_server]
-        .into_iter()
-        .flatten()
-        .find(|server| server.supports(Grammar::Rust));
-    let typescript_semantics = semantics_for_language_of(
-        chunks,
-        &asked,
-        declarations,
-        typescript_server,
-        Grammar::TypeScript,
-    );
-    let rust_semantics =
-        semantics_for_language_of(chunks, &asked, declarations, rust_server, Grammar::Rust);
+    let semantics = ServedSemantics::ask(chunks, &asked, declarations, servers);
     let candidate_pairs = candidates
         .into_iter()
         .map(|candidate| {
-            let semantics = if chunks[candidate.chunk_a].chunk.grammar() == Grammar::Rust {
-                &rust_semantics
-            } else {
-                &typescript_semantics
-            };
-            candidate_pair_of(chunks, semantics, candidate, thresholds)
+            // 言語をまたぐペアは候補にならないので、片側の grammar で引けば両側を覆う
+            let grammar = chunks[candidate.chunk_a].chunk.grammar();
+            candidate_pair_of(
+                chunks,
+                semantics.for_grammar(grammar),
+                candidate,
+                thresholds,
+            )
         })
         .collect();
-    let semantics_errors = [typescript_semantics, rust_semantics]
-        .into_iter()
-        .filter_map(ScanSemantics::into_error)
-        .collect();
+    let semantics_errors = semantics.into_errors();
 
     Scan {
         candidate_pairs,
@@ -1664,28 +1681,72 @@ fn scan_of_chunks(
     }
 }
 
-fn semantics_for_language_of(
-    chunks: &[ScannedChunk],
-    asked: &BTreeSet<usize>,
-    declarations: &DomainDeclarations,
-    server: Option<&ServerCommand>,
-    language: Grammar,
-) -> ScanSemantics {
-    let language_asked: BTreeSet<usize> = asked
-        .iter()
-        .copied()
-        .filter(|index| chunks[*index].chunk.grammar().same_language_as(language))
-        .collect();
-    let Some(server) = server else {
-        let mut semantics = ScanSemantics::not_asked(chunks.len());
-        for index in language_asked {
-            semantics.per_chunk[index] = ChunkSemantics::Unavailable {
+/// サーバごとに尋ねた意味情報と、どのサーバにも割り振られなかったチャンクの意味情報。
+///
+/// **サーバごとに別々の [`ScanSemantics`] で持つ。** 1 つに合流させると、
+/// [`ScanSemantics::into_error`] がチャンク順で最初の 1 件しか拾わず、
+/// 2 本とも落ちたときの理由が 1 件に減る。
+struct ServedSemantics<'a> {
+    servers: LanguageServers<'a>,
+    /// `servers` と同じ並び。
+    per_server: Vec<ScanSemantics>,
+    unserved: ScanSemantics,
+}
+
+impl<'a> ServedSemantics<'a> {
+    /// 候補チャンク `asked` を、grammar に対応する最初のサーバへ割り振って尋ねる。
+    /// どのサーバにも割り振られないチャンクは [`SemanticsUnavailable::NotAsked`] にする。
+    ///
+    /// **割り振るのは最初の 1 本だけ。** 同じ grammar に対応するサーバが 2 つ並んでいても、
+    /// 2 つ目にはチャンクが来ないので起こさない（[`scan_semantics_of`]）。
+    fn ask(
+        chunks: &[ScannedChunk],
+        asked: &BTreeSet<usize>,
+        declarations: &DomainDeclarations,
+        servers: LanguageServers<'a>,
+    ) -> Self {
+        let position_of = |index: &usize| servers.position_for(chunks[*index].chunk.grammar());
+        let per_server = servers
+            .0
+            .iter()
+            .enumerate()
+            .map(|(position, server)| {
+                let served: BTreeSet<usize> = asked
+                    .iter()
+                    .copied()
+                    .filter(|index| position_of(index) == Some(position))
+                    .collect();
+                scan_semantics_of(chunks, &served, declarations, server)
+            })
+            .collect();
+        let mut unserved = ScanSemantics::not_asked(chunks.len());
+        for index in asked.iter().filter(|index| position_of(index).is_none()) {
+            unserved.per_chunk[*index] = ChunkSemantics::Unavailable {
                 reason: SemanticsUnavailable::NotAsked,
             };
         }
-        return semantics;
-    };
-    scan_semantics_of(chunks, &language_asked, declarations, server)
+        Self {
+            servers,
+            per_server,
+            unserved,
+        }
+    }
+
+    /// `grammar` のチャンクへ尋ねた意味情報。
+    fn for_grammar(&self, grammar: Grammar) -> &ScanSemantics {
+        match self.servers.position_for(grammar) {
+            Some(position) => &self.per_server[position],
+            None => &self.unserved,
+        }
+    }
+
+    /// サーバの並びの順に、尋ねられなかった理由。
+    fn into_errors(self) -> Vec<SemanticsError> {
+        self.per_server
+            .into_iter()
+            .filter_map(ScanSemantics::into_error)
+            .collect()
+    }
 }
 
 /// 構造類似度だけで拾ったペアと、そこまでに測ったシグナル。
@@ -1932,7 +1993,7 @@ impl ScanSemantics {
 ///
 /// 落ちた理由そのものは持たない形（`Unavailable`）と、往復の失敗を持つ形（`Asked`）が
 /// 混ざるのは、**尋ねる前に止まる失敗は走査全体で 1 度しか起きない**ため。
-/// セッションは言語につき 1 本なので、起動や握手に失敗すればその言語の候補チャンクが同時に落ちる。
+/// セッションはサーバにつき 1 本なので、起動や握手に失敗すればそのサーバの候補チャンクが同時に落ちる。
 enum ChunkSemantics {
     /// 候補ペアに現れないので尋ねていない。
     NotACandidate,
@@ -1962,7 +2023,7 @@ struct AskedChunkSemantics {
 
 /// 候補ペアに現れるチャンクへ、Stage 2 のシグナルを尋ねる。
 ///
-/// **サーバは言語につき 1 度だけ起こす。** 候補ペアごとに起こすと、起動と握手と
+/// **サーバは 1 つにつき 1 度だけ起こす。** 候補ペアごとに起こすと、起動と握手と
 /// プロジェクトの読み込みが候補ペアの数だけ走る（`tests/corpus/src` で 65 回）。
 ///
 /// 根は**候補ペアに現れるファイル**から決め、そこから上へプロジェクトの印を探す
@@ -2635,6 +2696,27 @@ mod tests {
 
     fn measured(value: f64) -> Similarity {
         Similarity::new(value).expect("テストが渡す値は 0.0-1.0")
+    }
+
+    #[test]
+    fn test_server_for_picks_the_first_server_that_supports_the_grammar() {
+        let servers = [missing_server(), ServerCommand::typescript()];
+
+        let server = LanguageServers::new(&servers).server_for(Grammar::Tsx);
+
+        assert_eq!(
+            server.map(ServerCommand::program),
+            Some(missing_server().program())
+        );
+    }
+
+    #[test]
+    fn test_server_for_finds_none_when_no_server_supports_the_grammar() {
+        let servers = [ServerCommand::typescript()];
+
+        let server = LanguageServers::new(&servers).server_for(Grammar::Rust);
+
+        assert_eq!(server, None);
     }
 
     #[test]
