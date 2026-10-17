@@ -181,7 +181,7 @@ inventory = ["src/inventory/**", "src/**/product*.ts"]
 | `cli` | `LanguageOption` | `--lang` の値 | enum |
 | 入口（`main.rs`） | `source_language_of` | `--lang` から `SourceLanguage` へ | 網羅 `match` |
 | 入口（`main.rs`） | `report_compare` | `--lang` とファイルの言語の突き合わせ・サーバの選択 | **2 択が 2 つ**（`is_rust`） |
-| 入口（`main.rs`） | `report_scan` / `report_check` が組むサーバ | 言語ごとのサーバ | TypeScript と Rust の 2 本を固定で渡す |
+| 入口（`main.rs`） | `language_servers`（`report_scan` / `report_check` / `report_compare` が使うサーバの並び） | 言語ごとのサーバ | TypeScript と Rust の 2 本を固定で渡す |
 | `lsp` | `ServerLanguage`・`ServerCommand`（`*_SERVER`・`*_PROJECT_MARKERS`・`ServerCommand::rust` に当たる組み立て） | 起動方法・`project marker`・言語 | variant は enum。`ServerCommand::new` は独自サーバを TypeScript として扱う |
 | `lsp` | `ServerCommand::supports` | そのサーバが尋ねられる grammar | `ServerLanguage` に対しては網羅 `match` だが、**中身が 2 択**（`grammar != Grammar::Rust`） |
 | `lsp` | `Connection::new` の `language` | 接続の言語の既定 | TypeScript が既定（`with_language` を呼ばないと TypeScript として扱う） |
@@ -192,7 +192,7 @@ inventory = ["src/inventory/**", "src/**/product*.ts"]
 | `semantics::type_signature` | `type_signature_outcome_of` / `rust_type_signature_outcome_of` の系統 | hover の綴りから型シグネチャを組む系統 | TypeScript と Rust の 2 系統 |
 | `syntax::type_spelling` / `syntax::type_structure`（Rust は `syntax::rust_callable`） | 綴りを構文解析する箇所 | hover の綴りの読み取り | `Grammar::TypeScript` 決め打ち |
 | `pipeline` | `resolved_type_signature_outcome_of` | 型シグネチャの系統の振り分け | **2 択**（Rust でなければ TypeScript） |
-| `pipeline` | `LanguageServers` / `ScanServers`、`scan_with_language_servers` の引数、`scan_of_chunks` のサーバ探し・`semantics_for_language_of` の呼び出し・チャンクへの意味情報の配り方 | 言語ごとのサーバと意味情報 | **2 本固定**。配り方は Rust でなければ TypeScript の意味情報を当てる |
+| `pipeline` | `LanguageServers`・`ServedSemantics`（`scan_of_chunks` が grammar からサーバを引き、チャンクへ意味情報を配る） | 言語ごとのサーバと意味情報 | **2 本固定**。配り方は Rust でなければ TypeScript の意味情報を当てる |
 | CI | `.github/workflows/rust.yml` の「LSP サーバ」「rust-analyzer」の段 | サーバの導入。npm 配布なら「LSP サーバ」の段に倣う（`harness/deps/resolve-node.sh` と `pnpm-lock.yaml`）。それ以外は「rust-analyzer」の段に倣い、版を固定して取り sha256 で確かめる | 「LSP サーバ」が `pnpm install --frozen-lockfile` で typescript-language-server、「rust-analyzer」が curl と `sha256sum --check` で rust-analyzer |
 | テスト | 実サーバのテスト（TypeScript は `tests/semantics.rs`、Rust は `tests/rust_lsp.rs`）・`tests/language_cli.rs`・`tests/fixtures/` | 実サーバのテスト（`#[ignore]`、CI の `cargo test -- --ignored` が走らせる）・CLI の言語の振り分け・フィクスチャ | 言語ごと |
 
