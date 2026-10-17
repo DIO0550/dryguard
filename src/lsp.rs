@@ -1709,6 +1709,11 @@ mod tests {
     }
 
     /// `window/logMessage` を際限なく流し続ける台本。
+    ///
+    /// **`streaming limit` を超えたときに返る `Streamed` は決まらない。** `yes` がパイプを
+    /// 埋め続けるので読み口への補充はフレームの途中で切れることがあり、上限を過ぎたのがフレームを
+    /// 捌いた後なら `OtherMessages`、途中の補充なら `UnfinishedFrame` になる。
+    /// どちらになるかの見分けは `connection` の単体テストが決まった入力で確かめる。
     fn streaming_notifications() -> String {
         let notification = r#"{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":4,"message":"indexing"}}"#;
         format!(
@@ -1800,7 +1805,7 @@ mod tests {
                     program,
                     awaited: Awaited::Response { method },
                     waited,
-                    streamed: Streamed::OtherMessages,
+                    streamed: _,
                 } if program == "sh" && method == HoverRequest::METHOD && *waited == SHORT_LIMIT
             ),
             "{error:?}"
@@ -1881,7 +1886,7 @@ mod tests {
                     program,
                     awaited: Awaited::Response { method },
                     waited,
-                    streamed: Streamed::OtherMessages,
+                    streamed: _,
                 } if program == "sh"
                     && method == GotoImplementation::METHOD
                     && *waited == SHORT_LIMIT
