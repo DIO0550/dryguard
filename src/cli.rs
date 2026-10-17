@@ -98,7 +98,7 @@ pub struct CommonOptions {
     #[arg(long, global = true)]
     pub explain: bool,
 
-    /// 指定したラベルが出たら終了コードを 1 にする
+    /// 指定した判定が出たら終了コードを 1 にする（LSP に尋ね切れなければ 2）
     #[arg(long, value_enum, global = true)]
     pub fail_on: Option<FailOn>,
 }
