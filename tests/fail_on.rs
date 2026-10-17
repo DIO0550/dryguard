@@ -93,8 +93,13 @@ fn test_compare_with_fail_on_exits_with_two_even_when_the_verdict_would_pass() {
     // 尋ね切れていれば DO-NOT-EXTRACT に変わったかもしれないので、0 を返さない
     let [left, right] = extract_candidate_pair();
     let output = run_without_an_lsp(&["compare", &left, &right, "--fail-on", "do-not-extract"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
+    assert!(
+        stdout.starts_with("[EXTRACT-CANDIDATE] "),
+        "判定は通る組を選んでいる: {stdout}"
+    );
     assert_eq!(output.status.code(), Some(NOT_CLASSIFIED), "{stderr}");
 }
 
@@ -134,6 +139,28 @@ fn test_compare_with_fail_on_succeeds_without_an_lsp_when_the_pair_is_not_a_cand
 
     assert_eq!(output.status.code(), Some(0), "{stdout}");
     assert!(stdout.starts_with("[REVIEW] "), "{stdout}");
+}
+
+#[test]
+fn test_compare_json_with_fail_on_stays_readable_when_the_lsp_cannot_be_asked() {
+    // 2 で終わるときも、理由は stderr にだけ出す。stdout に混ぜると JSON を読む側が壊れる
+    let [left, right] = do_not_extract_pair();
+    let output = run_without_an_lsp(&[
+        "compare",
+        &left,
+        &right,
+        "--format",
+        "json",
+        "--fail-on",
+        "do-not-extract",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(NOT_CLASSIFIED), "{stdout}");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&stdout).is_ok(),
+        "stdout は JSON として読める: {stdout}"
+    );
 }
 
 #[test]
@@ -178,6 +205,28 @@ fn test_scan_with_fail_on_exits_with_two_when_the_lsp_cannot_be_asked() {
 }
 
 #[test]
+fn test_scan_with_fail_on_succeeds_without_an_lsp_when_there_is_no_candidate_pair() {
+    // 候補ペアが無ければ LSP に尋ねないので、検査は欠けていない。
+    // 対照は上のテストで、同じ環境・同じ指定で候補ペアのある走査は 2 になる
+    let root = format!("{}/tests/corpus/src/shared", env!("CARGO_MANIFEST_DIR"));
+    let output = run_without_an_lsp(&["scan", &root, "--fail-on", "do-not-extract"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+}
+
+#[test]
+fn test_scan_without_fail_on_succeeds_even_when_the_lsp_cannot_be_asked() {
+    let root = fixture("scan");
+    let output = run_without_an_lsp(&["scan", &root]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(stdout.contains("[DO-NOT-EXTRACT] "), "{stdout}");
+}
+
+#[test]
 fn test_scan_that_cannot_start_exits_with_two() {
     let root = fixture("does-not-exist");
     let output = run_without_an_lsp(&["scan", &root, "--fail-on", "do-not-extract"]);
@@ -215,6 +264,32 @@ fn test_compare_with_fail_on_succeeds_when_the_pair_is_extract_candidate() {
     assert_eq!(output.status.code(), Some(0), "{stdout}");
     assert!(stdout.starts_with("[EXTRACT-CANDIDATE] "), "{stdout}");
     assert!(!stderr.contains(UNCHECKED_REASON), "{stderr}");
+}
+
+#[test]
+#[ignore = "typescript-language-server が要る。CI では入れて --ignored で走らせる"]
+fn test_compare_with_fail_on_succeeds_when_a_signal_is_unmeasurable_but_the_lsp_answered() {
+    // サーバが答えたうえでの「測れない」は、検査が欠けたことに数えない。
+    // 数えると、環境が正常でも --fail-on が通る回が無くなる
+    let [left, right] = extract_candidate_pair();
+    let output = run_with_an_lsp(&[
+        "compare",
+        &left,
+        &right,
+        "--format",
+        "json",
+        "--fail-on",
+        "do-not-extract",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stdout.contains(r#""status": "unmeasurable""#),
+        "測れないシグナルを含む組を選んでいる: {stdout}"
+    );
+    assert!(!stderr.contains(UNCHECKED_REASON), "{stderr}");
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
 }
 
 #[test]
