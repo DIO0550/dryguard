@@ -174,10 +174,51 @@ impl WaitLimits {
     };
 }
 
+/// rust-analyzer は読み込みの進捗を複数の作業として報告する。
+/// 途中の応答を採らずに、その一連の作業が落ち着くまで尋ね直す上限。
+const RUST_SETTLED_ATTEMPTS: usize = 32;
+
+/// rust-analyzer は hover の綴りの前のフェンスにクレート名・モジュールのパスを置く。
+/// 2 つ目のフェンスが無ければ先頭を読む。
+const RUST_HOVER_FENCES: &[usize] = &[1, 0];
+
+/// サーバの問い合わせ形式。**サーバごとの値を選ぶのは、ここの網羅 `match` だけ。**
+///
+/// TypeScript の値は、バイト列で組む往復の既定として `hover` / `connection` が持ち、
+/// ここはそれを選ぶ。`connection` / `hover` には値だけを渡す。variant を足すと
+/// このファイルの `match` だけがコンパイルで止まり、サーバを足す変更がこのファイルに収まる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ServerLanguage {
     TypeScript,
     Rust,
+}
+
+impl ServerLanguage {
+    /// hover の応答で、綴りを探すコードフェンスの試す順（0 始まり）。
+    fn hover_fences(self) -> &'static [usize] {
+        match self {
+            Self::TypeScript => hover::LEADING_FENCE,
+            Self::Rust => RUST_HOVER_FENCES,
+        }
+    }
+
+    /// 落ち着いた答えを求めて尋ね直す回数の上限。
+    fn settled_attempts(self) -> usize {
+        match self {
+            Self::TypeScript => connection::SETTLED_ATTEMPTS,
+            Self::Rust => RUST_SETTLED_ATTEMPTS,
+        }
+    }
+
+    /// `project membership` を尋ねるか。
+    ///
+    /// Rust は Cargo.toml でワークスペースを決め、tsserver の projectInfo を持たない。
+    fn asks_project_membership(self) -> bool {
+        match self {
+            Self::TypeScript => true,
+            Self::Rust => false,
+        }
+    }
 }
 
 /// どの LSP サーバをどう起動するか。
@@ -279,6 +320,7 @@ pub struct Client {
     connection: Connection<BufReader<SilenceLimitedReader>, IntakeLimitedWriter>,
     stderr: StderrTail,
     program: String,
+    language: ServerLanguage,
     wait_limits: WaitLimits,
     terminated: bool,
     /// 沈黙の上限・待つ合計の上限を超えて見限ったか、見限ったならどちらの上限か。
@@ -348,10 +390,12 @@ impl Client {
         Ok(Self {
             child,
             connection: Connection::new(BufReader::new(output), input)
-                .with_language(command.language)
+                .with_hover_fences(command.language.hover_fences())
+                .with_settled_attempts(command.language.settled_attempts())
                 .with_streaming_limit(command.wait_limits.streaming),
             stderr,
             program: command.program.clone(),
+            language: command.language,
             wait_limits: command.wait_limits,
             terminated: false,
             abandoned: None,
@@ -526,10 +570,11 @@ pub struct Session {
 }
 
 impl Session {
-    /// Rust は Cargo.toml でワークスペースを決め、tsserver の projectInfo を持たない。
+    /// サーバに `project membership` を尋ねるか。
     pub(crate) fn needs_project_membership_query(&self) -> bool {
-        self.client.connection.language() == ServerLanguage::TypeScript
+        self.client.language.asks_project_membership()
     }
+
     /// サーバができること。
     pub fn capabilities(&self) -> &ServerCapabilities {
         &self.capabilities
@@ -1811,6 +1856,111 @@ mod tests {
             "{error:?}"
         );
         assert!(started.elapsed() < GENEROUS_LIMIT, "期限で戻る");
+    }
+
+    /// 握手に答えた後、黙って居続けるサーバを、`language` の問い合わせ形式で握手させた結果。
+    fn handshake_as(language: ServerLanguage, after_handshake: &str) -> Session {
+        let command = ServerCommand {
+            language,
+            ..fake_server(
+                &format!(
+                    "{}; {after_handshake}exec sleep 30",
+                    printed_frame(INITIALIZE_RESPONSE)
+                ),
+                GENEROUS_LIMITS,
+            )
+        };
+        Client::start(&command)
+            .expect("起動できる")
+            .handshake(&fixture_workspace_root())
+            .expect("握手できる")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_session_with_rust_analyzer_does_not_ask_project_membership() {
+        let session = handshake_as(ServerLanguage::Rust, "");
+
+        assert!(!session.needs_project_membership_query());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_session_with_typescript_server_asks_project_membership() {
+        let session = handshake_as(ServerLanguage::TypeScript, "");
+
+        assert!(session.needs_project_membership_query());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_session_with_rust_analyzer_asks_again_through_more_progress_phases_than_the_default() {
+        // 読み込みの作業を 3 つ報告し、そのたびに作業に触れた答えを返す台本。既定の 3 回で
+        // 尋ね直しを打ち切ると、4 回目の落ち着いた答え（id 5）に届かない
+        let phase = |token: &str, id: u64, answer: &str| {
+            [
+                format!(
+                    r#"{{"jsonrpc":"2.0","method":"$/progress","params":{{"token":"{token}","value":{{"kind":"begin","title":"loading"}}}}}}"#
+                ),
+                rust_hover_response(id, answer),
+                format!(
+                    r#"{{"jsonrpc":"2.0","method":"$/progress","params":{{"token":"{token}","value":{{"kind":"end"}}}}}}"#
+                ),
+            ]
+        };
+        let frames: Vec<String> = [
+            phase("fetching", 2, "fn early()"),
+            phase("crate-graph", 3, "fn partial()"),
+            phase("roots", 4, "fn almost()"),
+        ]
+        .into_iter()
+        .flatten()
+        .chain([rust_hover_response(5, "fn ready()")])
+        .map(|frame| format!("{}; ", printed_frame(&frame)))
+        .collect();
+        let mut session = handshake_as(ServerLanguage::Rust, &frames.concat());
+        let document = fixture_document();
+        session.open_document(&document).expect("開かせられる");
+        let position = SourcePosition::from_preceding_text(line(5), "export function ");
+
+        let outcome = session
+            .hover(&document, position)
+            .expect("応答を受け取れる");
+
+        assert_eq!(
+            outcome,
+            HoverOutcome::Answered(signature_text("fn ready()"))
+        );
+    }
+
+    /// rust-analyzer の形の hover の応答。綴りの前のフェンスにモジュールのパスを置く。
+    fn rust_hover_response(id: u64, signature: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"contents":{{"kind":"markdown","value":"```rust\nfixture\n```\n\n```rust\n{signature}\n```"}}}}}}"#
+        )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_session_with_rust_analyzer_reads_the_hover_after_the_module_path() {
+        // 先頭のフェンスだけを読むと、モジュールのパス（`fixture`）を綴りとして返す
+        let hover = rust_hover_response(2, "fn ready()");
+        let mut session = handshake_as(
+            ServerLanguage::Rust,
+            &format!("{}; ", printed_frame(&hover)),
+        );
+        let document = fixture_document();
+        session.open_document(&document).expect("開かせられる");
+        let position = SourcePosition::from_preceding_text(line(5), "export function ");
+
+        let outcome = session
+            .hover(&document, position)
+            .expect("応答を受け取れる");
+
+        assert_eq!(
+            outcome,
+            HoverOutcome::Answered(signature_text("fn ready()"))
+        );
     }
 
     #[test]
