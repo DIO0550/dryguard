@@ -485,12 +485,10 @@ const CHUNK_KINDS: [&str; 6] = [
 /// Rust でチャンクとして拾うノードの種別。
 ///
 /// 自由関数も `impl` / トレイト実装のメソッドも `function_item`。`impl_item` を入れないのは、
-/// 比較の単位がメソッドだから。
+/// 比較の単位がメソッドだから。本体のないトレイトの宣言 (`function_signature_item`) は比較しない。
 const RUST_CHUNK_KIND: &str = "function_item";
 
 /// そのノードが、grammar ごとのチャンク種別に当たるか。
-///
-/// Rust は本体のないトレイトの宣言 (`function_signature_item`) を比較しない。
 fn is_chunk_node(node: Node<'_>, grammar: Grammar) -> bool {
     match grammar {
         Grammar::TypeScript | Grammar::Tsx => CHUNK_KINDS.contains(&node.kind()),
