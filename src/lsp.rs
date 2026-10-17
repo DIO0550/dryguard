@@ -182,10 +182,11 @@ const RUST_SETTLED_ATTEMPTS: usize = 32;
 /// 2 つ目のフェンスが無ければ先頭を読む。
 const RUST_HOVER_FENCES: &[usize] = &[1, 0];
 
-/// サーバの問い合わせ形式。**サーバごとに決まる値はここの網羅 `match` だけが持つ。**
+/// サーバの問い合わせ形式。**サーバごとの値を選ぶのは、ここの網羅 `match` だけ。**
 ///
-/// `connection` / `hover` には値だけを渡す。variant を足すとこのファイルの `match` だけが
-/// コンパイルで止まり、サーバを足す変更がこのファイルに収まる。
+/// TypeScript の値は、バイト列で組む往復の既定として `hover` / `connection` が持ち、
+/// ここはそれを選ぶ。`connection` / `hover` には値だけを渡す。variant を足すと
+/// このファイルの `match` だけがコンパイルで止まり、サーバを足す変更がこのファイルに収まる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ServerLanguage {
     TypeScript,
