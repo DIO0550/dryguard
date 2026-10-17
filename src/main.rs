@@ -256,8 +256,8 @@ fn report_check(
 /// 言語ごとに起こす LSP サーバ。**言語を足すときはここに 1 行足す。**
 ///
 /// 並びの順が、サーバを使えなかった理由を stderr に出す順になる。
-fn language_servers() -> [ServerCommand; 2] {
-    [ServerCommand::typescript(), ServerCommand::rust()]
+fn language_servers() -> Vec<ServerCommand> {
+    vec![ServerCommand::typescript(), ServerCommand::rust()]
 }
 
 /// `--lang` から、走査するソースの言語。

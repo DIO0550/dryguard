@@ -1242,7 +1242,7 @@ pub fn scan_of(
 }
 
 /// 指定した言語のソースを走査する。渡したサーバが対応する言語だけに尋ねる。
-/// 混在走査で両方へ尋ねる場合は [`scan_with_language_servers`] を使う。
+/// 混在走査で言語ごとのサーバへ尋ねる場合は [`scan_with_language_servers`] を使う。
 ///
 /// # Errors
 ///
@@ -1345,7 +1345,7 @@ pub fn check_with_language_servers(
 /// 言語ごとに起こす LSP サーバの並び。
 ///
 /// **grammar からサーバを引く。** 言語ごとのフィールドで持つと、言語を足すたびに
-/// この型と、サーバを探して意味情報を配る側（[`scan_of_chunks`]）の両方を触ることになる。
+/// この型と、サーバを探して意味情報を配る側（`scan_of_chunks`）の両方を触ることになる。
 ///
 /// Why not（`BTreeMap<Grammar, &ServerCommand>`）: TS と TSX が同じサーバを指すので
 /// 同じ言語を 2 つのキーで登録することになり、`.tsx` だけ登録し忘れてもコンパイルが通る。
@@ -1360,11 +1360,11 @@ impl<'a> LanguageServers<'a> {
 
     /// `grammar` のチャンクへ尋ねるサーバ。並びの中で最初に対応するもの。
     /// 対応するサーバが並びに無ければ `None`。
-    pub fn server_for(self, grammar: Grammar) -> Option<&'a ServerCommand> {
-        self.0.iter().find(|server| server.supports(grammar))
+    fn server_for(self, grammar: Grammar) -> Option<&'a ServerCommand> {
+        self.position_for(grammar).map(|position| &self.0[position])
     }
 
-    /// 並びの中での `grammar` のサーバの位置。[`Self::server_for`] と同じものを指す。
+    /// 並びの中での `grammar` のサーバの位置。対応するサーバが並びに無ければ `None`。
     fn position_for(self, grammar: Grammar) -> Option<usize> {
         self.0.iter().position(|server| server.supports(grammar))
     }
