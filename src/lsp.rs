@@ -174,10 +174,50 @@ impl WaitLimits {
     };
 }
 
+/// rust-analyzer は読み込みの進捗を複数の作業として報告する。
+/// 途中の応答を採らずに、その一連の作業が落ち着くまで尋ね直す上限。
+const RUST_SETTLED_ATTEMPTS: usize = 32;
+
+/// rust-analyzer は hover の綴りの前のフェンスにクレート名・モジュールのパスを置く。
+/// 2 つ目のフェンスが無ければ先頭を読む。
+const RUST_HOVER_FENCES: &[usize] = &[1, 0];
+
+/// サーバの問い合わせ形式。**サーバごとに決まる値はここの網羅 `match` だけが持つ。**
+///
+/// `connection` / `hover` には値だけを渡す。variant を足すとこのファイルの `match` だけが
+/// コンパイルで止まり、サーバを足す変更がこのファイルに収まる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ServerLanguage {
     TypeScript,
     Rust,
+}
+
+impl ServerLanguage {
+    /// hover の応答で、綴りを探すコードフェンスの試す順（0 始まり）。
+    fn hover_fences(self) -> &'static [usize] {
+        match self {
+            Self::TypeScript => hover::LEADING_FENCE,
+            Self::Rust => RUST_HOVER_FENCES,
+        }
+    }
+
+    /// 落ち着いた答えを求めて尋ね直す回数の上限。
+    fn settled_attempts(self) -> usize {
+        match self {
+            Self::TypeScript => connection::SETTLED_ATTEMPTS,
+            Self::Rust => RUST_SETTLED_ATTEMPTS,
+        }
+    }
+
+    /// `project membership` を尋ねるか。
+    ///
+    /// Rust は Cargo.toml でワークスペースを決め、tsserver の projectInfo を持たない。
+    fn asks_project_membership(self) -> bool {
+        match self {
+            Self::TypeScript => true,
+            Self::Rust => false,
+        }
+    }
 }
 
 /// どの LSP サーバをどう起動するか。
@@ -279,6 +319,7 @@ pub struct Client {
     connection: Connection<BufReader<SilenceLimitedReader>, IntakeLimitedWriter>,
     stderr: StderrTail,
     program: String,
+    language: ServerLanguage,
     wait_limits: WaitLimits,
     terminated: bool,
     /// 沈黙の上限・待つ合計の上限を超えて見限ったか、見限ったならどちらの上限か。
@@ -348,10 +389,12 @@ impl Client {
         Ok(Self {
             child,
             connection: Connection::new(BufReader::new(output), input)
-                .with_language(command.language)
+                .with_hover_fences(command.language.hover_fences())
+                .with_settled_attempts(command.language.settled_attempts())
                 .with_streaming_limit(command.wait_limits.streaming),
             stderr,
             program: command.program.clone(),
+            language: command.language,
             wait_limits: command.wait_limits,
             terminated: false,
             abandoned: None,
@@ -526,10 +569,11 @@ pub struct Session {
 }
 
 impl Session {
-    /// Rust は Cargo.toml でワークスペースを決め、tsserver の projectInfo を持たない。
+    /// サーバに `project membership` を尋ねるか。
     pub(crate) fn needs_project_membership_query(&self) -> bool {
-        self.client.connection.language() == ServerLanguage::TypeScript
+        self.client.language.asks_project_membership()
     }
+
     /// サーバができること。
     pub fn capabilities(&self) -> &ServerCapabilities {
         &self.capabilities

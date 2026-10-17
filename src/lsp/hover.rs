@@ -4,11 +4,13 @@
 //! こちらが読める形へ直す変換だけなので、サーバを起動せずに確かめられる
 //! (rules/tdd.md「`lsp` は『応答を受け取ってから先』を切り出す」)。
 
-use super::ServerLanguage;
 use lsp_types::{Hover, HoverContents};
 
 /// マークダウンのコードフェンスの印。
 const FENCE: &str = "```";
+
+/// 先頭のフェンスだけを読む試す順。typescript-language-server は綴りを先頭のフェンスに置く。
+pub(super) const LEADING_FENCE: &[usize] = &[0];
 
 /// hover に由来する綴り。**型構造の正規化前**（`rules/naming.md` の `signature text`）。
 /// Rust の配列長をソースから復元した綴りも、構造比較の前はこの型で持つ。
@@ -85,11 +87,14 @@ pub enum HoverOutcome {
 /// 読むところまで。
 #[cfg(test)]
 pub(super) fn outcome_of(hover: &Hover) -> HoverOutcome {
-    outcome_for_language(hover, ServerLanguage::TypeScript)
+    outcome_of_fences(hover, LEADING_FENCE)
 }
 
-/// サーバの hover レイアウトに応じてシグネチャを読む。
-pub(super) fn outcome_for_language(hover: &Hover, language: ServerLanguage) -> HoverOutcome {
+/// `fences` の順にコードフェンスを試し、最初に見つかったものからシグネチャを読む。
+///
+/// `fences` は何番目のフェンス（0 始まり）を試すかの並び。どのフェンスに綴りがあるかは
+/// サーバごとに決まるので、ここでは選ばずに受け取る（サーバの指定は `lsp` が持つ）。
+pub(super) fn outcome_of_fences(hover: &Hover, fences: &[usize]) -> HoverOutcome {
     let HoverContents::Markup(content) = &hover.contents else {
         // `MarkedString` は LSP 3.15 で非推奨になった形。今つないでいるサーバは
         // どれも `Markup` を返すので、読める形は要る相手が現れたときに足す。
@@ -97,12 +102,9 @@ pub(super) fn outcome_for_language(hover: &Hover, language: ServerLanguage) -> H
         return HoverOutcome::Unreadable;
     };
 
-    let text = match language {
-        ServerLanguage::TypeScript => fenced_text_of(&content.value, 0),
-        ServerLanguage::Rust => {
-            fenced_text_of(&content.value, 1).or_else(|| fenced_text_of(&content.value, 0))
-        }
-    };
+    let text = fences
+        .iter()
+        .find_map(|&index| fenced_text_of(&content.value, index));
     match text.and_then(SignatureText::new) {
         Some(signature_text) => HoverOutcome::Answered(signature_text),
         None => HoverOutcome::Unreadable,
@@ -171,7 +173,7 @@ mod tests {
         );
 
         assert_eq!(
-            outcome_for_language(&hover, ServerLanguage::Rust),
+            outcome_of_fences(&hover, &[1, 0]),
             HoverOutcome::Answered(signature_text("pub fn first(value: i32) -> i32"))
         );
     }
@@ -181,7 +183,7 @@ mod tests {
         let hover =
             markdown_hover("```rust\nfixture::model\n```\n\n```rust\npub type Amount = u64\n```");
         assert_eq!(
-            outcome_for_language(&hover, ServerLanguage::Rust),
+            outcome_of_fences(&hover, &[1, 0]),
             HoverOutcome::Answered(signature_text("pub type Amount = u64"))
         );
     }
