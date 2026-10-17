@@ -2009,7 +2009,8 @@ mod tests {
     }
 
     #[test]
-    fn test_rust_hover_waits_through_several_progress_phases_and_content_modified() {
+    fn test_hover_with_attempts_beyond_the_phases_waits_through_several_progress_phases_and_content_modified()
+     {
         let server_output = frames_of(&[
             &progress_begin_notification("fetching"),
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32801,"message":"content modified"}}"#,

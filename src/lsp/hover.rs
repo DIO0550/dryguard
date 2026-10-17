@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rust_analyzer_hover_reads_the_declaration_after_the_crate_name() {
+    fn test_hover_outcome_of_fences_reads_the_declaration_after_the_crate_name() {
         let hover = markdown_hover(
             "```rust\ndryguard_fixture\n```\n\n```rust\npub fn first(value: i32) -> i32\n```",
         );
@@ -179,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rust_analyzer_hover_reads_alias_after_the_module_path() {
+    fn test_hover_outcome_of_fences_reads_alias_after_the_module_path() {
         let hover =
             markdown_hover("```rust\nfixture::model\n```\n\n```rust\npub type Amount = u64\n```");
         assert_eq!(
