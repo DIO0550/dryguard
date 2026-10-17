@@ -86,6 +86,20 @@ fn test_scan_auto_asks_both_servers_without_comparing_across_languages() {
 }
 
 #[test]
+fn test_scan_auto_reports_typescript_server_failure_before_rust_analyzer() {
+    let root = fixture("");
+    let output = run(&["scan", &root, "--lang", "auto"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let typescript = stderr.find("typescript-language-server");
+    let rust = stderr.find("rust-analyzer");
+
+    assert!(output.status.success(), "{stderr}");
+    assert!(typescript.is_some() && rust.is_some(), "{stderr}");
+    assert!(typescript < rust, "サーバの並びの順に出す: {stderr}");
+}
+
+#[test]
 fn test_scan_rust_only_asks_rust_analyzer_and_excludes_typescript() {
     let root = fixture("");
     let output = run(&["scan", &root, "--lang", "rust"]);

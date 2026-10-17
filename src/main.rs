@@ -24,8 +24,8 @@ use dryguard::domain_declaration::DomainDeclarations;
 use dryguard::location::Location;
 use dryguard::lsp::ServerCommand;
 use dryguard::pipeline::{
-    LanguageServers, Scan, check_with_language_servers, chunk_pair_of, measured_pair_of,
-    scan_with_language_servers,
+    LanguageServers, Scan, check_with_language_servers, chunk_pair_of,
+    measured_pair_with_language_servers, scan_with_language_servers,
 };
 use dryguard::report::{Explanation, json_of, scan_json_of, scan_text_of, text_of};
 use dryguard::syntax::chunk::TestFunctions;
@@ -158,21 +158,20 @@ fn report_compare(
         return ExitCode::from(NOT_CLASSIFIED);
     }
 
-    let server = if is_rust {
-        ServerCommand::rust()
-    } else {
-        ServerCommand::typescript()
-    };
     // **宣言の食い違いは判定を出さずに止める。** 直す先は dryguard.toml で、
     // どちらかの宣言へ寄せた判定を出すと、並べ替えただけで答えが変わる
-    let measured =
-        match measured_pair_of(&pair, settings.thresholds, settings.declarations, &server) {
-            Ok(measured) => measured,
-            Err(error) => {
-                eprintln!("{error}");
-                return ExitCode::from(NOT_CLASSIFIED);
-            }
-        };
+    let measured = match measured_pair_with_language_servers(
+        &pair,
+        settings.thresholds,
+        settings.declarations,
+        LanguageServers::new(&language_servers()),
+    ) {
+        Ok(measured) => measured,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(NOT_CLASSIFIED);
+        }
+    };
     if let Some(error) = measured.semantics_error() {
         // **どのシグナルが取れなかったかはここで言わない。** 片方だけ落ちることが
         // あるので数え上げると判定の根拠と食い違う。取れなかったシグナルは
@@ -212,8 +211,7 @@ fn report_scan(
         test_functions,
         settings.thresholds,
         settings.declarations,
-        &ServerCommand::typescript(),
-        &ServerCommand::rust(),
+        LanguageServers::new(&language_servers()),
     ) {
         Ok(scan) => scan,
         Err(error) => {
@@ -244,10 +242,7 @@ fn report_check(
         test_functions,
         settings.thresholds,
         settings.declarations,
-        LanguageServers {
-            typescript: &ServerCommand::typescript(),
-            rust: &ServerCommand::rust(),
-        },
+        LanguageServers::new(&language_servers()),
     ) {
         Ok(scan) => scan,
         Err(error) => {
@@ -256,6 +251,13 @@ fn report_check(
         }
     };
     report_walked(&scan, options)
+}
+
+/// 言語ごとに起こす LSP サーバ。**言語を足すときはここに 1 行足す。**
+///
+/// 並びの順が、サーバを使えなかった理由を stderr に出す順になる。
+fn language_servers() -> Vec<ServerCommand> {
+    vec![ServerCommand::typescript(), ServerCommand::rust()]
 }
 
 /// `--lang` から、走査するソースの言語。
