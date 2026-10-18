@@ -285,8 +285,8 @@ mod tests {
 }
 "#;
 
-    /// クラスとメソッド・コンストラクタを持つ Java のソース。TypeScript の grammar では
-    /// 引数の型を前に書く形（`double price`）が読めない。
+    /// クラスとメソッド・コンストラクタを持つ Java のソース。package 宣言や型を前に置く
+    /// 引数のように、Java の grammar でなければ読めない構文を含む。
     const A_JAVA_CLASS: &str = r#"package billing;
 
 import java.util.List;
@@ -336,6 +336,22 @@ public class Discount {
     }
 
     #[test]
+    fn test_grammar_of_a_java_path_reads_it_as_java() {
+        assert_eq!(
+            Grammar::of_path(Path::new("src/billing/Discount.java")),
+            Some(Grammar::Java)
+        );
+    }
+
+    #[test]
+    fn test_grammar_java_is_the_same_language_only_as_java() {
+        // 対照は Rust と TypeScript。腕を足し忘れると Java 同士も比べられない側へ倒れる
+        assert!(Grammar::Java.same_language_as(Grammar::Java));
+        assert!(!Grammar::Java.same_language_as(Grammar::Rust));
+        assert!(!Grammar::TypeScript.same_language_as(Grammar::Java));
+    }
+
+    #[test]
     fn test_grammar_of_an_mts_path_reads_it_as_typescript() {
         // `.mts` に JSX は書けないので TSX の grammar にはならない
         assert_eq!(
@@ -367,22 +383,6 @@ public class Discount {
     }
 
     #[test]
-    fn test_grammar_of_a_java_path_reads_it_as_java() {
-        assert_eq!(
-            Grammar::of_path(Path::new("src/billing/Discount.java")),
-            Some(Grammar::Java)
-        );
-    }
-
-    #[test]
-    fn test_grammar_java_is_the_same_language_only_as_java() {
-        // 対照は Rust と TypeScript。腕を足し忘れると Java 同士も比べられない側へ倒れる
-        assert!(Grammar::Java.same_language_as(Grammar::Java));
-        assert!(!Grammar::Java.same_language_as(Grammar::Rust));
-        assert!(!Grammar::TypeScript.same_language_as(Grammar::Java));
-    }
-
-    #[test]
     fn test_grammar_of_a_path_with_another_extension_is_not_readable() {
         // 対照は上の 2 つ。読める拡張子と同じディレクトリにあっても選べない
         assert_eq!(Grammar::of_path(Path::new("src/report/notes.md")), None);
@@ -408,8 +408,8 @@ public class Discount {
 
     #[test]
     fn test_syntax_tree_of_a_java_class_read_as_typescript_marks_an_error() {
-        // 対照は上のテスト。`language` が別の grammar を返していたら、上が落ちるか
-        // こちらと同じ答えになる
+        // 対照は上のテスト。このソースが他の grammar では読めないので、`language` が
+        // 別の grammar を返せば上のテストが落ちる
         assert!(has_error(A_JAVA_CLASS, Grammar::TypeScript));
     }
 
