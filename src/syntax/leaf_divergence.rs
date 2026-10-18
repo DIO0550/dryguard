@@ -353,6 +353,7 @@ fn signature_type_nodes_of(node: Node<'_>, grammar: Grammar) -> Vec<Node<'_>> {
     let parameter_kinds: &[&str] = match grammar {
         Grammar::Rust => &["parameter"],
         Grammar::TypeScript | Grammar::Tsx => &["required_parameter", "optional_parameter"],
+        Grammar::Swift => &[],
     };
     let mut cursor = parameters.walk();
     for parameter in parameters.named_children(&mut cursor) {
@@ -391,6 +392,8 @@ fn bound_names_of(
         match grammar {
             Grammar::Rust => rust_binders_of(current, source, &mut binders),
             Grammar::TypeScript | Grammar::Tsx => typescript_binders_of(current, &mut binders),
+            // 束縛を集めないと、付け替えも「違う」側に数えられる（偽陰性側）
+            Grammar::Swift => {}
         }
 
         let mut cursor = current.walk();

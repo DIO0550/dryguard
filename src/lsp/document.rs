@@ -103,6 +103,8 @@ enum LanguageId {
     TypeScriptReact,
     /// `.rs`
     Rust,
+    /// `.swift`
+    Swift,
 }
 
 impl LanguageId {
@@ -111,6 +113,7 @@ impl LanguageId {
             Grammar::TypeScript => Self::TypeScript,
             Grammar::Tsx => Self::TypeScriptReact,
             Grammar::Rust => Self::Rust,
+            Grammar::Swift => Self::Swift,
         }
     }
 
@@ -120,6 +123,7 @@ impl LanguageId {
             Self::TypeScript => "typescript",
             Self::TypeScriptReact => "typescriptreact",
             Self::Rust => "rust",
+            Self::Swift => "swift",
         }
     }
 }

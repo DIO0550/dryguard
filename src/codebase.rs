@@ -45,6 +45,8 @@ impl SourceLanguage {
             (Self::TypeScript, Grammar::Rust) => false,
             (Self::Rust, Grammar::Rust) => true,
             (Self::Rust, Grammar::TypeScript | Grammar::Tsx) => false,
+            // Swift のチャンクはまだ切り出せないので、`auto` でも走査に入れない
+            (Self::Auto | Self::TypeScript | Self::Rust, Grammar::Swift) => false,
         }
     }
 }

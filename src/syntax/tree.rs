@@ -29,6 +29,8 @@ pub enum Grammar {
     Tsx,
     /// `.rs`
     Rust,
+    /// `.swift`
+    Swift,
 }
 
 impl Grammar {
@@ -48,6 +50,7 @@ impl Grammar {
             "ts" | "mts" | "cts" => Some(Self::TypeScript),
             "tsx" => Some(Self::Tsx),
             "rs" => Some(Self::Rust),
+            "swift" => Some(Self::Swift),
             _ => None,
         }
     }
@@ -58,12 +61,14 @@ impl Grammar {
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Self::Swift => tree_sitter_swift::LANGUAGE.into(),
         }
     }
 
     /// TS と TSX は同じ言語のチャンクとして比較する。
     pub fn same_language_as(self, other: Self) -> bool {
         matches!((self, other), (Self::Rust, Self::Rust))
+            || matches!((self, other), (Self::Swift, Self::Swift))
             || matches!(
                 (self, other),
                 (Self::TypeScript | Self::Tsx, Self::TypeScript | Self::Tsx)

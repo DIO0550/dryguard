@@ -760,6 +760,8 @@ fn asked_semantics_of(
 /// （`semantics::resolved_type`）。**Rust は hover の後に宣言の場所とエイリアスの右辺を
 /// 集める。** 順序は `semantics::type_signature::rust_type_signature_outcome_of` が
 /// 中に持つ（読み込み前の definition は空を返すので、hover が落ち着くのを先に待つ）。
+/// 綴りを読む側がまだ無い grammar（Swift）は、尋ねずに
+/// [`TypeSignatureOutcome::NoSignatureReader`] を返す。
 ///
 /// `declarations_cache` は同じセッションで尋ねるチャンクのあいだで共有する、Rust の
 /// 宣言側の答え。**チャンクごとに作らない** — 答えはチャンクではなく宣言のファイルと
@@ -801,6 +803,8 @@ fn resolved_type_signature_outcome_of(
                 &traced,
             )
         }
+        // 綴りを読む側がまだ無い。hover を送らずに、そのことを理由として返す
+        Grammar::Swift => Ok(TypeSignatureOutcome::NoSignatureReader),
     }
 }
 
