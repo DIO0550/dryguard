@@ -28,7 +28,6 @@ use lsp_types::{
 };
 use serde_json::{Value, json};
 
-use super::ServerLanguage;
 use super::call_hierarchy::{self, CallHierarchyStart, CalleesOutcome};
 use super::declaration_site::{
     self, DeclarationSite, DeclarationSiteOutcome, ImplementationOutcome,
@@ -50,17 +49,13 @@ use crate::source_position::SourcePosition;
 /// `initialize` でサーバに名乗る名前。
 const CLIENT_NAME: &str = "dryguard";
 
-/// 落ち着いた答えを求めて尋ね直す回数の上限。
+/// 落ち着いた答えを求めて尋ね直す回数の上限の既定。
 ///
 /// 1 回目は読み込みの途中に当たりうる。2 回目はその読み込みが終わってからになる。
 /// **3 回目でも作業に触れているなら、尋ねるたびに始まっている**ので、待っても
 /// 答えは落ち着かない（`ReferencesOutcome::ServerStillWorking` /
 /// `HoverOutcome::ServerStillWorking` / `CalleesOutcome::ServerStillWorking`）。
-const SETTLED_ATTEMPTS: usize = 3;
-
-/// rust-analyzer は読み込みの進捗を複数の作業として報告する。
-/// 途中の応答を採らずに、その一連の作業が落ち着くまで尋ね直す上限。
-const RUST_SETTLED_ATTEMPTS: usize = 32;
+pub(super) const SETTLED_ATTEMPTS: usize = 3;
 
 /// LSP の `ContentModified`。rust-analyzer は読み込みが進んでいる間の要求に返す。
 const CONTENT_MODIFIED: i64 = -32801;
@@ -111,7 +106,10 @@ pub struct Connection<R: BufRead, W: Write> {
     /// **減らさない。** 始まって終わった作業は [`Self::running_progress`] から消えるので、
     /// 尋ねている間に何か起きたかは数でしか追えない。
     noticed_progress_count: usize,
-    language: ServerLanguage,
+    /// hover の応答で、綴りを探すコードフェンスの試す順。
+    hover_fences: &'static [usize],
+    /// 落ち着いた答えを求めて尋ね直す回数の上限。
+    settled_attempts: usize,
     /// 要求 1 本の応答・始まった作業の終わりを待つ合計の上限。無ければ待ち続ける。
     ///
     /// **既定は無し。** 子プロセスを起動する側（[`super::Client`]）だけが渡す。バイト列で
@@ -130,7 +128,8 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             prepared_progress: Vec::new(),
             running_progress: Vec::new(),
             noticed_progress_count: 0,
-            language: ServerLanguage::TypeScript,
+            hover_fences: hover::LEADING_FENCE,
+            settled_attempts: SETTLED_ATTEMPTS,
             streaming_limit: None,
         }
     }
@@ -141,14 +140,19 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         self
     }
 
-    /// サーバの言語に応じて、進捗待ちと hover の読み方を選ぶ。
-    pub(super) fn with_language(mut self, language: ServerLanguage) -> Self {
-        self.language = language;
+    /// hover の応答で、綴りを探すコードフェンスの試す順を付ける。
+    ///
+    /// **既定は先頭のフェンスだけ。** どのフェンスに綴りがあるかはサーバごとに決まるので、
+    /// 子プロセスを起動する側（[`super::Client`]）がサーバの指定から渡す。
+    pub(super) fn with_hover_fences(mut self, fences: &'static [usize]) -> Self {
+        self.hover_fences = fences;
         self
     }
 
-    pub(super) fn language(&self) -> ServerLanguage {
-        self.language
+    /// 落ち着いた答えを求めて尋ね直す回数の上限を付ける。既定は [`SETTLED_ATTEMPTS`]。
+    pub(super) fn with_settled_attempts(mut self, attempts: usize) -> Self {
+        self.settled_attempts = attempts;
+        self
     }
 
     /// サーバと握手し、サーバができることを受け取る。
@@ -386,7 +390,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             })?;
 
         Ok(match answered.as_ref() {
-            Some(hover) => hover::outcome_for_language(hover, self.language),
+            Some(hover) => hover::outcome_of_fences(hover, self.hover_fences),
             None => HoverOutcome::NoAnswer,
         })
     }
@@ -829,10 +833,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         // 読み込み中に返ってきた答えは、**サーバがまだ見ていないファイルの分が抜けている**
         // （references なら呼び出し元が欠け、hover なら推論された型が `any` になる）。
         // 作業が終わってから尋ね直し、**作業に触れていない答えだけを採る**。
-        let mut attempts_left = match self.language {
-            ServerLanguage::TypeScript => SETTLED_ATTEMPTS,
-            ServerLanguage::Rust => RUST_SETTLED_ATTEMPTS,
-        };
+        let mut attempts_left = self.settled_attempts;
 
         while attempts_left > 0 {
             // **尋ねる前に、動いている作業を待ち切る。** 動いている最中に送ると、
@@ -2008,7 +2009,8 @@ mod tests {
     }
 
     #[test]
-    fn test_rust_hover_waits_through_several_progress_phases_and_content_modified() {
+    fn test_hover_with_attempts_beyond_the_phases_waits_through_several_progress_phases_and_content_modified()
+     {
         let server_output = frames_of(&[
             &progress_begin_notification("fetching"),
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32801,"message":"content modified"}}"#,
@@ -2021,7 +2023,11 @@ mod tests {
             &progress_end_notification("roots"),
             &hover_response(4, "fn ready()"),
         ]);
-        let mut connection = connection_over(&server_output).with_language(ServerLanguage::Rust);
+        // 既定の 3 回では 3 つ目の作業の途中で尽きる。上限を作業の数より広く取り、
+        // 上限ではなく落ち着いた答えで止まることを 4 回目の要求で確かめる
+        const ATTEMPTS_BEYOND_PHASES: usize = 8;
+        let mut connection =
+            connection_over(&server_output).with_settled_attempts(ATTEMPTS_BEYOND_PHASES);
         let document = opened_document(&mut connection);
 
         let outcome = connection
@@ -2462,7 +2468,7 @@ mod tests {
             &progress_end_notification("loading"),
             &location_response(2, "file:///repo/src/fmt.rs"),
         ]);
-        let mut connection = connection_over(&server_output).with_language(ServerLanguage::Rust);
+        let mut connection = connection_over(&server_output);
         let document = opened_document(&mut connection);
 
         let outcome = connection
@@ -2516,7 +2522,7 @@ mod tests {
             &progress_end_notification("loading"),
             &location_response(2, "file:///repo/src/limits.rs"),
         ]);
-        let mut connection = connection_over(&server_output).with_language(ServerLanguage::Rust);
+        let mut connection = connection_over(&server_output);
         let document = opened_document(&mut connection);
 
         let outcome = connection
@@ -2544,7 +2550,7 @@ mod tests {
             &progress_end_notification("loading"),
             &location_response(2, "file:///repo/src/show.rs"),
         ]);
-        let mut connection = connection_over(&server_output).with_language(ServerLanguage::Rust);
+        let mut connection = connection_over(&server_output);
         let document = opened_document(&mut connection);
 
         let outcome = connection

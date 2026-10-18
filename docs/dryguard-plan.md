@@ -183,12 +183,11 @@ inventory = ["src/inventory/**", "src/**/product*.ts"]
 | 入口（`main.rs`） | `report_compare` | `--lang` とファイルの言語の突き合わせ | **2 択が 2 つ**（`is_rust`） |
 | 入口（`main.rs`） | `language_servers`（`report_scan` / `report_check` / `report_compare` が使うサーバの並び） | 言語ごとのサーバ。**並べ忘れると、その言語の候補ペアは尋ねずに `NotAsked` になり、`--fail-on` でも終了コード 2 にならない**（Issue #43） | TypeScript と Rust の 2 本を固定で渡す |
 | `lsp` | `ServerLanguage`・`ServerCommand`（`*_SERVER`・`*_PROJECT_MARKERS`・`ServerCommand::rust` に当たる組み立て） | 起動方法・`project marker`・言語 | variant は enum。`ServerCommand::new` は独自サーバを TypeScript として扱う |
-| `lsp` | `ServerCommand::supports` | そのサーバが尋ねられる grammar | `ServerLanguage` に対しては網羅 `match` だが、**中身が 2 択**（`grammar != Grammar::Rust`） |
-| `lsp` | `Connection::new` の `language` | 接続の言語の既定 | TypeScript が既定（`with_language` を呼ばないと TypeScript として扱う） |
-| `lsp` | `Session::needs_project_membership_query` | `project membership` を尋ねるか | **2 択**（`== ServerLanguage::TypeScript`。`Grammar::Rust` の grep には出ない） |
+| `lsp` | `ServerCommand::supports` | そのサーバが尋ねられる grammar | `ServerLanguage` × `Grammar` の網羅 `match`（Issue #363） |
+| `lsp` | `ServerLanguage::hover_fences` | hover のどのコードフェンスに綴りがあるか（試す順） | 網羅 `match`。`lsp::hover` は値を受け取るだけ（Issue #367） |
+| `lsp` | `ServerLanguage::settled_attempts` | 読み込み中の答えを捨てて尋ね直す回数 | 網羅 `match`。`lsp::connection` は値を受け取るだけ（Issue #367） |
+| `lsp` | `ServerLanguage::asks_project_membership` | `project membership` を尋ねるか | 網羅 `match`。`Session::needs_project_membership_query` はこれを返すだけ（Issue #367） |
 | `lsp::document` | `LanguageId`・`LanguageId::from_grammar` | `language id` の綴り | 網羅 `match` |
-| `lsp::hover` | `outcome_for_language` | hover のどのコードフェンスに綴りがあるか | 網羅 `match` |
-| `lsp::connection` | `outcome_untouched_by_work_of` の尋ね直しの回数 | 読み込み中の答えを捨てて尋ね直す回数 | 網羅 `match` |
 | `semantics::type_signature` | `type_signature_outcome_of` / `rust_type_signature_outcome_of` の系統 | hover の綴りから型シグネチャを組む系統 | TypeScript と Rust の 2 系統 |
 | `syntax::type_spelling` / `syntax::type_structure`（Rust は `syntax::rust_callable`） | 綴りを構文解析する箇所 | hover の綴りの読み取り | `Grammar::TypeScript` 決め打ち |
 | `pipeline` | `resolved_type_signature_outcome_of` | 型シグネチャの系統の振り分け | **2 択**（Rust でなければ TypeScript） |
