@@ -341,6 +341,21 @@ mod tests {
     }
 
     #[test]
+    fn test_source_paths_of_auto_leaves_out_java_files() {
+        // 対照は同じディレクトリの `.ts` / `.rs`。`.java` は読める拡張子になったが、
+        // チャンクにできないうちは `auto` でも走査に入れない
+        let root = fixture("language-scan");
+
+        let paths =
+            source_paths_of(&root, SourceLanguage::Auto).expect("フィクスチャのディレクトリはある");
+
+        assert_eq!(
+            relative_paths_of(&root, &paths),
+            vec!["a.rs", "a.ts", "b.rs", "b.ts"]
+        );
+    }
+
+    #[test]
     fn test_typescript_paths_of_a_missing_directory_reports_the_root_it_was_given() {
         let root = fixture("scan/missing");
 

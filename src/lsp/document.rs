@@ -217,6 +217,16 @@ mod tests {
     }
 
     #[test]
+    fn test_new_from_a_java_file_names_the_language_as_java() {
+        let path = repository_path("tests/fixtures/language-scan/Discount.java");
+
+        let document = SourceDocument::new(&path, "package billing;".to_owned())
+            .expect("ドキュメントにできる");
+
+        assert_eq!(document.to_text_document_item().language_id, "java");
+    }
+
+    #[test]
     fn test_new_keeps_the_text_it_was_given() {
         // 開いた中身がディスク上のものとずれると、位置を指す問い合わせが別の場所を指す
         let path = repository_path("tests/fixtures/billing/discount.ts");
