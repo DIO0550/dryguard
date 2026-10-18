@@ -985,10 +985,10 @@ fn document_of(chunk: &Chunk, source: &str) -> Result<SourceDocument, SemanticsE
 /// **片方でも正規化できていなければ「単一化不能」にしない。** 比べていないので、
 /// 取れなかった理由をそのまま出す（2 つとも取れていなければ、上の枝の理由）。
 ///
-/// **並びの軸は「環境を直しても変わらない理由を先に出す」。** 綴りが場所に依存するのは
-/// チャンクの形そのものなので、往復と読み取りについての理由（サーバを替える・
-/// ファイルを読めるようにすれば変わりうる）より先に置く
-/// (`rules/architecture.md`「理由は落とさない」)。
+/// **並びの軸は「環境を直しても変わらない理由を先に出す」。** 綴りを読む側が無いのは
+/// 言語で決まるので先頭に置く。綴りが場所に依存するのはチャンクの形そのものなので、
+/// 往復と読み取りについての理由（サーバを替える・ファイルを読めるようにすれば変わりうる）
+/// より先に置く (`rules/architecture.md`「理由は落とさない」)。
 ///
 /// **[`TypeSignatureOutcome::UntracedTypeName`] も形の理由だが、末尾に置いたままにしてある。**
 /// 動かすとこの関数が今出している理由が変わるので、そこだけ別の変更で見る。
@@ -1001,6 +1001,10 @@ fn type_signature_match_of(
             TypeSignatureOutcome::Normalized(normalized_a),
             TypeSignatureOutcome::Normalized(normalized_b),
         ) => unifiable_match_of(normalized_a.is_unifiable_with(normalized_b)),
+        // **読む側が無いことを、サーバの答えに由来する理由より先に出す。** 言語で決まる
+        // 答えなので、サーバを替えても変わらない。後ろに置くと、直せない相手の案内が出る
+        (TypeSignatureOutcome::NoSignatureReader, _)
+        | (_, TypeSignatureOutcome::NoSignatureReader) => TypeSignatureMatch::NoSignatureReader,
         (TypeSignatureOutcome::SiteDependentSpelling, _)
         | (_, TypeSignatureOutcome::SiteDependentSpelling) => {
             TypeSignatureMatch::SiteDependentSpelling

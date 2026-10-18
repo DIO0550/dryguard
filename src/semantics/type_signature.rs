@@ -129,6 +129,12 @@ pub enum TypeSignatureOutcome {
     UnreadableSignature,
     /// サーバが hover を提供していない。
     HoverNotProvided,
+    /// その言語の hover の綴りを読む側が、dryguard にまだ無い。hover は尋ねていない。
+    ///
+    /// **[`TypeSignatureOutcome::UnreadableSignature`] と混ぜない。** あちらは綴りが返った
+    /// うえで読み解けなかったもので、利用者はサーバの綴りを疑う。こちらは
+    /// **dryguard 側の未対応**で、どのサーバに替えても変わらない。
+    NoSignatureReader,
     /// **比較に残る綴りに現れる**型名を開けなかった。
     ///
     /// **綴りのまま比べた結果を出さない。** 開けていれば重なったかもしれないので、

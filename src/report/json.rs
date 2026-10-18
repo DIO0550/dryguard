@@ -436,6 +436,7 @@ fn type_signature_value_of(signal: TypeSignatureMatch, explanation: Explanation)
         TypeSignatureMatch::ServerStillWorking => unmeasurable_value_of("server-still-working"),
         TypeSignatureMatch::UnreadableSignature => unmeasurable_value_of("unreadable-signature"),
         TypeSignatureMatch::HoverNotProvided => unmeasurable_value_of("hover-not-provided"),
+        TypeSignatureMatch::NoSignatureReader => unmeasurable_value_of("no-signature-reader"),
         // 理由の内訳まで運ぶ。**利用者が次にすることが違う**ので、1 つのキーに畳むと
         // 直す先を選べなくなる（`rules/naming.md`「`untraced type name` と
         // `unopened` を混ぜない」）

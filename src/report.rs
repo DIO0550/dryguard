@@ -467,6 +467,9 @@ fn type_signature_text_of(signal: TypeSignatureMatch, explanation: Explanation) 
         }
         TypeSignatureMatch::UnreadableSignature => "測れない (返った綴りを読み解けない)",
         TypeSignatureMatch::HoverNotProvided => "測れない (サーバが hover を提供していない)",
+        TypeSignatureMatch::NoSignatureReader => {
+            "測れない (この言語の型シグネチャを読む側がまだ無い)"
+        }
         TypeSignatureMatch::UnopenedTypeName { reason } => unopened_text_of(reason),
         TypeSignatureMatch::UntracedTypeName { reason } => untraced_text_of(reason),
         // **ここだけ直す先を出さない。** 形ごとに直し方が違い、`this` 型は

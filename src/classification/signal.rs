@@ -315,6 +315,11 @@ pub enum TypeSignatureMatch {
     },
     /// サーバが hover を提供していない。
     HoverNotProvided,
+    /// その言語の hover の綴りを読む側が、dryguard にまだ無い。
+    ///
+    /// **`UnreadableSignature` と混ぜない。** あちらはサーバの綴りの側、こちらは
+    /// dryguard の側の話で、利用者が次にすることが違う。
+    NoSignatureReader,
     /// **比較に残る綴りに現れる**型名を開けなかった。
     ///
     /// 開けなかった型名が比較に残る綴りに現れなければ、判定は変わらないので
