@@ -285,6 +285,25 @@ mod tests {
 }
 "#;
 
+    /// クラスとメソッド・コンストラクタを持つ Java のソース。TypeScript の grammar では
+    /// 引数の型を前に書く形（`double price`）が読めない。
+    const A_JAVA_CLASS: &str = r#"package billing;
+
+import java.util.List;
+
+public class Discount {
+    private final double rate;
+
+    public Discount(double rate) {
+        this.rate = rate;
+    }
+
+    public double apply(double price) {
+        return price * rate;
+    }
+}
+"#;
+
     fn tree_of(source: &str) -> SyntaxTree<'_> {
         SyntaxTree::from_source(source, Grammar::TypeScript)
             .expect("テストが渡すソースは木にできる")
@@ -348,6 +367,22 @@ mod tests {
     }
 
     #[test]
+    fn test_grammar_of_a_java_path_reads_it_as_java() {
+        assert_eq!(
+            Grammar::of_path(Path::new("src/billing/Discount.java")),
+            Some(Grammar::Java)
+        );
+    }
+
+    #[test]
+    fn test_grammar_java_is_the_same_language_only_as_java() {
+        // 対照は Rust と TypeScript。腕を足し忘れると Java 同士も比べられない側へ倒れる
+        assert!(Grammar::Java.same_language_as(Grammar::Java));
+        assert!(!Grammar::Java.same_language_as(Grammar::Rust));
+        assert!(!Grammar::TypeScript.same_language_as(Grammar::Java));
+    }
+
+    #[test]
     fn test_grammar_of_a_path_with_another_extension_is_not_readable() {
         // 対照は上の 2 つ。読める拡張子と同じディレクトリにあっても選べない
         assert_eq!(Grammar::of_path(Path::new("src/report/notes.md")), None);
@@ -364,6 +399,18 @@ mod tests {
         // 対照は上のテスト。**拡張子だけ増やして grammar を選ばないと、
         // `.tsx` の関数が丸ごと「構文エラーで切り出せない」に落ちる**
         assert!(has_error(A_FUNCTION_RETURNING_JSX, Grammar::TypeScript));
+    }
+
+    #[test]
+    fn test_syntax_tree_of_a_java_class_read_as_java_has_no_error() {
+        assert!(!has_error(A_JAVA_CLASS, Grammar::Java));
+    }
+
+    #[test]
+    fn test_syntax_tree_of_a_java_class_read_as_typescript_marks_an_error() {
+        // 対照は上のテスト。`language` が別の grammar を返していたら、上が落ちるか
+        // こちらと同じ答えになる
+        assert!(has_error(A_JAVA_CLASS, Grammar::TypeScript));
     }
 
     #[test]
