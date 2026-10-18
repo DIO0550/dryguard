@@ -181,7 +181,7 @@ inventory = ["src/inventory/**", "src/**/product*.ts"]
 | `cli` | `LanguageOption` | `--lang` の値 | enum |
 | 入口（`main.rs`） | `source_language_of` | `--lang` から `SourceLanguage` へ | 網羅 `match` |
 | 入口（`main.rs`） | `report_compare` | `--lang` とファイルの言語の突き合わせ | **2 択が 2 つ**（`is_rust`） |
-| 入口（`main.rs`） | `language_servers`（`report_scan` / `report_check` / `report_compare` が使うサーバの並び） | 言語ごとのサーバ | TypeScript と Rust の 2 本を固定で渡す |
+| 入口（`main.rs`） | `language_servers`（`report_scan` / `report_check` / `report_compare` が使うサーバの並び） | 言語ごとのサーバ。**並べ忘れると、その言語の候補ペアは尋ねずに `NotAsked` になり、`--fail-on` でも終了コード 2 にならない**（Issue #43） | TypeScript と Rust の 2 本を固定で渡す |
 | `lsp` | `ServerLanguage`・`ServerCommand`（`*_SERVER`・`*_PROJECT_MARKERS`・`ServerCommand::rust` に当たる組み立て） | 起動方法・`project marker`・言語 | variant は enum。`ServerCommand::new` は独自サーバを TypeScript として扱う |
 | `lsp` | `ServerCommand::supports` | そのサーバが尋ねられる grammar | `ServerLanguage` に対しては網羅 `match` だが、**中身が 2 択**（`grammar != Grammar::Rust`） |
 | `lsp` | `Connection::new` の `language` | 接続の言語の既定 | TypeScript が既定（`with_language` を呼ばないと TypeScript として扱う） |
@@ -214,7 +214,7 @@ dryguard check --diff --staged   # ステージ済みの変更だけ (pre-commit
   --lang ts|rust|auto
   --format text|json
   --threshold <0-1>
-  --fail-on do-not-extract        # 非推奨ペアがあればexit 1
+  --fail-on do-not-extract        # 非推奨ペアがあればexit 1 (LSP に尋ね切れなければexit 2)
   --explain                      # 判定根拠のシグナル値を全表示
   --include-tests                # scan / check のみ。Rust / TypeScript のテスト関数も比較する (既定は外す)
 ```

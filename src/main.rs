@@ -5,6 +5,8 @@
 //! `--format` が人の読む text とエージェントの読む JSON を切り替える。
 //!
 //! 終了コードは 3 つ（[`FAILED_ON_VERDICT`] / [`NOT_CLASSIFIED`] と成功）。
+//! `--fail-on` を付けたときは、LSP に尋ね切れなかったことも [`NOT_CLASSIFIED`] にする
+//! （[`exit_code_of`]）。
 //!
 //! 判定に当てる閾値は `--threshold` > `dryguard.toml` > 既定値の順に決まる
 //! （[`configured_thresholds_of`]）。ドメインの宣言は `dryguard.toml` の `[domains]` だけが持つ。
@@ -102,7 +104,11 @@ const CHECK_ROOT: &str = ".";
 /// 計画書と README が書いてきた「非推奨ペアがあれば exit 1」をそのまま使う。
 const FAILED_ON_VERDICT: u8 = 1;
 
-/// 判定を出せなかった（設定を読めない・チャンクを切り出せない・走査を始められないなど）。
+/// 判定を出せなかった（設定を読めない・チャンクを切り出せない・走査を始められないなど）か、
+/// `--fail-on` を付けて候補ペアの Stage 2 を LSP に尋ね切れなかった。
+///
+/// 後者は判定を stdout に出し終えているが、**CI にとってはどちらも「答えとして読めない回」**で、
+/// 直す先は stderr の理由が持つ。だから同じコードにし、名前も分けない。
 ///
 /// **[`FAILED_ON_VERDICT`] と同じコードにしない。** 同じだと CI が「非推奨ペアがあった」と
 /// 「検査できなかった」を区別できない。2 にするのは、clap が引数の誤りを 2 で落とすのと揃えるため。
@@ -130,8 +136,8 @@ const CONFIG_DIRECTORY: &str = ".";
 /// 成功として返すと、後段が「似ていない」と「見ていない」を区別できなくなる
 /// (rules/architecture.md「取れなかったシグナルを既定値で埋めない」)。
 ///
-/// **LSP サーバを使えなくても失敗にしない。** Stage 1 のシグナルだけで判定でき、
-/// 取れなかったことは判定の根拠に出る。理由だけを stderr へ回すのは、
+/// **`--fail-on` が無ければ、LSP サーバを使えなくても失敗にしない。** Stage 1 のシグナルだけで
+/// 判定でき、取れなかったことは判定の根拠に出る。理由だけを stderr へ回すのは、
 /// **判定そのものではなく環境の話**だから（stdout は判定の出力に保つ）。
 /// 片方の問い合わせだけが落ちることもあるので、**stderr でシグナルを数え上げない**。
 ///
@@ -188,7 +194,11 @@ fn report_compare(
     };
     println!("{report}");
 
-    exit_code_of(options.fail_on, [classification.verdict()])
+    exit_code_of(
+        options.fail_on,
+        [classification.verdict()],
+        semantics_coverage_of(measured.semantics_error().is_some()),
+    )
 }
 
 /// `scan` の対象ディレクトリを走査して、候補ペアを理由付きで表示する。
@@ -197,7 +207,7 @@ fn report_compare(
 /// 1 ファイルで全体を失敗にすると、出せていた候補ペアまで捨てることになる
 /// （飛ばしたものは出力に残る）。
 ///
-/// **LSP サーバを使えなくても失敗にしない。** 理由を stderr へ回す分担は
+/// LSP サーバを使えなかったときの扱いと、理由を stderr へ回す分担は
 /// [`report_compare`] と同じ（stdout は判定の出力に保つ）。
 fn report_scan(
     root: &Path,
@@ -289,15 +299,54 @@ fn report_walked(scan: &Scan, options: &CommonOptions) -> ExitCode {
         .candidate_pairs()
         .iter()
         .map(|pair| pair.classification().verdict());
-    exit_code_of(options.fail_on, verdicts)
+    exit_code_of(
+        options.fail_on,
+        verdicts,
+        semantics_coverage_of(!scan.semantics_errors().is_empty()),
+    )
+}
+
+/// 候補ペアの Stage 2 を LSP に尋ね切れたか。
+///
+/// 数えるのは LSP とのやりとりが通らなかったこと（サーバが見つからない・握手に失敗した・
+/// 根を決められない・問い合わせ 1 本の往復が落ちたなど。`SemanticsError` が持つもの）だけ。
+/// 候補ペアでないので尋ねなかったペアと、サーバは答えたがシグナルが「測れない」だった
+/// ペアは数えない。前者は Stage 2 で判定が変わらず、後者は環境が正常でも起きるので、
+/// 数えると `--fail-on` が通る回が無くなる。
+///
+/// **サーバを並べていない言語の候補ペアも数えない**（尋ねずに `NotAsked` になる）。
+/// 言語を足すときにサーバを [`language_servers`] に並べ忘れると、その言語は尋ねないまま通る。
+#[derive(Debug, Clone, Copy)]
+enum SemanticsCoverage {
+    /// 尋ねるべき候補ペアに尋ね切れた（尋ねる候補ペアが無かった場合を含む）。
+    Complete,
+    /// どこかの LSP サーバに尋ね切れなかった。
+    Incomplete,
+}
+
+/// LSP への問い合わせが通らなかったか（`has_semantics_error`）から、[`SemanticsCoverage`]。
+fn semantics_coverage_of(has_semantics_error: bool) -> SemanticsCoverage {
+    if has_semantics_error {
+        return SemanticsCoverage::Incomplete;
+    }
+    SemanticsCoverage::Complete
 }
 
 /// 判定を出し終えたときの終了コード。`--fail-on` に指定した判定が 1 件でも出たら
 /// [`FAILED_ON_VERDICT`]、出なければ成功。
 ///
+/// **`--fail-on` を付けて LSP に尋ね切れなかったら、判定に関わらず [`NOT_CLASSIFIED`]。**
+/// 成功にすると、検査されなかったのか通ったのかを CI が区別できない（フェイルオープン）。
+/// [`FAILED_ON_VERDICT`] より優先するのは、それが「判定を出し終えたうえで」の約束だから。
+/// 1 を返すと CI は非推奨ペアを直せばよいと読み、検査が欠けたことを見落とす。
+///
 /// 失敗にするときも**判定の出力は stdout に出し終えてから**にし、理由を stderr に 1 行出す。
 /// stdout に混ぜると `--format json` を読む側が壊れる。
-fn exit_code_of(fail_on: Option<FailOn>, verdicts: impl IntoIterator<Item = Verdict>) -> ExitCode {
+fn exit_code_of(
+    fail_on: Option<FailOn>,
+    verdicts: impl IntoIterator<Item = Verdict>,
+    coverage: SemanticsCoverage,
+) -> ExitCode {
     let Some(fail_on) = fail_on else {
         return ExitCode::SUCCESS;
     };
@@ -305,12 +354,22 @@ fn exit_code_of(fail_on: Option<FailOn>, verdicts: impl IntoIterator<Item = Verd
         .into_iter()
         .filter(|verdict| fail_on.is_met_by(*verdict))
         .count();
-    if met_count == 0 {
-        return ExitCode::SUCCESS;
+    // 2 で終わるときも件数は出す。理由の行だけにすると、尋ね切れた分で既に見つかった
+    // 非推奨ペアの数が CI のログから消える
+    if met_count > 0 {
+        eprintln!("--fail-on に指定した判定が {met_count} 件出ました");
     }
 
-    eprintln!("--fail-on に指定した判定が {met_count} 件出ました");
-    ExitCode::from(FAILED_ON_VERDICT)
+    match coverage {
+        SemanticsCoverage::Incomplete => {
+            eprintln!(
+                "--fail-on の検査を終えられませんでした（LSP に尋ね切れなかった候補ペアがあります）"
+            );
+            ExitCode::from(NOT_CLASSIFIED)
+        }
+        SemanticsCoverage::Complete if met_count > 0 => ExitCode::from(FAILED_ON_VERDICT),
+        SemanticsCoverage::Complete => ExitCode::SUCCESS,
+    }
 }
 
 /// 根拠をどこまで出すか。`--explain` があれば、尋ねなかったシグナルと当てた閾値まで。
