@@ -1844,6 +1844,7 @@ mod tests {
             TypeSignatureMatch::ServerStillWorking,
             TypeSignatureMatch::UnreadableSignature,
             TypeSignatureMatch::HoverNotProvided,
+            TypeSignatureMatch::NoSignatureReader,
             TypeSignatureMatch::SiteDependentSpelling,
             TypeSignatureMatch::OverloadSetMiscounted {
                 counted: NonZeroUsize::MIN,

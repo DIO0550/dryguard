@@ -3121,6 +3121,24 @@ mod tests {
     }
 
     #[test]
+    fn test_type_signature_match_of_a_missing_signature_reader_outranks_a_site_dependent_spelling()
+    {
+        // 読む側が無いのは言語で決まり、チャンクの形を直しても変わらない。形の理由を先に
+        // 出すと、直しても測れないままの案内になる
+        let matched = type_signature_match_of(
+            &TypeSignatureOutcome::SiteDependentSpelling,
+            &TypeSignatureOutcome::NoSignatureReader,
+        );
+        let swapped = type_signature_match_of(
+            &TypeSignatureOutcome::NoSignatureReader,
+            &TypeSignatureOutcome::SiteDependentSpelling,
+        );
+
+        assert_eq!(matched, TypeSignatureMatch::NoSignatureReader);
+        assert_eq!(swapped, TypeSignatureMatch::NoSignatureReader);
+    }
+
+    #[test]
     fn test_type_signature_match_of_a_site_dependent_spelling_outranks_a_reason_the_server_can_change()
      {
         // 並びの軸は「環境を直しても変わらない理由を先に出す」。サーバがその位置に型を

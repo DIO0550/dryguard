@@ -1731,6 +1731,25 @@ mod tests {
     }
 
     #[test]
+    fn test_text_of_without_a_signature_reader_says_dryguard_cannot_read_the_language_yet() {
+        // 対照は「返った綴りを読み解けない」。あちらはサーバの綴りを疑う案内で、
+        // こちらはどのサーバに替えても変わらない dryguard 側の未対応
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::NoSignatureReader,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (この言語の型シグネチャを読む側がまだ無い) → どちらでもない"
+            ),
+            "読む側が無いことが理由として出る: {text}"
+        );
+    }
+
+    #[test]
     fn test_text_of_with_an_unsettled_type_name_query_says_the_type_name_could_not_be_opened() {
         // 対照は 1 つ上のテスト。**落ち着かなかった往復が別**（チャンクの位置の hover ではなく、
         // 型名を開く hover / definition / implementation）で、開く先が取れていない。

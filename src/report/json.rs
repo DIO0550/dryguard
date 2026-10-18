@@ -1173,6 +1173,26 @@ mod tests {
     }
 
     #[test]
+    fn test_json_of_reports_a_missing_signature_reader_apart_from_an_unreadable_signature() {
+        let reason_for = |signal| {
+            let signals =
+                accidental_duplication().with_semantics(signal, CallerDomainOverlap::NoReferences);
+            let json = json_of_signals(&signals, Explanation::AskedSignals);
+            reason_of(&json, "type-signature-match")["value"].clone()
+        };
+
+        let missing = reason_for(TypeSignatureMatch::NoSignatureReader);
+
+        assert_eq!(missing["status"], "unmeasurable");
+        assert_eq!(missing["reason"], "no-signature-reader");
+        // 対照。同じ綴りで出すと、読む側は綴りを返したサーバを疑いに行く
+        assert_eq!(
+            reason_for(TypeSignatureMatch::UnreadableSignature)["reason"],
+            "unreadable-signature"
+        );
+    }
+
+    #[test]
     fn test_json_of_names_the_request_the_server_did_not_provide() {
         // 対照は typeDefinition。Rust は definition を尋ねるので、同じ綴りで出すと
         // 利用者は提供されている問い合わせを確かめに行くことになる
