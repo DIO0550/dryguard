@@ -45,6 +45,8 @@ impl SourceLanguage {
             (Self::TypeScript, Grammar::Rust) => false,
             (Self::Rust, Grammar::Rust) => true,
             (Self::Rust, Grammar::TypeScript | Grammar::Tsx) => false,
+            // Java はまだチャンクにできないので、`auto` でも拾わない
+            (Self::Auto | Self::TypeScript | Self::Rust, Grammar::Java) => false,
         }
     }
 }

@@ -182,22 +182,24 @@ impl Chunk {
             name_position: name_position_of(node, source),
             annotated: match grammar {
                 Grammar::TypeScript | Grammar::Tsx => annotated_positions_of(node, source),
-                Grammar::Rust => AnnotatedPositions::Declared {
+                Grammar::Rust | Grammar::Java => AnnotatedPositions::Declared {
                     value_type: TypeAnnotation::Omitted,
                     parameters: Vec::new(),
                 },
             },
             overload_declarations: match grammar {
                 Grammar::TypeScript | Grammar::Tsx => overload_declarations_of(node, source),
-                Grammar::Rust => Vec::new(),
+                Grammar::Rust | Grammar::Java => Vec::new(),
             },
             type_references: match grammar {
                 Grammar::TypeScript | Grammar::Tsx => chunk_type_references_of(node, source),
                 Grammar::Rust => rust_callable::type_references_of(node, source),
+                // 集めないので、綴りに残る型名はどれも辿った記録を持たず測れない側へ倒れる
+                Grammar::Java => Vec::new(),
             },
             rust_impl_header: match grammar {
                 Grammar::Rust => rust_callable::impl_header_of(node, source),
-                Grammar::TypeScript | Grammar::Tsx => None,
+                Grammar::TypeScript | Grammar::Tsx | Grammar::Java => None,
             },
             source: source_of_lines(source, lines),
             tokens: TokenSequence::from_node(node),
@@ -495,6 +497,8 @@ fn is_chunk_node(node: Node<'_>, grammar: Grammar) -> bool {
         Grammar::Rust => {
             node.kind() == RUST_CHUNK_KIND && node.child_by_field_name("body").is_some()
         }
+        // チャンクにするノードの種別をまだ決めていないので、1 つも切り出さない
+        Grammar::Java => false,
     }
 }
 
@@ -521,6 +525,7 @@ fn is_test_function(node: Node<'_>, source: &str, grammar: Grammar) -> bool {
     match grammar {
         Grammar::Rust => has_test_attribute(node, source),
         Grammar::TypeScript | Grammar::Tsx => is_typescript_test_callback(node, source),
+        Grammar::Java => false,
     }
 }
 

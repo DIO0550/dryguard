@@ -145,6 +145,9 @@ impl ImportSet {
                 .into_iter()
                 .map(|specifier| ModulePath::from_rust_use(&specifier, importer))
                 .collect(),
+            // まだ読まないので測れない側へ倒す。`NoDeclarations` は事実と違うが、Java の
+            // チャンクはまだ切り出されず、この答えが載るチャンクも無い
+            Grammar::Java => HashSet::new(),
         };
 
         if paths.is_empty() {
