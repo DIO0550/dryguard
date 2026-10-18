@@ -229,6 +229,16 @@ mod tests {
     }
 
     #[test]
+    fn test_source_language_auto_does_not_accept_swift_yet() {
+        // 対照は Rust。Swift のチャンクはまだ切り出せないので、`auto` が拾うと
+        // 走査したファイル数だけが増える
+        assert!(SourceLanguage::Auto.accepts(Grammar::Rust));
+        assert!(!SourceLanguage::Auto.accepts(Grammar::Swift));
+        assert!(!SourceLanguage::TypeScript.accepts(Grammar::Swift));
+        assert!(!SourceLanguage::Rust.accepts(Grammar::Swift));
+    }
+
+    #[test]
     fn test_typescript_paths_of_a_directory_returns_every_typescript_file_in_path_order() {
         let root = fixture("scan");
 

@@ -2260,6 +2260,17 @@ mod tests {
     }
 
     #[test]
+    fn test_server_command_for_typescript_or_rust_does_not_support_swift() {
+        // 対照は TypeScript / Rust 自身の grammar。Swift を受けると、そのサーバに
+        // Swift のドキュメントを開かせて別の言語として尋ねる
+        for command in [ServerCommand::typescript(), ServerCommand::rust()] {
+            assert!(!command.supports(Grammar::Swift));
+        }
+        assert!(ServerCommand::typescript().supports(Grammar::TypeScript));
+        assert!(ServerCommand::rust().supports(Grammar::Rust));
+    }
+
+    #[test]
     fn test_server_command_without_project_markers_has_none() {
         // 対照は上のテスト。**印を持たないサーバもある**ので、
         // 印の一覧が空であることと TS の一覧を取り違えない

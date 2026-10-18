@@ -217,6 +217,17 @@ mod tests {
     }
 
     #[test]
+    fn test_new_from_a_swift_file_names_the_language_as_swift() {
+        // ファイルを見ないので、置いていないパスでよい（`test_new_does_not_look_at_the_file_system`）
+        let path = repository_path("Sources/Billing/Discount.swift");
+
+        let document =
+            SourceDocument::new(&path, "let a = 1".to_owned()).expect("ドキュメントにできる");
+
+        assert_eq!(document.to_text_document_item().language_id, "swift");
+    }
+
+    #[test]
     fn test_new_keeps_the_text_it_was_given() {
         // 開いた中身がディスク上のものとずれると、位置を指す問い合わせが別の場所を指す
         let path = repository_path("tests/fixtures/billing/discount.ts");
