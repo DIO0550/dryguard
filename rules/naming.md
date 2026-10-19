@@ -56,7 +56,7 @@ if structurally_similar && domains_differ { ... }
 | 語 | 指すもの |
 |---|---|
 | `codebase` | スキャンの対象になるディレクトリツリー。`scan` が受け取る根の下 |
-| `grammar` | ソースを読むのに使う tree-sitter の文法。拡張子で決まる（`.ts` / `.tsx` / `.mts` / `.cts`） |
+| `grammar` | ソースを読むのに使う tree-sitter の文法。拡張子で決まる（`.ts` / `.tsx` / `.mts` / `.cts` / `.rs` / `.java`） |
 | `chunk` | 比較の単位。関数・メソッド・impl ブロック |
 | `declared type identity` | Rust の具体的な型を、宣言のファイルと UTF-16 の位置で識別する比較用の綴り。局所名と独立し、Rust の識別子や正規化した型変数とは衝突しない |
 | `array length` | Rust の配列型の要素数。宣言側で評価した整数で比較し、定数名や未評価の式の綴りは比較に使わない |
@@ -99,7 +99,7 @@ if structurally_similar && domains_differ { ... }
 | `project root` | **ファイル 1 つずつ**について、そのディレクトリから上へ `project marker` を探した結果。`workspace root` と、**ファイルごとの印の有無**を持つ |
 | `project membership` | そのファイルを、サーバがどのプロジェクトの一員として扱っているか。**サーバに尋ねた答え** |
 | `document` | サーバに開かせるソースファイル 1 つ分。URI・`language id`・中身の組 |
-| `language id` | LSP がサーバに伝える言語の名前（`typescript` / `typescriptreact`） |
+| `language id` | LSP がサーバに伝える言語の名前（`typescript` / `typescriptreact` / `rust` / `java`） |
 | `hover` | ソースの 1 点を指して、そこにある名前の型を尋ねる問い合わせ |
 | `type definition` | ソースの 1 点を指して、そこに書かれた型がどこで宣言されているかを尋ねる問い合わせ。**名前ではなく、その名前が指す型の宣言**を返す（Rust のエイリアスには空を返す） |
 | `definition` | ソースの 1 点を指して、**そこに書かれた名前**がどこで宣言されているかを尋ねる問い合わせ。Rust の型名はこちらで辿る（TypeScript では輸入した名前が import 文へ戻るので使わない） |

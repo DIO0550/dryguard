@@ -801,6 +801,9 @@ fn resolved_type_signature_outcome_of(
                 &traced,
             )
         }
+        // hover の綴りを読む側がまだ無いので尋ねない。`UnreadableSignature` は綴りが
+        // 返った後の理由で、尋ねていない事実とは違うが、Java を受けるサーバが無いのでここへは来ない
+        Grammar::Java => Ok(TypeSignatureOutcome::UnreadableSignature),
     }
 }
 
