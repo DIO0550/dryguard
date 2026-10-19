@@ -29,6 +29,8 @@ pub enum Grammar {
     Tsx,
     /// `.rs`
     Rust,
+    /// `.java`
+    Java,
     /// `.swift`
     Swift,
 }
@@ -50,6 +52,7 @@ impl Grammar {
             "ts" | "mts" | "cts" => Some(Self::TypeScript),
             "tsx" => Some(Self::Tsx),
             "rs" => Some(Self::Rust),
+            "java" => Some(Self::Java),
             "swift" => Some(Self::Swift),
             _ => None,
         }
@@ -61,6 +64,7 @@ impl Grammar {
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Self::Java => tree_sitter_java::LANGUAGE.into(),
             Self::Swift => tree_sitter_swift::LANGUAGE.into(),
         }
     }
@@ -68,6 +72,7 @@ impl Grammar {
     /// TS と TSX は同じ言語のチャンクとして比較する。
     pub fn same_language_as(self, other: Self) -> bool {
         matches!((self, other), (Self::Rust, Self::Rust))
+            || matches!((self, other), (Self::Java, Self::Java))
             || matches!((self, other), (Self::Swift, Self::Swift))
             || matches!(
                 (self, other),
@@ -285,6 +290,25 @@ mod tests {
 }
 "#;
 
+    /// クラスとメソッド・コンストラクタを持つ Java のソース。package 宣言や型を前に置く
+    /// 引数のように、Java の grammar でなければ読めない構文を含む。
+    const A_JAVA_CLASS: &str = r#"package billing;
+
+import java.util.List;
+
+public class Discount {
+    private final double rate;
+
+    public Discount(double rate) {
+        this.rate = rate;
+    }
+
+    public double apply(double price) {
+        return price * rate;
+    }
+}
+"#;
+
     /// `struct` と `func` を含む Swift のソース。TypeScript の grammar では読めない。
     const A_SWIFT_STRUCT_AND_FUNCTION: &str = r#"struct Invoice {
     let amount: Int
@@ -324,6 +348,22 @@ func applyDiscount(to invoice: Invoice, rate: Double = 0.1) -> Double {
             Grammar::of_path(Path::new("src/report/Badge.tsx")),
             Some(Grammar::Tsx)
         );
+    }
+
+    #[test]
+    fn test_grammar_of_a_java_path_reads_it_as_java() {
+        assert_eq!(
+            Grammar::of_path(Path::new("src/billing/Discount.java")),
+            Some(Grammar::Java)
+        );
+    }
+
+    #[test]
+    fn test_grammar_java_is_the_same_language_only_as_java() {
+        // 対照は Rust と TypeScript。腕を足し忘れると Java 同士も比べられない側へ倒れる
+        assert!(Grammar::Java.same_language_as(Grammar::Java));
+        assert!(!Grammar::Java.same_language_as(Grammar::Rust));
+        assert!(!Grammar::TypeScript.same_language_as(Grammar::Java));
     }
 
     #[test]
@@ -393,6 +433,18 @@ func applyDiscount(to invoice: Invoice, rate: Double = 0.1) -> Double {
         // 対照は上のテスト。**拡張子だけ増やして grammar を選ばないと、
         // `.tsx` の関数が丸ごと「構文エラーで切り出せない」に落ちる**
         assert!(has_error(A_FUNCTION_RETURNING_JSX, Grammar::TypeScript));
+    }
+
+    #[test]
+    fn test_syntax_tree_of_a_java_class_read_as_java_has_no_error() {
+        assert!(!has_error(A_JAVA_CLASS, Grammar::Java));
+    }
+
+    #[test]
+    fn test_syntax_tree_of_a_java_class_read_as_typescript_marks_an_error() {
+        // 対照は上のテスト。このソースが他の grammar では読めないので、`language` が
+        // 別の grammar を返せば上のテストが落ちる
+        assert!(has_error(A_JAVA_CLASS, Grammar::TypeScript));
     }
 
     #[test]

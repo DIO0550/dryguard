@@ -804,7 +804,7 @@ fn resolved_type_signature_outcome_of(
             )
         }
         // 綴りを読む側がまだ無い。hover を送らずに、そのことを理由として返す
-        Grammar::Swift => Ok(TypeSignatureOutcome::NoSignatureReader),
+        Grammar::Java | Grammar::Swift => Ok(TypeSignatureOutcome::NoSignatureReader),
     }
 }
 

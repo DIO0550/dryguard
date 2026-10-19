@@ -301,6 +301,7 @@ impl ServerCommand {
             (ServerLanguage::TypeScript, Grammar::Rust) => false,
             (ServerLanguage::Rust, Grammar::Rust) => true,
             (ServerLanguage::Rust, Grammar::TypeScript | Grammar::Tsx) => false,
+            (ServerLanguage::TypeScript | ServerLanguage::Rust, Grammar::Java) => false,
             (ServerLanguage::TypeScript | ServerLanguage::Rust, Grammar::Swift) => false,
         }
     }

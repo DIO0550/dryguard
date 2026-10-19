@@ -103,6 +103,8 @@ enum LanguageId {
     TypeScriptReact,
     /// `.rs`
     Rust,
+    /// `.java`
+    Java,
     /// `.swift`
     Swift,
 }
@@ -113,6 +115,7 @@ impl LanguageId {
             Grammar::TypeScript => Self::TypeScript,
             Grammar::Tsx => Self::TypeScriptReact,
             Grammar::Rust => Self::Rust,
+            Grammar::Java => Self::Java,
             Grammar::Swift => Self::Swift,
         }
     }
@@ -123,6 +126,7 @@ impl LanguageId {
             Self::TypeScript => "typescript",
             Self::TypeScriptReact => "typescriptreact",
             Self::Rust => "rust",
+            Self::Java => "java",
             Self::Swift => "swift",
         }
     }
@@ -214,6 +218,16 @@ mod tests {
             .expect("ドキュメントにできる");
 
         assert_eq!(document.to_text_document_item().language_id, "typescript");
+    }
+
+    #[test]
+    fn test_new_from_a_java_file_names_the_language_as_java() {
+        let path = repository_path("tests/fixtures/language-scan/Discount.java");
+
+        let document = SourceDocument::new(&path, "package billing;".to_owned())
+            .expect("ドキュメントにできる");
+
+        assert_eq!(document.to_text_document_item().language_id, "java");
     }
 
     #[test]

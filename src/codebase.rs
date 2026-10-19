@@ -45,6 +45,8 @@ impl SourceLanguage {
             (Self::TypeScript, Grammar::Rust) => false,
             (Self::Rust, Grammar::Rust) => true,
             (Self::Rust, Grammar::TypeScript | Grammar::Tsx) => false,
+            // Java はまだチャンクにできないので、`auto` でも拾わない
+            (Self::Auto | Self::TypeScript | Self::Rust, Grammar::Java) => false,
             // Swift のチャンクはまだ切り出せないので、`auto` でも走査に入れない
             (Self::Auto | Self::TypeScript | Self::Rust, Grammar::Swift) => false,
         }
@@ -347,6 +349,21 @@ mod tests {
         assert!(
             !relative.iter().any(|path| path.ends_with(".md")),
             "読めない拡張子が混ざっている: {relative:?}"
+        );
+    }
+
+    #[test]
+    fn test_source_paths_of_auto_leaves_out_java_files() {
+        // 対照は同じディレクトリの `.ts` / `.rs`。`.java` は読める拡張子になったが、
+        // チャンクにできないうちは `auto` でも走査に入れない
+        let root = fixture("language-scan");
+
+        let paths =
+            source_paths_of(&root, SourceLanguage::Auto).expect("フィクスチャのディレクトリはある");
+
+        assert_eq!(
+            relative_paths_of(&root, &paths),
+            vec!["a.rs", "a.ts", "b.rs", "b.ts"]
         );
     }
 
