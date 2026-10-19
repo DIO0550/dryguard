@@ -1317,7 +1317,7 @@ export const rate = 0.1;
 
     #[test]
     fn test_chunk_of_a_line_inside_a_swift_function_is_not_cut_out_yet() {
-        // 対照は同じ並びの TypeScript の関数（`a.ts:3` で切り出せる）。Swift のチャンクの
+        // 対照は同じ並びの TypeScript の関数（`a.ts:4` で切り出せる）。Swift のチャンクの
         // 種別はまだ決めていないので、関数の中を指しても切り出さない
         let source = "func applyDiscount(price: Double) -> Double {\n    let rate = 0.1\n    return price * (1 - rate)\n}\n";
         let location: Location = "a.swift:3".parse().expect("テストが渡す位置は解釈できる");
