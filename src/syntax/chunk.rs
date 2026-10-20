@@ -557,7 +557,9 @@ const JAVA_MODIFIERS_KIND: &str = "modifiers";
 /// Java の注釈のノードの種別。引数なし（`@Test`）と引数付き（`@Test(timeout = 1)`）。
 const JAVA_ANNOTATION_KINDS: [&str; 2] = ["marker_annotation", "annotation"];
 
-/// テストの印とみなす Java の注釈の名前の、末尾の区切り。
+/// テストの印とみなす Java の注釈の名前が、**後ろで一致する**綴り。
+///
+/// 修飾付き（`org.junit.Test`）も綴り全体の後ろで見る。最後の区切り以降で比べても答えは同じ。
 ///
 /// `@Test` / `@ParameterizedTest` / `@RepeatedTest` / `@org.junit.Test` がこれに当たり、
 /// `@TestFactory` / `@TestTemplate` は当たらない。Rust の [`TEST_ATTRIBUTE_NAME`] と同じく
@@ -565,9 +567,10 @@ const JAVA_ANNOTATION_KINDS: [&str; 2] = ["marker_annotation", "annotation"];
 /// （`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」）。
 const JAVA_TEST_ANNOTATION_SUFFIX: &str = "Test";
 
-/// Java の宣言の修飾子に、名前の末尾が [`JAVA_TEST_ANNOTATION_SUFFIX`] の注釈があるか。
+/// Java の宣言の修飾子に、名前が [`JAVA_TEST_ANNOTATION_SUFFIX`] で終わる注釈があるか。
 ///
-/// Rust の属性と違い、注釈は宣言自身の子（`modifiers`）に入る。
+/// Rust の属性と違い、注釈は宣言自身の子（`modifiers`）に入る。**直下の `modifiers` だけを見る** —
+/// 子孫まで降りると、引数の注釈（`@Test int x`）や本体の中の匿名クラスのメソッドの注釈を拾う。
 fn has_java_test_annotation(node: Node<'_>, source: &str) -> bool {
     let mut cursor = node.walk();
     let Some(modifiers) = node
@@ -583,11 +586,7 @@ fn has_java_test_annotation(node: Node<'_>, source: &str) -> bool {
         .filter(|modifier| JAVA_ANNOTATION_KINDS.contains(&modifier.kind()))
         .filter_map(|annotation| annotation.child_by_field_name(NAME_FIELD))
         .filter_map(|name| source.get(name.byte_range()))
-        .any(|name| {
-            name.rsplit('.')
-                .next()
-                .is_some_and(|last| last.ends_with(JAVA_TEST_ANNOTATION_SUFFIX))
-        })
+        .any(|name| name.ends_with(JAVA_TEST_ANNOTATION_SUFFIX))
 }
 
 /// Rust の関数にテストの印の属性が付いているか。
@@ -3063,18 +3062,24 @@ class Square {
     }
 
     #[test]
-    fn test_java_annotation_in_a_comment_does_not_mark_a_test_function() {
-        // 注釈は `modifiers` の子として読む。コメントに書いた `@Test` は印にならない
-        let source = r#"class Notes {
-    /** Not a {@code @Test}. */
-    void documented() {
-        record(1);
+    fn test_java_test_annotation_inside_a_method_marks_only_the_annotated_declaration() {
+        // 外側のメソッドの引数の注釈と、本体の中の匿名クラスのメソッドの注釈は、
+        // 外側のメソッドの印ではない。外れるのは注釈を直接付けた内側のメソッドだけ
+        let source = r#"class Factory {
+    Runnable build(@Test int seed) {
+        return new Runnable() {
+            @Test
+            public void run() {
+                consume(seed);
+            }
+        };
     }
 }
 "#;
         let file_chunks = java_chunks_of(source, TestFunctions::Excluded);
 
-        assert_eq!(names_of(source, &file_chunks), vec!["documented"]);
+        assert_eq!(names_of(source, &file_chunks), vec!["build"]);
+        assert_eq!(file_chunks.excluded_test_function_count(), 1);
     }
 
     #[test]
