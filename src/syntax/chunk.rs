@@ -81,7 +81,7 @@ pub enum AnnotatedPositions {
     /// 構文木から来るのは、外側に書かれた型が綴り全体を決める形
     /// （`const handler: Handler = (x) => x`）と、型をすべて書く言語（Java）のチャンク。
     ///
-    /// **[`AnnotatedPositions::Declared`] で表さない。** hover が綴るのは注釈の型
+    /// **TypeScript では [`AnnotatedPositions::Declared`] で表さない。** hover が綴るのは注釈の型
     /// （`Handler`）なので、**ソースの引数の数と綴りの引数の数が揃うとは限らず**
     /// （2 引数の関数型を 1 引数のアローに注釈できる）、引数ごとの並びを作れない。
     AllWritten,
@@ -183,8 +183,8 @@ impl Chunk {
             annotated: match grammar {
                 Grammar::TypeScript | Grammar::Tsx => annotated_positions_of(node, source),
                 // 引数・戻り値の型は必ず書かれる（`var` はローカル変数だけ）。
-                // Why not（位置ごとに `Written` を並べる）: receiver parameter（`Foo this`）は
-                // ソースにあって綴りに現れないので、引数の数が揃わず測れない側へ倒れる
+                // Why not（位置ごとに `Written` を並べる）: 引数の数をソースで数えることになり、
+                // hover の綴りと揃うか（receiver parameter `Foo this` など）は jdtls で未実測
                 Grammar::Java => AnnotatedPositions::AllWritten,
                 // Swift はまだチャンクにならない（`is_chunk_node`）ので届かない。Rust と同じ値は
                 // 「省いたと確かめた」と読めるので、チャンクにするときに Swift の構文から読み直す
@@ -200,7 +200,8 @@ impl Chunk {
             type_references: match grammar {
                 Grammar::TypeScript | Grammar::Tsx => chunk_type_references_of(node, source),
                 Grammar::Rust => rust_callable::type_references_of(node, source),
-                // 集めないので、綴りに残る型名はどれも辿った記録を持たず測れない側へ倒れる
+                // 集めない。Java は綴りを読む側がまだ無く、`pipeline` が hover を送らずに
+                // 「尋ねていない」と答えるので、ここが空でも答えには効かない
                 Grammar::Java | Grammar::Swift => Vec::new(),
             },
             rust_impl_header: match grammar {
@@ -565,12 +566,16 @@ const JAVA_ANNOTATION_KINDS: [&str; 2] = ["marker_annotation", "annotation"];
 /// `@TestFactory` / `@TestTemplate` は当たらない。Rust の [`TEST_ATTRIBUTE_NAME`] と同じく
 /// **一覧から漏れた注釈のメソッドはチャンクとして残る**
 /// （`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」）。
+/// 逆に後ろだけを見るので、テストでない `@BeforeTest` / `@AfterTest`（TestNG の準備）の
+/// メソッドも外す。外した数は走査の出力に出るので、黙って消えはしない。
 const JAVA_TEST_ANNOTATION_SUFFIX: &str = "Test";
 
 /// Java の宣言の修飾子に、名前が [`JAVA_TEST_ANNOTATION_SUFFIX`] で終わる注釈があるか。
 ///
 /// Rust の属性と違い、注釈は宣言自身の子（`modifiers`）に入る。**直下の `modifiers` だけを見る** —
 /// 子孫まで降りると、引数の注釈（`@Test int x`）や本体の中の匿名クラスのメソッドの注釈を拾う。
+/// 型パラメータの後ろの注釈（`<T> @Test void m()`）は `modifiers` の外に並ぶので見ず、
+/// そのメソッドはチャンクとして残る。
 fn has_java_test_annotation(node: Node<'_>, source: &str) -> bool {
     let mut cursor = node.walk();
     let Some(modifiers) = node
@@ -3059,6 +3064,25 @@ class Square {
             ]
         );
         assert_eq!(file_chunks.excluded_test_function_count(), 0);
+    }
+
+    #[test]
+    fn test_java_annotation_after_type_parameters_does_not_mark_a_test_function() {
+        // `modifiers` の外に並ぶ注釈は見ない。対照の `@Test` は `modifiers` の中
+        let source = r#"class Generic {
+    public <T> @Test void afterTypeParameters(T value) {
+        consume(value);
+    }
+
+    @Test
+    public <T> void inModifiers(T value) {
+        consume(value);
+    }
+}
+"#;
+        let file_chunks = java_chunks_of(source, TestFunctions::Excluded);
+
+        assert_eq!(names_of(source, &file_chunks), vec!["afterTypeParameters"]);
     }
 
     #[test]
