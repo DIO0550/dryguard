@@ -1496,20 +1496,227 @@ export const rate = 0.1;
         assert_eq!(chunk.lines(), range(2, 4));
     }
 
-    #[test]
-    fn test_chunk_of_a_line_inside_a_swift_function_is_not_cut_out_yet() {
-        // 対照は同じ並びの TypeScript の関数（`a.ts:4` で切り出せる）。Swift のチャンクの
-        // 種別はまだ決めていないので、関数の中を指しても切り出さない
-        let source = "func applyDiscount(price: Double) -> Double {\n    let rate = 0.1\n    return price * (1 - rate)\n}\n";
-        let location: Location = "a.swift:3".parse().expect("テストが渡す位置は解釈できる");
+    fn swift_chunk_at(source: &str, location: &str) -> Result<Chunk, ChunkingError> {
+        let location: Location = location.parse().expect("テストが渡す位置は解釈できる");
         let tree = SyntaxTree::from_source(source, Grammar::Swift)
             .expect("テストが渡すソースは木にできる");
 
+        Chunk::find_enclosing(&location, &tree)
+    }
+
+    fn swift_chunks_of(source: &str, test_functions: TestFunctions) -> FileChunks {
+        let tree = SyntaxTree::from_source(source, Grammar::Swift)
+            .expect("テストが渡すソースは木にできる");
+
+        FileChunks::from_tree(&tree, Path::new("Sources/A.swift"), test_functions)
+    }
+
+    #[test]
+    fn test_chunk_of_a_line_inside_a_swift_function_covers_the_whole_function() {
+        let source = "func applyDiscount(price: Double) -> Double {\n    let rate = 0.1\n    return price * (1 - rate)\n}\n";
+
+        let chunk = swift_chunk_at(source, "a.swift:3").expect("切り出せる");
+
+        assert_eq!(chunk.lines(), range(1, 4));
+    }
+
+    /// 自由関数・メソッド・`init`・`deinit` と、チャンクにならない protocol の要求とクロージャ。
+    const SWIFT_FUNCTIONS_AND_NON_CHUNKS: &str = r#"func total(values: [Int]) -> Int {
+    values.reduce(0, +)
+}
+
+struct Cart {
+    init(items: [Int]) {
+        self.items = items
+    }
+
+    func count() -> Int {
+        items.count
+    }
+}
+
+final class Session {
+    deinit {
+        close()
+    }
+}
+
+protocol Pricing {
+    func price(of item: Int) -> Int
+    init(name: String)
+}
+
+let doubled = { (value: Int) -> Int in
+    value * 2
+}
+"#;
+
+    #[test]
+    fn test_file_chunks_of_swift_cut_out_free_functions_methods_initializers_and_deinitializers() {
+        // 対照として protocol の要求（22・23 行目。`init` の要求も本体を持たない）と
+        // クロージャ（26 行目）を同じソースに置く
+        let file_chunks = swift_chunks_of(SWIFT_FUNCTIONS_AND_NON_CHUNKS, TestFunctions::Included);
+
+        assert_eq!(start_lines_of(&file_chunks), vec![1, 6, 10, 16]);
+    }
+
+    #[test]
+    fn test_chunk_of_a_line_inside_a_swift_closure_falls_back_to_no_enclosing_function() {
+        // クロージャはチャンクにしないので、囲む関数が無ければ切り出さない
+        let result = swift_chunk_at(SWIFT_FUNCTIONS_AND_NON_CHUNKS, "a.swift:27");
+
+        assert_eq!(result, Err(ChunkingError::NoEnclosingFunction));
+    }
+
+    #[test]
+    fn test_chunk_of_a_swift_function_points_at_its_own_name() {
+        let chunk =
+            swift_chunk_at(SWIFT_FUNCTIONS_AND_NON_CHUNKS, "a.swift:11").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((10, 9)));
+    }
+
+    #[test]
+    fn test_chunk_of_a_swift_initializer_points_at_the_init_keyword() {
+        // `init` には名前のノードが無い。尋ねない（`None`）にすると Stage 2 で測れない側へ倒れる
+        let chunk =
+            swift_chunk_at(SWIFT_FUNCTIONS_AND_NON_CHUNKS, "a.swift:7").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((6, 4)));
+    }
+
+    #[test]
+    fn test_chunk_of_a_swift_deinitializer_points_at_the_deinit_keyword() {
+        let chunk =
+            swift_chunk_at(SWIFT_FUNCTIONS_AND_NON_CHUNKS, "a.swift:17").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((16, 4)));
+    }
+
+    /// そのチャンクの、注釈を省ける位置それぞれの注釈の有無。
+    fn swift_annotated_positions_of(source: &str, location: &str) -> AnnotatedPositions {
+        swift_chunk_at(source, location)
+            .expect("切り出せる")
+            .annotated_positions()
+            .clone()
+    }
+
+    #[test]
+    fn test_a_swift_function_omitting_its_return_type_omits_its_value_type() {
+        // 対照は戻り値を書いた同じ形の関数（次のテスト）
+        let source = "func log(message: String, level: Int) {\n    print(message)\n}\n";
+
         assert_eq!(
-            Chunk::find_enclosing(&location, &tree),
-            Err(ChunkingError::NoEnclosingFunction)
+            swift_annotated_positions_of(source, "a.swift:2"),
+            AnnotatedPositions::Declared {
+                value_type: TypeAnnotation::Omitted,
+                parameters: vec![TypeAnnotation::Written, TypeAnnotation::Written],
+            }
         );
-        assert!(chunk_at(FUNCTION_AFTER_A_CONSTANT, "a.ts:4").is_ok());
+    }
+
+    #[test]
+    fn test_a_swift_function_writing_its_return_type_writes_its_value_type() {
+        let source = "func log(message: String, level: Int) -> Bool {\n    true\n}\n";
+
+        assert_eq!(
+            swift_annotated_positions_of(source, "a.swift:2"),
+            AnnotatedPositions::Declared {
+                value_type: TypeAnnotation::Written,
+                parameters: vec![TypeAnnotation::Written, TypeAnnotation::Written],
+            }
+        );
+    }
+
+    #[test]
+    fn test_a_swift_parameter_with_a_default_value_still_writes_its_annotation() {
+        // Swift の引数は既定値を書いても型を省けない。TypeScript と違って省かれた側へ倒さない
+        let source = "func pad(_ text: String, width: Int = 8) -> String {\n    text\n}\n";
+
+        assert_eq!(
+            swift_annotated_positions_of(source, "a.swift:2"),
+            AnnotatedPositions::Declared {
+                value_type: TypeAnnotation::Written,
+                parameters: vec![TypeAnnotation::Written, TypeAnnotation::Written],
+            }
+        );
+    }
+
+    #[test]
+    fn test_a_swift_initializer_writes_its_value_type() {
+        // `init` は戻り値を注釈できない。囲む型の宣言が値の型を書いているので「書かれている」
+        assert_eq!(
+            swift_annotated_positions_of(SWIFT_FUNCTIONS_AND_NON_CHUNKS, "a.swift:7"),
+            AnnotatedPositions::Declared {
+                value_type: TypeAnnotation::Written,
+                parameters: vec![TypeAnnotation::Written],
+            }
+        );
+    }
+
+    /// Swift Testing と XCTest の印が付いた関数と、印の付かない対照。
+    const SWIFT_TESTS_AND_CONTROLS: &str = r#"import Testing
+import XCTest
+
+@MainActor @Test func totalIsTheSum() {
+    #expect(total(values: [1, 2]) == 3)
+}
+
+@Testing.Test("qualified") func totalOfNothingIsZero() {
+    #expect(total(values: []) == 0)
+}
+
+final class CartTests: XCTestCase {
+    func testCountOfTwoItems() {
+        XCTAssertEqual(Cart(items: [1, 2]).count(), 2)
+    }
+
+    func makeCart() -> Cart {
+        Cart(items: [1, 2])
+    }
+
+    func testable(count: Int) -> Bool {
+        count > 0
+    }
+}
+
+final class QualifiedTests: XCTest.XCTestCase {
+    func testQualified() {
+        XCTAssertTrue(true)
+    }
+}
+
+final class Scheduler {
+    func testConnection() -> Bool {
+        true
+    }
+}
+
+func testable(value: Int) -> Bool {
+    value > 0
+}
+"#;
+
+    #[test]
+    fn test_file_chunks_excluding_swift_tests_leave_out_marked_functions_and_keep_the_rest() {
+        // 対照: XCTestCase の中でも `test` で始まらないメソッド（17 行目）と引数を取る
+        // `func test…`（21 行目。XCTest は走らせない）、XCTestCase を継承しないクラスの
+        // `func test…`（33 行目）、`test` で始まる自由関数（38 行目）
+        let file_chunks = swift_chunks_of(SWIFT_TESTS_AND_CONTROLS, TestFunctions::Excluded);
+
+        assert_eq!(start_lines_of(&file_chunks), vec![17, 21, 33, 38]);
+        assert_eq!(file_chunks.excluded_test_function_count(), 4);
+    }
+
+    #[test]
+    fn test_file_chunks_including_swift_tests_keep_marked_functions() {
+        let file_chunks = swift_chunks_of(SWIFT_TESTS_AND_CONTROLS, TestFunctions::Included);
+
+        assert_eq!(
+            start_lines_of(&file_chunks),
+            vec![4, 8, 13, 17, 21, 27, 33, 38]
+        );
+        assert_eq!(file_chunks.excluded_test_function_count(), 0);
     }
 
     #[test]
