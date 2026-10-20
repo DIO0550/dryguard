@@ -105,6 +105,8 @@ enum LanguageId {
     Rust,
     /// `.java`
     Java,
+    /// `.swift`
+    Swift,
 }
 
 impl LanguageId {
@@ -114,6 +116,7 @@ impl LanguageId {
             Grammar::Tsx => Self::TypeScriptReact,
             Grammar::Rust => Self::Rust,
             Grammar::Java => Self::Java,
+            Grammar::Swift => Self::Swift,
         }
     }
 
@@ -124,6 +127,7 @@ impl LanguageId {
             Self::TypeScriptReact => "typescriptreact",
             Self::Rust => "rust",
             Self::Java => "java",
+            Self::Swift => "swift",
         }
     }
 }
@@ -224,6 +228,17 @@ mod tests {
             .expect("ドキュメントにできる");
 
         assert_eq!(document.to_text_document_item().language_id, "java");
+    }
+
+    #[test]
+    fn test_new_from_a_swift_file_names_the_language_as_swift() {
+        // ファイルを見ないので、置いていないパスでよい（`test_new_does_not_look_at_the_file_system`）
+        let path = repository_path("Sources/Billing/Discount.swift");
+
+        let document =
+            SourceDocument::new(&path, "let a = 1".to_owned()).expect("ドキュメントにできる");
+
+        assert_eq!(document.to_text_document_item().language_id, "swift");
     }
 
     #[test]

@@ -467,6 +467,9 @@ fn type_signature_text_of(signal: TypeSignatureMatch, explanation: Explanation) 
         }
         TypeSignatureMatch::UnreadableSignature => "測れない (返った綴りを読み解けない)",
         TypeSignatureMatch::HoverNotProvided => "測れない (サーバが hover を提供していない)",
+        TypeSignatureMatch::NoSignatureReader => {
+            "測れない (この言語の型シグネチャを読む側がまだ無い)"
+        }
         TypeSignatureMatch::UnopenedTypeName { reason } => unopened_text_of(reason),
         TypeSignatureMatch::UntracedTypeName { reason } => untraced_text_of(reason),
         // **ここだけ直す先を出さない。** 形ごとに直し方が違い、`this` 型は
@@ -1724,6 +1727,25 @@ mod tests {
                 "型シグネチャ: 測れない (サーバが作業中で hover の答えが落ち着かない) → どちらでもない"
             ),
             "落ち着かなかったことが理由として出る: {text}"
+        );
+    }
+
+    #[test]
+    fn test_text_of_without_a_signature_reader_says_dryguard_cannot_read_the_language_yet() {
+        // 対照は「返った綴りを読み解けない」。あちらはサーバの綴りを疑う案内で、
+        // こちらはどのサーバに替えても変わらない dryguard 側の未対応
+        let text = text_of_accidental_duplication_with_semantics(
+            TypeSignatureMatch::NoSignatureReader,
+            CallerDomainOverlap::Unavailable {
+                reason: SemanticsUnavailable::NotAsked,
+            },
+        );
+
+        assert!(
+            text.contains(
+                "型シグネチャ: 測れない (この言語の型シグネチャを読む側がまだ無い) → どちらでもない"
+            ),
+            "読む側が無いことが理由として出る: {text}"
         );
     }
 

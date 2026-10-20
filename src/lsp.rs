@@ -302,6 +302,7 @@ impl ServerCommand {
             (ServerLanguage::Rust, Grammar::Rust) => true,
             (ServerLanguage::Rust, Grammar::TypeScript | Grammar::Tsx) => false,
             (ServerLanguage::TypeScript | ServerLanguage::Rust, Grammar::Java) => false,
+            (ServerLanguage::TypeScript | ServerLanguage::Rust, Grammar::Swift) => false,
         }
     }
 }
@@ -2257,6 +2258,17 @@ mod tests {
         assert!(command.supports(Grammar::TypeScript));
         assert!(command.supports(Grammar::Tsx), "TSX も同じサーバに尋ねる");
         assert!(!command.supports(Grammar::Rust));
+    }
+
+    #[test]
+    fn test_server_command_for_typescript_or_rust_does_not_support_swift() {
+        // 対照は TypeScript / Rust 自身の grammar。Swift を受けると、そのサーバに
+        // Swift のドキュメントを開かせて別の言語として尋ねる
+        for command in [ServerCommand::typescript(), ServerCommand::rust()] {
+            assert!(!command.supports(Grammar::Swift));
+        }
+        assert!(ServerCommand::typescript().supports(Grammar::TypeScript));
+        assert!(ServerCommand::rust().supports(Grammar::Rust));
     }
 
     #[test]

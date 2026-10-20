@@ -31,6 +31,8 @@ pub enum Grammar {
     Rust,
     /// `.java`
     Java,
+    /// `.swift`
+    Swift,
 }
 
 impl Grammar {
@@ -51,6 +53,7 @@ impl Grammar {
             "tsx" => Some(Self::Tsx),
             "rs" => Some(Self::Rust),
             "java" => Some(Self::Java),
+            "swift" => Some(Self::Swift),
             _ => None,
         }
     }
@@ -62,6 +65,7 @@ impl Grammar {
             Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
             Self::Java => tree_sitter_java::LANGUAGE.into(),
+            Self::Swift => tree_sitter_swift::LANGUAGE.into(),
         }
     }
 
@@ -69,6 +73,7 @@ impl Grammar {
     pub fn same_language_as(self, other: Self) -> bool {
         matches!((self, other), (Self::Rust, Self::Rust))
             || matches!((self, other), (Self::Java, Self::Java))
+            || matches!((self, other), (Self::Swift, Self::Swift))
             || matches!(
                 (self, other),
                 (Self::TypeScript | Self::Tsx, Self::TypeScript | Self::Tsx)
@@ -304,6 +309,16 @@ public class Discount {
 }
 "#;
 
+    /// `struct` と `func` を含む Swift のソース。TypeScript の grammar では読めない。
+    const A_SWIFT_STRUCT_AND_FUNCTION: &str = r#"struct Invoice {
+    let amount: Int
+}
+
+func applyDiscount(to invoice: Invoice, rate: Double = 0.1) -> Double {
+    return Double(invoice.amount) * (1 - rate)
+}
+"#;
+
     fn tree_of(source: &str) -> SyntaxTree<'_> {
         SyntaxTree::from_source(source, Grammar::TypeScript)
             .expect("テストが渡すソースは木にできる")
@@ -390,6 +405,25 @@ public class Discount {
     }
 
     #[test]
+    fn test_grammar_of_a_swift_path_reads_it_as_swift() {
+        assert_eq!(Grammar::of_path(Path::new("A.swift")), Some(Grammar::Swift));
+    }
+
+    #[test]
+    fn test_grammar_swift_is_the_same_language_as_swift() {
+        // `matches!` の組を足し忘れると、Swift のチャンクどうしが比べられない
+        assert!(Grammar::Swift.same_language_as(Grammar::Swift));
+    }
+
+    #[test]
+    fn test_grammar_swift_is_not_the_same_language_as_typescript_or_rust() {
+        // 対照は 1 つ上のテスト（Swift どうし）
+        assert!(!Grammar::Swift.same_language_as(Grammar::TypeScript));
+        assert!(!Grammar::Swift.same_language_as(Grammar::Tsx));
+        assert!(!Grammar::Rust.same_language_as(Grammar::Swift));
+    }
+
+    #[test]
     fn test_syntax_tree_of_jsx_read_as_tsx_has_no_error() {
         assert!(!has_error(A_FUNCTION_RETURNING_JSX, Grammar::Tsx));
     }
@@ -411,6 +445,17 @@ public class Discount {
         // 対照は上のテスト。このソースが他の grammar では読めないので、`language` が
         // 別の grammar を返せば上のテストが落ちる
         assert!(has_error(A_JAVA_CLASS, Grammar::TypeScript));
+    }
+
+    #[test]
+    fn test_syntax_tree_of_a_swift_struct_and_function_read_as_swift_has_no_error() {
+        assert!(!has_error(A_SWIFT_STRUCT_AND_FUNCTION, Grammar::Swift));
+    }
+
+    #[test]
+    fn test_syntax_tree_of_a_swift_struct_and_function_read_as_typescript_marks_an_error() {
+        // 対照は上のテスト。`language()` が TypeScript の言語を返していたら、上が落ちる
+        assert!(has_error(A_SWIFT_STRUCT_AND_FUNCTION, Grammar::TypeScript));
     }
 
     #[test]

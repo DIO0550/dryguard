@@ -436,6 +436,7 @@ fn type_signature_value_of(signal: TypeSignatureMatch, explanation: Explanation)
         TypeSignatureMatch::ServerStillWorking => unmeasurable_value_of("server-still-working"),
         TypeSignatureMatch::UnreadableSignature => unmeasurable_value_of("unreadable-signature"),
         TypeSignatureMatch::HoverNotProvided => unmeasurable_value_of("hover-not-provided"),
+        TypeSignatureMatch::NoSignatureReader => unmeasurable_value_of("no-signature-reader"),
         // 理由の内訳まで運ぶ。**利用者が次にすることが違う**ので、1 つのキーに畳むと
         // 直す先を選べなくなる（`rules/naming.md`「`untraced type name` と
         // `unopened` を混ぜない」）
@@ -1169,6 +1170,26 @@ mod tests {
         let reason = reason_of(&json, "type-signature-match");
         assert_eq!(reason["value"]["status"], "measured");
         assert_eq!(reason["value"]["unifiable"], true);
+    }
+
+    #[test]
+    fn test_json_of_reports_a_missing_signature_reader_apart_from_an_unreadable_signature() {
+        let reason_for = |signal| {
+            let signals =
+                accidental_duplication().with_semantics(signal, CallerDomainOverlap::NoReferences);
+            let json = json_of_signals(&signals, Explanation::AskedSignals);
+            reason_of(&json, "type-signature-match")["value"].clone()
+        };
+
+        let missing = reason_for(TypeSignatureMatch::NoSignatureReader);
+
+        assert_eq!(missing["status"], "unmeasurable");
+        assert_eq!(missing["reason"], "no-signature-reader");
+        // 対照。同じ綴りで出すと、読む側は綴りを返したサーバを疑いに行く
+        assert_eq!(
+            reason_for(TypeSignatureMatch::UnreadableSignature)["reason"],
+            "unreadable-signature"
+        );
     }
 
     #[test]

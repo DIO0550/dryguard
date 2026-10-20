@@ -47,6 +47,8 @@ impl SourceLanguage {
             (Self::Rust, Grammar::TypeScript | Grammar::Tsx) => false,
             // Java はまだチャンクにできないので、`auto` でも拾わない
             (Self::Auto | Self::TypeScript | Self::Rust, Grammar::Java) => false,
+            // Swift のチャンクはまだ切り出せないので、`auto` でも走査に入れない
+            (Self::Auto | Self::TypeScript | Self::Rust, Grammar::Swift) => false,
         }
     }
 }
@@ -226,6 +228,16 @@ mod tests {
                     .into_owned()
             })
             .collect()
+    }
+
+    #[test]
+    fn test_source_language_auto_does_not_accept_swift_yet() {
+        // 対照は Rust。Swift のチャンクはまだ切り出せないので、`auto` が拾うと
+        // 走査したファイル数だけが増える
+        assert!(SourceLanguage::Auto.accepts(Grammar::Rust));
+        assert!(!SourceLanguage::Auto.accepts(Grammar::Swift));
+        assert!(!SourceLanguage::TypeScript.accepts(Grammar::Swift));
+        assert!(!SourceLanguage::Rust.accepts(Grammar::Swift));
     }
 
     #[test]

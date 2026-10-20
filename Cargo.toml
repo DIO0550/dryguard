@@ -23,6 +23,9 @@ tree-sitter = "0.26"
 tree-sitter-typescript = "0.23"
 tree-sitter-rust = "0.24"
 tree-sitter-java = "0.23.5"
+# Swift だけは tree-sitter org ではなく alex-pinkus が公開している。それでも採るのは、
+# Swift の tree-sitter grammar はこれが事実上の唯一で、nvim-treesitter などもこれを使っているため。
+tree-sitter-swift = "0.7"
 
 # 本番コードでの unwrap / expect の禁止は、規約の文ではなくツールで落とす。
 # テストコード内は clippy.toml の allow-unwrap-in-tests / allow-expect-in-tests で許可する

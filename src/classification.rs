@@ -565,6 +565,7 @@ fn type_signature_lean_of(signal: TypeSignatureMatch) -> Lean {
         | TypeSignatureMatch::ServerStillWorking
         | TypeSignatureMatch::UnreadableSignature
         | TypeSignatureMatch::HoverNotProvided
+        | TypeSignatureMatch::NoSignatureReader
         | TypeSignatureMatch::UnopenedTypeName { .. }
         | TypeSignatureMatch::UntracedTypeName { .. }
         | TypeSignatureMatch::SiteDependentSpelling
@@ -1843,6 +1844,7 @@ mod tests {
             TypeSignatureMatch::ServerStillWorking,
             TypeSignatureMatch::UnreadableSignature,
             TypeSignatureMatch::HoverNotProvided,
+            TypeSignatureMatch::NoSignatureReader,
             TypeSignatureMatch::SiteDependentSpelling,
             TypeSignatureMatch::OverloadSetMiscounted {
                 counted: NonZeroUsize::MIN,

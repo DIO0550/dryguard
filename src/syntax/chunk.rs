@@ -182,24 +182,26 @@ impl Chunk {
             name_position: name_position_of(node, source),
             annotated: match grammar {
                 Grammar::TypeScript | Grammar::Tsx => annotated_positions_of(node, source),
-                Grammar::Rust | Grammar::Java => AnnotatedPositions::Declared {
+                // Swift はまだチャンクにならない（`is_chunk_node`）ので届かない。Rust と同じ値は
+                // 「省いたと確かめた」と読めるので、チャンクにするときに Swift の構文から読み直す
+                Grammar::Rust | Grammar::Java | Grammar::Swift => AnnotatedPositions::Declared {
                     value_type: TypeAnnotation::Omitted,
                     parameters: Vec::new(),
                 },
             },
             overload_declarations: match grammar {
                 Grammar::TypeScript | Grammar::Tsx => overload_declarations_of(node, source),
-                Grammar::Rust | Grammar::Java => Vec::new(),
+                Grammar::Rust | Grammar::Java | Grammar::Swift => Vec::new(),
             },
             type_references: match grammar {
                 Grammar::TypeScript | Grammar::Tsx => chunk_type_references_of(node, source),
                 Grammar::Rust => rust_callable::type_references_of(node, source),
                 // 集めないので、綴りに残る型名はどれも辿った記録を持たず測れない側へ倒れる
-                Grammar::Java => Vec::new(),
+                Grammar::Java | Grammar::Swift => Vec::new(),
             },
             rust_impl_header: match grammar {
                 Grammar::Rust => rust_callable::impl_header_of(node, source),
-                Grammar::TypeScript | Grammar::Tsx | Grammar::Java => None,
+                Grammar::TypeScript | Grammar::Tsx | Grammar::Java | Grammar::Swift => None,
             },
             source: source_of_lines(source, lines),
             tokens: TokenSequence::from_node(node),
@@ -499,6 +501,8 @@ fn is_chunk_node(node: Node<'_>, grammar: Grammar) -> bool {
         }
         // チャンクにするノードの種別をまだ決めていないので、1 つも切り出さない
         Grammar::Java => false,
+        // チャンクにするノードの種別はまだ決めていない。Swift のファイルからチャンクは出ない
+        Grammar::Swift => false,
     }
 }
 
@@ -526,6 +530,7 @@ fn is_test_function(node: Node<'_>, source: &str, grammar: Grammar) -> bool {
         Grammar::Rust => has_test_attribute(node, source),
         Grammar::TypeScript | Grammar::Tsx => is_typescript_test_callback(node, source),
         Grammar::Java => false,
+        Grammar::Swift => false,
     }
 }
 
@@ -1308,6 +1313,22 @@ export const rate = 0.1;
         let chunk = chunk_at(METHOD_IN_A_CLASS, "a.ts:3").expect("切り出せる");
 
         assert_eq!(chunk.lines(), range(2, 4));
+    }
+
+    #[test]
+    fn test_chunk_of_a_line_inside_a_swift_function_is_not_cut_out_yet() {
+        // 対照は同じ並びの TypeScript の関数（`a.ts:4` で切り出せる）。Swift のチャンクの
+        // 種別はまだ決めていないので、関数の中を指しても切り出さない
+        let source = "func applyDiscount(price: Double) -> Double {\n    let rate = 0.1\n    return price * (1 - rate)\n}\n";
+        let location: Location = "a.swift:3".parse().expect("テストが渡す位置は解釈できる");
+        let tree = SyntaxTree::from_source(source, Grammar::Swift)
+            .expect("テストが渡すソースは木にできる");
+
+        assert_eq!(
+            Chunk::find_enclosing(&location, &tree),
+            Err(ChunkingError::NoEnclosingFunction)
+        );
+        assert!(chunk_at(FUNCTION_AFTER_A_CONSTANT, "a.ts:4").is_ok());
     }
 
     #[test]

@@ -760,6 +760,8 @@ fn asked_semantics_of(
 /// （`semantics::resolved_type`）。**Rust は hover の後に宣言の場所とエイリアスの右辺を
 /// 集める。** 順序は `semantics::type_signature::rust_type_signature_outcome_of` が
 /// 中に持つ（読み込み前の definition は空を返すので、hover が落ち着くのを先に待つ）。
+/// 綴りを読む側がまだ無い grammar（Swift）は、尋ねずに
+/// [`TypeSignatureOutcome::NoSignatureReader`] を返す。
 ///
 /// `declarations_cache` は同じセッションで尋ねるチャンクのあいだで共有する、Rust の
 /// 宣言側の答え。**チャンクごとに作らない** — 答えはチャンクではなく宣言のファイルと
@@ -801,9 +803,8 @@ fn resolved_type_signature_outcome_of(
                 &traced,
             )
         }
-        // hover の綴りを読む側がまだ無いので尋ねない。`UnreadableSignature` は綴りが
-        // 返った後の理由で、尋ねていない事実とは違うが、Java を受けるサーバが無いのでここへは来ない
-        Grammar::Java => Ok(TypeSignatureOutcome::UnreadableSignature),
+        // 綴りを読む側がまだ無い。hover を送らずに、そのことを理由として返す
+        Grammar::Java | Grammar::Swift => Ok(TypeSignatureOutcome::NoSignatureReader),
     }
 }
 
@@ -988,10 +989,10 @@ fn document_of(chunk: &Chunk, source: &str) -> Result<SourceDocument, SemanticsE
 /// **片方でも正規化できていなければ「単一化不能」にしない。** 比べていないので、
 /// 取れなかった理由をそのまま出す（2 つとも取れていなければ、上の枝の理由）。
 ///
-/// **並びの軸は「環境を直しても変わらない理由を先に出す」。** 綴りが場所に依存するのは
-/// チャンクの形そのものなので、往復と読み取りについての理由（サーバを替える・
-/// ファイルを読めるようにすれば変わりうる）より先に置く
-/// (`rules/architecture.md`「理由は落とさない」)。
+/// **並びの軸は「環境を直しても変わらない理由を先に出す」。** 綴りを読む側が無いのは
+/// 言語で決まるので先頭に置く。綴りが場所に依存するのはチャンクの形そのものなので、
+/// 往復と読み取りについての理由（サーバを替える・ファイルを読めるようにすれば変わりうる）
+/// より先に置く (`rules/architecture.md`「理由は落とさない」)。
 ///
 /// **[`TypeSignatureOutcome::UntracedTypeName`] も形の理由だが、末尾に置いたままにしてある。**
 /// 動かすとこの関数が今出している理由が変わるので、そこだけ別の変更で見る。
@@ -1004,6 +1005,10 @@ fn type_signature_match_of(
             TypeSignatureOutcome::Normalized(normalized_a),
             TypeSignatureOutcome::Normalized(normalized_b),
         ) => unifiable_match_of(normalized_a.is_unifiable_with(normalized_b)),
+        // **読む側が無いことを、サーバの答えに由来する理由より先に出す。** 言語で決まる
+        // 答えなので、サーバを替えても変わらない。後ろに置くと、直せない相手の案内が出る
+        (TypeSignatureOutcome::NoSignatureReader, _)
+        | (_, TypeSignatureOutcome::NoSignatureReader) => TypeSignatureMatch::NoSignatureReader,
         (TypeSignatureOutcome::SiteDependentSpelling, _)
         | (_, TypeSignatureOutcome::SiteDependentSpelling) => {
             TypeSignatureMatch::SiteDependentSpelling
@@ -3117,6 +3122,24 @@ mod tests {
         ClientError::ServerNotFound {
             program: name.to_owned(),
         }
+    }
+
+    #[test]
+    fn test_type_signature_match_of_a_missing_signature_reader_outranks_a_site_dependent_spelling()
+    {
+        // 読む側が無いのは言語で決まり、チャンクの形を直しても変わらない。形の理由を先に
+        // 出すと、直しても測れないままの案内になる
+        let matched = type_signature_match_of(
+            &TypeSignatureOutcome::SiteDependentSpelling,
+            &TypeSignatureOutcome::NoSignatureReader,
+        );
+        let swapped = type_signature_match_of(
+            &TypeSignatureOutcome::NoSignatureReader,
+            &TypeSignatureOutcome::SiteDependentSpelling,
+        );
+
+        assert_eq!(matched, TypeSignatureMatch::NoSignatureReader);
+        assert_eq!(swapped, TypeSignatureMatch::NoSignatureReader);
     }
 
     #[test]
