@@ -120,7 +120,9 @@ spread 引数の後ろも引数位置が確定しないため残す。テスト�
 自由関数・`impl` 内のメソッド・トレイト実装のメソッドをそれぞれ 1 チャンクにする。
 正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない関数（1〜3 行のアクセサ・委譲）は `scan` では比べず、
 外した数を走査量の行に出す（`compare` は名指しされれば比べる）。
-`.java` / `.swift` は構文木として読めるが、関数をチャンクにする対応がまだ無いので、`scan` も `compare` も比べない。
+`.java` は構文木として読めるが、関数をチャンクにする対応がまだ無いので、`scan` も `compare` も比べない。
+`.swift` は関数・メソッド・`init` / `deinit` をチャンクにし、`compare` で名指しすれば比べるが、
+正規化トークン・葉の綴りの違い・依存の宣言の対応がまだ無いので、`scan` は走査しない。
 CLI は拡張子から TypeScript と Rust の LSP サーバを選ぶ。`scan --lang auto` では
 言語ごとに候補を揃え、TypeScript は typescript-language-server、Rust は rust-analyzer の
 セッションで hover / references を問い合わせる。Rust の型シグネチャ比較は #40 まで

@@ -64,7 +64,7 @@ if structurally_similar && domains_differ { ... }
 | `generic alias` | Rust の型パラメータ・既定値・右辺を持ち、使用側の型引数を当てはめて展開する型エイリアス |
 | `impl header` | Rust メソッドが直接所属する impl の本体より前のソース。対象型・型変数・境界・実装トレイトを、そのスコープのまま運ぶ |
 | `accessor` | プロパティのように読み書きされるメンバーを実装する関数（`get` / `set`）。**チャンクとしては関数**だが、`hover` が返すのは**メンバーとしての型** |
-| `test function` | Rust のテスト属性（パス末尾が `test`）付き関数、または TypeScript / TSX の `describe` / `it` / `test`（`.only` / `.skip` を含む）の第2引数に直接書いたアロー関数・関数式。callback 側の透過ラッパーは辿るが、spread で位置が確定しない形・別名・namespace・未知の修飾は残す。TS は呼び出し名のヒューリスティックで、同名の業務 API も対象。**`scan` / `check` は既定でチャンクにしない**（`--include-tests` で入れる）。ファイル名や囲むテストでは判定せず、印の付かないヘルパー・内部の関数は残す |
+| `test function` | Rust のテスト属性（パス末尾が `test`）付き関数、または TypeScript / TSX の `describe` / `it` / `test`（`.only` / `.skip` を含む）の第2引数に直接書いたアロー関数・関数式、または Swift の `@Test`（Swift Testing。`@Testing.Test` も末尾で見る）付きの関数と、`XCTestCase`（末尾で見る）を継承したクラスに直接書いた `func test…`（XCTest）。callback 側の透過ラッパーは辿るが、spread で位置が確定しない形・別名・namespace・未知の修飾は残す。TS は呼び出し名のヒューリスティックで、同名の業務 API も対象。Swift の XCTest は直接囲むクラスの継承だけを見るので、`extension` の中のメソッドと `XCTestCase` を間接に継承したクラスのメソッドは残る。**`scan` / `check` は既定でチャンクにしない**（`--include-tests` で入れる）。ファイル名や囲むテストでは判定せず（XCTest の継承の確かめは印の一部で、囲むテストによる判定ではない）、印の付かないヘルパー・内部の関数は残す |
 | `diff base` | `check --diff` が `diff target` と比べるリビジョン（既定は `HEAD`）。**範囲は取らない** — 行番号がチャンクを切り出す版を指さなくなる（`codebase::diff::DiffBase`） |
 | `diff target` | `diff base` と比べる側。作業ツリー（既定）か index（`--staged`）。**変わった行の行番号はこの側の版を指し、チャンクもこの側の版から切り出す**（`codebase::diff::DiffTarget`。index の版は `codebase::index`） |
 | `changed chunk` | `diff target` の側で `diff base` から変わった行を含む chunk。`check --diff` が比べる起点で、**少なくとも片方がこれである pair だけ**を比べる。作業ツリーと比べるときは追跡していないファイルの chunk はすべて当たる（index と比べるときは追跡していないファイルを読まない）。消しただけの変更は消した点を内側に含む chunk だけが当たる |
@@ -129,9 +129,9 @@ if structurally_similar && domains_differ { ... }
 | `resolved type` | その型名が指していた型の綴り。**解決後** |
 | `traced type name` | シグネチャに書かれた型名 1 つを、宣言まで辿った結果。宣言の場所・開いた綴り・**開けなかった理由**のどれか |
 | `untraced type name` | 比較に残る綴りに現れたのに、**その出現を辿った記録が無い**型名。尋ねる位置を作れなかったもので、**ソースに書かれていない**（推論された値の型・推論された引数の型の型名）か、書かれているのに**集める場所の一覧から漏れた**か、**どの出現が書かれていないかを言えない**かのどれか。**束縛された型変数は入らない** |
-| `value type` | チャンクが受け渡しする値の型。関数・getter では戻り値の型、setter では引数の型。**`annotatable position` の 1 つ**で、省くと TypeScript が推論する |
+| `value type` | チャンクが受け渡しする値の型。関数・getter では戻り値の型、setter では引数の型。**`annotatable position` の 1 つ**で、省くと TypeScript が推論する（Swift の関数の戻り値は省くと `Void` に決まる。`init` / `deinit` は注釈できないので「書かれている」に数える） |
 | `type annotation` | ソースが**その位置**に型注釈を書いたか（書かれている / 省かれている）。省かれていれば hover はそこに推論した型を綴るので、**その出現は尋ねていない** |
-| `annotatable position` | チャンクの宣言が `type annotation` を省ける位置。**`value type` 1 つと、引数ごとに 1 つ**。引数は既定値を書くと省ける |
+| `annotatable position` | チャンクの宣言が `type annotation` を省ける位置。**`value type` 1 つと、引数ごとに 1 つ**。TypeScript の引数は既定値を書くと省ける（Swift の引数は省けないので、いつも「書かれている」） |
 | `value type annotation` | `value type` の位置の `type annotation` |
 | `parameter annotation` | 引数 1 つ分の `type annotation`。**引数ごとに答えが違う** |
 | `site-dependent spelling` | **型名にならないのに、指す先が書かれた場所で決まる**綴り（`typeof localValue` / `{ [key]: string }` / `import("./local").T` / `this`）。型名のノードにならないので、尋ねる位置そのものを作れない。**Rust では直接囲む impl で置換できない Self を数える**。Self を含む関連型は末尾の位置を尋ね、解決できなければその理由を出す。impl の対象型へ置換できた Self / レシーバ（関連型 RHS の Self を含む）と、展開できた関連型は数えない |
