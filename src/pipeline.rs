@@ -2657,7 +2657,7 @@ impl fmt::Display for ChunkPairError {
             Self::UnreadableExtension { location } => {
                 write!(
                     formatter,
-                    "{location} の言語を拡張子から判定できません（対応: .ts / .tsx / .mts / .cts / .rs）。--lang を指定しても未対応の拡張子は読み取れません"
+                    "{location} の言語を拡張子から判定できません（対応: .ts / .tsx / .mts / .cts / .rs / .java）。--lang を指定しても未対応の拡張子は読み取れません"
                 )
             }
             Self::SourceUnreadable { location, cause } => {
