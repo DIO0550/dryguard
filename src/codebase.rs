@@ -45,7 +45,7 @@ impl SourceLanguage {
             (Self::TypeScript, Grammar::Rust) => false,
             (Self::Rust, Grammar::Rust) => true,
             (Self::Rust, Grammar::TypeScript | Grammar::Tsx) => false,
-            // Java はまだチャンクにできないので、`auto` でも拾わない
+            // Java を走査に入れる対応（言語の選択肢と候補の揃え方）がまだ無いので、`auto` でも拾わない
             (Self::Auto | Self::TypeScript | Self::Rust, Grammar::Java) => false,
             // Swift はチャンクを切り出せるが、正規化トークンの表に Swift の種別がまだ無いので、
             // `auto` でも走査に入れない
@@ -355,8 +355,8 @@ mod tests {
 
     #[test]
     fn test_source_paths_of_auto_leaves_out_java_files() {
-        // 対照は同じディレクトリの `.ts` / `.rs`。`.java` は読める拡張子になったが、
-        // チャンクにできないうちは `auto` でも走査に入れない
+        // 対照は同じディレクトリの `.ts` / `.rs`。`.java` はチャンクにできるようになったが、
+        // 走査に入れる対応が入るまでは `auto` でも走査に入れない
         let root = fixture("language-scan");
 
         let paths =

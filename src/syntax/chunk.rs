@@ -79,9 +79,9 @@ pub enum AnnotatedPositions {
     /// **どの位置の綴りもソースに書かれている。**
     ///
     /// 構文木から来るのは、外側に書かれた型が綴り全体を決める形
-    /// （`const handler: Handler = (x) => x`）。
+    /// （`const handler: Handler = (x) => x`）と、型をすべて書く言語（Java）のチャンク。
     ///
-    /// **[`AnnotatedPositions::Declared`] で表さない。** hover が綴るのは注釈の型
+    /// **TypeScript では [`AnnotatedPositions::Declared`] で表さない。** hover が綴るのは注釈の型
     /// （`Handler`）なので、**ソースの引数の数と綴りの引数の数が揃うとは限らず**
     /// （2 引数の関数型を 1 引数のアローに注釈できる）、引数ごとの並びを作れない。
     AllWritten,
@@ -183,7 +183,11 @@ impl Chunk {
                 .and_then(|name| source_position_of(name, source)),
             annotated: match grammar {
                 Grammar::TypeScript | Grammar::Tsx => annotated_positions_of(node, source),
-                Grammar::Rust | Grammar::Java => AnnotatedPositions::Declared {
+                // 引数・戻り値の型は必ず書かれる（`var` はローカル変数だけ）。
+                // Why not（位置ごとに `Written` を並べる）: 引数の数をソースで数えることになり、
+                // hover の綴りと揃うか（receiver parameter `Foo this` など）は jdtls で未実測
+                Grammar::Java => AnnotatedPositions::AllWritten,
+                Grammar::Rust => AnnotatedPositions::Declared {
                     value_type: TypeAnnotation::Omitted,
                     parameters: Vec::new(),
                 },
@@ -196,7 +200,8 @@ impl Chunk {
             type_references: match grammar {
                 Grammar::TypeScript | Grammar::Tsx => chunk_type_references_of(node, source),
                 Grammar::Rust => rust_callable::type_references_of(node, source),
-                // 集めないので、綴りに残る型名はどれも辿った記録を持たず測れない側へ倒れる
+                // 集めない。Java は綴りを読む側がまだ無く、`pipeline` が hover を送らずに
+                // 「尋ねていない」と答えるので、ここが空でも答えには効かない
                 Grammar::Java | Grammar::Swift => Vec::new(),
             },
             rust_impl_header: match grammar {
@@ -346,8 +351,8 @@ pub struct FileChunks {
     excluded_test_function_count: usize,
 }
 
-/// `test function`（Rust のテスト属性付き関数・TypeScript のテストコールバック・Swift の
-/// `@Test` と XCTest のメソッド）をチャンクにするか。
+/// `test function`（Rust のテスト属性付き関数・Java のテスト注釈付きメソッド・TypeScript の
+/// テストコールバック・Swift の `@Test` と XCTest のメソッド）をチャンクにするか。
 ///
 /// **外す既定を持たない。** 既定は入口（`scan` の `--include-tests`）が決め、
 /// `compare` は位置を名指ししているので外さない（[`Chunk::find_enclosing`] は見ない）。
@@ -498,6 +503,17 @@ const CHUNK_KINDS: [&str; 6] = [
 /// 比較の単位がメソッドだから。本体のないトレイトの宣言 (`function_signature_item`) は比較しない。
 const RUST_CHUNK_KIND: &str = "function_item";
 
+/// Java でチャンクにするノードの種別。
+///
+/// メソッド・コンストラクタ・record の compact constructor。本体のない interface の抽象メソッドは
+/// Rust の `function_signature_item` と同じく比較しない。`lambda_expression` は Rust の
+/// クロージャと同じく入れない。
+const JAVA_CHUNK_KINDS: [&str; 3] = [
+    "method_declaration",
+    "constructor_declaration",
+    "compact_constructor_declaration",
+];
+
 /// Swift でチャンクとして拾うノードの種別。
 ///
 /// メソッドも自由関数と同じ `function_declaration`。`struct` / `class` / `enum` / `extension` は
@@ -526,8 +542,9 @@ fn is_chunk_node(node: Node<'_>, grammar: Grammar) -> bool {
         Grammar::Rust => {
             node.kind() == RUST_CHUNK_KIND && node.child_by_field_name("body").is_some()
         }
-        // チャンクにするノードの種別をまだ決めていないので、1 つも切り出さない
-        Grammar::Java => false,
+        Grammar::Java => {
+            JAVA_CHUNK_KINDS.contains(&node.kind()) && node.child_by_field_name("body").is_some()
+        }
         Grammar::Swift => {
             SWIFT_CHUNK_KINDS.contains(&node.kind()) && node.child_by_field_name("body").is_some()
         }
@@ -557,9 +574,51 @@ fn is_test_function(node: Node<'_>, source: &str, grammar: Grammar) -> bool {
     match grammar {
         Grammar::Rust => has_test_attribute(node, source),
         Grammar::TypeScript | Grammar::Tsx => is_typescript_test_callback(node, source),
-        Grammar::Java => false,
+        Grammar::Java => has_java_test_annotation(node, source),
         Grammar::Swift => is_swift_test_function(node, source),
     }
+}
+
+/// Java の宣言の修飾子を載せるノードの種別。フィールドではなく名前の無い子として並ぶ。
+const JAVA_MODIFIERS_KIND: &str = "modifiers";
+
+/// Java の注釈のノードの種別。引数なし（`@Test`）と引数付き（`@Test(timeout = 1)`）。
+const JAVA_ANNOTATION_KINDS: [&str; 2] = ["marker_annotation", "annotation"];
+
+/// テストの印とみなす Java の注釈の名前が、**後ろで一致する**綴り。
+///
+/// 修飾付き（`org.junit.Test`）も綴り全体の後ろで見る。最後の区切り以降で比べても答えは同じ。
+///
+/// `@Test` / `@ParameterizedTest` / `@RepeatedTest` / `@org.junit.Test` がこれに当たり、
+/// `@TestFactory` / `@TestTemplate` は当たらない。Rust の [`TEST_ATTRIBUTE_NAME`] と同じく
+/// **一覧から漏れた注釈のメソッドはチャンクとして残る**
+/// （`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」）。
+/// 逆に後ろだけを見るので、テストでない `@BeforeTest` / `@AfterTest`（TestNG の準備）の
+/// メソッドも外す。外した数は走査の出力に出るので、黙って消えはしない。
+const JAVA_TEST_ANNOTATION_SUFFIX: &str = "Test";
+
+/// Java の宣言の修飾子に、名前が [`JAVA_TEST_ANNOTATION_SUFFIX`] で終わる注釈があるか。
+///
+/// Rust の属性と違い、注釈は宣言自身の子（`modifiers`）に入る。**直下の `modifiers` だけを見る** —
+/// 子孫まで降りると、引数の注釈（`@Test int x`）や本体の中の匿名クラスのメソッドの注釈を拾う。
+/// 型パラメータの後ろの注釈（`<T> @Test void m()`）は `modifiers` の外に並ぶので見ず、
+/// そのメソッドはチャンクとして残る。
+fn has_java_test_annotation(node: Node<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    let Some(modifiers) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == JAVA_MODIFIERS_KIND)
+    else {
+        return false;
+    };
+
+    let mut cursor = modifiers.walk();
+    modifiers
+        .named_children(&mut cursor)
+        .filter(|modifier| JAVA_ANNOTATION_KINDS.contains(&modifier.kind()))
+        .filter_map(|annotation| annotation.child_by_field_name(NAME_FIELD))
+        .filter_map(|name| source.get(name.byte_range()))
+        .any(|name| name.ends_with(JAVA_TEST_ANNOTATION_SUFFIX))
 }
 
 /// Rust の関数にテストの印の属性が付いているか。
@@ -3258,5 +3317,213 @@ export function scale(a: unknown, rate?: unknown): unknown {
         };
 
         assert!(!chunk.is_undersized());
+    }
+
+    fn java_chunks_of(source: &str, test_functions: TestFunctions) -> FileChunks {
+        let tree =
+            SyntaxTree::from_source(source, Grammar::Java).expect("テストが渡すソースは木にできる");
+
+        FileChunks::from_tree(&tree, Path::new("src/A.java"), test_functions)
+    }
+
+    /// チャンクの名前の綴り。名前の位置の行から、その列以降の識別子を読む。
+    fn names_of(source: &str, file_chunks: &FileChunks) -> Vec<String> {
+        file_chunks
+            .chunks()
+            .iter()
+            .map(|chunk| {
+                let position = chunk.name_position().expect("Java のチャンクは名前を持つ");
+                let line = source
+                    .lines()
+                    .nth(position.line().to_index())
+                    .expect("名前の行はソースにある");
+                line.chars()
+                    .skip(position.character())
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_java_method_constructor_and_compact_constructor_become_three_chunks() {
+        let source = r#"class Account {
+    Account(int balance) {
+        this.balance = balance;
+    }
+
+    int deposit(int amount) {
+        return balance + amount;
+    }
+}
+
+record Range(int low, int high) {
+    Range {
+        check(low, high);
+    }
+}
+"#;
+        let file_chunks = java_chunks_of(source, TestFunctions::Excluded);
+
+        assert_eq!(
+            names_of(source, &file_chunks),
+            vec!["Account", "deposit", "Range"]
+        );
+    }
+
+    #[test]
+    fn test_java_abstract_interface_method_and_lambda_do_not_become_chunks() {
+        // 対照として本体のあるメソッドを 1 つ置く。チャンクになるのはそれだけ
+        let source = r#"interface Shape {
+    double area();
+}
+
+class Square {
+    Runnable printer() {
+        return () -> System.out.println("square");
+    }
+}
+"#;
+        let file_chunks = java_chunks_of(source, TestFunctions::Excluded);
+
+        assert_eq!(names_of(source, &file_chunks), vec!["printer"]);
+    }
+
+    const TEST_CLASS: &str = r#"class AccountTest {
+    @BeforeEach
+    void setUp() {
+        account = new Account(0);
+    }
+
+    @Test
+    void depositAddsTheAmount() {
+        assertEquals(1, account.deposit(1));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 2})
+    void depositsArePositive(int amount) {
+        assertTrue(account.deposit(amount) > 0);
+    }
+
+    @org.junit.Test
+    public void qualifiedTest() {
+        assertEquals(0, account.balance());
+    }
+
+    @Test(timeout = 1)
+    void timedTest() {
+        account.deposit(1);
+    }
+
+    @TestFactory
+    Stream<DynamicTest> generatedTests() {
+        return Stream.empty();
+    }
+}
+"#;
+
+    #[test]
+    fn test_java_excluding_test_functions_leaves_out_methods_annotated_as_tests() {
+        let file_chunks = java_chunks_of(TEST_CLASS, TestFunctions::Excluded);
+
+        assert_eq!(
+            names_of(TEST_CLASS, &file_chunks),
+            vec!["setUp", "generatedTests"],
+            "注釈の名前の末尾が Test のメソッドだけが外れる（`@BeforeEach` / `@TestFactory` は残る）"
+        );
+        assert_eq!(file_chunks.excluded_test_function_count(), 4);
+    }
+
+    #[test]
+    fn test_java_including_test_functions_keeps_methods_annotated_as_tests() {
+        let file_chunks = java_chunks_of(TEST_CLASS, TestFunctions::Included);
+
+        assert_eq!(
+            names_of(TEST_CLASS, &file_chunks),
+            vec![
+                "setUp",
+                "depositAddsTheAmount",
+                "depositsArePositive",
+                "qualifiedTest",
+                "timedTest",
+                "generatedTests"
+            ]
+        );
+        assert_eq!(file_chunks.excluded_test_function_count(), 0);
+    }
+
+    #[test]
+    fn test_java_annotation_after_type_parameters_does_not_mark_a_test_function() {
+        // `modifiers` の外に並ぶ注釈は見ない。対照の `@Test` は `modifiers` の中
+        let source = r#"class Generic {
+    public <T> @Test void afterTypeParameters(T value) {
+        consume(value);
+    }
+
+    @Test
+    public <T> void inModifiers(T value) {
+        consume(value);
+    }
+}
+"#;
+        let file_chunks = java_chunks_of(source, TestFunctions::Excluded);
+
+        assert_eq!(names_of(source, &file_chunks), vec!["afterTypeParameters"]);
+    }
+
+    #[test]
+    fn test_java_test_annotation_inside_a_method_marks_only_the_annotated_declaration() {
+        // 外側のメソッドの引数の注釈と、本体の中の匿名クラスのメソッドの注釈は、
+        // 外側のメソッドの印ではない。外れるのは注釈を直接付けた内側のメソッドだけ
+        let source = r#"class Factory {
+    Runnable build(@Test int seed) {
+        return new Runnable() {
+            @Test
+            public void run() {
+                consume(seed);
+            }
+        };
+    }
+}
+"#;
+        let file_chunks = java_chunks_of(source, TestFunctions::Excluded);
+
+        assert_eq!(names_of(source, &file_chunks), vec!["build"]);
+        assert_eq!(file_chunks.excluded_test_function_count(), 1);
+    }
+
+    #[test]
+    fn test_java_chunk_spells_every_annotatable_position_in_source() {
+        // 引数・戻り値の型は必ず書かれる（`var` はローカル変数だけ）
+        let source = r#"class Account {
+    int deposit(int amount) {
+        return balance + amount;
+    }
+}
+"#;
+        let file_chunks = java_chunks_of(source, TestFunctions::Excluded);
+        let [chunk] = file_chunks.chunks() else {
+            panic!("メソッド 1 つがチャンクになる");
+        };
+
+        assert_eq!(chunk.annotated_positions(), &AnnotatedPositions::AllWritten);
+    }
+
+    #[test]
+    fn test_java_chunk_at_a_line_inside_a_method_covers_that_method() {
+        let source = r#"class Account {
+    int deposit(int amount) {
+        return balance + amount;
+    }
+}
+"#;
+        let location: Location = "src/A.java:3".parse().expect("位置は解釈できる");
+        let tree = SyntaxTree::from_source(source, Grammar::Java).expect("木にできる");
+
+        let chunk = Chunk::find_enclosing(&location, &tree).expect("メソッドを切り出せる");
+
+        assert_eq!(chunk.lines().start().get(), 2);
+        assert_eq!(chunk.lines().end().get(), 4);
     }
 }
