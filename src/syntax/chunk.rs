@@ -179,19 +179,19 @@ impl Chunk {
             path: path.to_path_buf(),
             grammar,
             lines,
-            name_position: name_position_of(node, source),
+            name_position: chunk_name_node_of(node, grammar)
+                .and_then(|name| source_position_of(name, source)),
             annotated: match grammar {
                 Grammar::TypeScript | Grammar::Tsx => annotated_positions_of(node, source),
                 // 引数・戻り値の型は必ず書かれる（`var` はローカル変数だけ）。
                 // Why not（位置ごとに `Written` を並べる）: 引数の数をソースで数えることになり、
                 // hover の綴りと揃うか（receiver parameter `Foo this` など）は jdtls で未実測
                 Grammar::Java => AnnotatedPositions::AllWritten,
-                // Swift はまだチャンクにならない（`is_chunk_node`）ので届かない。Rust と同じ値は
-                // 「省いたと確かめた」と読めるので、チャンクにするときに Swift の構文から読み直す
-                Grammar::Rust | Grammar::Swift => AnnotatedPositions::Declared {
+                Grammar::Rust => AnnotatedPositions::Declared {
                     value_type: TypeAnnotation::Omitted,
                     parameters: Vec::new(),
                 },
+                Grammar::Swift => swift_annotated_positions_of(node),
             },
             overload_declarations: match grammar {
                 Grammar::TypeScript | Grammar::Tsx => overload_declarations_of(node, source),
@@ -210,7 +210,12 @@ impl Chunk {
             },
             source: source_of_lines(source, lines),
             tokens: TokenSequence::from_node(node),
-            leaves: ChunkLeaves::from_node(node, name_node_of(node), source, grammar),
+            leaves: ChunkLeaves::from_node(
+                node,
+                chunk_name_node_of(node, grammar),
+                source,
+                grammar,
+            ),
             imports,
         }
     }
@@ -346,8 +351,8 @@ pub struct FileChunks {
     excluded_test_function_count: usize,
 }
 
-/// `test function`（Rust のテスト属性付き関数・Java のテスト注釈付きメソッド・TypeScript のテストコールバック）
-/// をチャンクにするか。
+/// `test function`（Rust のテスト属性付き関数・Java のテスト注釈付きメソッド・TypeScript の
+/// テストコールバック・Swift の `@Test` と XCTest のメソッド）をチャンクにするか。
 ///
 /// **外す既定を持たない。** 既定は入口（`scan` の `--include-tests`）が決め、
 /// `compare` は位置を名指ししているので外さない（[`Chunk::find_enclosing`] は見ない）。
@@ -509,6 +514,27 @@ const JAVA_CHUNK_KINDS: [&str; 3] = [
     "compact_constructor_declaration",
 ];
 
+/// Swift でチャンクとして拾うノードの種別。
+///
+/// メソッドも自由関数と同じ `function_declaration`。`struct` / `class` / `enum` / `extension` は
+/// どれも `class_declaration` で、入れないのは比較の単位がメソッドだから。本体のない
+/// protocol の要求（`protocol_function_declaration`）とクロージャ（`lambda_literal`）は、
+/// Rust の `function_signature_item` とクロージャと同じ理由で比較しない。
+/// `subscript` と computed property の `get` / `set`・`willSet` / `didSet` も入れていない。
+/// hover が返すのはメンバーとしての型で、関数とは 1 段ずれる（TypeScript の `accessor` と同じ）ため、
+/// 読み方を決めるまではチャンクにしない（中の行は囲む関数が無ければ切り出せない）。
+const SWIFT_CHUNK_KINDS: [&str; 3] = [SWIFT_FUNCTION_KIND, "init_declaration", SWIFT_DEINIT_KIND];
+
+/// Swift の関数・メソッドのノードの種別。TypeScript の関数宣言と同じ綴りなので、
+/// 種別だけでは grammar を見分けられない。
+const SWIFT_FUNCTION_KIND: &str = "function_declaration";
+
+/// Swift の `deinit` のノードの種別。
+const SWIFT_DEINIT_KIND: &str = "deinit_declaration";
+
+/// Swift の引数 1 つ分のノードの種別。引数リストの包みは無く、宣言の直接の子として並ぶ。
+const SWIFT_PARAMETER_KIND: &str = "parameter";
+
 /// そのノードが、grammar ごとのチャンク種別に当たるか。
 fn is_chunk_node(node: Node<'_>, grammar: Grammar) -> bool {
     match grammar {
@@ -519,8 +545,9 @@ fn is_chunk_node(node: Node<'_>, grammar: Grammar) -> bool {
         Grammar::Java => {
             JAVA_CHUNK_KINDS.contains(&node.kind()) && node.child_by_field_name("body").is_some()
         }
-        // チャンクにするノードの種別はまだ決めていない。Swift のファイルからチャンクは出ない
-        Grammar::Swift => false,
+        Grammar::Swift => {
+            SWIFT_CHUNK_KINDS.contains(&node.kind()) && node.child_by_field_name("body").is_some()
+        }
     }
 }
 
@@ -548,7 +575,7 @@ fn is_test_function(node: Node<'_>, source: &str, grammar: Grammar) -> bool {
         Grammar::Rust => has_test_attribute(node, source),
         Grammar::TypeScript | Grammar::Tsx => is_typescript_test_callback(node, source),
         Grammar::Java => has_java_test_annotation(node, source),
-        Grammar::Swift => false,
+        Grammar::Swift => is_swift_test_function(node, source),
     }
 }
 
@@ -619,6 +646,106 @@ pub(super) fn has_attribute(
         sibling = previous.prev_named_sibling();
     }
     false
+}
+
+/// Swift Testing のテストの印とみなす属性の名前。`@Test` / `@Testing.Test` がこれに当たる。
+const SWIFT_TEST_ATTRIBUTE_NAME: &str = "Test";
+
+/// XCTest がテストとして走らせるメソッドの名前の接頭辞。
+const XCTEST_METHOD_PREFIX: &str = "test";
+
+/// XCTest のテストを持つクラスが継承する型の名前。
+const XCTEST_CASE_NAME: &str = "XCTestCase";
+
+/// Swift の関数が `test function` か。`@Test` の属性（Swift Testing）か、
+/// `XCTestCase` を継承したクラスの引数を取らない `func test…`（XCTest）。
+///
+/// **XCTest は継承と引数まで確かめる。** 名前の接頭辞だけで外すと、`test` で始まる普通の関数や、
+/// XCTest が走らせない引数付きのヘルパーまで外す。直接囲むクラスの継承しか見ないので、
+/// `extension` の中のメソッドと、`XCTestCase` を間接に継承したクラスのメソッドはチャンクとして
+/// 残る（比べる側へ倒れる）。`static` / `private` は見ないので、XCTest が走らせない
+/// `static func test…` なども外れる（比べない側へ倒れる。外した数は走査の出力に出る）。
+fn is_swift_test_function(node: Node<'_>, source: &str) -> bool {
+    if has_swift_test_attribute(node, source) {
+        return true;
+    }
+    if node.kind() != SWIFT_FUNCTION_KIND {
+        return false;
+    }
+    let named_like_a_test = node
+        .child_by_field_name(NAME_FIELD)
+        .and_then(|name| source.get(name.byte_range()))
+        .is_some_and(|name| name.starts_with(XCTEST_METHOD_PREFIX));
+    let mut cursor = node.walk();
+    let takes_no_parameters = !node
+        .named_children(&mut cursor)
+        .any(|child| child.kind() == SWIFT_PARAMETER_KIND);
+    named_like_a_test && takes_no_parameters && is_in_xctest_case(node, source)
+}
+
+/// Swift の宣言の属性に `@Test` があるか。
+///
+/// 属性は `modifiers` の子として見る。grammar の `node-types.json` は宣言の直接の子にも
+/// `attribute` を許すが、前置きの修飾子・改行・引数付きの `@Test` を並べても `modifiers` の下に
+/// しか並ばなかった。見落とした形は印の無い関数としてチャンクに残る（比べる側へ倒れる）。
+fn has_swift_test_attribute(node: Node<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    let Some(modifiers) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "modifiers")
+    else {
+        return false;
+    };
+    let mut modifier_cursor = modifiers.walk();
+    let mut attributes = modifiers
+        .named_children(&mut modifier_cursor)
+        .filter(|modifier| modifier.kind() == "attribute");
+    attributes.any(|attribute| {
+        let mut attribute_cursor = attribute.walk();
+        attribute
+            .named_children(&mut attribute_cursor)
+            .find(|child| child.kind() == "user_type")
+            .is_some_and(|name| {
+                swift_type_name_tail_of(name, source) == Some(SWIFT_TEST_ATTRIBUTE_NAME)
+            })
+    })
+}
+
+/// その関数を直接囲むクラスが、`XCTestCase` を継承しているか。
+fn is_in_xctest_case(node: Node<'_>, source: &str) -> bool {
+    let Some(declaration) = node
+        .parent()
+        .filter(|body| body.kind() == "class_body")
+        .and_then(|body| body.parent())
+        .filter(|declaration| declaration.kind() == "class_declaration")
+    else {
+        return false;
+    };
+    let mut cursor = declaration.walk();
+    declaration
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "inheritance_specifier")
+        .filter_map(|specifier| specifier.child_by_field_name("inherits_from"))
+        .any(|parent| swift_type_name_tail_of(parent, source) == Some(XCTEST_CASE_NAME))
+}
+
+/// `user_type` の末尾の型名の綴り。`XCTest.XCTestCase` なら `XCTestCase`。
+///
+/// 末尾で見るのは、モジュールで修飾した綴り（`@Testing.Test`）も同じ印として拾うため
+/// （Rust の `#[tokio::test]` を末尾で見るのと同じ形）。
+fn swift_type_name_tail_of<'source>(
+    user_type: Node<'_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    if user_type.kind() != "user_type" {
+        return None;
+    }
+    let mut cursor = user_type.walk();
+    let last = user_type
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "type_identifier")
+        .last()?;
+    source.get(last.byte_range())
 }
 
 /// `describe` / `it` / `test`（`.only` / `.skip` を含む）の第2引数の関数か。
@@ -774,6 +901,59 @@ fn innermost_chunk_node<'tree>(
 /// `source` はそのノードを含むファイル全体のソース。
 fn name_position_of(node: Node<'_>, source: &str) -> Option<SourcePosition> {
     source_position_of(name_node_of(node)?, source)
+}
+
+/// grammar ごとに、そのチャンクの hover を向ける先のノード（多くは名前）。無ければ `None`。
+fn chunk_name_node_of(node: Node<'_>, grammar: Grammar) -> Option<Node<'_>> {
+    match grammar {
+        Grammar::TypeScript | Grammar::Tsx | Grammar::Rust | Grammar::Java => name_node_of(node),
+        Grammar::Swift => swift_name_node_of(node),
+    }
+}
+
+/// Swift のチャンクの、hover を向ける先のノード。
+///
+/// `init` / `deinit` は名前のノードを持たないので、**その字句**を指す。`None`（無名として
+/// 尋ねない）にすると Stage 2 で測れない側へ倒れる。`init` の字句は grammar が `name`
+/// フィールドに載せる。
+///
+/// **[`name_node_of`] を通さない。** あちらは名前が無いと親（代入先）へ登る TypeScript の
+/// 形で、`deinit` では囲む型の本体から名前を探しにいく。
+fn swift_name_node_of(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == SWIFT_DEINIT_KIND {
+        let mut cursor = node.walk();
+        return node
+            .children(&mut cursor)
+            .find(|child| child.kind() == "deinit");
+    }
+    node.child_by_field_name(NAME_FIELD)
+}
+
+/// Swift のチャンクが、注釈を省ける位置それぞれに注釈を書いたか。
+///
+/// 引数の型は省けないので、引数はどれも「書かれている」。省けるのは関数の戻り値だけ
+/// （省くと `Void`）。省いた戻り値は推論ではなく `Void` に決まるが、書いたかどうかを構文のまま
+/// 運び、綴りに `Void` が現れたときの扱いは hover の綴りを読む側で決める。`init` / `deinit` は戻り値を**注釈できない**位置で、`init` は囲む型の
+/// 宣言が値の型を書いているので「書かれている」に数える（TypeScript のコンストラクタと同じ）。
+fn swift_annotated_positions_of(node: Node<'_>) -> AnnotatedPositions {
+    let omits_return_type =
+        node.kind() == SWIFT_FUNCTION_KIND && node.child_by_field_name(RETURN_TYPE_FIELD).is_none();
+    let value_type = if omits_return_type {
+        TypeAnnotation::Omitted
+    } else {
+        TypeAnnotation::Written
+    };
+    let mut cursor = node.walk();
+    let parameters = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == SWIFT_PARAMETER_KIND)
+        .map(|_| TypeAnnotation::Written)
+        .collect();
+
+    AnnotatedPositions::Declared {
+        value_type,
+        parameters,
+    }
 }
 
 /// そのチャンクの名前になっている識別子のノード。無名なら `None`。
@@ -1375,20 +1555,227 @@ export const rate = 0.1;
         assert_eq!(chunk.lines(), range(2, 4));
     }
 
-    #[test]
-    fn test_chunk_of_a_line_inside_a_swift_function_is_not_cut_out_yet() {
-        // 対照は同じ並びの TypeScript の関数（`a.ts:4` で切り出せる）。Swift のチャンクの
-        // 種別はまだ決めていないので、関数の中を指しても切り出さない
-        let source = "func applyDiscount(price: Double) -> Double {\n    let rate = 0.1\n    return price * (1 - rate)\n}\n";
-        let location: Location = "a.swift:3".parse().expect("テストが渡す位置は解釈できる");
+    fn swift_chunk_at(source: &str, location: &str) -> Result<Chunk, ChunkingError> {
+        let location: Location = location.parse().expect("テストが渡す位置は解釈できる");
         let tree = SyntaxTree::from_source(source, Grammar::Swift)
             .expect("テストが渡すソースは木にできる");
 
+        Chunk::find_enclosing(&location, &tree)
+    }
+
+    fn swift_chunks_of(source: &str, test_functions: TestFunctions) -> FileChunks {
+        let tree = SyntaxTree::from_source(source, Grammar::Swift)
+            .expect("テストが渡すソースは木にできる");
+
+        FileChunks::from_tree(&tree, Path::new("Sources/A.swift"), test_functions)
+    }
+
+    #[test]
+    fn test_chunk_of_a_line_inside_a_swift_function_covers_the_whole_function() {
+        let source = "func applyDiscount(price: Double) -> Double {\n    let rate = 0.1\n    return price * (1 - rate)\n}\n";
+
+        let chunk = swift_chunk_at(source, "a.swift:3").expect("切り出せる");
+
+        assert_eq!(chunk.lines(), range(1, 4));
+    }
+
+    /// 自由関数・メソッド・`init`・`deinit` と、チャンクにならない protocol の要求とクロージャ。
+    const SWIFT_FUNCTIONS_AND_NON_CHUNKS: &str = r#"func total(values: [Int]) -> Int {
+    values.reduce(0, +)
+}
+
+struct Cart {
+    init(items: [Int]) {
+        self.items = items
+    }
+
+    func count() -> Int {
+        items.count
+    }
+}
+
+final class Session {
+    deinit {
+        close()
+    }
+}
+
+protocol Pricing {
+    func price(of item: Int) -> Int
+    init(name: String)
+}
+
+let doubled = { (value: Int) -> Int in
+    value * 2
+}
+"#;
+
+    #[test]
+    fn test_file_chunks_of_swift_cut_out_free_functions_methods_initializers_and_deinitializers() {
+        // 対照として protocol の要求（22・23 行目。`init` の要求も本体を持たない）と
+        // クロージャ（26 行目）を同じソースに置く
+        let file_chunks = swift_chunks_of(SWIFT_FUNCTIONS_AND_NON_CHUNKS, TestFunctions::Included);
+
+        assert_eq!(start_lines_of(&file_chunks), vec![1, 6, 10, 16]);
+    }
+
+    #[test]
+    fn test_chunk_of_a_line_inside_a_swift_closure_falls_back_to_no_enclosing_function() {
+        // クロージャはチャンクにしないので、囲む関数が無ければ切り出さない
+        let result = swift_chunk_at(SWIFT_FUNCTIONS_AND_NON_CHUNKS, "a.swift:27");
+
+        assert_eq!(result, Err(ChunkingError::NoEnclosingFunction));
+    }
+
+    #[test]
+    fn test_chunk_of_a_swift_function_points_at_its_own_name() {
+        let chunk =
+            swift_chunk_at(SWIFT_FUNCTIONS_AND_NON_CHUNKS, "a.swift:11").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((10, 9)));
+    }
+
+    #[test]
+    fn test_chunk_of_a_swift_initializer_points_at_the_init_keyword() {
+        // `init` には名前のノードが無い。尋ねない（`None`）にすると Stage 2 で測れない側へ倒れる
+        let chunk =
+            swift_chunk_at(SWIFT_FUNCTIONS_AND_NON_CHUNKS, "a.swift:7").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((6, 4)));
+    }
+
+    #[test]
+    fn test_chunk_of_a_swift_deinitializer_points_at_the_deinit_keyword() {
+        let chunk =
+            swift_chunk_at(SWIFT_FUNCTIONS_AND_NON_CHUNKS, "a.swift:17").expect("切り出せる");
+
+        assert_eq!(name_position_of_chunk(&chunk), Some((16, 4)));
+    }
+
+    /// そのチャンクの、注釈を省ける位置それぞれの注釈の有無。
+    fn swift_annotated_positions_of(source: &str, location: &str) -> AnnotatedPositions {
+        swift_chunk_at(source, location)
+            .expect("切り出せる")
+            .annotated_positions()
+            .clone()
+    }
+
+    #[test]
+    fn test_a_swift_function_omitting_its_return_type_omits_its_value_type() {
+        // 対照は戻り値を書いた同じ形の関数（次のテスト）
+        let source = "func log(message: String, level: Int) {\n    print(message)\n}\n";
+
         assert_eq!(
-            Chunk::find_enclosing(&location, &tree),
-            Err(ChunkingError::NoEnclosingFunction)
+            swift_annotated_positions_of(source, "a.swift:2"),
+            AnnotatedPositions::Declared {
+                value_type: TypeAnnotation::Omitted,
+                parameters: vec![TypeAnnotation::Written, TypeAnnotation::Written],
+            }
         );
-        assert!(chunk_at(FUNCTION_AFTER_A_CONSTANT, "a.ts:4").is_ok());
+    }
+
+    #[test]
+    fn test_a_swift_function_writing_its_return_type_writes_its_value_type() {
+        let source = "func log(message: String, level: Int) -> Bool {\n    true\n}\n";
+
+        assert_eq!(
+            swift_annotated_positions_of(source, "a.swift:2"),
+            AnnotatedPositions::Declared {
+                value_type: TypeAnnotation::Written,
+                parameters: vec![TypeAnnotation::Written, TypeAnnotation::Written],
+            }
+        );
+    }
+
+    #[test]
+    fn test_a_swift_parameter_with_a_default_value_still_writes_its_annotation() {
+        // Swift の引数は既定値を書いても型を省けない。TypeScript と違って省かれた側へ倒さない
+        let source = "func pad(_ text: String, width: Int = 8) -> String {\n    text\n}\n";
+
+        assert_eq!(
+            swift_annotated_positions_of(source, "a.swift:2"),
+            AnnotatedPositions::Declared {
+                value_type: TypeAnnotation::Written,
+                parameters: vec![TypeAnnotation::Written, TypeAnnotation::Written],
+            }
+        );
+    }
+
+    #[test]
+    fn test_a_swift_initializer_writes_its_value_type() {
+        // `init` は戻り値を注釈できない。囲む型の宣言が値の型を書いているので「書かれている」
+        assert_eq!(
+            swift_annotated_positions_of(SWIFT_FUNCTIONS_AND_NON_CHUNKS, "a.swift:7"),
+            AnnotatedPositions::Declared {
+                value_type: TypeAnnotation::Written,
+                parameters: vec![TypeAnnotation::Written],
+            }
+        );
+    }
+
+    /// Swift Testing と XCTest の印が付いた関数と、印の付かない対照。
+    const SWIFT_TESTS_AND_CONTROLS: &str = r#"import Testing
+import XCTest
+
+@MainActor @Test func totalIsTheSum() {
+    #expect(total(values: [1, 2]) == 3)
+}
+
+@Testing.Test("qualified") func totalOfNothingIsZero() {
+    #expect(total(values: []) == 0)
+}
+
+final class CartTests: XCTestCase {
+    func testCountOfTwoItems() {
+        XCTAssertEqual(Cart(items: [1, 2]).count(), 2)
+    }
+
+    func makeCart() -> Cart {
+        Cart(items: [1, 2])
+    }
+
+    func testable(count: Int) -> Bool {
+        count > 0
+    }
+}
+
+final class QualifiedTests: XCTest.XCTestCase {
+    func testQualified() {
+        XCTAssertTrue(true)
+    }
+}
+
+final class Scheduler {
+    func testConnection() -> Bool {
+        true
+    }
+}
+
+func testable(value: Int) -> Bool {
+    value > 0
+}
+"#;
+
+    #[test]
+    fn test_file_chunks_excluding_swift_tests_leave_out_marked_functions_and_keep_the_rest() {
+        // 対照: XCTestCase の中でも `test` で始まらないメソッド（17 行目）と引数を取る
+        // `func test…`（21 行目。XCTest は走らせない）、XCTestCase を継承しないクラスの
+        // `func test…`（33 行目）、`test` で始まる自由関数（38 行目）
+        let file_chunks = swift_chunks_of(SWIFT_TESTS_AND_CONTROLS, TestFunctions::Excluded);
+
+        assert_eq!(start_lines_of(&file_chunks), vec![17, 21, 33, 38]);
+        assert_eq!(file_chunks.excluded_test_function_count(), 4);
+    }
+
+    #[test]
+    fn test_file_chunks_including_swift_tests_keep_marked_functions() {
+        let file_chunks = swift_chunks_of(SWIFT_TESTS_AND_CONTROLS, TestFunctions::Included);
+
+        assert_eq!(
+            start_lines_of(&file_chunks),
+            vec![4, 8, 13, 17, 21, 27, 33, 38]
+        );
+        assert_eq!(file_chunks.excluded_test_function_count(), 0);
     }
 
     #[test]

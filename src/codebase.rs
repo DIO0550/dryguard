@@ -47,7 +47,8 @@ impl SourceLanguage {
             (Self::Rust, Grammar::TypeScript | Grammar::Tsx) => false,
             // Java を走査に入れる対応（言語の選択肢と候補の揃え方）がまだ無いので、`auto` でも拾わない
             (Self::Auto | Self::TypeScript | Self::Rust, Grammar::Java) => false,
-            // Swift のチャンクはまだ切り出せないので、`auto` でも走査に入れない
+            // Swift はチャンクを切り出せるが、正規化トークンの表に Swift の種別がまだ無いので、
+            // `auto` でも走査に入れない
             (Self::Auto | Self::TypeScript | Self::Rust, Grammar::Swift) => false,
         }
     }
@@ -232,8 +233,8 @@ mod tests {
 
     #[test]
     fn test_source_language_auto_does_not_accept_swift_yet() {
-        // 対照は Rust。Swift のチャンクはまだ切り出せないので、`auto` が拾うと
-        // 走査したファイル数だけが増える
+        // 対照は Rust。正規化トークンの表に Swift の種別がまだ無いので、`auto` が拾うと
+        // Swift の種別を表に持たないトークン列のまま候補を数える
         assert!(SourceLanguage::Auto.accepts(Grammar::Rust));
         assert!(!SourceLanguage::Auto.accepts(Grammar::Swift));
         assert!(!SourceLanguage::TypeScript.accepts(Grammar::Swift));
