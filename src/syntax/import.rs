@@ -76,10 +76,6 @@ impl ModulePath {
     /// **importer を受け取らない。** モジュールはファイルシステムに対応しないので、
     /// 書いた位置から解決するものが無い。要素のバッククォートは外す（`` `Foundation` `` と
     /// `Foundation` は同じモジュール）。
-    ///
-    /// 同じモジュールのファイルどうしは `import` を書かないので、重なりが見るのは
-    /// **フレームワーク単位の依存だけ**。`@testable import` も同じ扱いで、テストからの
-    /// 読み込みかどうかは区別しない。
     fn from_swift_import(specifier: &str) -> Self {
         let path: Vec<&str> = specifier
             .split('.')
@@ -301,13 +297,19 @@ fn rust_join(prefix: &str, name: &str) -> String {
 ///
 /// 要素は `identifier` のテキストではなく `simple_identifier` ごとに読む。テキストのままだと
 /// `Foundation . Date` のような空白の入れ方で同じモジュールが別の綴りになる。
+///
+/// 同じモジュールのファイルどうしは `import` を書かないので、ここで集まるのは
+/// **フレームワーク単位の依存だけ**。`@testable import` も区別しない。
 fn swift_import_specifiers_of(tree: &SyntaxTree<'_>) -> Result<Vec<String>, ImportsUnavailable> {
     let mut specifiers = Vec::new();
     for node in tree.named_descendants() {
+        let line = LineNumber::from_index(node.start_position().row);
+        if node.is_error() && contains_an_import_keyword(node) {
+            return Err(ImportsUnavailable::UnreadableDeclaration { line });
+        }
         if node.kind() != "import_declaration" {
             continue;
         }
-        let line = LineNumber::from_index(node.start_position().row);
         if is_unreadable_swift_import(node) {
             return Err(ImportsUnavailable::UnreadableDeclaration { line });
         }
@@ -318,18 +320,30 @@ fn swift_import_specifiers_of(tree: &SyntaxTree<'_>) -> Result<Vec<String>, Impo
     Ok(specifiers)
 }
 
-/// 宣言の周りに壊れた場所があるか。
+/// ERROR の中に `import` の字句が残っているか。
 ///
-/// **宣言自身の `has_error` だけでは足りない。** 名前の無い `import` は次の行の `func` を
-/// 名前として飲み込んだまま祖先の ERROR に包まれ、`import Foundation.Date.` は宣言を
-/// 正常に閉じたあと同じ行に ERROR を残す。どちらも宣言の中には壊れた印が無い。
+/// **宣言の形を探さない。** 名前の無い `import` は `import_declaration` にならず、字句だけが
+/// ERROR に残る。名前のある宣言が ERROR に包まれる形（次の行の `func` を名前として飲み込む・
+/// `import func Swift.+` の演算子）も、包む ERROR の側でここに当たる。
+fn contains_an_import_keyword(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+    children
+        .into_iter()
+        .any(|child| child.kind() == "import" || contains_an_import_keyword(child))
+}
+
+/// 宣言の中か、宣言を閉じた行の続きに壊れた場所があるか。
+///
+/// **宣言自身の `has_error` だけでは足りない。** `import Foundation.Date.` は宣言を
+/// 正常に閉じたあと、同じ行に ERROR を残す。間にコメントが挟まっても同じ行の続きとして見る。
 fn is_unreadable_swift_import(declaration: Node<'_>) -> bool {
-    let inside_an_error = std::iter::successors(declaration.parent(), Node::parent)
-        .any(|ancestor| ancestor.is_error());
-    let error_continues_on_the_line = declaration.next_sibling().is_some_and(|sibling| {
+    let following = std::iter::successors(declaration.next_sibling(), Node::next_sibling)
+        .find(|sibling| !matches!(sibling.kind(), "comment" | "multiline_comment"));
+    let error_continues_on_the_line = following.is_some_and(|sibling| {
         sibling.is_error() && sibling.start_position().row == declaration.end_position().row
     });
-    declaration.has_error() || inside_an_error || error_continues_on_the_line
+    declaration.has_error() || error_continues_on_the_line
 }
 
 fn swift_import_specifier_of(tree: &SyntaxTree<'_>, declaration: Node<'_>) -> Option<String> {
@@ -1796,6 +1810,37 @@ mod tests {
     fn test_swift_import_followed_by_a_syntax_error_on_the_same_line_cannot_be_read() {
         assert_eq!(
             swift_import_set("import Foundation.Date.\n", "A/One.swift"),
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(0)
+            })
+        );
+    }
+
+    #[test]
+    fn test_swift_import_without_a_module_name_on_a_later_line_says_which_line() {
+        assert_eq!(
+            swift_import_set("import Foundation\nimport\n", "A/One.swift"),
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(1)
+            })
+        );
+    }
+
+    #[test]
+    fn test_swift_import_followed_by_a_comment_and_a_syntax_error_on_the_same_line_cannot_be_read()
+    {
+        assert_eq!(
+            swift_import_set("import Foundation /* c */ )\n", "A/One.swift"),
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(0)
+            })
+        );
+    }
+
+    #[test]
+    fn test_swift_operator_import_is_not_read_as_a_module_path() {
+        assert_eq!(
+            swift_import_set("import func Swift.+\n", "A/One.swift"),
             Err(ImportsUnavailable::UnreadableDeclaration {
                 line: LineNumber::from_index(0)
             })
