@@ -13,6 +13,7 @@
 | `session-url-notice.sh` | `SessionStart` | このセッションの URL（`https://claude.ai/code/session_<id>`）を組み立ててコンテキストに出す。ブランチが `claude/issue-<N>-...` なら Issue 番号も添える |
 | `pre-push-check.sh` | `PreToolUse`（`Bash`） | コマンドに `git push` があれば `harness/githooks/pre-push` を走らせ、落ちたら exit 2 で止める |
 | `hook-canary.sh` | `PreToolUse`（`Bash`） | コマンドが `echo hook-canary` そのものなら exit 2 で止める。このセッションでフックが発火しているかを確かめるためだけのもの |
+| `pr-body-check.sh` | `PreToolUse`（`mcp__github__create_pull_request`） | 本文に `差分規模:` の宣言の行が無ければ exit 2 で止める。数の突き合わせは層 1（`harness/ci/pr-body-diff.sh`）に任せる |
 | `post-merge-review.sh` | `PostToolUse`（`mcp__github__merge_pull_request` / `Bash`） | PR のマージ（MCP のマージか `gh pr merge`）を検知したら、Issue への追記と `harness/records/pr-<N>.md` の記録を `additionalContext` で促す。止めない |
 | `post-edit-rust.sh` | `PostToolUse`（`Edit` / `Write` / `MultiEdit`） | `.rs` を編集したら、そのクレートに `cargo fmt` をかけ、`cargo clippy` が落ちたら診断を exit 2 で返す |
 
@@ -146,6 +147,7 @@ bash .claude/hooks/post-edit-rust-test.sh
 bash .claude/hooks/hook-canary-test.sh
 bash .claude/hooks/session-url-notice-test.sh
 bash .claude/hooks/post-merge-review-test.sh
+bash .claude/hooks/pr-body-check-test.sh
 ```
 
 CI（`.github/workflows/rust.yml` の `claude-hooks`）でも走る。

@@ -126,6 +126,9 @@ jobs:
       - name: post-merge-review
         run: bash .claude/hooks/post-merge-review-test.sh
 
+      - name: pr-body-check
+        run: bash .claude/hooks/pr-body-check-test.sh
+
       # post-edit-rust のテストは使い捨てのクレートに fmt / clippy をかけるので、
       # check ジョブと同じくツールチェーンを明示して用意する。
       - name: Rust ツールチェーン

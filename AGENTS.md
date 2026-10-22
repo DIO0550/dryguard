@@ -250,6 +250,7 @@ bash .claude/hooks/post-edit-rust-test.sh   # 層 3 の編集後 fmt / clippy �
 bash .claude/hooks/hook-canary-test.sh      # 層 3 のカナリア（フックの発火の確認）のテスト
 bash .claude/hooks/session-url-notice-test.sh  # 層 3 のセッション URL の通知のテスト
 bash .claude/hooks/post-merge-review-test.sh   # 層 3 のマージ後の振り返りを促すフックのテスト
+bash .claude/hooks/pr-body-check-test.sh       # 層 3 の PR 本文の差分規模の宣言を作成前に確かめるフックのテスト
 ```
 
 PR 本文の差分規模の突き合わせ自体は、本文をファイルに落として走らせる
