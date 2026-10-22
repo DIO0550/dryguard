@@ -609,6 +609,11 @@ mod tests {
         }
     }
 
+    fn java_divergence(source_a: &str, source_b: &str) -> Vec<String> {
+        let java = |source| leaves_of(source, Grammar::Java, "method_declaration");
+        divergence_of(java(source_a).compared_with(&java(source_b)))
+    }
+
     fn typescript_divergence(source_a: &str, source_b: &str) -> Vec<String> {
         divergence_of(typescript(source_a).compared_with(&typescript(source_b)))
     }
@@ -626,6 +631,28 @@ mod tests {
         );
 
         assert_eq!(divergence, vec!["identical"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_differing_only_in_a_primitive_type_diverge_at_the_type() {
+        // 正規化でプリミティブ型が名前に潰れて列が揃うので、型の綴りの違いはここに出る
+        // （揃わなければ `unaligned` で、葉の違いは判定を傾けない）
+        let divergence = java_divergence(
+            "class C { void f() { int total = base; } }",
+            "class C { void f() { long total = base; } }",
+        );
+
+        assert_eq!(divergence, vec!["int ↔ long"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_differing_only_in_a_number_notation_diverge_at_the_literal() {
+        let divergence = java_divergence(
+            "class C { void f() { long total = 42; } }",
+            "class C { void f() { long total = 0x1F; } }",
+        );
+
+        assert_eq!(divergence, vec!["42 ↔ 0x1F"]);
     }
 
     #[test]
