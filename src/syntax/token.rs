@@ -326,16 +326,20 @@ mod tests {
         tokens_of(root)
     }
 
+    /// Java のソース全体を覆うノードの、正規化トークン列。
+    fn java_source_tokens(source: &str) -> Vec<Token> {
+        let tree =
+            SyntaxTree::from_source(source, Grammar::Java).expect("テストが渡すソースは木にできる");
+        let root = *tree.named_descendants().first().expect("木には根がある");
+
+        tokens_of(root)
+    }
+
     /// Java のメソッド本体に `statement` を置いたソース全体の、正規化トークン列。
     ///
     /// Java の grammar は文をクラスの外に書けないので、メソッドで包む。
     fn java_tokens(statement: &str) -> Vec<Token> {
-        let source = format!("class C {{ void f() {{ {statement} }} }}");
-        let tree = SyntaxTree::from_source(&source, Grammar::Java)
-            .expect("テストが渡すソースは木にできる");
-        let root = *tree.named_descendants().first().expect("木には根がある");
-
-        tokens_of(root)
+        java_source_tokens(&format!("class C {{ void f() {{ {statement} }} }}"))
     }
 
     fn sequence(source: &str) -> TokenSequence {
@@ -511,14 +515,9 @@ mod tests {
 
     #[test]
     fn test_tokens_of_a_java_void_method_are_the_same_as_a_method_returning_a_class() {
-        let returning_void =
-            SyntaxTree::from_source("class C { void f() {} }", Grammar::Java).expect("木にできる");
-        let returning_class = SyntaxTree::from_source("class C { Amount f() {} }", Grammar::Java)
-            .expect("木にできる");
-
         assert_eq!(
-            tokens_of(returning_void.named_descendants()[0]),
-            tokens_of(returning_class.named_descendants()[0])
+            java_source_tokens("class C { void f() {} }"),
+            java_source_tokens("class C { Amount f() {} }")
         );
     }
 

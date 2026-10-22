@@ -596,6 +596,10 @@ mod tests {
         leaves_of(source, Grammar::Rust, "function_item")
     }
 
+    fn java(source: &str) -> ChunkLeaves {
+        leaves_of(source, Grammar::Java, "method_declaration")
+    }
+
     /// 違った葉の組を `a ↔ b` の綴りで並べる。違いが無い / 揃わないときは、その旨の 1 語。
     fn divergence_of(comparison: LeafComparison) -> Vec<String> {
         match comparison {
@@ -609,17 +613,16 @@ mod tests {
         }
     }
 
-    fn java_divergence(source_a: &str, source_b: &str) -> Vec<String> {
-        let java = |source| leaves_of(source, Grammar::Java, "method_declaration");
-        divergence_of(java(source_a).compared_with(&java(source_b)))
-    }
-
     fn typescript_divergence(source_a: &str, source_b: &str) -> Vec<String> {
         divergence_of(typescript(source_a).compared_with(&typescript(source_b)))
     }
 
     fn rust_divergence(source_a: &str, source_b: &str) -> Vec<String> {
         divergence_of(rust(source_a).compared_with(&rust(source_b)))
+    }
+
+    fn java_divergence(source_a: &str, source_b: &str) -> Vec<String> {
+        divergence_of(java(source_a).compared_with(&java(source_b)))
     }
 
     #[test]
@@ -635,11 +638,21 @@ mod tests {
 
     #[test]
     fn test_leaves_of_java_methods_differing_only_in_a_primitive_type_diverge_at_the_type() {
-        // 正規化でプリミティブ型が名前に潰れて列が揃うので、型の綴りの違いはここに出る
-        // （揃わなければ `unaligned` で、葉の違いは判定を傾けない）
+        // プリミティブ型の違いが `unaligned` に消えず、葉の違いとして出る
         let divergence = java_divergence(
             "class C { void f() { int total = base; } }",
             "class C { void f() { long total = base; } }",
+        );
+
+        assert_eq!(divergence, vec!["int ↔ long"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_differing_only_in_signature_primitive_types_diverge_at_them() {
+        // Java はシグネチャの型を外していないので、引数・戻り値の型の違いも葉の違いに数える
+        let divergence = java_divergence(
+            "class C { int sum(int a) { return a + 1; } }",
+            "class C { long sum(long a) { return a + 1; } }",
         );
 
         assert_eq!(divergence, vec!["int ↔ long"]);
