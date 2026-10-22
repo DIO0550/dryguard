@@ -71,6 +71,23 @@ impl ModulePath {
         Self(specifier.to_owned())
     }
 
+    /// Swift の `import` が書いたモジュールの綴り（`Dispatch.DispatchTime`）を、区切りを `/` にして持つ。
+    ///
+    /// **importer を受け取らない。** モジュールはファイルシステムに対応しないので、
+    /// 書いた位置から解決するものが無い。要素のバッククォートは外す（`` `Foundation` `` と
+    /// `Foundation` は同じモジュール）。
+    ///
+    /// 同じモジュールのファイルどうしは `import` を書かないので、重なりが見るのは
+    /// **フレームワーク単位の依存だけ**。`@testable import` も同じ扱いで、テストからの
+    /// 読み込みかどうかは区別しない。
+    fn from_swift_import(specifier: &str) -> Self {
+        let path: Vec<&str> = specifier
+            .split('.')
+            .map(|segment| segment.trim_matches('`'))
+            .collect();
+        Self(path.join("/"))
+    }
+
     /// 解決済みの依存先そのもの。
     pub fn as_str(&self) -> &str {
         &self.0
@@ -148,9 +165,10 @@ impl ImportSet {
             // まだ読まないので測れない側へ倒す。`NoDeclarations` は事実と違い、`compare` に
             // 渡した Java のチャンクにはこの答えが載る。読み方を足すときに差し替える
             Grammar::Java => HashSet::new(),
-            // `import` の読み方はまだ無い。空なので `NoDeclarations` になり、どちらへも傾けない。
-            // 「宣言が無い」とは言い切れないので、読み方を足すときに差し替える
-            Grammar::Swift => HashSet::new(),
+            Grammar::Swift => swift_import_specifiers_of(tree)?
+                .iter()
+                .map(|specifier| ModulePath::from_swift_import(specifier))
+                .collect(),
         };
 
         if paths.is_empty() {
@@ -273,6 +291,61 @@ fn rust_join(prefix: &str, name: &str) -> String {
         return name.to_owned();
     }
     format!("{prefix}::{name}")
+}
+
+/// Swift の `import_declaration` を、モジュールの綴り（要素を `.` で繋いだもの）にする。
+///
+/// 種類の指定（`import struct …`）は落とす。同じ宣言を `struct` と `class` のどちらで
+/// 書いても同じ依存先を指す。`#if canImport(…)` の中の宣言も、条件に関わらず集める
+/// （Rust の `#[cfg]` 付きの `use` と同じ扱い）。
+///
+/// 要素は `identifier` のテキストではなく `simple_identifier` ごとに読む。テキストのままだと
+/// `Foundation . Date` のような空白の入れ方で同じモジュールが別の綴りになる。
+fn swift_import_specifiers_of(tree: &SyntaxTree<'_>) -> Result<Vec<String>, ImportsUnavailable> {
+    let mut specifiers = Vec::new();
+    for node in tree.named_descendants() {
+        if node.kind() != "import_declaration" {
+            continue;
+        }
+        let line = LineNumber::from_index(node.start_position().row);
+        if is_unreadable_swift_import(node) {
+            return Err(ImportsUnavailable::UnreadableDeclaration { line });
+        }
+        let specifier = swift_import_specifier_of(tree, node)
+            .ok_or(ImportsUnavailable::UnreadableDeclaration { line })?;
+        specifiers.push(specifier);
+    }
+    Ok(specifiers)
+}
+
+/// 宣言の周りに壊れた場所があるか。
+///
+/// **宣言自身の `has_error` だけでは足りない。** 名前の無い `import` は次の行の `func` を
+/// 名前として飲み込んだまま祖先の ERROR に包まれ、`import Foundation.Date.` は宣言を
+/// 正常に閉じたあと同じ行に ERROR を残す。どちらも宣言の中には壊れた印が無い。
+fn is_unreadable_swift_import(declaration: Node<'_>) -> bool {
+    let inside_an_error = std::iter::successors(declaration.parent(), Node::parent)
+        .any(|ancestor| ancestor.is_error());
+    let error_continues_on_the_line = declaration.next_sibling().is_some_and(|sibling| {
+        sibling.is_error() && sibling.start_position().row == declaration.end_position().row
+    });
+    declaration.has_error() || inside_an_error || error_continues_on_the_line
+}
+
+fn swift_import_specifier_of(tree: &SyntaxTree<'_>, declaration: Node<'_>) -> Option<String> {
+    let mut cursor = declaration.walk();
+    let identifier = declaration
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "identifier")?;
+    let mut cursor = identifier.walk();
+    let segments = identifier
+        .named_children(&mut cursor)
+        .map(|segment| tree.text_of(segment))
+        .collect::<Option<Vec<&str>>>()?;
+    if segments.is_empty() {
+        return None;
+    }
+    Some(segments.join("."))
 }
 
 /// 依存先を宣言する文の種別。どちらも `source` フィールドに指定子の文字列を持つ。
@@ -1615,6 +1688,127 @@ mod tests {
         assert_eq!(
             ImportSet::from_tree(&tree, Path::new("src/billing/discount.rs")),
             Err(ImportsUnavailable::NoDeclarations)
+        );
+    }
+
+    fn swift_import_set(source: &str, importer: &str) -> Result<ImportSet, ImportsUnavailable> {
+        let tree = SyntaxTree::from_source(source, Grammar::Swift).expect("Swift の木にできる");
+        ImportSet::from_tree(&tree, Path::new(importer))
+    }
+
+    fn swift_module_paths_of(source: &str) -> HashSet<String> {
+        let set = swift_import_set(source, "Sources/App/View.swift").expect("import を読める");
+        set.0.iter().map(|path| path.as_str().to_owned()).collect()
+    }
+
+    fn strings_of(paths: &[&str]) -> HashSet<String> {
+        paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
+    #[test]
+    fn test_swift_import_of_a_module_and_of_a_kind_qualified_declaration_reach_their_module_paths()
+    {
+        let paths = swift_module_paths_of("import Foundation\nimport struct Foundation.Date\n");
+
+        assert_eq!(paths, strings_of(&["Foundation", "Foundation/Date"]));
+    }
+
+    #[test]
+    fn test_swift_import_kind_does_not_make_the_same_declaration_a_different_dependency() {
+        let as_struct = swift_import_set("import struct Foundation.Date\n", "A/One.swift")
+            .expect("import を読める");
+        let as_class = swift_import_set("import class Foundation.Date\n", "A/One.swift")
+            .expect("import を読める");
+
+        assert_eq!(as_struct, as_class);
+    }
+
+    #[test]
+    fn test_swift_testable_and_exported_imports_reach_the_same_module_paths_as_plain_imports() {
+        let paths = swift_module_paths_of(
+            "@testable import MyApp\n@_exported import Dispatch.DispatchTime\n",
+        );
+
+        assert_eq!(paths, strings_of(&["MyApp", "Dispatch/DispatchTime"]));
+    }
+
+    #[test]
+    fn test_swift_import_written_with_backticks_or_spaces_reaches_the_same_module_path() {
+        let paths = swift_module_paths_of("import `Foundation` . Date\n");
+
+        assert_eq!(paths, strings_of(&["Foundation/Date"]));
+    }
+
+    #[test]
+    fn test_swift_import_inside_a_conditional_compilation_block_is_collected() {
+        let paths = swift_module_paths_of("#if canImport(UIKit)\nimport UIKit\n#endif\n");
+
+        assert_eq!(paths, strings_of(&["UIKit"]));
+    }
+
+    #[test]
+    fn test_swift_source_without_import_has_no_import_signal() {
+        assert_eq!(
+            swift_import_set("func total() -> Int { 1 }\n", "Sources/App/Total.swift"),
+            Err(ImportsUnavailable::NoDeclarations)
+        );
+    }
+
+    #[test]
+    fn test_swift_import_sets_do_not_depend_on_the_importer_location() {
+        let source = "import struct Foundation.Date\n";
+        let windows = swift_import_set(source, r"C:\app\Sources\Billing\View.swift")
+            .expect("import を読める");
+        let unix =
+            swift_import_set(source, "app/Sources/Shipping/Label.swift").expect("import を読める");
+
+        assert_eq!(
+            windows.0.iter().map(ModulePath::as_str).collect::<Vec<_>>(),
+            vec!["Foundation/Date"]
+        );
+        assert_eq!(windows.jaccard(&unix).value(), 1.0);
+    }
+
+    #[test]
+    fn test_swift_import_without_a_module_name_swallowed_by_a_syntax_error_cannot_be_read() {
+        assert_eq!(
+            swift_import_set("import\nfunc f() {}\n", "A/One.swift"),
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(0)
+            })
+        );
+    }
+
+    #[test]
+    fn test_swift_import_ending_with_a_dot_says_which_line_instead_of_reading_the_next_keyword() {
+        assert_eq!(
+            swift_import_set(
+                "import UIKit\nimport Foundation.\nfunc f() {}\n",
+                "A/One.swift"
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(1)
+            })
+        );
+    }
+
+    #[test]
+    fn test_swift_import_followed_by_a_syntax_error_on_the_same_line_cannot_be_read() {
+        assert_eq!(
+            swift_import_set("import Foundation.Date.\n", "A/One.swift"),
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(0)
+            })
+        );
+    }
+
+    #[test]
+    fn test_swift_import_missing_its_module_name_cannot_be_read() {
+        assert_eq!(
+            swift_import_set("import struct\n", "A/One.swift"),
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(0)
+            })
         );
     }
 
