@@ -85,9 +85,9 @@ if structurally_similar && domains_differ { ... }
 | `domain declaration` | `dryguard.toml` の `[domains]` の 1 行。ドメインの名前と、そのドメインに属するファイルを指すパスの glob |
 | `declared domain` | ファイルが当たった `domain declaration` の名前。**名前の違う 2 つに当たったら決めない**（`AmbiguousDomain`） |
 | `domain counts` | ドメインごとのファイルの件数。**向きを持たない** — `caller domain` と `callee domain` が中身として持つ |
-| `import` | 依存の宣言。ソースに書かれた `import` / `export ... from` / `require` そのもの |
-| `specifier` | 依存の宣言が依存先として書いている文字列（`from` の後ろ・`require` の引数。`"./pad"`）。**解決前** |
-| `module path` | 指定子を importer の位置から解決した依存先（`src/utils/pad`）。**解決後** |
+| `import` | 依存の宣言。ソースに書かれた `import` / `export ... from` / `require` そのもの。Swift では `import_declaration`（`import Foundation` / `import struct Foundation.Date` / `@testable import`）。同じモジュールのファイルどうしは書かないので、Swift の重なりはフレームワーク単位の依存しか見ない |
+| `specifier` | 依存の宣言が依存先として書いている文字列（`from` の後ろ・`require` の引数。`"./pad"`。Swift はモジュールの綴りを要素ごとに読んで `.` で繋いだもの（`Foundation.Date`）で、種類の指定 `struct` / `func` は落とす。tree-sitter-swift が演算子の import（`import func Swift.+`）を構文エラーにするので、それは読めない宣言として測れない側へ倒す）。**解決前** |
+| `module path` | 指定子を importer の位置から解決した依存先（`src/utils/pad`）。**解決後**。Swift はモジュールがファイルシステムに対応しないので importer の位置から解決せず、`.` を `/` にしてバッククォートを外した綴り（`Foundation/Date`） |
 | `module distance` | 2 つのファイルを隔てているディレクトリの段数 |
 | `module separation` | 2 つのファイルの隔たりのシグナル。どちらも宣言に当たらなければ `module distance`、どちらかが当たれば両側の `declared domain` |
 | `frame` | LSP のストリーム上の 1 通分。`Content-Length` ヘッダと、それが数えた本文 |
