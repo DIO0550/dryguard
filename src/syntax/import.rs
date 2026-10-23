@@ -87,7 +87,8 @@ impl ModulePath {
     /// Java の `import` が書いた綴り（`java.util.List` / `java.util.*`）を、区切りを `/` にして持つ。
     ///
     /// **importer を受け取らず、ファイルシステムでも解決しない。** パッケージがどこにあるかは
-    /// クラスパスが無いと決まらないので、Rust の `crate::` 以外の `use` と同じく綴りのまま持つ。
+    /// クラスパスが無いと決まらないので、Rust の `crate::` / `self::` / `super::` 以外の `use` と
+    /// 同じく綴りのまま持つ。
     /// ワイルドカードは `java/util/*` の形で残す（Rust の `use a::*` と同じ）。
     fn from_java_import(specifier: &str) -> Self {
         Self(specifier.replace('.', "/"))
@@ -313,8 +314,9 @@ fn rust_join(prefix: &str, name: &str) -> String {
 ///
 /// # Errors
 ///
-/// 宣言が壊れていれば（名前の欠け・`;` の欠け）、または名前の無い `import` が `ERROR` に
-/// 残っていれば [`ImportsUnavailable::UnreadableDeclaration`]。
+/// 宣言が壊れていれば（名前の欠け・`;` の欠け）、または `import` の字句を含む `ERROR` が
+/// **ファイルのどこかに**残っていれば（メソッド本体の中でも）
+/// [`ImportsUnavailable::UnreadableDeclaration`]。読めた宣言があっても集合は作らない。
 fn java_import_specifiers_of(tree: &SyntaxTree<'_>) -> Result<Vec<String>, ImportsUnavailable> {
     let mut specifiers = Vec::new();
     for node in tree.named_descendants() {
@@ -4790,6 +4792,13 @@ const value = 1;
         );
 
         assert_eq!(paths, strings_of(&["java/util/List", "java/util/Map"]));
+    }
+
+    #[test]
+    fn test_java_import_of_a_single_name_reaches_that_name() {
+        let paths = java_module_paths_of("import Foo;\nclass View {}\n");
+
+        assert_eq!(paths, strings_of(&["Foo"]));
     }
 
     #[test]
