@@ -74,8 +74,9 @@ enum Normalization {
 ///
 /// 型名（`type_identifier` / `predefined_type`）を混ぜているのは、**ここが構造だけを見る層**で、
 /// 型の違いは Stage 2 が見るため。`x: number` と `x: string` を別物にすると、
-/// 型注釈を書き換えただけで構造が違って見える。
-const NAME_KINDS: [&str; 9] = [
+/// 型注釈を書き換えただけで構造が違って見える。Java のプリミティブ型
+/// （`integral_type` など）も `predefined_type` と同じ理由で混ぜる。
+const NAME_KINDS: [&str; 13] = [
     "identifier",
     "property_identifier",
     "shorthand_property_identifier",
@@ -85,6 +86,10 @@ const NAME_KINDS: [&str; 9] = [
     "type_identifier",
     "predefined_type",
     "field_identifier",
+    "integral_type",
+    "floating_point_type",
+    "boolean_type",
+    "void_type",
 ];
 
 /// リテラルのノード種別と、その型タグ。
@@ -92,7 +97,9 @@ const NAME_KINDS: [&str; 9] = [
 /// `string_fragment` が要るのは、テンプレートリテラルへ降りるため。`string` は
 /// そこで潰れるので `string_fragment` が現れないが、`` `a ${b} c` `` では
 /// 文字の部分が `string_fragment` として出てくる。
-const LITERAL_KINDS: [(&str, LiteralType); 15] = [
+///
+/// Java のテキストブロックは `string_literal` で潰れるので、中の `multiline_string_fragment` は要らない。
+const LITERAL_KINDS: [(&str, LiteralType); 23] = [
     ("number", LiteralType::Number),
     ("string", LiteralType::Text),
     ("string_fragment", LiteralType::Text),
@@ -108,6 +115,14 @@ const LITERAL_KINDS: [(&str, LiteralType); 15] = [
     ("char_literal", LiteralType::Text),
     ("boolean_literal", LiteralType::Boolean),
     ("unit_expression", LiteralType::Null),
+    ("decimal_integer_literal", LiteralType::Number),
+    ("hex_integer_literal", LiteralType::Number),
+    ("octal_integer_literal", LiteralType::Number),
+    ("binary_integer_literal", LiteralType::Number),
+    ("decimal_floating_point_literal", LiteralType::Number),
+    ("hex_floating_point_literal", LiteralType::Number),
+    ("character_literal", LiteralType::Text),
+    ("null_literal", LiteralType::Null),
 ];
 
 /// コメントのノード種別。
@@ -311,6 +326,22 @@ mod tests {
         tokens_of(root)
     }
 
+    /// Java のソース全体を覆うノードの、正規化トークン列。
+    fn java_source_tokens(source: &str) -> Vec<Token> {
+        let tree =
+            SyntaxTree::from_source(source, Grammar::Java).expect("テストが渡すソースは木にできる");
+        let root = *tree.named_descendants().first().expect("木には根がある");
+
+        tokens_of(root)
+    }
+
+    /// Java のメソッド本体に `statement` を置いたソース全体の、正規化トークン列。
+    ///
+    /// Java の grammar は文をクラスの外に書けないので、メソッドで包む。
+    fn java_tokens(statement: &str) -> Vec<Token> {
+        java_source_tokens(&format!("class C {{ void f() {{ {statement} }} }}"))
+    }
+
     fn sequence(source: &str) -> TokenSequence {
         let tree = SyntaxTree::from_source(source, Grammar::TypeScript)
             .expect("テストが渡すソースは木にできる");
@@ -427,6 +458,73 @@ mod tests {
     #[test]
     fn test_tokens_skip_a_block_comment_but_keep_what_follows() {
         assert_eq!(tokens("/* const invoice */ 1"), tokens("1"));
+    }
+
+    #[test]
+    fn test_tokens_of_java_number_literals_are_the_same_for_every_notation() {
+        // Java は整数・浮動小数点を表記ごとに別の種別で返す。潰さないと 16 進に書き換えただけで落ちる
+        let decimal = java_tokens("long a = 42;");
+
+        assert_eq!(java_tokens("long a = 0x1F;"), decimal);
+        assert_eq!(java_tokens("long a = 017;"), decimal);
+        assert_eq!(java_tokens("long a = 0b101;"), decimal);
+        assert_eq!(java_tokens("long a = 1.5;"), decimal);
+        assert_eq!(java_tokens("long a = 0x1.8p1;"), decimal);
+    }
+
+    #[test]
+    fn test_tokens_of_a_java_number_literal_are_a_number() {
+        // 上のテストは列が揃うことしか見ないので、どの型タグに潰したかはここで見る
+        assert!(java_tokens("long a = 0x1F;").contains(&Token::Literal(LiteralType::Number)));
+    }
+
+    #[test]
+    fn test_tokens_of_a_java_text_block_are_the_same_as_a_string_literal() {
+        assert_eq!(
+            java_tokens("String s = \"\"\"\n  invoice\n  \"\"\";"),
+            java_tokens("String s = \"x\";")
+        );
+    }
+
+    #[test]
+    fn test_tokens_of_a_java_character_literal_are_text() {
+        // 1 文字か文字列かは値の違い。`char` と `String` の差は型（Stage 2）が見る
+        assert_eq!(
+            java_tokens("Object c = 'c';"),
+            java_tokens("Object c = \"x\";")
+        );
+    }
+
+    #[test]
+    fn test_tokens_of_a_java_null_literal_are_null() {
+        assert!(java_tokens("Object o = null;").contains(&Token::Literal(LiteralType::Null)));
+    }
+
+    #[test]
+    fn test_tokens_of_java_primitive_types_drop_which_type_it_is() {
+        // TypeScript の `x: number` と `x: string` と同じく、型の違いを見るのは Stage 2
+        assert_eq!(java_tokens("int a = b;"), java_tokens("long a = b;"));
+        assert_eq!(java_tokens("double a = b;"), java_tokens("boolean a = b;"));
+    }
+
+    #[test]
+    fn test_tokens_of_a_java_primitive_type_are_the_same_as_a_class_type() {
+        // TypeScript の `predefined_type` と `type_identifier` が同じ名前に潰れるのと揃える
+        assert_eq!(java_tokens("int a = b;"), java_tokens("String a = b;"));
+    }
+
+    #[test]
+    fn test_tokens_of_a_java_void_method_are_the_same_as_a_method_returning_a_class() {
+        assert_eq!(
+            java_source_tokens("class C { void f() {} }"),
+            java_source_tokens("class C { Amount f() {} }")
+        );
+    }
+
+    #[test]
+    fn test_tokens_of_java_sources_keep_which_operator_was_used() {
+        // 対照は上の Java のテスト群。名前・値・型は潰すが、演算子は潰さない
+        assert_ne!(java_tokens("int a = b + 1;"), java_tokens("int a = b - 1;"));
     }
 
     #[test]

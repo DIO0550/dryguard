@@ -596,6 +596,10 @@ mod tests {
         leaves_of(source, Grammar::Rust, "function_item")
     }
 
+    fn java(source: &str) -> ChunkLeaves {
+        leaves_of(source, Grammar::Java, "method_declaration")
+    }
+
     /// 違った葉の組を `a ↔ b` の綴りで並べる。違いが無い / 揃わないときは、その旨の 1 語。
     fn divergence_of(comparison: LeafComparison) -> Vec<String> {
         match comparison {
@@ -617,6 +621,10 @@ mod tests {
         divergence_of(rust(source_a).compared_with(&rust(source_b)))
     }
 
+    fn java_divergence(source_a: &str, source_b: &str) -> Vec<String> {
+        divergence_of(java(source_a).compared_with(&java(source_b)))
+    }
+
     #[test]
     fn test_leaves_of_functions_that_only_rename_what_they_bind_do_not_diverge() {
         // Type-2 の本体。引数・`const`・関数自身の名前は書いた人の都合
@@ -626,6 +634,38 @@ mod tests {
         );
 
         assert_eq!(divergence, vec!["identical"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_differing_only_in_a_primitive_type_diverge_at_the_type() {
+        // プリミティブ型の違いが `unaligned` に消えず、葉の違いとして出る
+        let divergence = java_divergence(
+            "class C { void f() { int total = base; } }",
+            "class C { void f() { long total = base; } }",
+        );
+
+        assert_eq!(divergence, vec!["int ↔ long"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_differing_only_in_signature_primitive_types_diverge_at_them() {
+        // Java はシグネチャの型を外していないので、引数・戻り値の型の違いも葉の違いに数える
+        let divergence = java_divergence(
+            "class C { int sum(int a) { return a + 1; } }",
+            "class C { long sum(long a) { return a + 1; } }",
+        );
+
+        assert_eq!(divergence, vec!["int ↔ long"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_differing_only_in_a_number_notation_diverge_at_the_literal() {
+        let divergence = java_divergence(
+            "class C { void f() { long total = 42; } }",
+            "class C { void f() { long total = 0x1F; } }",
+        );
+
+        assert_eq!(divergence, vec!["42 ↔ 0x1F"]);
     }
 
     #[test]
