@@ -64,8 +64,8 @@ const EXTERNAL_NAME_FIELD: &str = "external_name";
 /// 親の種別（[`OUTSIDE_NAME_PARENT_KINDS`]）と引数のラベルのほかに、Swift の 2 つの形を
 /// 並びで見る。`.` の直後の名前はメンバーで、プロパティ（`self.rate` / key path の `\.rate`）と
 /// 暗黙のメンバー（`.rate` / `case .low`。列挙子や静的メンバー）がこれに当たる。
-/// タプル式のラベル（`(x: 1)`）は `:` の直前の名前で、要素の値（`(x, y)` の `x`）と
-/// 同じ親の下に並ぶので種別では分けられない。
+/// タプル式・タプル型・パターンのラベル（`(x: 1)` / `(x: Int)` / `case .pt(low: let a)`）は
+/// `:` の直前の名前で、要素の値（`(x, y)` の `x`）と同じ親の下に並ぶので種別では分けられない。
 ///
 /// **漏れは束縛の側へ倒れる**（拒否リスト）。ただし束縛に効くのは、同じ綴りが先に
 /// 束縛されたときだけ（[`SpellingContext::spelling_of`]）。
@@ -76,7 +76,7 @@ fn is_outside_name(node: Node<'_>) -> bool {
     let names_member = node
         .prev_sibling()
         .is_some_and(|previous| !previous.is_named() && previous.kind() == ".");
-    let labels_tuple_element = parent.kind() == "tuple_expression"
+    let labels_element = LABELLED_PARENT_KINDS.contains(&parent.kind())
         && node
             .next_sibling()
             .is_some_and(|next| !next.is_named() && next.kind() == ":");
@@ -84,8 +84,13 @@ fn is_outside_name(node: Node<'_>) -> bool {
     OUTSIDE_NAME_PARENT_KINDS.contains(&parent.kind())
         || parent.child_by_field_name(EXTERNAL_NAME_FIELD) == Some(node)
         || names_member
-        || labels_tuple_element
+        || labels_element
 }
+
+/// `:` の直前の名前がラベルになる親の種別（Swift）。
+///
+/// 三項演算子の `a ? b : c` の `b` も `:` の直前に来るので、親を限らずに並びだけで見ない。
+const LABELLED_PARENT_KINDS: [&str; 3] = ["tuple_expression", "tuple_type_item", "pattern"];
 
 /// 正規化トークン 1 つ分の綴りと、それをどう突き合わせるか。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -617,6 +622,8 @@ fn rust_pattern_binders_of<'tree>(
 /// **ラベルを書かない関数の引数（`func f(x: Int)`）は束縛に入れない。** 内部名がラベルを
 /// 兼ねるので、付け替えるとラベルも変わる。束縛に入れると、ラベルの違うペアが付け替えに
 /// 見える（倒れる向きは「違う」側）。クロージャの引数は呼び出しのラベルを持たないので入れる。
+///
+/// `while let` / `repeat` / キャプチャリスト（`[x = y]`）の束縛は集めない（「違う」側へ倒れる）。
 fn swift_binders_of<'tree>(node: Node<'tree>, binders: &mut Vec<Node<'tree>>) {
     match node.kind() {
         "function_declaration" => binders.extend(node.child_by_field_name("name")),
@@ -673,8 +680,9 @@ const SWIFT_VALUE_BINDING_KIND: &str = "value_binding_pattern";
 
 /// `if` / `guard` の条件が束縛する名前のノード。
 ///
-/// `if let a = b` の `a` は文の `bound_identifier` に載るが、**`=` が続かない短縮形
-/// （`if let rate {`）は入れない** — 同じ名前で外の値を読むので、付け替えると読む相手が
+/// `if let a = b` の `a` は文の `bound_identifier` に載る。**`let` の直後で `=` が続くものだけを
+/// 入れる** — `=` が続かない短縮形（`if let rate {`）は同じ名前で外の値を読み、`let` の無い
+/// `if case low = v` の `low` は外の値と比べる式のパターンで、どちらも付け替えると読む相手が
 /// 変わる。`if case let .some(r) = opt` は
 /// `let`・列挙子・`pattern(r)` が**文の子として平らに並ぶ**。`let` から次の `,` までを
 /// 1 つの条件として、その中のパターンだけを束縛の文脈で読む。
@@ -686,8 +694,13 @@ fn swift_condition_binders_of<'tree>(node: Node<'tree>, binders: &mut Vec<Node<'
     binders.extend(
         node.children_by_field_name("bound_identifier", &mut cursor)
             .filter(|name| {
-                name.next_sibling()
-                    .is_some_and(|next| !next.is_named() && next.kind() == "=")
+                let follows_let = name
+                    .prev_sibling()
+                    .is_some_and(|previous| previous.kind() == SWIFT_VALUE_BINDING_KIND);
+                let assigned = name
+                    .next_sibling()
+                    .is_some_and(|next| !next.is_named() && next.kind() == "=");
+                follows_let && assigned
             }),
     );
 
@@ -705,28 +718,28 @@ fn swift_condition_binders_of<'tree>(node: Node<'tree>, binders: &mut Vec<Node<'
 
 /// Swift のパターンが束縛する名前のノード。
 ///
-/// `binding` はそのパターンが `let` / `var` の文脈にあるか。`bound_identifier` はいつでも
-/// 束縛で、タプルの要素（`let (a, b)` の `a`）はフィールドを持たず、子が名前 1 つだけの
-/// パターンになる。**`let` の文脈の外では、名前 1 つのパターンを束縛にしない** —
-/// `case .none:` / `if case .some(c) = d` の名前は式のパターンで、外の名前を指す。
+/// `binding` はそのパターンが `let` / `var` の文脈にあるか。名前は `bound_identifier` に載るか、
+/// タプルの要素（`let (a, b)` の `a`）のようにフィールドを持たず、子が名前 1 つだけの
+/// パターンになる。**`let` の文脈の外では、どちらも束縛にしない** — `case .none:` /
+/// `if case .some(c) = d` / `catch low` の名前は式のパターンで、外の名前を指す
+/// （`catch low` の `low` も `bound_identifier` に載る）。
 /// 列挙子（`case let .some(s)` の `some`）は名前 1 つのパターンにならないので入らない。
 fn swift_pattern_binders_of<'tree>(
     pattern: Node<'tree>,
     binding: bool,
     binders: &mut Vec<Node<'tree>>,
 ) {
-    let mut cursor = pattern.walk();
-    binders.extend(pattern.children_by_field_name("bound_identifier", &mut cursor));
-
-    let sole_name = (pattern.child_count() == 1)
-        .then(|| pattern.child(0))
-        .flatten()
-        .filter(|child| child.kind() == "simple_identifier");
+    let binding = binding || has_child_of_kind(pattern, SWIFT_VALUE_BINDING_KIND);
     if binding {
+        let mut cursor = pattern.walk();
+        binders.extend(pattern.children_by_field_name("bound_identifier", &mut cursor));
+        let sole_name = (pattern.child_count() == 1)
+            .then(|| pattern.child(0))
+            .flatten()
+            .filter(|child| child.kind() == "simple_identifier");
         binders.extend(sole_name);
     }
 
-    let binding = binding || has_child_of_kind(pattern, SWIFT_VALUE_BINDING_KIND);
     let mut cursor = pattern.walk();
     for child in pattern.named_children(&mut cursor) {
         if child.kind() == SWIFT_PATTERN_KIND {
@@ -1294,5 +1307,49 @@ mod tests {
             divergence_of(leaves_a.compared_with(&leaves_b)),
             vec!["identical"]
         );
+    }
+
+    #[test]
+    fn test_leaves_of_swift_functions_matching_different_names_by_if_case_without_let_diverge() {
+        // `if case low = v` / `guard case low = v` の `low` は外の値と比べる式のパターン
+        let divergence = swift_divergence(
+            "func f(_ v: Int) -> Int { if case low = v { return 1 }; guard case low = v else { return 0 }; return 2 }",
+            "func f(_ v: Int) -> Int { if case high = v { return 1 }; guard case high = v else { return 0 }; return 2 }",
+        );
+
+        assert_eq!(divergence, vec!["low ↔ high"]);
+    }
+
+    #[test]
+    fn test_leaves_of_swift_functions_catching_different_names_without_let_diverge() {
+        // `catch low` の `low` は式のパターン。`catch let e` だけが束縛する
+        let divergence = swift_divergence(
+            "func f() -> Int { do { try g() } catch low { return 1 } catch { return 0 }; return 2 }",
+            "func f() -> Int { do { try g() } catch high { return 1 } catch { return 0 }; return 2 }",
+        );
+
+        assert_eq!(divergence, vec!["low ↔ high"]);
+    }
+
+    #[test]
+    fn test_leaves_of_swift_functions_matching_payloads_by_different_labels_diverge() {
+        // パターンのラベルは先に束縛した名前と同じ綴りでも、どの case かを決める
+        let divergence = swift_divergence(
+            "func f(_ low: Kind) -> Int { switch low { case .pt(low: let a): return a; default: return 0 } }",
+            "func f(_ high: Kind) -> Int { switch high { case .pt(high: let a): return a; default: return 0 } }",
+        );
+
+        assert_eq!(divergence, vec!["low ↔ high"]);
+    }
+
+    #[test]
+    fn test_leaves_of_swift_functions_declaring_tuple_types_with_different_labels_diverge() {
+        // 本体のタプル型のラベルは、先に束縛した名前と同じ綴りでもラベル
+        let divergence = swift_divergence(
+            "func f(_ x: Int) -> Int { let t: (x: Int, z: Int) = (x, 1); return t.z }",
+            "func f(_ y: Int) -> Int { let t: (y: Int, z: Int) = (y, 1); return t.z }",
+        );
+
+        assert_eq!(divergence, vec!["x ↔ y"]);
     }
 }
