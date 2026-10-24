@@ -989,6 +989,29 @@ mod tests {
     }
 
     #[test]
+    fn test_leaves_of_rust_functions_differing_in_comments_diverge_only_at_the_code() {
+        // doc コメントの本文は葉の綴りを持ち、片側だけの `//` は列をずらす。どちらも構造ではない。
+        // 対照に呼ぶ相手の名前を変え、比べる対象が残っていることを見る
+        let divergence = rust_divergence(
+            "fn f() { /// a\n let x = pad(1); }",
+            "fn f() { /// b\n // c\n let x = trim(1); }",
+        );
+
+        assert_eq!(divergence, vec!["pad ↔ trim"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_differing_in_comments_diverge_only_at_the_code() {
+        // Java のコメントは本文の綴りを持つ葉。対照は上の Rust のテストと同じく読む相手の名前
+        let divergence = java_divergence(
+            "class C { void f() { /* a */ int t = base; } }",
+            "class C { void f() { /* b */ // c\n int t = other; } }",
+        );
+
+        assert_eq!(divergence, vec!["base ↔ other"]);
+    }
+
+    #[test]
     fn test_leaves_of_java_methods_differing_only_in_a_primitive_type_diverge_at_the_type() {
         // プリミティブ型の違いが `unaligned` に消えず、葉の違いとして出る
         let divergence = java_divergence(
