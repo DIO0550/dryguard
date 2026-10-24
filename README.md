@@ -122,7 +122,7 @@ spread 引数の後ろも引数位置が確定しないため残す。テスト�
 外した数を走査量の行に出す（`compare` は名指しされれば比べる）。
 `.java` はメソッド・コンストラクタをチャンクにでき、`compare` は名指しされれば比べるが、`scan` の走査にはまだ入らない（葉の綴りの違い・型シグネチャは Java の読み方がまだ無い）。
 `.swift` は関数・メソッド・`init` / `deinit` をチャンクにし、`compare` で名指しすれば比べるが、
-正規化トークン・葉の綴りの違い・依存の宣言の対応がまだ無いので、`scan` は走査しない。
+正規化トークン・依存の宣言の対応がまだ無いので、`scan` は走査しない。
 CLI は拡張子から TypeScript と Rust の LSP サーバを選ぶ。`scan --lang auto` では
 言語ごとに候補を揃え、TypeScript は typescript-language-server、Rust は rust-analyzer の
 セッションで hover / references を問い合わせる。Rust の型シグネチャ比較は #40 まで
