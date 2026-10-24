@@ -172,7 +172,7 @@ inventory = ["src/inventory/**", "src/**/product*.ts"]
 | `syntax::chunk` | `Chunk::from_node` の `annotated` / `overload_declarations` / `type_references`、`OVERLOAD_DECLARATION_KINDS`・`PARAMETER_KINDS`・`TYPE_ASSERTION_KINDS` | 注釈を省ける位置・オーバーロード宣言・型名の集め方 | **2 択が 3 箇所**（Rust でなければ TypeScript の表） |
 | `syntax::chunk` | `Chunk::from_node` の `rust_impl_header` | 囲む宣言のヘッダーを運ぶか | 網羅 `match` |
 | `syntax::chunk` | `is_test_function` | `test function` の印 | 網羅 `match` |
-| `syntax::token` | `NAME_KINDS`・`LITERAL_KINDS`・`COMMENT_KIND` | 名前・リテラル・コメントのノード種別 | grammar を引数に取らない 1 つの表。**種別名が文法をまたいで別の意味にならないか**を確かめて足す |
+| `syntax::token` | `NAME_KINDS`・`LITERAL_KINDS`・`COMMENT_KINDS` | 名前・リテラル・コメントのノード種別 | grammar を引数に取らない 1 つの表。**種別名が文法をまたいで別の意味にならないか**を確かめて足す |
 | `syntax::import` | `ImportSet::from_tree`、`DEPENDENCY_STATEMENT_KINDS`・`IMPORT_EXPORT_KINDS`・`TYPE_ONLY_KINDS` ほか TypeScript の種別の表 | 依存の宣言の読み方と、`module path` への解決 | **2 択**（Rust でなければ TypeScript） |
 | `syntax::leaf_divergence` | `signature_type_nodes_of` の引数の種別・`bound_names_of` の束縛の集め方 | 引数の種別・束縛の形 | 網羅 `match` が 2 箇所 |
 | `syntax::leaf_divergence` | `BINDABLE_LEAF_KINDS`・`OUTSIDE_NAME_PARENT_KINDS`・`OUTSIDE_NAME_FIELDS` | 束縛として扱う葉・外の名前を指す親の種別と位置 | 全 grammar に当たる表 |
