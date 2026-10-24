@@ -251,6 +251,7 @@ bash .claude/hooks/hook-canary-test.sh      # 層 3 のカナリア（フック�
 bash .claude/hooks/session-url-notice-test.sh  # 層 3 のセッション URL の通知のテスト
 bash .claude/hooks/post-merge-review-test.sh   # 層 3 のマージ後の振り返りを促すフックのテスト
 bash .claude/hooks/pr-body-check-test.sh       # 層 3 の PR 本文の差分規模の宣言を作成前に確かめるフックのテスト
+bash .claude/skills/discord-notify/send-test.sh  # Discord の通知を上限内に割るスクリプトのテスト
 ```
 
 PR 本文の差分規模の突き合わせ自体は、本文をファイルに落として走らせる
