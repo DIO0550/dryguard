@@ -126,7 +126,10 @@ const LITERAL_KINDS: [(&str, LiteralType); 23] = [
 ];
 
 /// コメントのノード種別。
-const COMMENT_KIND: &str = "comment";
+///
+/// Rust と Java はどちらも `line_comment` / `block_comment`、TypeScript と Swift の行コメントは `comment`。
+/// ノードごと落とすので、Rust の doc コメントの子（印と本文）も一緒に落ちる。
+const COMMENT_KINDS: [&str; 3] = ["comment", "line_comment", "block_comment"];
 
 /// 突き合わせる並びの長さ。
 ///
@@ -158,7 +161,7 @@ fn normalization_of(kind: &'static str) -> Normalization {
     if let Some(literal_type) = LiteralType::from_kind(kind) {
         return Normalization::Collapsed(Token::Literal(literal_type));
     }
-    if kind == COMMENT_KIND {
+    if COMMENT_KINDS.contains(&kind) {
         return Normalization::Dropped;
     }
 
@@ -342,6 +345,16 @@ mod tests {
         java_source_tokens(&format!("class C {{ void f() {{ {statement} }} }}"))
     }
 
+    /// Rust の関数本体に `statement` を置いたソース全体の、正規化トークン列。
+    fn rust_tokens(statement: &str) -> Vec<Token> {
+        let source = format!("fn f() {{ {statement} }}");
+        let tree = SyntaxTree::from_source(&source, Grammar::Rust)
+            .expect("テストが渡すソースは木にできる");
+        let root = *tree.named_descendants().first().expect("木には根がある");
+
+        tokens_of(root)
+    }
+
     fn sequence(source: &str) -> TokenSequence {
         let tree = SyntaxTree::from_source(source, Grammar::TypeScript)
             .expect("テストが渡すソースは木にできる");
@@ -458,6 +471,38 @@ mod tests {
     #[test]
     fn test_tokens_skip_a_block_comment_but_keep_what_follows() {
         assert_eq!(tokens("/* const invoice */ 1"), tokens("1"));
+    }
+
+    #[test]
+    fn test_tokens_of_rust_sources_skip_a_line_comment() {
+        assert_eq!(rust_tokens("// c\n 1;"), rust_tokens("1;"));
+    }
+
+    #[test]
+    fn test_tokens_of_rust_sources_skip_a_block_comment() {
+        assert_eq!(rust_tokens("/* c */ 1;"), rust_tokens("1;"));
+    }
+
+    #[test]
+    fn test_tokens_of_rust_sources_skip_a_doc_comment() {
+        // doc コメントは `line_comment` の子に印と本文を持つ。子まで含めて落ちることを見る
+        assert_eq!(rust_tokens("/// c\n let a = 1;"), rust_tokens("let a = 1;"));
+    }
+
+    #[test]
+    fn test_tokens_of_rust_sources_keep_an_inserted_statement() {
+        // 対照は上の Rust のコメントのテスト群。コメントは落とすが、文を挟めば列は変わる
+        assert_ne!(rust_tokens("2;\n 1;"), rust_tokens("1;"));
+    }
+
+    #[test]
+    fn test_tokens_of_java_sources_skip_a_line_comment() {
+        assert_eq!(java_tokens("// c\n int a = 1;"), java_tokens("int a = 1;"));
+    }
+
+    #[test]
+    fn test_tokens_of_java_sources_skip_a_block_comment() {
+        assert_eq!(java_tokens("/* c */ int a = 1;"), java_tokens("int a = 1;"));
     }
 
     #[test]
