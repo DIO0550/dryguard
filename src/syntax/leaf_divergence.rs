@@ -40,7 +40,8 @@ use crate::syntax::tree::Grammar;
 /// 付け替えただけと読む**。
 const BINDABLE_LEAF_KINDS: [&str; 2] = ["identifier", "type_identifier"];
 
-/// 子に置かれた `identifier` が、束縛ではなく外の名前を指す親の種別（Rust）。
+/// 子に置かれた `identifier` が、束縛ではなく外の名前を指す親の種別（Rust。Java も型のパスで
+/// `scoped_type_identifier` を使う）。
 ///
 /// パス（`inner::hover` の `inner` / `hover`）は局所の名前を指せないので、チャンク自身と
 /// 同じ綴りでも束縛にしない。構造体式の短縮形（`Request { hover }`）は局所の名前と同時に
@@ -49,6 +50,19 @@ const OUTSIDE_NAME_PARENT_KINDS: [&str; 3] = [
     "scoped_identifier",
     "scoped_type_identifier",
     "shorthand_field_initializer",
+];
+
+/// 子に置かれた `identifier` が、束縛ではなく外の名前を指す位置（Java）。親の種別と、その子が
+/// 置かれるフィールドの組。
+///
+/// Java はフィールドとメソッドの名前も `identifier` なので、[`BINDABLE_LEAF_KINDS`] の種別では
+/// 止まらない。引数 `rate` を束縛すると `this.rate` の `rate` まで束縛になり、
+/// **読むフィールドが変わったペアを付け替えただけと読む**。親の種別だけで引かないのは、
+/// 同じ親の `object`（`list.add(x)` の `list`）が局所の名前を指せるため。
+const OUTSIDE_NAME_FIELDS: [(&str, &str); 3] = [
+    ("field_access", "field"),
+    ("method_invocation", "name"),
+    ("element_value_pair", "key"),
 ];
 
 /// 正規化トークン 1 つ分の綴りと、それをどう突き合わせるか。
@@ -305,10 +319,8 @@ impl<'tree> SpellingContext<'tree, '_> {
             return Spelling::Bound(text);
         }
 
-        let bindable = BINDABLE_LEAF_KINDS.contains(&node.kind())
-            && !node
-                .parent()
-                .is_some_and(|parent| OUTSIDE_NAME_PARENT_KINDS.contains(&parent.kind()));
+        let bindable =
+            BINDABLE_LEAF_KINDS.contains(&node.kind()) && !is_in_outside_name_position(node);
         let bound_by_then = self
             .bound
             .get(&text)
@@ -329,20 +341,66 @@ impl<'tree> SpellingContext<'tree, '_> {
     }
 }
 
-/// チャンク自身のシグネチャに書かれた型のノード。引数の型・戻り値の型・型引数・`where` 節。
+/// その葉が、束縛と同じ綴りでも外の名前を指す位置にあるか（[`OUTSIDE_NAME_PARENT_KINDS`]・
+/// [`OUTSIDE_NAME_FIELDS`]・Java のメソッド参照の `::` の後ろ）。
 ///
-/// **型シグネチャ（Stage 2）が見ている範囲だけを外す。** 引数の既定値はシグネチャに書かれるが
+/// メソッド参照（`Foo::bar`）はフィールドを持たないので、`::` より左の局所の名前
+/// （`rate::apply` の `rate`）を外さないよう位置で見分ける。直前の兄弟では見ない —
+/// `data::<T>size` では `::` と名前の間に型引数が入る。
+fn is_in_outside_name_position(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if OUTSIDE_NAME_PARENT_KINDS.contains(&parent.kind()) {
+        return true;
+    }
+    let at_outside_field = OUTSIDE_NAME_FIELDS.iter().any(|(kind, field)| {
+        parent.kind() == *kind && parent.child_by_field_name(field) == Some(node)
+    });
+    let after_method_reference = parent.kind() == "method_reference" && follows_double_colon(node);
+    at_outside_field || after_method_reference
+}
+
+/// 前の兄弟のどれかが `::` か。
+fn follows_double_colon(node: Node<'_>) -> bool {
+    let mut previous = node.prev_sibling();
+    while let Some(sibling) = previous {
+        if sibling.kind() == "::" {
+            return true;
+        }
+        previous = sibling.prev_sibling();
+    }
+    false
+}
+
+/// チャンク自身のシグネチャに書かれた型のノード。引数の型・戻り値の型・型引数・`where` 節
+/// （Java は `throws` と、名前の後ろに書いた配列の次元も）。
+///
+/// **型シグネチャ（Stage 2）が見る範囲だけを外す。** 引数の既定値はシグネチャに書かれるが
 /// 型ではない（式）ので外さない。一覧から漏れたシグネチャの形は比べる側へ倒れ、
-/// 型の違いが綴りの違いとしても出るだけ（REVIEW 側）。
+/// 型の違いが綴りの違いとしても出るだけ（REVIEW 側）。Java は Stage 2 の綴りを読む側が
+/// まだ無いが、TypeScript・Rust でサーバに尋ねられなかったときと同じく、型の違いは
+/// 葉の綴りではなく型シグネチャの答えとして扱う。
 fn signature_type_nodes_of(node: Node<'_>, grammar: Grammar) -> Vec<Node<'_>> {
     let mut types: Vec<Node<'_>> = ["return_type", "type_parameters"]
         .into_iter()
         .filter_map(|field| node.child_by_field_name(field))
         .collect();
+    if grammar == Grammar::Java {
+        // 戻り値は `return_type` ではなく `type`。`int f()[]` の次元も戻り値の型
+        types.extend(
+            ["type", "dimensions"]
+                .into_iter()
+                .filter_map(|field| node.child_by_field_name(field)),
+        );
+    }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if child.kind() == "where_clause" {
+        // `throws` は Java の例外の型。hover の綴りにも出る。Swift の `throws` は型ではない
+        let is_signature_clause = child.kind() == "where_clause"
+            || (grammar == Grammar::Java && child.kind() == "throws");
+        if is_signature_clause {
             types.push(child);
         }
     }
@@ -350,22 +408,61 @@ fn signature_type_nodes_of(node: Node<'_>, grammar: Grammar) -> Vec<Node<'_>> {
     let Some(parameters) = node.child_by_field_name("parameters") else {
         return types;
     };
-    let parameter_kinds: &[&str] = match grammar {
-        Grammar::Rust => &["parameter"],
-        Grammar::TypeScript | Grammar::Tsx => &["required_parameter", "optional_parameter"],
-        // 外さないので、引数・戻り値の型の違いも葉の綴りの違いに数える（違う側へ倒れる）
-        Grammar::Java => &[],
-        Grammar::Swift => &[],
-    };
     let mut cursor = parameters.walk();
     for parameter in parameters.named_children(&mut cursor) {
-        if parameter_kinds.contains(&parameter.kind()) {
-            types.extend(parameter.child_by_field_name("type"));
-        }
+        types.extend(parameter_type_nodes_of(parameter, grammar));
     }
 
     types
 }
+
+/// 引数 1 つのうち、型を書いた部分のノード。型を持たない引数なら空。
+fn parameter_type_nodes_of(parameter: Node<'_>, grammar: Grammar) -> Vec<Node<'_>> {
+    let typed_fields = |fields: &[&str]| -> Vec<Node<'_>> {
+        fields
+            .iter()
+            .filter_map(|field| parameter.child_by_field_name(field))
+            .collect()
+    };
+    // 一覧に無い引数の種別は外さないので、引数の型の違いも葉の綴りの違いに数える（違う側へ倒れる）
+    match grammar {
+        Grammar::Rust => match parameter.kind() {
+            "parameter" => typed_fields(&["type"]),
+            _ => Vec::new(),
+        },
+        Grammar::TypeScript | Grammar::Tsx => match parameter.kind() {
+            "required_parameter" | "optional_parameter" => typed_fields(&["type"]),
+            _ => Vec::new(),
+        },
+        Grammar::Java => match parameter.kind() {
+            // `int a[]` の次元も引数の型
+            "formal_parameter" => typed_fields(&["type", "dimensions"]),
+            // `T... xs` と `Foo this`。型はフィールドを持たない子として、名前や注釈と並ぶ
+            "spread_parameter" | "receiver_parameter" => {
+                let mut cursor = parameter.walk();
+                parameter
+                    .named_children(&mut cursor)
+                    .filter(|child| !JAVA_NON_TYPE_PARAMETER_CHILD_KINDS.contains(&child.kind()))
+                    .collect()
+            }
+            _ => Vec::new(),
+        },
+        Grammar::Swift => Vec::new(),
+    }
+}
+
+/// Java の引数のうち、フィールドを持たない子で型ではないものの種別。
+///
+/// 注釈は型ではなく値を渡しうるので比べる側に残す。`identifier` は `Outer.this` の外側の
+/// クラス名。
+const JAVA_NON_TYPE_PARAMETER_CHILD_KINDS: [&str; 6] = [
+    "modifiers",
+    "annotation",
+    "marker_annotation",
+    "variable_declarator",
+    "identifier",
+    "this",
+];
 
 /// そのチャンクが束縛した名前の綴り。
 ///
@@ -378,7 +475,8 @@ fn signature_type_nodes_of(node: Node<'_>, grammar: Grammar) -> Vec<Node<'_>> {
 /// 綴りごとに、**最初の束縛の始まり**（バイト位置）を返す。
 ///
 /// **スコープは辿らない。** 束縛より後に現れた同じ綴りは、束縛の外（兄弟のブロック）でも
-/// 束縛として扱う。そこを閉じるにはスコープ解析を TypeScript と Rust の両方に書くことになる。
+/// 束縛として扱う。そこを閉じるにはスコープ解析を束縛を集める文法ごと（TypeScript・Rust・Java）に
+/// 書くことになる。
 /// パスとフィールドは種別で外し、束縛より前の出現は位置で外してあるので、穴は
 /// **束縛より後に現れた同じ綴りの、外の素の名前**に限られる（[`SpellingContext::spelling_of`]）。
 fn bound_names_of(
@@ -394,8 +492,7 @@ fn bound_names_of(
         match grammar {
             Grammar::Rust => rust_binders_of(current, source, &mut binders),
             Grammar::TypeScript | Grammar::Tsx => typescript_binders_of(current, &mut binders),
-            // 束縛を集めないので、付け替えも違いに数える（違う側へ倒れる）
-            Grammar::Java => {}
+            Grammar::Java => java_binders_of(current, &mut binders),
             // 束縛を集めないと、付け替えも「違う」側に数えられる（偽陰性側）
             Grammar::Swift => {}
         }
@@ -470,6 +567,66 @@ fn typescript_pattern_binders_of<'tree>(
             typescript_pattern_binders_of(pattern.child_by_field_name("left"), binders);
         }
         _ => {}
+    }
+}
+
+/// Java のノード 1 つが束縛する名前のノード。束縛しなければ何も足さない。
+///
+/// **メソッド・コンストラクタの名前は集めない。** Rust の入れ子の `function_item` と違い、
+/// 匿名クラス・ローカルクラスの中のメソッドはクラスのメンバーで、`run` を `go` に替えると
+/// 上書きしていたものが新しいメソッドになる。チャンク自身の名前は位置で数える
+/// （[`SpellingContext::spelling_of`]）。
+///
+/// 束縛は宣言の `name` の位置で決まり、Rust のパターンのように定数と同じ形にならないので、
+/// 大文字で始まる名前も束縛に数える（型変数・ローカルクラス）。`_`（`underscore_pattern`）は
+/// 名前ではないので足さない。`try (r)` のように既存の変数を書いたリソースは `name` を持たない。
+fn java_binders_of<'tree>(node: Node<'tree>, binders: &mut Vec<Node<'tree>>) {
+    match node.kind() {
+        "class_declaration"
+        | "formal_parameter"
+        | "catch_formal_parameter"
+        | "enhanced_for_statement"
+        | "variable_declarator"
+        | "resource"
+        | "instanceof_expression" => {
+            java_name_binders_of(node.child_by_field_name("name"), binders);
+        }
+        "lambda_expression" => {
+            // `(int a) -> a` は `formal_parameters` で、`formal_parameter` の枝が拾う
+            let parameters = node.child_by_field_name("parameters");
+            match parameters.map(|parameters| parameters.kind()) {
+                Some("identifier") => java_name_binders_of(parameters, binders),
+                Some("inferred_parameters") => java_children_binders_of(parameters, binders),
+                _ => {}
+            }
+        }
+        // 型変数の名前と、パターンの末尾の名前（`case Foo f` / `Point(int x, var y)` の `x`）。
+        // `record_pattern` の先頭の `identifier` は record の型名なので見ない
+        "type_parameter" | "type_pattern" | "record_pattern_component" => {
+            let mut cursor = node.walk();
+            let last = node
+                .named_children(&mut cursor)
+                .filter(|child| matches!(child.kind(), "identifier" | "type_identifier"))
+                .last();
+            java_name_binders_of(last, binders);
+        }
+        _ => {}
+    }
+}
+
+/// `name` に置かれた Java の名前を束縛に足す。`_` のように名前でないものは足さない。
+fn java_name_binders_of<'tree>(name: Option<Node<'tree>>, binders: &mut Vec<Node<'tree>>) {
+    binders.extend(name.filter(|name| BINDABLE_LEAF_KINDS.contains(&name.kind())));
+}
+
+/// 子に並んだ Java の名前（`(a, b) -> a` の `a` / `b`）を束縛に足す。
+fn java_children_binders_of<'tree>(node: Option<Node<'tree>>, binders: &mut Vec<Node<'tree>>) {
+    let Some(node) = node else {
+        return;
+    };
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        java_name_binders_of(Some(child), binders);
     }
 }
 
@@ -648,14 +805,126 @@ mod tests {
     }
 
     #[test]
-    fn test_leaves_of_java_methods_differing_only_in_signature_primitive_types_diverge_at_them() {
-        // Java はシグネチャの型を外していないので、引数・戻り値の型の違いも葉の違いに数える
+    fn test_leaves_of_java_methods_differing_only_in_signature_types_and_throws_do_not_diverge() {
+        // 引数・可変長引数・戻り値・`throws` の型は型シグネチャ（Stage 2）が見る
         let divergence = java_divergence(
-            "class C { int sum(int a) { return a + 1; } }",
-            "class C { long sum(long a) { return a + 1; } }",
+            "class C { <T> int sum(int a, List<T> xs, Amount... rest) throws IOException { return a + 1; } }",
+            "class C { <T> long sum(long a, Set<T> xs, Money... rest) throws SQLException { return a + 1; } }",
         );
 
-        assert_eq!(divergence, vec!["int ↔ long"]);
+        assert_eq!(divergence, vec!["identical"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_building_different_types_in_their_bodies_diverge() {
+        // 対照: シグネチャの型を外しても、本体の中の型名は比べる
+        let divergence = java_divergence(
+            "class C { List<String> names(List<String> source) { return new ArrayList<>(source); } }",
+            "class C { List<String> names(List<String> source) { return new LinkedList<>(source); } }",
+        );
+
+        assert_eq!(divergence, vec!["ArrayList ↔ LinkedList"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_that_only_rename_what_they_bind_do_not_diverge() {
+        // 引数・ローカル・拡張 for・lambda（引数 1 つ・推論・型付き）・型変数
+        let divergence = java_divergence(
+            "class C { <T> int total(List<T> items) { int sum = 0; for (T item : items) { sum += weight(item); } Function<T, T> same = x -> x; BiFunction<T, T, T> left = (a, b) -> a; BinaryOperator<Integer> add = (int p, int q) -> p + q; return add.apply(sum, 1); } }",
+            "class C { <U> int count(List<U> values) { int acc = 0; for (U value : values) { acc += weight(value); } Function<U, U> keep = y -> y; BiFunction<U, U, U> first = (c, d) -> c; BinaryOperator<Integer> plus = (int m, int n) -> m + n; return plus.apply(acc, 1); } }",
+        );
+
+        assert_eq!(divergence, vec!["identical"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_that_only_rename_pattern_and_resource_binders_do_not_diverge() {
+        // catch・try のリソース・instanceof・switch の型パターン・record パターン・ローカルクラス
+        let divergence = java_divergence(
+            "class C { int f(Object o) { class Box {} try (var in = open()) { if (o instanceof Foo foo) { use(foo, in, new Box()); } } catch (IOException | RuntimeException e) { use(e); } if (o instanceof Point(int x, var y)) { return x + y; } return switch (o) { case Bar bar -> bar.size(); default -> 0; }; } }",
+            "class C { int g(Object v) { class Cell {} try (var res = open()) { if (v instanceof Foo hit) { use(hit, res, new Cell()); } } catch (IOException | RuntimeException err) { use(err); } if (v instanceof Point(int a, var b)) { return a + b; } return switch (v) { case Bar found -> found.size(); default -> 0; }; } }",
+        );
+
+        assert_eq!(divergence, vec!["identical"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_reading_fields_named_like_their_parameters_diverge_at_the_field()
+    {
+        // 引数 `rate` / `tax` の付け替えは許すが、同じ綴りのフィールドは別の相手を指す
+        let divergence = java_divergence(
+            "class C { double apply(double rate) { return this.rate * rate; } }",
+            "class C { double apply(double tax) { return this.tax * tax; } }",
+        );
+
+        assert_eq!(divergence, vec!["rate ↔ tax"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_calling_methods_named_like_their_locals_diverge_at_the_call() {
+        // メソッドの名前は、同じ綴りの束縛とは別の相手
+        let divergence = java_divergence(
+            "class C { int f(Data data) { int size = 0; return size + data.size(); } }",
+            "class C { int f(Data data) { int count = 0; return count + data.count(); } }",
+        );
+
+        assert_eq!(divergence, vec!["size ↔ count"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_referring_to_methods_named_like_their_locals_diverge() {
+        // メソッド参照の `::` の後ろも別の相手。左の `data` は引数なので付け替えを許す
+        let divergence = java_divergence(
+            "class C { int f(Data data) { int size = 0; Supplier<Integer> s = data::size; return size + s.get(); } }",
+            "class C { int f(Data other) { int count = 0; Supplier<Integer> s = other::count; return count + s.get(); } }",
+        );
+
+        assert_eq!(divergence, vec!["size ↔ count"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_referring_with_type_arguments_to_methods_named_like_locals_diverge()
+     {
+        // `::` と名前の間に型引数が入っても、名前は別の相手
+        let divergence = java_divergence(
+            "class C { int f(Data data) { int size = 0; Supplier<Integer> s = data::<T>size; return size + s.get(); } }",
+            "class C { int f(Data data) { int count = 0; Supplier<Integer> s = data::<T>count; return count + s.get(); } }",
+        );
+
+        assert_eq!(divergence, vec!["size ↔ count"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_overriding_different_methods_in_anonymous_classes_diverge() {
+        // 匿名クラスのメソッドの名前は束縛ではない。`run` の上書きと新しい `go` は別物
+        let divergence = java_divergence(
+            "class C { Thread f() { return new Thread() { public void run() { work(); } }; } }",
+            "class C { Thread f() { return new Thread() { public void go() { work(); } }; } }",
+        );
+
+        assert_eq!(divergence, vec!["run ↔ go"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_naming_annotation_elements_like_their_locals_diverge() {
+        // 注釈の要素の名前は、同じ綴りの束縛とは別の相手
+        let divergence = java_divergence(
+            "class C { int f() { int value = 0; @Tag(value = 1) int other = value; return other; } }",
+            "class C { int f() { int level = 0; @Tag(level = 1) int other = level; return other; } }",
+        );
+
+        assert_eq!(divergence, vec!["value ↔ level"]);
+    }
+
+    #[test]
+    fn test_leaves_of_java_methods_renaming_an_unlisted_binder_diverge() {
+        // ラベルは束縛の一覧に無い形。一覧から漏れた形は「違う」側へ倒れる
+        let divergence = java_divergence(
+            "class C { void f(int n) { outer: for (int i = 0; i < n; i++) { break outer; } } }",
+            "class C { void f(int n) { inner: for (int i = 0; i < n; i++) { break inner; } } }",
+        );
+
+        assert_eq!(divergence, vec!["outer ↔ inner"]);
     }
 
     #[test]
