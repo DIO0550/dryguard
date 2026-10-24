@@ -111,6 +111,8 @@ pub enum LanguageOption {
     Ts,
     /// Rust
     Rust,
+    /// Swift
+    Swift,
     /// 対象から判定する
     Auto,
 }
@@ -337,6 +339,20 @@ mod tests {
         let cli = parse(&["dryguard", "compare", "a.ts:10", "b.ts:20", "--lang", "ts"]);
 
         assert_eq!(cli.options.lang, LanguageOption::Ts);
+    }
+
+    #[test]
+    fn test_compare_with_lang_swift_selects_swift() {
+        let cli = parse(&[
+            "dryguard",
+            "compare",
+            "a.swift:1",
+            "b.swift:2",
+            "--lang",
+            "swift",
+        ]);
+
+        assert_eq!(cli.options.lang, LanguageOption::Swift);
     }
 
     #[test]

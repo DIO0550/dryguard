@@ -112,3 +112,96 @@ fn test_scan_rust_only_asks_rust_analyzer_and_excludes_typescript() {
     assert_eq!(stdout.matches(" <-> ").count(), 1, "{stdout}");
     assert!(stdout.contains("対象 2 ファイル"), "{stdout}");
 }
+
+fn swift_fixture(name: &str) -> String {
+    format!(
+        "{}/tests/fixtures/swift-language/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+#[test]
+fn test_compare_typescript_language_rejects_swift_files() {
+    let left = format!("{}:1", swift_fixture("a.swift"));
+    let right = format!("{}:1", swift_fixture("b.swift"));
+    let output = run(&["compare", &left, &right, "--lang", "ts"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("一致しません"), "{stderr}");
+    assert!(
+        !stdout.contains(" <-> "),
+        "不一致なら判定を出さない: {stdout}"
+    );
+}
+
+#[test]
+fn test_compare_swift_language_rejects_typescript_files() {
+    let left = format!("{}:1", fixture("a.ts"));
+    let right = format!("{}:1", fixture("b.ts"));
+    let output = run(&["compare", &left, &right, "--lang", "swift"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("一致しません"), "{stderr}");
+    assert!(
+        !stdout.contains(" <-> "),
+        "不一致なら判定を出さない: {stdout}"
+    );
+}
+
+#[test]
+fn test_compare_auto_accepts_swift_files() {
+    // `auto` の走査は Swift を拾わないが、`compare` は名指しされれば比べる
+    let left = format!("{}:1", swift_fixture("a.swift"));
+    let right = format!("{}:1", swift_fixture("b.swift"));
+    let output = run(&["compare", &left, &right]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("a.swift:1 <->"), "{stdout}");
+}
+
+#[test]
+fn test_compare_swift_language_accepts_swift_files() {
+    // 上の拒否と対にする。Swift を受け付ける腕が無ければ、こちらも不一致で落ちる
+    let left = format!("{}:1", swift_fixture("a.swift"));
+    let right = format!("{}:1", swift_fixture("b.swift"));
+    let output = run(&["compare", &left, &right, "--lang", "swift"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("a.swift:1 <->"), "{stdout}");
+}
+
+#[test]
+fn test_compare_typescript_language_rejects_java_files() {
+    let location = format!("{}:4", fixture("Discount.java"));
+    let output = run(&["compare", &location, &location, "--lang", "ts"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("一致しません"), "{stderr}");
+}
+
+#[test]
+fn test_scan_swift_language_walks_only_swift_files() {
+    // 同じディレクトリに `.ts` を 1 つ置く。TypeScript を走査すると対象が 1 ファイルになる
+    let root = swift_fixture("");
+    let output = run(&["scan", &root, "--lang", "swift"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stdout.matches(" <-> ").count(), 1, "{stdout}");
+    assert!(stdout.contains("a.swift:1 <->"), "{stdout}");
+    assert!(stdout.contains("対象 2 ファイル"), "{stdout}");
+    assert!(
+        !stderr.contains("typescript-language-server") && !stderr.contains("rust-analyzer"),
+        "Swift のサーバはまだ無いので、どのサーバにも尋ねない: {stderr}"
+    );
+}
