@@ -128,8 +128,9 @@ CLI は拡張子から TypeScript と Rust の LSP サーバを選ぶ。`scan --
 セッションで hover / references を問い合わせる。Rust の型シグネチャ比較は #40 まで
 「測れない」。
 
-`node_modules` / `dist` / `build` / `target` / `.git` は
-降りない。**読むときの grammar は拡張子で選ぶ**（JSX は TypeScript の grammar では読めず、
+`node_modules` / `dist` / `build` / `target` / `.git` /
+`.build` / `.swiftpm` / `Pods` / `DerivedData` は降りない。
+**読むときの grammar は拡張子で選ぶ**（JSX は TypeScript の grammar では読めず、
 型アサーション `<T>value` は TSX の grammar では JSX に見えるので、片方で兼ねられない）。
 読めなかったファイルと構文エラーで切り出せなかった関数は、
 **候補ペアの後ろに一覧で出す**（黙って飛ばすと、対象だったのか除外されたのかが分からない）。
