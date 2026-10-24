@@ -22,16 +22,31 @@ pub mod index;
 
 /// 走査から外すディレクトリの名前。
 ///
+/// 依存・生成物・ツールの置き場で、**降りると自分のコードではないものどうしを比べる**
+/// （SwiftPM の `.build` は `checkouts/` の下に依存パッケージのソースが丸ごと入る）。
+/// 言語で分けないのは、どの言語を走査するときもこの下を比べる理由が無いため。
+///
 /// ハードコードのまま置く。`dryguard.toml`（`crate::config`）が読むのは閾値だけで、
 /// **この一覧を調整したくなった記録はまだ無い**。記録が出てから外へ出す
 /// — まだ意味の分かっていないつまみを増やさないため。
-const EXCLUDED_DIRECTORY_NAMES: [&str; 5] = ["node_modules", "dist", "build", "target", ".git"];
+const EXCLUDED_DIRECTORY_NAMES: [&str; 9] = [
+    "node_modules",
+    "dist",
+    "build",
+    "target",
+    ".git",
+    ".build",
+    ".swiftpm",
+    "Pods",
+    "DerivedData",
+];
 
 /// 走査するソースの言語。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceLanguage {
     TypeScript,
     Rust,
+    Swift,
     Auto,
 }
 
@@ -45,8 +60,10 @@ impl SourceLanguage {
             (Self::TypeScript, Grammar::Rust) => false,
             (Self::Rust, Grammar::Rust) => true,
             (Self::Rust, Grammar::TypeScript | Grammar::Tsx) => false,
+            (Self::Swift, Grammar::Swift) => true,
+            (Self::Swift, Grammar::TypeScript | Grammar::Tsx | Grammar::Rust) => false,
             // Java を走査に入れる対応（言語の選択肢と候補の揃え方）がまだ無いので、`auto` でも拾わない
-            (Self::Auto | Self::TypeScript | Self::Rust, Grammar::Java) => false,
+            (Self::Auto | Self::TypeScript | Self::Rust | Self::Swift, Grammar::Java) => false,
             // Swift はチャンクを切り出せるが、正規化トークンの表に Swift の種別がまだ無いので、
             // `auto` でも走査に入れない
             (Self::Auto | Self::TypeScript | Self::Rust, Grammar::Swift) => false,
@@ -54,14 +71,14 @@ impl SourceLanguage {
     }
 }
 
-/// そのディレクトリ以下の TypeScript ファイル（`.ts` / `.tsx` / `.mts` / `.cts`）を、
-/// パス順に集める。
+/// そのディレクトリ以下の TypeScript のソースを、パス順に集める。
 ///
 /// `root` は走査を始めるディレクトリ。`node_modules` などの生成物・依存の置き場
 /// （`EXCLUDED_DIRECTORY_NAMES`）は中へ降りない。
 ///
-/// 対象かどうかは [`Grammar::of_path`] が読める拡張子かで決める。**拡張子の一覧を
-/// ここに持たない**（持つと、読める拡張子を増やしたときに片方だけが古くなる）。
+/// 対象かどうかは、[`Grammar::of_path`] が読める拡張子のうち TypeScript の grammar のものかで
+/// 決める。**拡張子の一覧をここに持たない**（持つと、読める拡張子を増やしたときに片方だけが
+/// 古くなる）。
 ///
 /// シンボリックリンクは辿らない。**辿ると循環したツリーで走査が終わらない**うえ、
 /// 同じファイルを別のパスで 2 回数えることになる。
@@ -128,7 +145,7 @@ pub fn source_paths_of(
 
 /// 対象ファイルを丸ごと読む。
 ///
-/// `path` は [`typescript_paths_of`] が集めたファイル。
+/// `path` は [`source_paths_of`] が集めたファイル。
 ///
 /// **`syntax` へ渡す前の読み込みをここに閉じる。** 呼び出し側で `fs` を直接叩くと、
 /// I/O の置き場所が `codebase` と `location` の 2 つに閉じている形が崩れる
@@ -365,6 +382,34 @@ mod tests {
         assert_eq!(
             relative_paths_of(&root, &paths),
             vec!["a.rs", "a.ts", "b.rs", "b.ts"]
+        );
+    }
+
+    #[test]
+    fn test_source_paths_of_swift_returns_only_swift_files() {
+        // 対照は同じディレクトリの `.ts` / `.rs`。`SourceLanguage::Swift` の走査が他の grammar まで
+        // 拾うと、Swift のチャンクどうしの比較に TypeScript・Rust のチャンクが混ざる
+        let root = fixture("swift-scan/Sources");
+
+        let paths = source_paths_of(&root, SourceLanguage::Swift)
+            .expect("フィクスチャのディレクトリはある");
+
+        assert_eq!(relative_paths_of(&root, &paths), vec!["App/Rate.swift"]);
+    }
+
+    #[test]
+    fn test_source_paths_of_swift_leaves_out_the_package_manager_and_build_directories() {
+        // 対照は Sources/ の `.swift`。`.build/checkouts/` には依存パッケージのソースが丸ごと
+        // 入るので、降りると依存のコードどうしを比べる。`.swiftpm` / `Pods` / `DerivedData` にも
+        // 置いておき、一覧から 1 つ落としただけで落ちるようにする
+        let root = fixture("swift-scan");
+
+        let paths = source_paths_of(&root, SourceLanguage::Swift)
+            .expect("フィクスチャのディレクトリはある");
+
+        assert_eq!(
+            relative_paths_of(&root, &paths),
+            vec!["Sources/App/Rate.swift"]
         );
     }
 
