@@ -84,6 +84,16 @@ impl ModulePath {
         Self(path.join("/"))
     }
 
+    /// Java の `import` が書いた綴り（`java.util.List` / `java.util.*`）を、区切りを `/` にして持つ。
+    ///
+    /// **importer を受け取らず、ファイルシステムでも解決しない。** パッケージがどこにあるかは
+    /// クラスパスが無いと決まらないので、Rust の `crate::` / `self::` / `super::` 以外の `use` と
+    /// 同じく綴りのまま持つ。
+    /// ワイルドカードは `java/util/*` の形で残す（Rust の `use a::*` と同じ）。
+    fn from_java_import(specifier: &str) -> Self {
+        Self(specifier.replace('.', "/"))
+    }
+
     /// 解決済みの依存先そのもの。
     pub fn as_str(&self) -> &str {
         &self.0
@@ -158,9 +168,10 @@ impl ImportSet {
                 .into_iter()
                 .map(|specifier| ModulePath::from_rust_use(&specifier, importer))
                 .collect(),
-            // まだ読まないので測れない側へ倒す。`NoDeclarations` は事実と違い、`compare` に
-            // 渡した Java のチャンクにはこの答えが載る。読み方を足すときに差し替える
-            Grammar::Java => HashSet::new(),
+            Grammar::Java => java_import_specifiers_of(tree)?
+                .iter()
+                .map(|specifier| ModulePath::from_java_import(specifier))
+                .collect(),
             Grammar::Swift => swift_import_specifiers_of(tree)?
                 .iter()
                 .map(|specifier| ModulePath::from_swift_import(specifier))
@@ -289,6 +300,74 @@ fn rust_join(prefix: &str, name: &str) -> String {
     format!("{prefix}::{name}")
 }
 
+/// Java の `import_declaration` を、綴り（要素を `.` で繋ぎ、ワイルドカードは末尾の `*`）にする。
+///
+/// `import static` の `static` は落とす。`import static a.B.c` と `import a.B.c` は
+/// 同じ綴りの同じ名前を指す。`package_declaration` は依存ではないので見ない。
+///
+/// 同じパッケージのクラスは `import` を書かずに使えるので、ここで集まるのは
+/// **別のパッケージへの依存だけ**。同じパッケージの依存は Stage 2 の呼び出し先ドメインが
+/// 見るもので、Java の LSP サーバに対応するまでは尋ねていないまま残る。
+///
+/// tree-sitter-java 0.23.5 は `import module java.base;`（Java 25）を構文エラーにするので、
+/// 読めない宣言として測れない側へ倒す。
+///
+/// # Errors
+///
+/// 宣言が壊れていれば（名前の欠け・`;` の欠け）、または `import` の字句を含む `ERROR` が
+/// **ファイルのどこかに**残っていれば（メソッド本体の中でも）
+/// [`ImportsUnavailable::UnreadableDeclaration`]。読めた宣言があっても集合は作らない。
+fn java_import_specifiers_of(tree: &SyntaxTree<'_>) -> Result<Vec<String>, ImportsUnavailable> {
+    let mut specifiers = Vec::new();
+    for node in tree.named_descendants() {
+        let line = LineNumber::from_index(node.start_position().row);
+        if node.is_error() && contains_an_import_keyword(node) {
+            return Err(ImportsUnavailable::UnreadableDeclaration { line });
+        }
+        if node.kind() != "import_declaration" {
+            continue;
+        }
+        // Why not（Swift のように同じ行の続きの ERROR も見る）: Java の宣言は `;` で閉じるので、
+        // 名前の途中で切れた宣言は宣言自身の中に MISSING / ERROR を残す。続きの ERROR は宣言の外
+        if node.has_error() {
+            return Err(ImportsUnavailable::UnreadableDeclaration { line });
+        }
+        let specifier = java_import_specifier_of(tree, node)
+            .ok_or(ImportsUnavailable::UnreadableDeclaration { line })?;
+        specifiers.push(specifier);
+    }
+    Ok(specifiers)
+}
+
+/// 要素は `scoped_identifier` のテキストではなく `identifier` の葉ごとに読む。テキストのままだと
+/// `java . util . List` やコメントの挟み方で同じクラスが別の綴りになる。
+fn java_import_specifier_of(tree: &SyntaxTree<'_>, declaration: Node<'_>) -> Option<String> {
+    let mut cursor = declaration.walk();
+    let children: Vec<Node<'_>> = declaration.named_children(&mut cursor).collect();
+    let name = children
+        .iter()
+        .find(|child| matches!(child.kind(), "scoped_identifier" | "identifier"))?;
+    let mut segments = java_name_segments_of(tree, *name)?;
+    if children.iter().any(|child| child.kind() == "asterisk") {
+        segments.push("*");
+    }
+    Some(segments.join("."))
+}
+
+fn java_name_segments_of<'source>(
+    tree: &SyntaxTree<'source>,
+    name: Node<'_>,
+) -> Option<Vec<&'source str>> {
+    if name.kind() == "identifier" {
+        return Some(vec![tree.text_of(name)?]);
+    }
+    let scope = name.child_by_field_name("scope")?;
+    let last = name.child_by_field_name("name")?;
+    let mut segments = java_name_segments_of(tree, scope)?;
+    segments.extend(java_name_segments_of(tree, last)?);
+    Some(segments)
+}
+
 /// Swift の `import_declaration` を、モジュールの綴り（要素を `.` で繋いだもの）にする。
 ///
 /// 種類の指定（`import struct …`）は落とす。同じ宣言を `struct` と `class` のどちらで
@@ -324,7 +403,8 @@ fn swift_import_specifiers_of(tree: &SyntaxTree<'_>) -> Result<Vec<String>, Impo
 ///
 /// **宣言の形を探さない。** 名前の無い `import` は `import_declaration` にならず、字句だけが
 /// ERROR に残る。名前のある宣言が ERROR に包まれる形（次の行の `func` を名前として飲み込む・
-/// `import func Swift.+` の演算子）も、包む ERROR の側でここに当たる。
+/// `import func Swift.+` の演算子）も、包む ERROR の側でここに当たる。Java の `import ;` も
+/// 同じく字句だけが ERROR に残る。
 fn contains_an_import_keyword(node: Node<'_>) -> bool {
     let mut cursor = node.walk();
     let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
@@ -4692,6 +4772,147 @@ const value = 1;
         assert_eq!(
             ImportSet::from_tree(&tree_of(no_imports), Path::new("src/utils/pad.ts")),
             Err(ImportsUnavailable::NoDeclarations)
+        );
+    }
+
+    fn java_import_set(source: &str, importer: &str) -> Result<ImportSet, ImportsUnavailable> {
+        let tree = SyntaxTree::from_source(source, Grammar::Java).expect("Java の木にできる");
+        ImportSet::from_tree(&tree, Path::new(importer))
+    }
+
+    fn java_module_paths_of(source: &str) -> HashSet<String> {
+        let set = java_import_set(source, "src/main/java/app/View.java").expect("import を読める");
+        set.0.iter().map(|path| path.as_str().to_owned()).collect()
+    }
+
+    #[test]
+    fn test_java_imports_of_classes_reach_their_package_paths_with_forward_separators() {
+        let paths = java_module_paths_of(
+            "package app;\nimport java.util.List;\nimport java.util.Map;\nclass View {}\n",
+        );
+
+        assert_eq!(paths, strings_of(&["java/util/List", "java/util/Map"]));
+    }
+
+    #[test]
+    fn test_java_import_of_a_single_name_reaches_that_name() {
+        let paths = java_module_paths_of("import Foo;\nclass View {}\n");
+
+        assert_eq!(paths, strings_of(&["Foo"]));
+    }
+
+    #[test]
+    fn test_java_static_wildcard_import_keeps_the_wildcard_as_the_last_segment() {
+        let paths = java_module_paths_of("import static java.lang.Math.*;\nclass View {}\n");
+
+        assert_eq!(paths, strings_of(&["java/lang/Math/*"]));
+    }
+
+    #[test]
+    fn test_java_wildcard_import_keeps_the_wildcard_as_the_last_segment() {
+        let paths = java_module_paths_of("import java.util.*;\nclass View {}\n");
+
+        assert_eq!(paths, strings_of(&["java/util/*"]));
+    }
+
+    #[test]
+    fn test_java_static_import_reaches_the_same_module_path_as_a_plain_import() {
+        let as_static = java_import_set("import static a.B.c;\nclass X {}\n", "src/X.java")
+            .expect("import を読める");
+        let as_plain =
+            java_import_set("import a.B.c;\nclass X {}\n", "src/X.java").expect("import を読める");
+
+        assert_eq!(
+            as_static
+                .0
+                .iter()
+                .map(ModulePath::as_str)
+                .collect::<Vec<_>>(),
+            vec!["a/B/c"]
+        );
+        assert_eq!(as_static, as_plain);
+    }
+
+    #[test]
+    fn test_java_import_written_with_spaces_or_comments_reaches_the_same_module_path() {
+        let paths = java_module_paths_of("import /* list */ java . util . List ;\nclass X {}\n");
+
+        assert_eq!(paths, strings_of(&["java/util/List"]));
+    }
+
+    #[test]
+    fn test_java_source_with_only_a_package_declaration_has_no_import_signal() {
+        // パッケージの宣言は依存先ではない。同じパッケージのクラスは import を書かないので、
+        // それを依存先に数えると書かれていない依存が重なる
+        assert_eq!(
+            java_import_set("package a.b;\nclass X {}\n", "src/a/b/X.java"),
+            Err(ImportsUnavailable::NoDeclarations)
+        );
+    }
+
+    #[test]
+    fn test_java_import_sets_do_not_depend_on_the_importer_location() {
+        let source = "import java.util.List;\nclass X {}\n";
+        let windows =
+            java_import_set(source, r"C:\app\src\billing\Invoice.java").expect("import を読める");
+        let unix = java_import_set(source, "app/src/shipping/Label.java").expect("import を読める");
+
+        assert_eq!(
+            windows.0.iter().map(ModulePath::as_str).collect::<Vec<_>>(),
+            vec!["java/util/List"]
+        );
+        assert_eq!(windows.jaccard(&unix).value(), 1.0);
+    }
+
+    #[test]
+    fn test_java_import_missing_its_last_segment_says_which_line_instead_of_dropping_it() {
+        assert_eq!(
+            java_import_set(
+                "import java.util.List;\nimport java.util.;\nclass X {}\n",
+                "src/X.java"
+            ),
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(1)
+            })
+        );
+    }
+
+    #[test]
+    fn test_java_import_missing_its_semicolon_cannot_be_read() {
+        assert_eq!(
+            java_import_set("import java.util.List\nclass X {}\n", "src/X.java"),
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(0)
+            })
+        );
+    }
+
+    #[test]
+    fn test_java_module_import_rejected_by_the_grammar_cannot_be_read() {
+        assert_eq!(
+            java_import_set("import module java.base;\nclass X {}\n", "src/X.java"),
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(0)
+            })
+        );
+    }
+
+    #[test]
+    fn test_java_import_closed_by_its_semicolon_is_read_even_if_a_syntax_error_follows_on_the_line()
+    {
+        // 対照。宣言の外の壊れた場所は依存の宣言ではないので、集合を作らない理由にしない
+        let paths = java_module_paths_of("import java.util.List; )\nclass X {}\n");
+
+        assert_eq!(paths, strings_of(&["java/util/List"]));
+    }
+
+    #[test]
+    fn test_java_import_without_a_name_swallowed_by_a_syntax_error_cannot_be_read() {
+        assert_eq!(
+            java_import_set("import ;\nclass X {}\n", "src/X.java"),
+            Err(ImportsUnavailable::UnreadableDeclaration {
+                line: LineNumber::from_index(0)
+            })
         );
     }
 }
