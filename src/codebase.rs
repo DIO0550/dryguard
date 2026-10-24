@@ -47,6 +47,7 @@ pub enum SourceLanguage {
     TypeScript,
     Rust,
     Swift,
+    Java,
     Auto,
 }
 
@@ -62,11 +63,14 @@ impl SourceLanguage {
             (Self::Rust, Grammar::TypeScript | Grammar::Tsx) => false,
             (Self::Swift, Grammar::Swift) => true,
             (Self::Swift, Grammar::TypeScript | Grammar::Tsx | Grammar::Rust) => false,
-            // Java を走査に入れる対応（言語の選択肢と候補の揃え方）がまだ無いので、`auto` でも拾わない
+            (Self::Java, Grammar::Java) => true,
+            (Self::Java, Grammar::TypeScript | Grammar::Tsx | Grammar::Rust) => false,
+            // `auto` は CLI から届くが、Java のチャンクに jdtls を選ぶ対応がまだ無いので、
+            // `auto` でも `.java` を拾わない
             (Self::Auto | Self::TypeScript | Self::Rust | Self::Swift, Grammar::Java) => false,
             // Swift はチャンクを切り出せるが、正規化トークンの表に Swift の種別がまだ無いので、
             // `auto` でも走査に入れない
-            (Self::Auto | Self::TypeScript | Self::Rust, Grammar::Swift) => false,
+            (Self::Auto | Self::TypeScript | Self::Rust | Self::Java, Grammar::Swift) => false,
         }
     }
 }
@@ -372,8 +376,8 @@ mod tests {
 
     #[test]
     fn test_source_paths_of_auto_leaves_out_java_files() {
-        // 対照は同じディレクトリの `.ts` / `.rs`。`.java` はチャンクにできるようになったが、
-        // 走査に入れる対応が入るまでは `auto` でも走査に入れない
+        // 対照は同じディレクトリの `.ts` / `.rs`。`.java` は `SourceLanguage::Java` なら集めるが、
+        // Java のチャンクに jdtls を選ぶ対応が入るまでは `auto` でも走査に入れない
         let root = fixture("language-scan");
 
         let paths =
@@ -411,6 +415,18 @@ mod tests {
             relative_paths_of(&root, &paths),
             vec!["Sources/App/Rate.swift"]
         );
+    }
+
+    #[test]
+    fn test_source_paths_of_java_returns_only_java_files() {
+        // 対照は同じディレクトリの `.ts` / `.tsx` / `.rs` / `.swift` / `.py`。`SourceLanguage::Java` の
+        // 走査が他の grammar まで拾うと、Java のチャンクどうしの比較に他の言語のチャンクが混ざる
+        let root = fixture("java-scan/src/main/java");
+
+        let paths =
+            source_paths_of(&root, SourceLanguage::Java).expect("フィクスチャのディレクトリはある");
+
+        assert_eq!(relative_paths_of(&root, &paths), vec!["app/Rate.java"]);
     }
 
     #[test]
