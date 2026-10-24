@@ -23,13 +23,14 @@ pub mod index;
 /// 走査から外すディレクトリの名前。
 ///
 /// 依存・生成物・ツールの置き場で、**降りると自分のコードではないものどうしを比べる**
-/// （SwiftPM の `.build` は `checkouts/` の下に依存パッケージのソースが丸ごと入る）。
+/// （SwiftPM の `.build` は `checkouts/` の下に依存パッケージのソースが丸ごと入る。
+/// Gradle の `build/generated/`・Maven の `target/generated-sources/` には生成されたソースが入る）。
 /// 言語で分けないのは、どの言語を走査するときもこの下を比べる理由が無いため。
 ///
 /// ハードコードのまま置く。`dryguard.toml`（`crate::config`）が読むのは閾値だけで、
-/// **この一覧を調整したくなった記録はまだ無い**。記録が出てから外へ出す
+/// **この一覧を外から調整したくなった記録はまだ無い**。記録が出てから外へ出す
 /// — まだ意味の分かっていないつまみを増やさないため。
-const EXCLUDED_DIRECTORY_NAMES: [&str; 9] = [
+const EXCLUDED_DIRECTORY_NAMES: [&str; 10] = [
     "node_modules",
     "dist",
     "build",
@@ -39,6 +40,7 @@ const EXCLUDED_DIRECTORY_NAMES: [&str; 9] = [
     ".swiftpm",
     "Pods",
     "DerivedData",
+    ".gradle",
 ];
 
 /// 走査するソースの言語。
@@ -427,6 +429,22 @@ mod tests {
             source_paths_of(&root, SourceLanguage::Java).expect("フィクスチャのディレクトリはある");
 
         assert_eq!(relative_paths_of(&root, &paths), vec!["app/Rate.java"]);
+    }
+
+    #[test]
+    fn test_source_paths_of_java_leaves_out_the_build_tool_directories() {
+        // 対照は src/main/java/ の `.java`。Gradle の `build/generated/` と Maven の
+        // `target/generated-sources/` には生成されたソースが入るので、降りると生成物どうしを比べる。
+        // `.gradle/` にも置き、一覧から 1 つ落としただけで落ちるようにする
+        let root = fixture("java-scan");
+
+        let paths =
+            source_paths_of(&root, SourceLanguage::Java).expect("フィクスチャのディレクトリはある");
+
+        assert_eq!(
+            relative_paths_of(&root, &paths),
+            vec!["src/main/java/app/Rate.java"]
+        );
     }
 
     #[test]
