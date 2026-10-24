@@ -222,10 +222,18 @@ JSON が壊れているのは違う話）。1 語で呼ぶと、どちらの層�
 
 **`leaf divergence` の束縛は、スコープを辿らずに綴りで引く。** 束縛より後に現れた同じ綴りの
 外の名前は付け替えとして許す（**束縛より前の出現は外の名前として比べる**）。束縛として扱う葉は
-`identifier` / `type_identifier` に限り、**パスの要素とフィールド（`x.foo` / `Request { hover }`）は
-束縛と同じ綴りでも比べる**。Java はフィールドとメソッドの名前も `identifier` なので、
-**種別ではなく位置**（`this.rate` の `rate`・`data.size()` の `size`・`data::size` の `::` の後ろ・
-注釈の要素名）で外す（`syntax::leaf_divergence` の `OUTSIDE_NAME_FIELDS`）。
+`identifier` / `type_identifier` / `simple_identifier`（Swift）に限り、**パスの要素とフィールド
+（`x.foo` / `Request { hover }`）・Swift の `.` の直後のメンバー（`self.rate` / `.low`）・
+引数・呼び出し・タプル・パターンのラベル（`to x: Int` の `to` / `g(to: a)` / `(x: 1)` /
+`(x: Int)` / `case .pt(low: let a)`）は束縛と同じ綴りでも比べる**。Swift の束縛は `let` / `var` の
+文脈（`case` の無い `for` を含む）の名前と、ラベルを書いた引数の内部名・クロージャの引数・
+型変数に限る。`if let rate {` の短縮形・`let` の無いパターン（`case .none:` / `if case low = v` /
+`catch low`）・ラベルを書かない引数（`func f(x: Int)`）は、付け替えると読む値・比べる相手・
+呼び出しのラベルが変わるので束縛に入れない。
+Java はフィールドとメソッドの名前も `identifier` なので、**種別ではなく並びと位置**で外す。
+`this.rate` / `data.size()` は Swift のメンバーと同じ `.` の直後の判定、修飾の無い `size()` と
+注釈の要素名は `syntax::leaf_divergence` の `OUTSIDE_NAME_FIELDS`、`data::size` は `::` より後ろの位置。Java の束縛は宣言の `name` の位置の名前で、
+メソッド・コンストラクタの名前は入れない（匿名クラスのメソッドはメンバーで、付け替えると上書きする相手が変わる）。
 束縛の形は許可リストで集めるので、一覧から漏れた形は「違う」側へ倒れる
 （`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」）。
 
