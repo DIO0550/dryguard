@@ -127,7 +127,8 @@ const LITERAL_KINDS: [(&str, LiteralType); 23] = [
 
 /// コメントのノード種別。
 ///
-/// Rust と Java はどちらも `line_comment` / `block_comment`、TypeScript と Swift の行コメントは `comment`。
+/// Rust と Java はどちらも `line_comment` / `block_comment`。TypeScript は行・ブロックとも `comment`、
+/// Swift は行コメントだけが `comment`。
 /// ノードごと落とすので、Rust の doc コメントの子（印と本文）も一緒に落ちる。
 const COMMENT_KINDS: [&str; 3] = ["comment", "line_comment", "block_comment"];
 
@@ -485,7 +486,7 @@ mod tests {
 
     #[test]
     fn test_tokens_of_rust_sources_skip_a_doc_comment() {
-        // doc コメントは `line_comment` の子に印と本文を持つ。子まで含めて落ちることを見る
+        // doc コメントも `line_comment` の種別で、子に印と本文を持つ
         assert_eq!(rust_tokens("/// c\n let a = 1;"), rust_tokens("let a = 1;"));
     }
 
