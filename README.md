@@ -132,7 +132,7 @@ CLI は拡張子から TypeScript と Rust の LSP サーバを選ぶ。`scan --
 「測れない」。
 
 `node_modules` / `dist` / `build` / `target` / `.git` /
-`.build` / `.swiftpm` / `Pods` / `DerivedData` は降りない。
+`.build` / `.swiftpm` / `Pods` / `DerivedData` / `.gradle` は降りない。
 **読むときの grammar は拡張子で選ぶ**（JSX は TypeScript の grammar では読めず、
 型アサーション `<T>value` は TSX の grammar では JSX に見えるので、片方で兼ねられない）。
 読めなかったファイルと構文エラーで切り出せなかった関数は、
