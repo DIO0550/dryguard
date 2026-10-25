@@ -42,7 +42,7 @@ pub enum Command {
         // 既定で外すのは、テスト関数どうしが `fn()` の型シグネチャと呼び出し元の無さで
         // 空の一致を作り、本番コードの候補ペアを埋もれさせるため。`compare` は位置を
         // 名指しするので、このオプションを持たない（global にしない）
-        /// Rust のテスト属性付き関数・TypeScript のテストコールバックも比較する
+        /// Rust のテスト属性付き関数・TypeScript のテストコールバック・Java / Swift のテスト関数も比較する
         #[arg(long)]
         include_tests: bool,
     },
@@ -63,7 +63,7 @@ pub enum Command {
         /// 作業ツリーではなく、ステージ済みの変更（index）をリビジョンと比べる。未追跡のファイルは比べない
         #[arg(long)]
         staged: bool,
-        /// Rust のテスト属性付き関数・TypeScript のテストコールバックも比較する
+        /// Rust のテスト属性付き関数・TypeScript のテストコールバック・Java / Swift のテスト関数も比較する
         #[arg(long)]
         include_tests: bool,
     },
@@ -113,6 +113,8 @@ pub enum LanguageOption {
     Rust,
     /// Swift
     Swift,
+    /// Java
+    Java,
     /// 対象から判定する
     Auto,
 }
@@ -353,6 +355,15 @@ mod tests {
         ]);
 
         assert_eq!(cli.options.lang, LanguageOption::Swift);
+    }
+
+    #[test]
+    fn test_compare_with_lang_java_selects_java() {
+        let cli = parse(&[
+            "dryguard", "compare", "A.java:1", "B.java:2", "--lang", "java",
+        ]);
+
+        assert_eq!(cli.options.lang, LanguageOption::Java);
     }
 
     #[test]

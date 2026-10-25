@@ -273,6 +273,7 @@ fn source_language_of(lang: LanguageOption) -> SourceLanguage {
         LanguageOption::Ts => SourceLanguage::TypeScript,
         LanguageOption::Rust => SourceLanguage::Rust,
         LanguageOption::Swift => SourceLanguage::Swift,
+        LanguageOption::Java => SourceLanguage::Java,
         LanguageOption::Auto => SourceLanguage::Auto,
     }
 }
@@ -301,6 +302,11 @@ fn accepts_grammar(lang: LanguageOption, grammar: Grammar) -> bool {
         (
             LanguageOption::Swift,
             Grammar::TypeScript | Grammar::Tsx | Grammar::Rust | Grammar::Java,
+        ) => false,
+        (LanguageOption::Java, Grammar::Java) => true,
+        (
+            LanguageOption::Java,
+            Grammar::TypeScript | Grammar::Tsx | Grammar::Rust | Grammar::Swift,
         ) => false,
     }
 }

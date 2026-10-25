@@ -210,12 +210,12 @@ dryguard check --diff [rev]      # git diff範囲のみ (フック用)      [Pha
 dryguard check --diff --staged   # ステージ済みの変更だけ (pre-commit 用) [Phase 5]
 
 オプション:
-  --lang ts|rust|swift|auto
+  --lang ts|rust|swift|java|auto
   --format text|json
   --threshold <0-1>
   --fail-on do-not-extract        # 非推奨ペアがあればexit 1 (LSP に尋ね切れなければexit 2)
   --explain                      # 判定根拠のシグナル値を全表示
-  --include-tests                # scan / check のみ。Rust / TypeScript のテスト関数も比較する (既定は外す)
+  --include-tests                # scan / check のみ。Rust / TypeScript / Java / Swift のテスト関数も比較する (既定は外す)
 ```
 
 `--lang` の値は言語を 1 つ足すたびに増える（Phase 6 で 3 言語分。綴りは言語ごとの Issue で決める）。値は enum の `LanguageOption` が持ち、**選択肢と、それが変える振る舞いは同じ差分に入れる**（`rules/coding.md`「値の語彙を型で閉じる」）。`--include-tests` が外す `test function` の印も、言語ごとに決めて足す。
