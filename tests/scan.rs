@@ -16,6 +16,8 @@
 use std::path::{Path, PathBuf};
 
 use dryguard::classification::ConfiguredThresholds;
+use dryguard::classification::reason::Reason;
+use dryguard::classification::signal::ModuleSeparation;
 use dryguard::classification::verdict::Verdict;
 use dryguard::codebase::SourceLanguage;
 use dryguard::domain_declaration::DomainDeclarations;
@@ -221,6 +223,174 @@ fn test_rust_scan_leaves_out_the_pair_of_two_accessors_and_counts_them() {
         "lib.rs:15",
         "lib.rs:20"
     ));
+    assert_eq!(scan.undersized_chunk_count(), 2);
+}
+
+/// `swift-package` のフィクスチャを、言語と `test function` の扱いを指定して走査した結果。
+fn swift_package_scan_of(language: SourceLanguage, test_functions: TestFunctions) -> Scan {
+    let root = PathBuf::from(format!(
+        "{}/tests/fixtures/swift-package",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    let Ok(scan) = scan_of_language(
+        &root,
+        language,
+        test_functions,
+        ConfiguredThresholds::default(),
+        &DomainDeclarations::default(),
+        &missing_server(),
+    ) else {
+        panic!("Swift のフィクスチャを走査できる");
+    };
+    scan
+}
+
+#[test]
+fn test_swift_scan_lists_functions_and_initializers_without_asking_a_server() {
+    let scan = swift_package_scan_of(SourceLanguage::Swift, TestFunctions::Excluded);
+
+    assert_eq!(scan.file_count(), 4, "`.ts` は数えない");
+    assert_eq!(
+        scan.chunk_count(),
+        6,
+        "テスト関数と小さいチャンクは数えない"
+    );
+    assert_eq!(scan.compared_pair_count(), 15);
+    assert!(
+        scan.semantics_error().is_none(),
+        "Swift のサーバはまだ無いので尋ねない"
+    );
+    assert!(
+        scan.candidate_pairs().iter().any(|pair| is_pair_of(
+            pair,
+            "Billing/Discount.swift:3",
+            "Inventory/Reorder.swift:3"
+        )),
+        "自由関数の候補ペアを列挙する"
+    );
+    assert!(
+        scan.candidate_pairs().iter().any(|pair| is_pair_of(
+            pair,
+            "Billing/Discount.swift:10",
+            "Inventory/Reorder.swift:10"
+        )),
+        "`init` を列挙する"
+    );
+    assert!(
+        scan.candidate_pairs().iter().any(|pair| is_pair_of(
+            pair,
+            "Billing/Discount.swift:14",
+            "Inventory/Reorder.swift:14"
+        )),
+        "メソッドを列挙する"
+    );
+}
+
+/// そのペアの 2 つのファイルを隔てるディレクトリの段数。宣言で比べたペアなら `None`。
+fn directory_steps_of(pair: &CandidatePair) -> Option<usize> {
+    pair.classification().reasons().iter().find_map(|reason| {
+        if let Reason::ModuleDistance {
+            signal: ModuleSeparation::Directories(distance),
+            ..
+        } = reason
+        {
+            return Some(distance.steps());
+        }
+        None
+    })
+}
+
+#[test]
+fn test_swift_scan_separates_two_swiftpm_targets_by_their_directories() {
+    // 対照は同じファイルの中の組。ディレクトリから推定するドメインが Billing / Inventory に
+    // 分かれていなければ、別のターゲットの組も 0 段になる
+    let scan = swift_package_scan_of(SourceLanguage::Swift, TestFunctions::Excluded);
+    let steps_between = |one: &str, other: &str| {
+        scan.candidate_pairs()
+            .iter()
+            .find(|pair| is_pair_of(pair, one, other))
+            .and_then(directory_steps_of)
+    };
+
+    assert_eq!(
+        steps_between("Billing/Discount.swift:3", "Inventory/Reorder.swift:3"),
+        Some(2),
+        "Billing と Inventory は別のターゲット"
+    );
+    assert_eq!(
+        steps_between("Inventory/Reorder.swift:3", "Inventory/Reorder.swift:14"),
+        Some(0)
+    );
+}
+
+#[test]
+fn test_auto_scan_does_not_compare_swift_with_typescript() {
+    // `auto` が `.swift` を集めない今の振る舞いを固定する（理由は `codebase::SourceLanguage`）
+    let scan = swift_package_scan_of(SourceLanguage::Auto, TestFunctions::Excluded);
+
+    assert_eq!(scan.file_count(), 1, "`.ts` だけを集める");
+    assert_eq!(scan.chunk_count(), 1);
+    assert_eq!(
+        scan.compared_pair_count(),
+        0,
+        "チャンクが `.ts` の 1 つだけなので、組を作らない"
+    );
+}
+
+#[test]
+fn test_swift_scan_excluding_test_functions_leaves_out_both_kinds_of_tests() {
+    // 対照として本番の関数どうしのペアを同じフィクスチャに置く。消えるのは
+    // `@Test` と XCTest のメソッドを含むペアだけ
+    let scan = swift_package_scan_of(SourceLanguage::Swift, TestFunctions::Excluded);
+
+    assert_eq!(
+        scan.excluded_test_function_count(),
+        2,
+        "`@Test` と XCTest のメソッドを 1 つずつ外す"
+    );
+    assert!(scan.candidate_pairs().iter().all(|pair| {
+        !pair.location_a().to_string().contains("Tests.swift:")
+            && !pair.location_b().to_string().contains("Tests.swift:")
+    }));
+    assert!(scan.candidate_pairs().iter().any(|pair| is_pair_of(
+        pair,
+        "Billing/Discount.swift:3",
+        "Inventory/Reorder.swift:3"
+    )));
+}
+
+#[test]
+fn test_swift_scan_including_test_functions_keeps_the_pair_of_two_tests() {
+    let scan = swift_package_scan_of(SourceLanguage::Swift, TestFunctions::Included);
+
+    assert!(
+        scan.candidate_pairs().iter().any(|pair| is_pair_of(
+            pair,
+            "BillingTests/DiscountTests.swift:3",
+            "InventoryTests/ReorderTests.swift:4"
+        )),
+        "`--include-tests` を付けると、`@Test` と XCTest のメソッドの組も比べる"
+    );
+    assert_eq!(scan.excluded_test_function_count(), 0);
+    assert_eq!(scan.chunk_count(), 8);
+    assert_eq!(scan.compared_pair_count(), 28);
+}
+
+#[test]
+fn test_swift_scan_leaves_out_the_pair_of_two_short_functions_and_counts_them() {
+    // 対照として、下限に届く大きさの同じ形のメソッドの組（14 行目どうし）が同じ走査で残る
+    let scan = swift_package_scan_of(SourceLanguage::Swift, TestFunctions::Excluded);
+
+    assert!(!scan.candidate_pairs().iter().any(|pair| is_pair_of(
+        pair,
+        "Billing/Discount.swift:18",
+        "Inventory/Reorder.swift:18"
+    )));
+    assert!(scan.candidate_pairs().iter().any(|pair| is_pair_of(
+        pair,
+        "Billing/Discount.swift:14",
+        "Inventory/Reorder.swift:14"
+    )));
     assert_eq!(scan.undersized_chunk_count(), 2);
 }
 

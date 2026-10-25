@@ -292,6 +292,32 @@ fn test_compare_of_rust_and_typescript_functions_reports_different_languages() {
 }
 
 #[test]
+fn test_compare_of_swift_and_typescript_functions_reports_different_languages() {
+    let swift = fixture("swift-package/Sources/Billing/Discount.swift", 3);
+    let typescript = fixture("swift-package/Sources/Report/summary.ts", 1);
+
+    let result = chunk_pair_of(&swift, &typescript);
+
+    let Err(ChunkPairError::DifferentLanguages {
+        location_a,
+        location_b,
+    }) = result
+    else {
+        panic!("Swift と TypeScript の関数は DifferentLanguages になる");
+    };
+    assert_eq!(location_a, swift);
+    assert_eq!(location_b, typescript);
+    assert_eq!(
+        ChunkPairError::DifferentLanguages {
+            location_a,
+            location_b,
+        }
+        .to_string(),
+        format!("異なる言語の関数は比較できません: {swift} / {typescript}")
+    );
+}
+
+#[test]
 fn test_compare_of_two_locations_yields_the_function_that_encloses_each_line() {
     let pair = chunk_pair_of(
         &fixture("billing/discount.ts", 6),
@@ -443,6 +469,38 @@ fn test_compare_of_rust_functions_does_not_ask_stage2() {
     assert!(
         measured.semantics_error().is_none(),
         "Rust は LSP を起動していない: {:?}",
+        measured.semantics_error().map(ToString::to_string)
+    );
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unavailable {
+            reason: SemanticsUnavailable::NotAsked
+        }
+    );
+    assert_eq!(
+        measured.signals().caller_domain_overlap(),
+        &CallerDomainOverlap::Unavailable {
+            reason: SemanticsUnavailable::NotAsked
+        }
+    );
+    assert_eq!(
+        measured.signals().callee_domain_overlap(),
+        &CalleeDomainOverlap::Unavailable {
+            reason: SemanticsUnavailable::NotAsked
+        }
+    );
+}
+
+#[test]
+fn test_compare_of_swift_functions_does_not_ask_stage2() {
+    let measured = measured_without_an_lsp(
+        &fixture("swift-package/Sources/Billing/Discount.swift", 3),
+        &fixture("swift-package/Sources/Inventory/Reorder.swift", 3),
+    );
+
+    assert!(
+        measured.semantics_error().is_none(),
+        "Swift のサーバはまだ無いので起動していない: {:?}",
         measured.semantics_error().map(ToString::to_string)
     );
     assert_eq!(
