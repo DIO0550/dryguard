@@ -113,6 +113,8 @@ pub enum LanguageOption {
     Rust,
     /// Swift
     Swift,
+    /// Java
+    Java,
     /// 対象から判定する
     Auto,
 }
@@ -353,6 +355,15 @@ mod tests {
         ]);
 
         assert_eq!(cli.options.lang, LanguageOption::Swift);
+    }
+
+    #[test]
+    fn test_compare_with_lang_java_selects_java() {
+        let cli = parse(&[
+            "dryguard", "compare", "A.java:1", "B.java:2", "--lang", "java",
+        ]);
+
+        assert_eq!(cli.options.lang, LanguageOption::Java);
     }
 
     #[test]
