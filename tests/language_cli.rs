@@ -205,3 +205,50 @@ fn test_scan_swift_language_walks_only_swift_files() {
         "Swift のサーバはまだ無いので、どのサーバにも尋ねない: {stderr}"
     );
 }
+
+fn java_fixture(name: &str) -> String {
+    format!(
+        "{}/tests/fixtures/java-language/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+#[test]
+fn test_compare_java_language_rejects_typescript_files() {
+    let location = format!("{}:1", java_fixture("a.ts"));
+    let output = run(&["compare", &location, &location, "--lang", "java"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("一致しません"), "{stderr}");
+    assert!(stdout.is_empty(), "判定を出さない: {stdout}");
+}
+
+#[test]
+fn test_compare_java_language_accepts_java_files() {
+    // 対照は上の `.ts`。Java の腕を拒否へ写し違えると、こちらが落ちる
+    let left = format!("{}:2", java_fixture("A.java"));
+    let right = format!("{}:2", java_fixture("B.java"));
+    let output = run(&["compare", &left, &right, "--lang", "java"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("A.java:2 <->"), "{stdout}");
+}
+
+#[test]
+fn test_scan_java_language_walks_only_java_files() {
+    // 同じディレクトリに `.ts` を 1 つ置く。TypeScript も走査すると対象が 3 ファイルになり、
+    // Java の腕を TypeScript へ写し違えると対象が 1 ファイルになる
+    let root = java_fixture("");
+    let output = run(&["scan", &root, "--lang", "java"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stdout.matches(" <-> ").count(), 1, "{stdout}");
+    assert!(stdout.contains("A.java:2 <->"), "{stdout}");
+    assert!(stdout.contains("対象 2 ファイル"), "{stdout}");
+}
