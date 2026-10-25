@@ -1335,6 +1335,30 @@ mod tests {
     }
 
     #[test]
+    fn test_leaves_of_rust_functions_differing_only_in_a_primitive_and_a_named_type_diverge_at_the_type()
+     {
+        // 本体の中の型の違いが `unaligned` に消えず、葉の違いとして出る
+        let divergence = rust_divergence(
+            "fn f() { let total: i32 = base; }",
+            "fn f() { let total: Amount = base; }",
+        );
+
+        assert_eq!(divergence, vec!["i32 ↔ Amount"]);
+    }
+
+    #[test]
+    fn test_leaves_of_rust_functions_differing_only_in_primitive_and_named_signature_types_do_not_diverge()
+     {
+        // シグネチャの型は型シグネチャ（Stage 2）が見る。対照は上の本体の型のテスト
+        let divergence = rust_divergence(
+            "fn total(a: i32) -> i32 { a.checked() }",
+            "fn total(a: Amount) -> Amount { a.checked() }",
+        );
+
+        assert_eq!(divergence, vec!["identical"]);
+    }
+
+    #[test]
     fn test_leaves_of_typescript_functions_building_different_generic_types_diverge() {
         let divergence = typescript_divergence(
             "function counts() { return new Map<string, number>(); }",

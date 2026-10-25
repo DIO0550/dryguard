@@ -75,8 +75,8 @@ enum Normalization {
 /// 型名（`type_identifier` / `predefined_type`）を混ぜているのは、**ここが構造だけを見る層**で、
 /// 型の違いは Stage 2 が見るため。`x: number` と `x: string` を別物にすると、
 /// 型注釈を書き換えただけで構造が違って見える。Java のプリミティブ型
-/// （`integral_type` など）も `predefined_type` と同じ理由で混ぜる。
-const NAME_KINDS: [&str; 13] = [
+/// （`integral_type` など）と Rust の `primitive_type` も `predefined_type` と同じ理由で混ぜる。
+const NAME_KINDS: [&str; 14] = [
     "identifier",
     "property_identifier",
     "shorthand_property_identifier",
@@ -90,6 +90,7 @@ const NAME_KINDS: [&str; 13] = [
     "floating_point_type",
     "boolean_type",
     "void_type",
+    "primitive_type",
 ];
 
 /// リテラルのノード種別と、その型タグ。
@@ -494,6 +495,15 @@ mod tests {
     fn test_tokens_of_rust_sources_keep_an_inserted_statement() {
         // 対照は上の Rust のコメントのテスト群。コメントは落とすが、文を挟めば列は変わる
         assert_ne!(rust_tokens("2;\n 1;"), rust_tokens("1;"));
+    }
+
+    #[test]
+    fn test_tokens_of_a_rust_primitive_type_are_the_same_as_a_named_type() {
+        // TypeScript の `predefined_type`・Java の `integral_type` と揃える。型の違いは Stage 2 が見る
+        assert_eq!(
+            rust_tokens("let a: i32 = b;"),
+            rust_tokens("let a: Amount = b;")
+        );
     }
 
     #[test]
