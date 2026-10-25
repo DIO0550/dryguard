@@ -23,13 +23,14 @@ pub mod index;
 /// 走査から外すディレクトリの名前。
 ///
 /// 依存・生成物・ツールの置き場で、**降りると自分のコードではないものどうしを比べる**
-/// （SwiftPM の `.build` は `checkouts/` の下に依存パッケージのソースが丸ごと入る）。
+/// （SwiftPM の `.build` は `checkouts/` の下に依存パッケージのソースが丸ごと入る。
+/// Gradle の `build/generated/`・Maven の `target/generated-sources/` には生成されたソースが入る）。
 /// 言語で分けないのは、どの言語を走査するときもこの下を比べる理由が無いため。
 ///
 /// ハードコードのまま置く。`dryguard.toml`（`crate::config`）が読むのは閾値だけで、
-/// **この一覧を調整したくなった記録はまだ無い**。記録が出てから外へ出す
+/// **この一覧を外から調整したくなった記録はまだ無い**。記録が出てから外へ出す
 /// — まだ意味の分かっていないつまみを増やさないため。
-const EXCLUDED_DIRECTORY_NAMES: [&str; 9] = [
+const EXCLUDED_DIRECTORY_NAMES: [&str; 10] = [
     "node_modules",
     "dist",
     "build",
@@ -39,6 +40,7 @@ const EXCLUDED_DIRECTORY_NAMES: [&str; 9] = [
     ".swiftpm",
     "Pods",
     "DerivedData",
+    ".gradle",
 ];
 
 /// 走査するソースの言語。
@@ -47,6 +49,7 @@ pub enum SourceLanguage {
     TypeScript,
     Rust,
     Swift,
+    Java,
     Auto,
 }
 
@@ -62,11 +65,14 @@ impl SourceLanguage {
             (Self::Rust, Grammar::TypeScript | Grammar::Tsx) => false,
             (Self::Swift, Grammar::Swift) => true,
             (Self::Swift, Grammar::TypeScript | Grammar::Tsx | Grammar::Rust) => false,
-            // Java を走査に入れる対応（言語の選択肢と候補の揃え方）がまだ無いので、`auto` でも拾わない
+            (Self::Java, Grammar::Java) => true,
+            (Self::Java, Grammar::TypeScript | Grammar::Tsx | Grammar::Rust) => false,
+            // `auto` は CLI から届くが、Java のチャンクに jdtls を選ぶ対応がまだ無いので、
+            // `auto` でも `.java` を拾わない
             (Self::Auto | Self::TypeScript | Self::Rust | Self::Swift, Grammar::Java) => false,
             // Swift はチャンクを切り出せるが、正規化トークンの表に Swift の種別がまだ無いので、
             // `auto` でも走査に入れない
-            (Self::Auto | Self::TypeScript | Self::Rust, Grammar::Swift) => false,
+            (Self::Auto | Self::TypeScript | Self::Rust | Self::Java, Grammar::Swift) => false,
         }
     }
 }
@@ -372,8 +378,8 @@ mod tests {
 
     #[test]
     fn test_source_paths_of_auto_leaves_out_java_files() {
-        // 対照は同じディレクトリの `.ts` / `.rs`。`.java` はチャンクにできるようになったが、
-        // 走査に入れる対応が入るまでは `auto` でも走査に入れない
+        // 対照は同じディレクトリの `.ts` / `.rs`。`.java` は `SourceLanguage::Java` なら集めるが、
+        // Java のチャンクに jdtls を選ぶ対応が入るまでは `auto` でも走査に入れない
         let root = fixture("language-scan");
 
         let paths =
@@ -410,6 +416,34 @@ mod tests {
         assert_eq!(
             relative_paths_of(&root, &paths),
             vec!["Sources/App/Rate.swift"]
+        );
+    }
+
+    #[test]
+    fn test_source_paths_of_java_returns_only_java_files() {
+        // 対照は同じディレクトリの `.ts` / `.tsx` / `.rs` / `.swift` / `.py`。`SourceLanguage::Java` の
+        // 走査が他の grammar まで拾うと、Java のチャンクどうしの比較に他の言語のチャンクが混ざる
+        let root = fixture("java-scan/src/main/java");
+
+        let paths =
+            source_paths_of(&root, SourceLanguage::Java).expect("フィクスチャのディレクトリはある");
+
+        assert_eq!(relative_paths_of(&root, &paths), vec!["app/Rate.java"]);
+    }
+
+    #[test]
+    fn test_source_paths_of_java_leaves_out_the_build_tool_directories() {
+        // 対照は src/main/java/ の `.java`。Gradle の `build/generated/` と Maven の
+        // `target/generated-sources/` には生成されたソースが入るので、降りると生成物どうしを比べる。
+        // `.gradle/` にも置き、一覧から 1 つ落としただけで落ちるようにする
+        let root = fixture("java-scan");
+
+        let paths =
+            source_paths_of(&root, SourceLanguage::Java).expect("フィクスチャのディレクトリはある");
+
+        assert_eq!(
+            relative_paths_of(&root, &paths),
+            vec!["src/main/java/app/Rate.java"]
         );
     }
 
