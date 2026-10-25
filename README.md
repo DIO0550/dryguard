@@ -68,7 +68,7 @@ cargo run -- check --diff [rev]      # git の差分に含まれる関数を起�
 cargo run -- check --diff --staged   # ステージ済みの変更だけを起点に、index の版の全体と比較
 
 オプション:
-  --lang ts|rust|swift|auto
+  --lang ts|rust|swift|java|auto
   --format text|json
   --threshold <0-1>
   --explain                          # 判定根拠のシグナル値を全表示
@@ -104,7 +104,7 @@ spread 引数の後ろも引数位置が確定しないため残す。テスト�
 
 - 候補ペアでないので尋ねなかったペア・サーバは答えたがシグナルが「測れない」だったペアは数えない
   （前者は Stage 2 で判定が変わらない。後者は理由が根拠の行に出る）
-- dryguard が LSP サーバを持たない言語の候補ペアも数えない（今は `--lang swift` で走査した Swift がこれに当たる）
+- dryguard が LSP サーバを持たない言語の候補ペアも数えない（今は `--lang swift` / `--lang java` で走査した Swift / Java がこれに当たる）
 - `--fail-on` が無ければ、LSP サーバが使えなくても判定を出して 0 で終わる
   （取れなかったシグナルは根拠に出る）
 
@@ -117,15 +117,16 @@ spread 引数の後ろも引数位置が確定しないため残す。テスト�
 
 `scan` は `.ts` / `.tsx` / `.mts` / `.cts` / `.rs` を見る。`--lang ts` / `--lang rust` で
 対象を絞り、`auto` では両方を走査する（異なる言語の関数同士は比較しない）。
-`--lang swift` を指定したときだけ `.swift` を走査する（`auto` には入らない）。Rust の
+`--lang swift` を指定したときだけ `.swift` を、`--lang java` を指定したときだけ `.java` を走査する（どちらも `auto` には入らない）。Rust の
 自由関数・`impl` 内のメソッド・トレイト実装のメソッドをそれぞれ 1 チャンクにする。
 正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない関数（1〜3 行のアクセサ・委譲）は `scan` では比べず、
 外した数を走査量の行に出す（`compare` は名指しされれば比べる）。
-`.java` はメソッド・コンストラクタをチャンクにでき、`compare` は名指しされれば比べるが、`scan` の走査にはまだ入らない（型シグネチャは Java の読み方がまだ無い）。
+`.java` はメソッド・コンストラクタをチャンクにし、`compare` で名指しすれば比べる。
+Java の LSP サーバはまだ無いので、型シグネチャ・呼び出し元・呼び出し先は尋ねない。
 `.swift` は関数・メソッド・`init` / `deinit` をチャンクにし、`compare` で名指しすれば比べる。
 正規化トークンの表に Swift の種別がまだ無いので、`scan` / `check` は `--lang swift` を指定したときだけ走査する。
 Swift の LSP サーバはまだ無いので、型シグネチャ・呼び出し元・呼び出し先は尋ねない。
-`compare` は `--lang` と拡張子が一致しなければ比べない（`--lang ts` と `.swift` / `.java` など。`auto` は拡張子に従う）。
+`compare` は `--lang` と拡張子が一致しなければ比べない（`--lang ts` と `.swift` / `.java`、`--lang java` と `.ts` など。`auto` は拡張子に従う）。
 CLI は拡張子から TypeScript と Rust の LSP サーバを選ぶ。`scan --lang auto` では
 言語ごとに候補を揃え、TypeScript は typescript-language-server、Rust は rust-analyzer の
 セッションで hover / references を問い合わせる。Rust の型シグネチャ比較は #40 まで

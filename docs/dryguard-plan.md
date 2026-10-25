@@ -210,7 +210,7 @@ dryguard check --diff [rev]      # git diff範囲のみ (フック用)      [Pha
 dryguard check --diff --staged   # ステージ済みの変更だけ (pre-commit 用) [Phase 5]
 
 オプション:
-  --lang ts|rust|swift|auto
+  --lang ts|rust|swift|java|auto
   --format text|json
   --threshold <0-1>
   --fail-on do-not-extract        # 非推奨ペアがあればexit 1 (LSP に尋ね切れなければexit 2)
