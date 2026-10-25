@@ -73,12 +73,14 @@ cargo run -- check --diff --staged   # ステージ済みの変更だけを起�
   --threshold <0-1>
   --explain                          # 判定根拠のシグナル値を全表示
   --fail-on do-not-extract           # 非推奨ペアがあれば exit 1 (LSP に尋ね切れなければ exit 2)
-  --include-tests                    # scan / check のみ。Rust / TypeScript のテスト関数も比較する (既定は外す)
+  --include-tests                    # scan / check のみ。Rust / TypeScript / Java / Swift のテスト関数も比較する (既定は外す)
 ```
 
 `scan` は Rust のテスト属性（`#[test]` / `#[tokio::test]` など）付き関数と、
 TypeScript / TSX の `describe` / `it` / `test`（`.only` / `.skip` も対応）の第2引数に
 直接書いたアロー関数・関数式を除外する。コールバック側の括弧・型アサーション等は辿る。
+`--lang java` では注釈の名前が `Test` で終わるメソッド（`@Test` / `@ParameterizedTest` など）を、
+`--lang swift` では `@Test` 付きの関数と、`XCTestCase` を継承したクラスに直接書いた引数を取らない `func test…` を除外する。
 ファイル名では除外せず、ヘルパーやテスト本体内の通常の関数は残す。除外数は走査結果に出る。
 `--include-tests` で再び比較対象にでき、`compare` での直接指定には影響しない。
 
