@@ -180,7 +180,7 @@ inventory = ["src/inventory/**", "src/**/product*.ts"]
 | `codebase` | `EXCLUDED_DIRECTORY_NAMES` | 降りない生成物・依存の置き場（Python の `.venv` など） | 全言語共通の表 |
 | `cli` | `LanguageOption` | `--lang` の値 | enum |
 | 入口（`main.rs`） | `source_language_of` | `--lang` から `SourceLanguage` へ | 網羅 `match` |
-| 入口（`main.rs`） | `report_compare` | `--lang` とファイルの言語の突き合わせ | **2 択が 2 つ**（`is_rust`） |
+| 入口（`main.rs`） | `report_compare` の `accepts_grammar` | `--lang` とファイルの言語の突き合わせ | `LanguageOption` × `Grammar` の網羅 `match` |
 | 入口（`main.rs`） | `language_servers`（`report_scan` / `report_check` / `report_compare` が使うサーバの並び） | 言語ごとのサーバ。**並べ忘れると、その言語の候補ペアは尋ねずに `NotAsked` になり、`--fail-on` でも終了コード 2 にならない**（Issue #43） | TypeScript と Rust の 2 本を固定で渡す |
 | `lsp` | `ServerLanguage`・`ServerCommand`（`*_SERVER`・`*_PROJECT_MARKERS`・`ServerCommand::rust` に当たる組み立て） | 起動方法・`project marker`・言語 | variant は enum。`ServerCommand::new` は独自サーバを TypeScript として扱う |
 | `lsp` | `ServerCommand::supports` | そのサーバが尋ねられる grammar | `ServerLanguage` × `Grammar` の網羅 `match`（Issue #363） |
@@ -210,7 +210,7 @@ dryguard check --diff [rev]      # git diff範囲のみ (フック用)      [Pha
 dryguard check --diff --staged   # ステージ済みの変更だけ (pre-commit 用) [Phase 5]
 
 オプション:
-  --lang ts|rust|auto
+  --lang ts|rust|swift|auto
   --format text|json
   --threshold <0-1>
   --fail-on do-not-extract        # 非推奨ペアがあればexit 1 (LSP に尋ね切れなければexit 2)

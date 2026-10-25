@@ -156,10 +156,7 @@ fn report_compare(
             return ExitCode::from(NOT_CLASSIFIED);
         }
     };
-    let is_rust = pair.chunk_a().grammar() == Grammar::Rust;
-    if matches!(options.lang, LanguageOption::Ts) && is_rust
-        || matches!(options.lang, LanguageOption::Rust) && !is_rust
-    {
+    if !accepts_grammar(options.lang, pair.chunk_a().grammar()) {
         eprintln!("指定した --lang と比較するファイルの言語が一致しません");
         return ExitCode::from(NOT_CLASSIFIED);
     }
@@ -275,7 +272,36 @@ fn source_language_of(lang: LanguageOption) -> SourceLanguage {
     match lang {
         LanguageOption::Ts => SourceLanguage::TypeScript,
         LanguageOption::Rust => SourceLanguage::Rust,
+        LanguageOption::Swift => SourceLanguage::Swift,
         LanguageOption::Auto => SourceLanguage::Auto,
+    }
+}
+
+/// `compare` で、`--lang` が比べるファイルの grammar を受け付けるか。
+///
+/// grammar 側も網羅 `match` にする。「Rust 以外」の否定で書くと、grammar を足したときに
+/// `--lang ts` が黙って受け付ける。
+///
+/// Why not（`SourceLanguage::accepts` を引く）: あちらは走査に入れる grammar で、
+/// `auto` が Swift / Java を拾わない。`compare` は名指しされれば `auto` でも比べる。
+fn accepts_grammar(lang: LanguageOption, grammar: Grammar) -> bool {
+    match (lang, grammar) {
+        (
+            LanguageOption::Auto,
+            Grammar::TypeScript | Grammar::Tsx | Grammar::Rust | Grammar::Java | Grammar::Swift,
+        ) => true,
+        (LanguageOption::Ts, Grammar::TypeScript | Grammar::Tsx) => true,
+        (LanguageOption::Ts, Grammar::Rust | Grammar::Java | Grammar::Swift) => false,
+        (LanguageOption::Rust, Grammar::Rust) => true,
+        (
+            LanguageOption::Rust,
+            Grammar::TypeScript | Grammar::Tsx | Grammar::Java | Grammar::Swift,
+        ) => false,
+        (LanguageOption::Swift, Grammar::Swift) => true,
+        (
+            LanguageOption::Swift,
+            Grammar::TypeScript | Grammar::Tsx | Grammar::Rust | Grammar::Java,
+        ) => false,
     }
 }
 
