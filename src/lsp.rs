@@ -87,6 +87,9 @@ const TYPESCRIPT_SERVER: &str = "typescript-language-server";
 /// Rust の LSP サーバの実行ファイル名。
 const RUST_SERVER: &str = "rust-analyzer";
 
+/// Swift の LSP サーバの実行ファイル名。
+const SWIFT_SERVER: &str = "sourcekit-lsp";
+
 /// stdio でしゃべらせる指定。付けないとサーバは使い方を表示して終わる。
 const STDIO_OPTION: &str = "--stdio";
 
@@ -99,6 +102,12 @@ const TYPESCRIPT_PROJECT_MARKERS: [&str; 2] = ["tsconfig.json", "jsconfig.json"]
 
 /// rust-analyzer がワークスペースを見つけるためのマニフェスト。
 const RUST_PROJECT_MARKERS: [&str; 1] = ["Cargo.toml"];
+
+/// sourcekit-lsp が SwiftPM のパッケージとしてビルド設定を組むためのマニフェスト。
+///
+/// 印の外のファイルはビルド設定を持てず、別ファイルの参照元が揃わない見込み。
+/// **未実測**で、実サーバで確かめるのは CI で sourcekit-lsp を起動する回。
+const SWIFT_PROJECT_MARKERS: [&str; 1] = ["Package.swift"];
 
 /// サーバが何も送ってこないまま待つ上限。
 ///
@@ -182,6 +191,17 @@ const RUST_SETTLED_ATTEMPTS: usize = 32;
 /// 2 つ目のフェンスが無ければ先頭を読む。
 const RUST_HOVER_FENCES: &[usize] = &[1, 0];
 
+/// sourcekit-lsp の hover で、綴りを探すコードフェンスの試す順。
+///
+/// **未実測。** 応答の形を測るまでは TypeScript と同じ先頭のフェンスを置く。
+const SWIFT_HOVER_FENCES: &[usize] = hover::LEADING_FENCE;
+
+/// sourcekit-lsp で、落ち着いた答えを求めて尋ね直す回数の上限。
+///
+/// **未実測。** 測るまでは TypeScript と同じ値を置く。background indexing の進捗を
+/// `$/progress` で報告するので、rust-analyzer と同じく回数が多く要る見込み。
+const SWIFT_SETTLED_ATTEMPTS: usize = connection::SETTLED_ATTEMPTS;
+
 /// サーバの問い合わせ形式。**サーバごとの値を選ぶのは、ここの網羅 `match` だけ。**
 ///
 /// TypeScript の値は、バイト列で組む往復の既定として `hover` / `connection` が持ち、
@@ -191,6 +211,7 @@ const RUST_HOVER_FENCES: &[usize] = &[1, 0];
 pub(super) enum ServerLanguage {
     TypeScript,
     Rust,
+    Swift,
 }
 
 impl ServerLanguage {
@@ -199,6 +220,7 @@ impl ServerLanguage {
         match self {
             Self::TypeScript => hover::LEADING_FENCE,
             Self::Rust => RUST_HOVER_FENCES,
+            Self::Swift => SWIFT_HOVER_FENCES,
         }
     }
 
@@ -207,16 +229,18 @@ impl ServerLanguage {
         match self {
             Self::TypeScript => connection::SETTLED_ATTEMPTS,
             Self::Rust => RUST_SETTLED_ATTEMPTS,
+            Self::Swift => SWIFT_SETTLED_ATTEMPTS,
         }
     }
 
     /// `project membership` を尋ねるか。
     ///
-    /// Rust は Cargo.toml でワークスペースを決め、tsserver の projectInfo を持たない。
+    /// Rust は Cargo.toml、Swift は Package.swift でワークスペースを決め、
+    /// どちらも tsserver の projectInfo を持たない。
     fn asks_project_membership(self) -> bool {
         match self {
             Self::TypeScript => true,
-            Self::Rust => false,
+            Self::Rust | Self::Swift => false,
         }
     }
 }
@@ -241,7 +265,8 @@ impl ServerCommand {
     /// `project_markers` はそのサーバがプロジェクトの根と見なすファイルの名前。
     /// **印で範囲を決めないサーバには空を渡す。** 根が範囲そのものになるので、
     /// 参照元は揃う扱いになる（`WorkspaceRoot::enclosing_project`）。
-    /// 独自サーバは TypeScript の問い合わせ形式を使う。Rust は [`Self::rust`] を使う。
+    /// 独自サーバは TypeScript の問い合わせ形式を使う。Rust は [`Self::rust`]、
+    /// Swift は [`Self::swift`] を使う。
     pub fn new(
         program: impl Into<String>,
         args: Vec<String>,
@@ -279,6 +304,20 @@ impl ServerCommand {
         }
     }
 
+    /// sourcekit-lsp を stdio で起動する指定。
+    ///
+    /// sourcekit-lsp は引数を付けずに起動すると stdio でしゃべる（rust-analyzer と同じ形）。
+    pub fn swift() -> Self {
+        Self {
+            language: ServerLanguage::Swift,
+            ..Self::new(
+                SWIFT_SERVER,
+                Vec::new(),
+                SWIFT_PROJECT_MARKERS.map(str::to_owned).to_vec(),
+            )
+        }
+    }
+
     /// 実行ファイル名。
     pub fn program(&self) -> &str {
         &self.program
@@ -301,7 +340,12 @@ impl ServerCommand {
             (ServerLanguage::TypeScript, Grammar::Rust) => false,
             (ServerLanguage::Rust, Grammar::Rust) => true,
             (ServerLanguage::Rust, Grammar::TypeScript | Grammar::Tsx) => false,
-            (ServerLanguage::TypeScript | ServerLanguage::Rust, Grammar::Java) => false,
+            (ServerLanguage::Swift, Grammar::Swift) => true,
+            (ServerLanguage::Swift, Grammar::TypeScript | Grammar::Tsx | Grammar::Rust) => false,
+            (
+                ServerLanguage::TypeScript | ServerLanguage::Rust | ServerLanguage::Swift,
+                Grammar::Java,
+            ) => false,
             (ServerLanguage::TypeScript | ServerLanguage::Rust, Grammar::Swift) => false,
         }
     }
@@ -1888,6 +1932,15 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn test_session_with_sourcekit_lsp_does_not_ask_project_membership() {
+        // projectInfo は tsserver 固有の要求で、sourcekit-lsp に送っても答えは返らない
+        let session = handshake_as(ServerLanguage::Swift, "");
+
+        assert!(!session.needs_project_membership_query());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn test_session_with_typescript_server_asks_project_membership() {
         let session = handshake_as(ServerLanguage::TypeScript, "");
 
@@ -2269,6 +2322,31 @@ mod tests {
         }
         assert!(ServerCommand::typescript().supports(Grammar::TypeScript));
         assert!(ServerCommand::rust().supports(Grammar::Rust));
+    }
+
+    #[test]
+    fn test_server_command_for_swift_uses_sourcekit_lsp_with_swift_packages() {
+        let command = ServerCommand::swift();
+
+        assert_eq!(command.program(), "sourcekit-lsp");
+        assert!(command.args.is_empty(), "引数無しで stdio を使う");
+        assert_eq!(command.project_markers(), ["Package.swift".to_owned()]);
+    }
+
+    #[test]
+    fn test_server_command_for_swift_supports_only_swift() {
+        // 他の grammar を受けると、sourcekit-lsp に別の言語のドキュメントを開かせて尋ねる
+        let command = ServerCommand::swift();
+
+        assert!(command.supports(Grammar::Swift));
+        for grammar in [
+            Grammar::TypeScript,
+            Grammar::Tsx,
+            Grammar::Rust,
+            Grammar::Java,
+        ] {
+            assert!(!command.supports(grammar), "{grammar:?} は受けない");
+        }
     }
 
     #[test]

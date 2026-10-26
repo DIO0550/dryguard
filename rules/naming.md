@@ -94,7 +94,7 @@ if structurally_similar && domains_differ { ... }
 | `payload` | frame の本文。JSON-RPC のメッセージ 1 通そのもの |
 | `handshake` | `initialize` 要求 → 応答 → `initialized` 通知。ここまでで 1 つ |
 | `session` | handshake を終えた接続。問い合わせを送れる状態。握手前は `client` |
-| `project marker` | そのサーバがプロジェクトの根と見なすファイルの名前（TS は `tsconfig.json` / `jsconfig.json`、Rust は `Cargo.toml`）。言語ごとに決まる |
+| `project marker` | そのサーバがプロジェクトの根と見なすファイルの名前（TS は `tsconfig.json` / `jsconfig.json`、Rust は `Cargo.toml`、Swift は `Package.swift`）。言語ごとに決まる |
 | `workspace root` | `initialize` でサーバに見せるディレクトリ |
 | `project root` | **ファイル 1 つずつ**について、そのディレクトリから上へ `project marker` を探した結果。`workspace root` と、**ファイルごとの印の有無**を持つ |
 | `project membership` | そのファイルを、サーバがどのプロジェクトの一員として扱っているか。**サーバに尋ねた答え** |
