@@ -495,8 +495,8 @@ impl AskedMembership {
             };
         }
 
-        // rust-analyzer には tsserver の projectInfo が無い。Cargo.toml の下なら
-        // ワークスペースの根を渡して参照元を尋ねられる。
+        // rust-analyzer / sourcekit-lsp には tsserver の projectInfo が無い。印の下なら
+        // ワークスペースの根を渡して参照元を尋ねられる（sourcekit-lsp は未実測）。
         if !session.needs_project_membership_query() {
             return Self::Askable;
         }
