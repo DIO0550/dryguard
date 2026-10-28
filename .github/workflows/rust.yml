@@ -129,6 +129,9 @@ jobs:
       - name: pr-body-check
         run: bash .claude/hooks/pr-body-check-test.sh
 
+      - name: issue-comment-count-check
+        run: bash .claude/hooks/issue-comment-count-check-test.sh
+
       # post-edit-rust のテストは使い捨てのクレートに fmt / clippy をかけるので、
       # check ジョブと同じくツールチェーンを明示して用意する。
       - name: Rust ツールチェーン

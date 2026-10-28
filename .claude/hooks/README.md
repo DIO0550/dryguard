@@ -14,6 +14,7 @@
 | `pre-push-check.sh` | `PreToolUse`（`Bash`） | コマンドに `git push` があれば `harness/githooks/pre-push` を走らせ、落ちたら exit 2 で止める |
 | `hook-canary.sh` | `PreToolUse`（`Bash`） | コマンドが `echo hook-canary` そのものなら exit 2 で止める。このセッションでフックが発火しているかを確かめるためだけのもの |
 | `pr-body-check.sh` | `PreToolUse`（`mcp__github__create_pull_request`） | 本文に `差分規模:` の宣言の行が無ければ exit 2 で止める。数の突き合わせは層 1（`harness/ci/pr-body-diff.sh`）に任せる |
+| `issue-comment-count-check.sh` | `PreToolUse`（`mcp__github__add_issue_comment` / `update_issue_comment` / `issue_write`） | 本文に「N 件」「N 箇所」などの数があるのに `数の出どころ:` の行が無ければ exit 2 で止める。数が正しいかは見ない |
 | `post-merge-review.sh` | `PostToolUse`（`mcp__github__merge_pull_request` / `Bash`） | PR のマージ（MCP のマージか `gh pr merge`）を検知したら、Issue への追記と `harness/records/pr-<N>.md` の記録を `additionalContext` で促す。止めない |
 | `post-edit-rust.sh` | `PostToolUse`（`Edit` / `Write` / `MultiEdit`） | `.rs` を編集したら、そのクレートに `cargo fmt` をかけ、`cargo clippy` が落ちたら診断を exit 2 で返す |
 
@@ -108,6 +109,23 @@ push の前に `echo hook-canary` を 1 度実行する。**止められれば**
 **移植元は読んでいない。** Issue #51 は design-composer の `session-url-notice.sh` を参照に挙げたが、
 実装したセッションからは読めなかったため新規に書いた。
 
+## `issue-comment-count-check.sh` — Issue コメントの数に、立ち止まる一度を挟む
+
+層 1 が突き合わせるのは PR 本文の差分規模だけで、Issue コメントに書いた「N 件」「N 箇所」は
+どの層も見ない。`unverified-claim` が `implementation-flow` の「7. PR」に観点を足した
+（層 4）後も、Issue コメントの数で再発している（pr-411 指摘 7・pr-421 指摘 2・pr-431 指摘 14・
+pr-444 指摘 1・pr-453 指摘 8・pr-437 指摘 15）。
+
+- **止めるのは、数と単位が隣り合う本文に `数の出どころ:` の行が無いとき。** 行の中身は
+  走らせたコマンドと出力、または `未確認`。正しさは見ない（見られるのは層 1 に上げられる
+  PR 本文の差分規模だけ）。確かめていないものを確かめたように書かないための一拍
+- **単位の付かない番号（`#403`・日付・版）は数の主張に読まない。** 読むと毎回止まり、
+  出どころの行が儀式になる
+- **コミット本文は見ない。** `git commit` は Bash のコマンドで、本文を取り出す読み方が
+  `pre-push-check.sh` の `git push` の見つけ方と同じ重さになる。別の回で見る
+
+**黙って通す条件**: `jq` が無い・入力の JSON が読めない・本文が空。
+
 ## `post-merge-review.sh` — マージ後の振り返りへの入口
 
 マージを検知したら、関連 Issue への追記と `harness/records/pr-<N>.md` の記録
@@ -148,6 +166,7 @@ bash .claude/hooks/hook-canary-test.sh
 bash .claude/hooks/session-url-notice-test.sh
 bash .claude/hooks/post-merge-review-test.sh
 bash .claude/hooks/pr-body-check-test.sh
+bash .claude/hooks/issue-comment-count-check-test.sh
 ```
 
 CI（`.github/workflows/rust.yml` の `claude-hooks`）でも走る。
