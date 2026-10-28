@@ -318,6 +318,32 @@ fn test_compare_of_swift_and_typescript_functions_reports_different_languages() 
 }
 
 #[test]
+fn test_compare_of_java_and_typescript_methods_reports_different_languages() {
+    let java = fixture("java-maven/src/main/java/billing/Discount.java", 10);
+    let typescript = fixture("java-maven/src/main/java/report/summary.ts", 1);
+
+    let result = chunk_pair_of(&java, &typescript);
+
+    let Err(ChunkPairError::DifferentLanguages {
+        location_a,
+        location_b,
+    }) = result
+    else {
+        panic!("Java と TypeScript のメソッドは DifferentLanguages になる");
+    };
+    assert_eq!(location_a, java);
+    assert_eq!(location_b, typescript);
+    assert_eq!(
+        ChunkPairError::DifferentLanguages {
+            location_a,
+            location_b,
+        }
+        .to_string(),
+        format!("異なる言語の関数は比較できません: {java} / {typescript}")
+    );
+}
+
+#[test]
 fn test_compare_of_two_locations_yields_the_function_that_encloses_each_line() {
     let pair = chunk_pair_of(
         &fixture("billing/discount.ts", 6),
@@ -501,6 +527,38 @@ fn test_compare_of_swift_functions_does_not_ask_stage2() {
     assert!(
         measured.semantics_error().is_none(),
         "Swift のサーバはまだ無いので起動していない: {:?}",
+        measured.semantics_error().map(ToString::to_string)
+    );
+    assert_eq!(
+        measured.signals().type_signature_match(),
+        TypeSignatureMatch::Unavailable {
+            reason: SemanticsUnavailable::NotAsked
+        }
+    );
+    assert_eq!(
+        measured.signals().caller_domain_overlap(),
+        &CallerDomainOverlap::Unavailable {
+            reason: SemanticsUnavailable::NotAsked
+        }
+    );
+    assert_eq!(
+        measured.signals().callee_domain_overlap(),
+        &CalleeDomainOverlap::Unavailable {
+            reason: SemanticsUnavailable::NotAsked
+        }
+    );
+}
+
+#[test]
+fn test_compare_of_java_methods_does_not_ask_stage2() {
+    let measured = measured_without_an_lsp(
+        &fixture("java-maven/src/main/java/billing/Discount.java", 10),
+        &fixture("java-maven/src/main/java/inventory/Reorder.java", 10),
+    );
+
+    assert!(
+        measured.semantics_error().is_none(),
+        "Java のサーバはまだ無いので起動していない: {:?}",
         measured.semantics_error().map(ToString::to_string)
     );
     assert_eq!(

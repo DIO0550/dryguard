@@ -394,6 +394,156 @@ fn test_swift_scan_leaves_out_the_pair_of_two_short_functions_and_counts_them() 
     assert_eq!(scan.undersized_chunk_count(), 2);
 }
 
+/// `java-maven` のフィクスチャを、言語と `test function` の扱いを指定して走査した結果。
+fn java_maven_scan_of(language: SourceLanguage, test_functions: TestFunctions) -> Scan {
+    let root = PathBuf::from(format!(
+        "{}/tests/fixtures/java-maven",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    let Ok(scan) = scan_of_language(
+        &root,
+        language,
+        test_functions,
+        ConfiguredThresholds::default(),
+        &DomainDeclarations::default(),
+        &missing_server(),
+    ) else {
+        panic!("Java のフィクスチャを走査できる");
+    };
+    scan
+}
+
+#[test]
+fn test_java_scan_lists_methods_and_constructors_without_asking_a_server() {
+    let scan = java_maven_scan_of(SourceLanguage::Java, TestFunctions::Excluded);
+
+    assert_eq!(scan.file_count(), 4, "`.ts` は数えない");
+    assert_eq!(
+        scan.chunk_count(),
+        6,
+        "テスト関数と小さいチャンクは数えない"
+    );
+    assert_eq!(scan.compared_pair_count(), 15);
+    assert!(
+        scan.semantics_error().is_none(),
+        "Java のサーバはまだ無いので尋ねない"
+    );
+    assert!(
+        scan.candidate_pairs().iter().any(|pair| is_pair_of(
+            pair,
+            "billing/Discount.java:6",
+            "inventory/Reorder.java:6"
+        )),
+        "コンストラクタを列挙する"
+    );
+    assert!(
+        scan.candidate_pairs().iter().any(|pair| is_pair_of(
+            pair,
+            "billing/Discount.java:10",
+            "inventory/Reorder.java:10"
+        )),
+        "static メソッドを列挙する"
+    );
+    assert!(
+        scan.candidate_pairs().iter().any(|pair| is_pair_of(
+            pair,
+            "billing/Discount.java:14",
+            "inventory/Reorder.java:14"
+        )),
+        "メソッドを列挙する"
+    );
+}
+
+#[test]
+fn test_java_scan_separates_two_maven_packages_by_their_directories() {
+    // 対照は同じファイルの中の組。ディレクトリから推定するドメインが billing / inventory に
+    // 分かれていなければ、別のパッケージの組も 0 段になる
+    let scan = java_maven_scan_of(SourceLanguage::Java, TestFunctions::Excluded);
+    let steps_between = |one: &str, other: &str| {
+        scan.candidate_pairs()
+            .iter()
+            .find(|pair| is_pair_of(pair, one, other))
+            .and_then(directory_steps_of)
+    };
+
+    assert_eq!(
+        steps_between("billing/Discount.java:10", "inventory/Reorder.java:10"),
+        Some(2),
+        "billing と inventory は別のパッケージ"
+    );
+    assert_eq!(
+        steps_between("inventory/Reorder.java:10", "inventory/Reorder.java:14"),
+        Some(0)
+    );
+}
+
+#[test]
+fn test_auto_scan_does_not_compare_java_with_typescript() {
+    // `auto` が `.java` を集めない今の振る舞いを固定する（理由は `codebase::SourceLanguage`）
+    let scan = java_maven_scan_of(SourceLanguage::Auto, TestFunctions::Excluded);
+
+    assert_eq!(scan.file_count(), 1, "`.ts` だけを集める");
+    assert_eq!(scan.chunk_count(), 1);
+    assert_eq!(
+        scan.compared_pair_count(),
+        0,
+        "チャンクが `.ts` の 1 つだけなので、組を作らない"
+    );
+}
+
+#[test]
+fn test_java_scan_excluding_test_functions_leaves_out_the_pair_of_two_tests() {
+    // 対照として本番のメソッドどうしのペアを同じフィクスチャに置く。消えるのは
+    // `@Test` のメソッドを含むペアだけ
+    let scan = java_maven_scan_of(SourceLanguage::Java, TestFunctions::Excluded);
+
+    assert_eq!(scan.excluded_test_function_count(), 2);
+    assert!(scan.candidate_pairs().iter().all(|pair| {
+        !pair.location_a().to_string().contains("Test.java:")
+            && !pair.location_b().to_string().contains("Test.java:")
+    }));
+    assert!(scan.candidate_pairs().iter().any(|pair| is_pair_of(
+        pair,
+        "billing/Discount.java:10",
+        "inventory/Reorder.java:10"
+    )));
+}
+
+#[test]
+fn test_java_scan_including_test_functions_keeps_the_pair_of_two_tests() {
+    let scan = java_maven_scan_of(SourceLanguage::Java, TestFunctions::Included);
+
+    assert!(
+        scan.candidate_pairs().iter().any(|pair| is_pair_of(
+            pair,
+            "billing/DiscountTest.java:6",
+            "inventory/ReorderTest.java:6"
+        )),
+        "`--include-tests` を付けると、`@Test` のメソッドどうしの組も比べる"
+    );
+    assert_eq!(scan.excluded_test_function_count(), 0);
+    assert_eq!(scan.chunk_count(), 8);
+    assert_eq!(scan.compared_pair_count(), 28);
+}
+
+#[test]
+fn test_java_scan_leaves_out_the_pair_of_two_getters_and_counts_them() {
+    // 対照として、下限に届く大きさの同じ形のメソッドの組（14 行目どうし）が同じ走査で残る
+    let scan = java_maven_scan_of(SourceLanguage::Java, TestFunctions::Excluded);
+
+    assert!(!scan.candidate_pairs().iter().any(|pair| is_pair_of(
+        pair,
+        "billing/Discount.java:18",
+        "inventory/Reorder.java:18"
+    )));
+    assert!(scan.candidate_pairs().iter().any(|pair| is_pair_of(
+        pair,
+        "billing/Discount.java:14",
+        "inventory/Reorder.java:14"
+    )));
+    assert_eq!(scan.undersized_chunk_count(), 2);
+}
+
 /// そのペアが、コーパスの中の 2 箇所（`<相対パス>:<行>`）を指しているか。
 fn is_pair_of(pair: &CandidatePair, one: &str, other: &str) -> bool {
     let ends_with_both = |left: &str, right: &str| {
