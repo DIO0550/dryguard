@@ -498,6 +498,12 @@ mod tests {
     }
 
     #[test]
+    fn test_tokens_skip_an_html_closing_comment_between_statements() {
+        // `-->` も同じ `html_comment` の種別で返る。前後の文は残る
+        assert_eq!(tokens("1\n--> c\n2"), tokens("1\n2"));
+    }
+
+    #[test]
     fn test_tokens_keep_an_inserted_statement() {
         // 対照は上の TypeScript のコメントのテスト群。コメントは落とすが、文を挟めば列は変わる
         assert_ne!(tokens("2\n1"), tokens("1"));
