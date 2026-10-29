@@ -52,6 +52,15 @@
         ]
       },
       {
+        "matcher": "mcp__github__add_issue_comment|mcp__github__update_issue_comment|mcp__github__issue_write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/issue-comment-count-check.sh\""
+          }
+        ]
+      },
+      {
         "matcher": "Bash",
         "hooks": [
           {
