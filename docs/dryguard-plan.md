@@ -165,7 +165,7 @@ inventory = ["src/inventory/**", "src/**/product*.ts"]
 
 | モジュール | 場所 | 言語ごとに足すもの | 今の形 |
 |---|---|---|---|
-| `syntax::tree` | `Grammar`・`Grammar::of_path`・`Grammar::language`、`Cargo.toml`（grammar クレートは `harness/deps/resolve.sh add` で足す） | variant・拡張子・tree-sitter の言語 | `language` は網羅 `match`、`of_path` は拡張子の `match`（漏れても読めないだけ） |
+| `syntax::tree` | `Grammar`・`READABLE_EXTENSIONS`・`Grammar::language`、`Cargo.toml`（grammar クレートは `harness/deps/resolve.sh add` で足す） | variant・拡張子・tree-sitter の言語 | `language` は網羅 `match`、拡張子は `READABLE_EXTENSIONS` の表（漏れても読めないだけ。`Grammar::of_path` と、`compare` が読めない拡張子を断るときの案内の文言がこの表を引く） |
 | `syntax::tree` | `Grammar::same_language_as` | 同じ言語として比べる grammar の組 | **2 択**（`matches!`。足さないと新しい言語のチャンク同士が比べられない） |
 | `syntax::tree` | `TRANSPARENT_EXPRESSION_KINDS` | 値を通すだけの包みの種別 | 全 grammar に当たる TypeScript の表 |
 | `syntax::chunk` | `is_chunk_node`・`CHUNK_KINDS` | チャンクにするノードの種別 | **2 択**（Rust でなければ TypeScript の表） |

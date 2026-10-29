@@ -2655,9 +2655,13 @@ impl fmt::Display for ChunkPairError {
                 )
             }
             Self::UnreadableExtension { location } => {
+                let readable = Grammar::readable_extensions()
+                    .map(|extension| format!(".{extension}"))
+                    .collect::<Vec<_>>()
+                    .join(" / ");
                 write!(
                     formatter,
-                    "{location} の言語を拡張子から判定できません（対応: .ts / .tsx / .mts / .cts / .rs / .java）。--lang を指定しても未対応の拡張子は読み取れません"
+                    "{location} の言語を拡張子から判定できません（対応: {readable}）。--lang を指定しても未対応の拡張子は読み取れません"
                 )
             }
             Self::SourceUnreadable { location, cause } => {
@@ -3755,6 +3759,20 @@ mod tests {
         assert!(
             result.is_err(),
             "2 つの宣言に当たるファイルの判定を出さない"
+        );
+    }
+
+    #[test]
+    fn test_unreadable_extension_message_lists_every_readable_extension() {
+        let error = ChunkPairError::UnreadableExtension {
+            location: Location::new(PathBuf::from("src/report/notes.md"), line(1)),
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("（対応: .ts / .tsx / .mts / .cts / .rs / .java / .swift）"),
+            "案内する拡張子が grammar の読める拡張子と揃う: {error}"
         );
     }
 }
