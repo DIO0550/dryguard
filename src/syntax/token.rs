@@ -129,7 +129,8 @@ const LITERAL_KINDS: [(&str, LiteralType); 23] = [
 /// コメントのノード種別。
 ///
 /// Rust と Java はどちらも `line_comment` / `block_comment`。TypeScript は行・ブロックとも `comment`
-/// で、レガシー構文の `<!--` だけが `html_comment`。Swift は行が `comment`、ブロックが `multiline_comment`。
+/// で、レガシー構文の `<!--` / `-->` から行末までが `html_comment`。Swift は行が `comment`、ブロックが
+/// `multiline_comment`。
 /// ノードごと落とすので、Rust の doc コメントの子（印と本文）も一緒に落ちる。
 const COMMENT_KINDS: [&str; 5] = [
     "comment",
