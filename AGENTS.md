@@ -252,6 +252,7 @@ bash .claude/hooks/session-url-notice-test.sh  # 層 3 のセッション URL �
 bash .claude/hooks/post-merge-review-test.sh   # 層 3 のマージ後の振り返りを促すフックのテスト
 bash .claude/hooks/pr-body-check-test.sh       # 層 3 の PR 本文の差分規模の宣言を作成前に確かめるフックのテスト
 bash .claude/hooks/issue-comment-count-check-test.sh  # 層 3 の Issue コメントの件数に出どころを求めるフックのテスト
+bash .claude/hooks/plan-impact-check-test.sh   # 層 3 の計画のコメントに影響範囲の grep を求めるフックのテスト
 bash .claude/skills/discord-notify/send-test.sh  # Discord の通知を上限内に割るスクリプトのテスト
 ```
 
