@@ -16,6 +16,20 @@ use tree_sitter::{Node, Parser};
 use crate::line_number::LineNumber;
 use crate::source_position::SourcePosition;
 
+/// 読める拡張子と、それを読む grammar の対応。並びは利用者に案内する順。
+///
+/// `.mts` / `.cts` に JSX は書けない（TypeScript が `.tsx` を要求する）ので
+/// TSX の grammar にはならない。
+const READABLE_EXTENSIONS: [(&str, Grammar); 7] = [
+    ("ts", Grammar::TypeScript),
+    ("tsx", Grammar::Tsx),
+    ("mts", Grammar::TypeScript),
+    ("cts", Grammar::TypeScript),
+    ("rs", Grammar::Rust),
+    ("java", Grammar::Java),
+    ("swift", Grammar::Swift),
+];
+
 /// ソースを読むのに使う grammar。
 ///
 /// TypeScript と TSX は tree-sitter では別の grammar で、**片方で兼ねられない**。
@@ -46,16 +60,19 @@ impl Grammar {
     /// **綴りの上で両者を区別できない**。区別するにはファイル名の接尾辞で判定することになるが、
     /// 宣言ファイルは本体を持つノードが無く `Chunk` を 1 つも産まないので、分ける利益が無い。
     pub fn of_path(path: &Path) -> Option<Self> {
-        match path.extension()?.to_str()? {
-            // `.mts` / `.cts` に JSX は書けない（TypeScript が `.tsx` を要求する）ので
-            // TSX の grammar にはならない
-            "ts" | "mts" | "cts" => Some(Self::TypeScript),
-            "tsx" => Some(Self::Tsx),
-            "rs" => Some(Self::Rust),
-            "java" => Some(Self::Java),
-            "swift" => Some(Self::Swift),
-            _ => None,
-        }
+        let extension = path.extension()?.to_str()?;
+        READABLE_EXTENSIONS
+            .iter()
+            .find(|(readable, _)| *readable == extension)
+            .map(|(_, grammar)| *grammar)
+    }
+
+    /// 読める拡張子（`.` を付けない綴り）を、利用者に案内する順で返す。
+    ///
+    /// **案内の文言はこれから組み立てる。** 文言が別に一覧を持つと、[`Grammar::of_path`] が
+    /// 読めるのに案内に出ない拡張子が生まれる。
+    pub fn readable_extensions() -> impl Iterator<Item = &'static str> {
+        READABLE_EXTENSIONS.iter().map(|(extension, _)| *extension)
     }
 
     /// tree-sitter に渡す言語。
