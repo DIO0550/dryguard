@@ -128,10 +128,17 @@ const LITERAL_KINDS: [(&str, LiteralType); 23] = [
 
 /// コメントのノード種別。
 ///
-/// Rust と Java はどちらも `line_comment` / `block_comment`。TypeScript は行・ブロックとも `comment`、
-/// Swift は行コメントだけが `comment`。
+/// Rust と Java はどちらも `line_comment` / `block_comment`。TypeScript は行・ブロックとも `comment`
+/// で、レガシー構文の `<!--` / `-->` から行末までが `html_comment`。Swift は行が `comment`、ブロックが
+/// `multiline_comment`。
 /// ノードごと落とすので、Rust の doc コメントの子（印と本文）も一緒に落ちる。
-const COMMENT_KINDS: [&str; 3] = ["comment", "line_comment", "block_comment"];
+const COMMENT_KINDS: [&str; 5] = [
+    "comment",
+    "line_comment",
+    "block_comment",
+    "multiline_comment",
+    "html_comment",
+];
 
 /// 突き合わせる並びの長さ。
 ///
@@ -347,6 +354,15 @@ mod tests {
         java_source_tokens(&format!("class C {{ void f() {{ {statement} }} }}"))
     }
 
+    /// Swift のソース全体を覆うノードの、正規化トークン列。
+    fn swift_tokens(source: &str) -> Vec<Token> {
+        let tree = SyntaxTree::from_source(source, Grammar::Swift)
+            .expect("テストが渡すソースは木にできる");
+        let root = *tree.named_descendants().first().expect("木には根がある");
+
+        tokens_of(root)
+    }
+
     /// Rust の関数本体に `statement` を置いたソース全体の、正規化トークン列。
     fn rust_tokens(statement: &str) -> Vec<Token> {
         let source = format!("fn f() {{ {statement} }}");
@@ -473,6 +489,44 @@ mod tests {
     #[test]
     fn test_tokens_skip_a_block_comment_but_keep_what_follows() {
         assert_eq!(tokens("/* const invoice */ 1"), tokens("1"));
+    }
+
+    #[test]
+    fn test_tokens_skip_an_html_comment_but_keep_the_next_line() {
+        // `<!--` は JS のレガシー構文の行コメント。文法は `comment` と別の種別で返す
+        assert_eq!(tokens("<!-- c\n1"), tokens("1"));
+    }
+
+    #[test]
+    fn test_tokens_skip_an_html_closing_comment_between_statements() {
+        // `-->` も同じ `html_comment` の種別で返る。前後の文は残る
+        assert_eq!(tokens("1\n--> c\n2"), tokens("1\n2"));
+    }
+
+    #[test]
+    fn test_tokens_keep_an_inserted_statement() {
+        // 対照は上の TypeScript のコメントのテスト群。コメントは落とすが、文を挟めば列は変わる
+        assert_ne!(tokens("2\n1"), tokens("1"));
+    }
+
+    #[test]
+    fn test_tokens_of_swift_sources_skip_a_line_comment() {
+        assert_eq!(swift_tokens("// c\nlet a = 1"), swift_tokens("let a = 1"));
+    }
+
+    #[test]
+    fn test_tokens_of_swift_sources_skip_a_block_comment() {
+        // Swift はブロックコメントだけを `multiline_comment` の種別で返す
+        assert_eq!(swift_tokens("/* c */ let a = 1"), swift_tokens("let a = 1"));
+    }
+
+    #[test]
+    fn test_tokens_of_swift_sources_keep_an_inserted_statement() {
+        // 対照は上の Swift のコメントのテスト群。コメントは落とすが、文を挟めば列は変わる
+        assert_ne!(
+            swift_tokens("let b = 2\nlet a = 1"),
+            swift_tokens("let a = 1")
+        );
     }
 
     #[test]
