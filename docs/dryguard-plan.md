@@ -193,7 +193,7 @@ inventory = ["src/inventory/**", "src/**/product*.ts"]
 | `pipeline` | `resolved_type_signature_outcome_of` | 型シグネチャの系統の振り分け | **2 択**（Rust でなければ TypeScript） |
 | `pipeline` | `LanguageServers`・`ServedSemantics`（`scan_of_chunks` が grammar からサーバを引き、チャンクへ意味情報を配る） | 言語ごとのサーバと意味情報 | **2 本固定**。配り方は Rust でなければ TypeScript の意味情報を当てる |
 | CI | `.github/workflows/rust.yml` の「LSP サーバ」「rust-analyzer」の段 | サーバの導入。npm 配布なら「LSP サーバ」の段に倣う（`harness/deps/resolve-node.sh` と `pnpm-lock.yaml`）。それ以外は「rust-analyzer」の段に倣い、版を固定して取り sha256 で確かめる | 「LSP サーバ」が `pnpm install --frozen-lockfile` で typescript-language-server、「rust-analyzer」が curl と `sha256sum --check` で rust-analyzer |
-| テスト | 実サーバのテスト（TypeScript は `tests/semantics.rs`、Rust は `tests/rust_lsp.rs`）・`tests/language_cli.rs`・`tests/fixtures/` | 実サーバのテスト（`#[ignore]`、CI の `cargo test -- --ignored` が走らせる）・CLI の言語の振り分け・フィクスチャ | 言語ごと |
+| テスト | 実サーバのテスト（TypeScript は `tests/semantics.rs`、Rust は `tests/rust_lsp.rs`、Swift は `tests/swift_lsp.rs`）・`tests/language_cli.rs`・`tests/fixtures/` | 実サーバのテスト（`#[ignore]`、CI の `cargo test -- --ignored` が走らせる）・CLI の言語の振り分け・フィクスチャ | 言語ごと |
 
 **触らなくてよいもの**: `semantics::caller_domain` の `ReferenceSources::is_test` は Rust 以外の参照を除かないので、新しい言語は TypeScript と同じく全部数える（上のスコープ外どおり）。テスト参照の除外を足すときの置き場所はここ。`codebase::typescript_paths_of` と `pipeline::scan_of` は名前どおり TypeScript 専用の入口で、**`SourceLanguage::accepts` を網羅 `match` に直した後なら**言語を足しても黙って倒れない（直す前は `grammar != Grammar::Rust` なので、新しい言語のファイルまで拾う）。
 
@@ -245,7 +245,7 @@ dryguard check --diff --staged   # ステージ済みの変更だけ (pre-commit
 - 単一バイナリで配布が楽、Rust解析対象なので dogfooding できる
 - その他: `rayon` (Stage 1 並列化), `serde`, `clap`
 
-LSPサーバ: TS は typescript-language-server、Rust は rust-analyzer。Phase 6 で Python は pyright、Java は Eclipse JDT Language Server（jdtls）、Swift は sourcekit-lsp を足す（配布形は言語ごとの親 Issue #368 / #369 / #370。hover の綴りの形・references / callHierarchy の対応・読み込みの待ち時間は未実測で、各言語の「実サーバで確かめる」Issue が最初に測る）。
+LSPサーバ: TS は typescript-language-server、Rust は rust-analyzer。Phase 6 で Python は pyright、Java は Eclipse JDT Language Server（jdtls）、Swift は sourcekit-lsp を足す（配布形は言語ごとの親 Issue #368 / #369 / #370。hover の綴りの形・references / callHierarchy の対応・読み込みの待ち時間は、各言語の「実サーバで確かめる」Issue が最初に測る。Swift は #406 で測り、sourcekit-lsp は index を作り終える前の references / callHierarchy に進捗を始める前から空を返すので、握手の後に `workspace/synchronize` で index を待つ。pyright と jdtls は未実測）。
 
 ---
 

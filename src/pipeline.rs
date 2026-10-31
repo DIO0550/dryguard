@@ -496,7 +496,7 @@ impl AskedMembership {
         }
 
         // rust-analyzer / sourcekit-lsp には tsserver の projectInfo が無い。印の下なら
-        // ワークスペースの根を渡して参照元を尋ねられる（sourcekit-lsp は未実測）。
+        // ワークスペースの根を渡して参照元を尋ねられる。
         if !session.needs_project_membership_query() {
             return Self::Askable;
         }
