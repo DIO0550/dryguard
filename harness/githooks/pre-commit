@@ -24,3 +24,6 @@ if ! cargo fmt --check; then
   echo "pre-commit: 整形の差分があります。'cargo fmt' をかけて、直した分を stage し直してください" >&2
   exit 1
 fi
+
+echo "pre-commit: probe"
+bash harness/githooks/probe-check

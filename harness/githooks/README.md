@@ -9,6 +9,7 @@ git ネイティブのフック置き場。`core.hooksPath` をここへ向け�
 | --- | --- |
 | `pre-commit` | `cargo fmt --check`（整形だけのコミットを積まないため。`fmt-failure` が 17 件再発した介入） |
 | `commit-msg` | コミットメッセージにコメントへの URL（`#discussion_r` / `#issuecomment-` / `#pullrequestreview-`）を書かせない（`unverified-claim` のうち、確かめていない URL を書いた形への介入） |
+| `pre-commit`（`probe-check`） | 調べるために足した一時モジュール（`mod probe` / `scratch*` / `zz_*`）と、テストが生成した `tests/fixtures/**/Cargo.lock` を commit に混ぜない（`probe-leftover` への介入） |
 | `pre-push` | `cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` |
 
 `cargo` が無い環境では、何も検査せずに通す。検査できないことを理由に push を止めても
