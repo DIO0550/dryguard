@@ -103,6 +103,28 @@ jobs:
           echo "$PWD" >> "$GITHUB_PATH"
           ./rust-analyzer --version
 
+      # ランナーのイメージに入っている Swift の sourcekit-lsp を使う。
+      #
+      # **残った緩み: 版をこちらで固定できない。** イメージの更新で Swift の版が変わり、
+      # rust-analyzer のように sha256 で中身を固定する形と揃わない。版が変わって
+      # 実サーバテストが落ちたら、swift.org のツールチェーンを sha256 で固定して取る形に移る。
+      #
+      # Why not（swift.org の tar.gz を sha256 で固定する）: 6.4.2 で 1 GB を超え、毎回の取得が重い。
+      # Why not（swift-actions/setup-swift）: 公式以外を使う理由が無い。
+      #
+      # sourcekit-lsp には `--version` が無い（6.4.2 で Unknown option）。版は swift から読み、
+      # sourcekit-lsp は起動できることだけを確かめる。
+      #
+      # イメージは swift だけを PATH に出し、sourcekit-lsp を出さない（6.4.1 のイメージで
+      # `command -v sourcekit-lsp` が落ちた）。swift の実体と同じツールチェーンの bin から取る。
+      - name: sourcekit-lsp
+        run: |
+          swift --version
+          swift_bin="$(dirname "$(readlink -f "$(command -v swift)")")"
+          test -x "$swift_bin/sourcekit-lsp"
+          echo "$swift_bin" >> "$GITHUB_PATH"
+          "$swift_bin/sourcekit-lsp" --help > /dev/null
+
       - name: cargo test (LSP)
         run: cargo test -- --ignored
 

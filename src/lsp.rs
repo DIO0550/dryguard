@@ -124,8 +124,8 @@ const RUST_PROJECT_MARKERS: [&str; 1] = ["Cargo.toml"];
 
 /// sourcekit-lsp が SwiftPM のパッケージとしてビルド設定を組むためのマニフェスト。
 ///
-/// 印の外のファイルはビルド設定を持てず、別ファイルの参照元が揃わない見込み。
-/// **未実測**で、実サーバで確かめるのは CI で sourcekit-lsp を起動する回。
+/// 印の外のファイルはビルド設定を持てず、別ファイルの参照元が揃わない。sourcekit-lsp 6.4.2 で
+/// 実測すると、印の無いディレクトリでは index を待つ要求がすぐに答え、references は空のまま返った。
 const SWIFT_PROJECT_MARKERS: [&str; 1] = ["Package.swift"];
 
 /// jdtls が Maven / Gradle のプロジェクトとして取り込むためのビルドファイル。
@@ -218,13 +218,15 @@ const RUST_HOVER_FENCES: &[usize] = &[1, 0];
 
 /// sourcekit-lsp の hover で、綴りを探すコードフェンスの試す順。
 ///
-/// **未実測。** 応答の形を測るまでは TypeScript と同じ先頭のフェンスを置く。
+/// sourcekit-lsp 6.4.2 は宣言どおりの綴り（既定値を含む）を `swift` のフェンス 1 つに置き、
+/// doc コメントはフェンスの外に続ける。先頭のフェンスを読めば足りる。
 const SWIFT_HOVER_FENCES: &[usize] = hover::LEADING_FENCE;
 
 /// sourcekit-lsp で、落ち着いた答えを求めて尋ね直す回数の上限。
 ///
-/// **未実測。** 測るまでは TypeScript と同じ値を置く。background indexing の進捗を
-/// `$/progress` で報告するので、rust-analyzer と同じく回数が多く要る見込み。
+/// **既定の回数で足りる。** background indexing の進捗は `$/progress` で報告されるが、
+/// 握手の後に index を待ち終えてから尋ねる（`index synchronization`）ので、問い合わせが
+/// 読み込みに当たらない。回数を増やしても、進捗が始まる前の空の答えは捨てられない。
 const SWIFT_SETTLED_ATTEMPTS: usize = connection::SETTLED_ATTEMPTS;
 
 /// jdtls の hover で、綴りを探すコードフェンスの試す順。
@@ -268,6 +270,19 @@ impl ServerLanguage {
             Self::Rust => RUST_SETTLED_ATTEMPTS,
             Self::Swift => SWIFT_SETTLED_ATTEMPTS,
             Self::Java => JAVA_SETTLED_ATTEMPTS,
+        }
+    }
+
+    /// 握手の後、サーバの index を作り終えるまで待ってから問い合わせを送るか。
+    ///
+    /// sourcekit-lsp だけが、index を作り終える前の references / callHierarchy に
+    /// **進捗を始める前から**空を返す（[`Connection::synchronize_index`]）。
+    /// rust-analyzer と tsserver は読み込みの途中を進捗で知らせるので、尋ね直しで足りる。
+    /// jdtls は未実測で、`workspace/synchronize` は sourcekit-lsp 固有の要求なので送らない。
+    fn synchronizes_index(self) -> bool {
+        match self {
+            Self::Swift => true,
+            Self::TypeScript | Self::Rust | Self::Java => false,
         }
     }
 
@@ -537,6 +552,9 @@ impl Client {
     ///
     /// `root` はサーバに見せるワークスペースの根。開くファイルを含む位置を渡す。
     ///
+    /// sourcekit-lsp では、握手の後に index を作り終えるまで待ってから返す
+    /// （`index synchronization`。待つかは `ServerLanguage::synchronizes_index` が決める）。
+    ///
     /// 値を取るのは、握手を 2 回できないようにするため。`initialize` を 2 度送られた
     /// サーバは 2 通目を拒む。
     ///
@@ -547,11 +565,17 @@ impl Client {
     /// [`ClientError::ServerUnresponsive`]、応答以外のもの・1 フレームの続きだけを送り続けて答えない場合は
     /// [`ClientError::ServerKeptStreaming`]、送ったものを受け取らないまま期限を過ぎた場合は
     /// [`ClientError::ServerNotReading`]。抜けた [`Client`] は `Drop` が kill する。
+    /// index を待つ間の失敗は握手の後の往復と同じに出す（接続が閉じても
+    /// [`ClientError::ServerClosedDuringHandshake`] にはしない）。
     pub fn handshake(mut self, root: &WorkspaceRoot) -> Result<Session, ClientError> {
         let capabilities = match self.connection.handshake(root) {
             Ok(capabilities) => capabilities,
             Err(cause) => return Err(self.handshake_error_of(cause)),
         };
+
+        if self.language.synchronizes_index() {
+            self.converse(Connection::synchronize_index)?;
+        }
 
         Ok(Session {
             client: self,
@@ -2064,11 +2088,80 @@ mod tests {
         assert!(!session.needs_project_membership_query());
     }
 
+    /// 2 通目の要求（握手の直後の `workspace/synchronize`）への応答。
+    const SYNCHRONIZE_RESPONSE: &str = r#"{"jsonrpc":"2.0","id":2,"result":{}}"#;
+
+    /// initialize には答えるが、index を待つ要求には答えないサーバを、`language` として握手させた結果。
+    fn handshake_unsynchronized_as(language: ServerLanguage) -> Result<Session, ClientError> {
+        let command = ServerCommand {
+            language,
+            ..fake_server(
+                &format!("{}; exec sleep 30", printed_frame(INITIALIZE_RESPONSE)),
+                WaitLimits {
+                    silence: AFTER_HANDSHAKE_LIMIT,
+                    ..GENEROUS_LIMITS
+                },
+            )
+        };
+        Client::start(&command)
+            .expect("起動できる")
+            .handshake(&fixture_workspace_root())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_client_handshake_with_sourcekit_lsp_waits_for_the_index() {
+        // 待たずに Session を返していると、index を作り終える前の空の references を答えとして採る
+        let error = handshake_unsynchronized_as(ServerLanguage::Swift)
+            .expect_err("index を待ち終えるまで Session にならない");
+
+        assert!(
+            matches!(&error, ClientError::ServerUnresponsive { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_client_handshake_with_rust_analyzer_or_tsserver_does_not_wait_for_the_index() {
+        // 対照: 同じ台本でも待たない。送っていると、答えの来ない要求で沈黙の上限に触れる
+        for language in [ServerLanguage::Rust, ServerLanguage::TypeScript] {
+            let handshake = handshake_unsynchronized_as(language);
+
+            assert!(handshake.is_ok(), "{language:?}: {:?}", handshake.err());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_client_handshake_with_sourcekit_lsp_closing_while_indexing_is_not_a_handshake_failure()
+    {
+        // initialize に答え、initialized を受け取れるだけ居てから終わるサーバ。すぐ終わると
+        // initialized の書き込みが握手の中で落ちる。閉じたのは握手の後の往復
+        let command = ServerCommand {
+            language: ServerLanguage::Swift,
+            ..fake_server(
+                &format!("{}; sleep 1; exit 0", printed_frame(INITIALIZE_RESPONSE)),
+                GENEROUS_LIMITS,
+            )
+        };
+
+        let error = Client::start(&command)
+            .expect("起動できる")
+            .handshake(&fixture_workspace_root())
+            .expect_err("index を待つ要求に答えない");
+
+        assert!(matches!(&error, ClientError::Conversation(_)), "{error:?}");
+    }
+
     #[test]
     #[cfg(unix)]
     fn test_session_with_sourcekit_lsp_does_not_ask_project_membership() {
         // projectInfo は tsserver 固有の要求で、sourcekit-lsp に送っても答えは返らない
-        let session = handshake_as(ServerLanguage::Swift, "");
+        let session = handshake_as(
+            ServerLanguage::Swift,
+            &format!("{}; ", printed_frame(SYNCHRONIZE_RESPONSE)),
+        );
 
         assert!(!session.needs_project_membership_query());
     }

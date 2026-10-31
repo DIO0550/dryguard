@@ -36,8 +36,8 @@ use super::document::SourceDocument;
 use super::framing::{self, FramingError};
 use super::hover::{self, HoverOutcome};
 use super::message::{
-    self, MessageError, Payload, RequestId, ResponseFailure, ResponseOutcome, ServerMessage,
-    ServerRequestId,
+    self, METHOD_NOT_FOUND, MessageError, Payload, RequestId, ResponseFailure, ResponseOutcome,
+    ServerMessage, ServerRequestId,
 };
 use super::project_membership::{
     self, PROJECT_INFO_COMMAND, ProjectMembershipOutcome, TSSERVER_REQUEST_COMMAND,
@@ -59,6 +59,9 @@ pub(super) const SETTLED_ATTEMPTS: usize = 3;
 
 /// LSP の `ContentModified`。rust-analyzer は読み込みが進んでいる間の要求に返す。
 const CONTENT_MODIFIED: i64 = -32801;
+
+/// sourcekit-lsp 固有の、サーバの読み込みが終わるまで応答を返さない要求。
+const SYNCHRONIZE_METHOD: &str = "workspace/synchronize";
 
 /// 落ち着きを待って尋ねる、宣言の場所を返す問い合わせ。
 ///
@@ -218,6 +221,36 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         self.notify(Initialized::METHOD, Some(json!({})))?;
 
         Ok(initialized.capabilities)
+    }
+
+    /// サーバの background indexing が終わるまで待つ。
+    ///
+    /// **Why**: sourcekit-lsp は index を作り終える前の references / callHierarchy に空を返し、
+    /// しかもその時点では `$/progress` がまだ始まっていない（6.4.2 で実測）。進捗に触れた答えを
+    /// 捨てて尋ね直す形では、始まる前の空を落ち着いた答えとして採ってしまう。
+    ///
+    /// **Why not（最初の進捗の終わりを待つ）**: `Package.swift` の外では進捗が来ないので、
+    /// 沈黙の上限まで待ってサーバを kill する。この要求はその場合すぐに答える。
+    ///
+    /// 待つ間も [`super::SILENCE_LIMIT`] / [`super::STREAMING_LIMIT`] が効く。フィクスチャ
+    /// （2 ファイル）では待ちが約 3 秒・最長の沈黙が約 2 秒で、**大きなパッケージでは未実測**。
+    ///
+    /// # Errors
+    ///
+    /// 送受信が失敗したとき、サーバが error を返したとき。**この要求を持たない
+    /// （`MethodNotFound` を返す）サーバは失敗にしない** — 待てないだけで、問い合わせは送れる。
+    /// 待てなかった結果の空の references は [`ReferencesOutcome::NoAnswer`] になる
+    /// （呼び出し元が本当に無いときと区別しない。空配列を受けたときの既存の扱い）。
+    pub fn synchronize_index(&mut self) -> Result<(), ConnectionError> {
+        match self.request(SYNCHRONIZE_METHOD, Some(json!({ "index": true }))) {
+            Ok(_) => Ok(()),
+            Err(ConnectionError::ServerFailure { failure, .. })
+                if failure.code == METHOD_NOT_FOUND =>
+            {
+                Ok(())
+            }
+            Err(cause) => Err(cause),
+        }
     }
 
     /// サーバを終わらせる。
@@ -1790,6 +1823,53 @@ mod tests {
         assert_eq!(
             sent[0]["params"]["capabilities"]["textDocument"]["callHierarchy"],
             json!({ "dynamicRegistration": false })
+        );
+    }
+
+    #[test]
+    fn test_synchronize_index_asks_the_server_to_wait_for_its_index() {
+        // index を付けないと、sourcekit-lsp はビルド設定の更新だけを待って答える
+        let server_output = frames_of(&[r#"{"jsonrpc":"2.0","id":1,"result":{}}"#]);
+        let mut connection = connection_over(&server_output);
+
+        connection.synchronize_index().expect("待ち終えられる");
+
+        let sent = sent_payloads(&connection.writer);
+        assert_eq!(sent[0]["method"], json!("workspace/synchronize"));
+        assert_eq!(sent[0]["params"], json!({"index": true}));
+    }
+
+    #[test]
+    fn test_synchronize_index_with_a_server_that_lacks_the_request_goes_on() {
+        // 要求を持たない版は待たせられないだけで、問い合わせそのものは送れる
+        let server_output = frames_of(&[
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#,
+        ]);
+        let mut connection = connection_over(&server_output);
+
+        connection
+            .synchronize_index()
+            .expect("持たない要求は飛ばして進む");
+    }
+
+    #[test]
+    fn test_synchronize_index_with_another_failure_reports_it() {
+        let server_output = frames_of(&[
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"internal"}}"#,
+        ]);
+        let mut connection = connection_over(&server_output);
+
+        let error = connection
+            .synchronize_index()
+            .expect_err("待てなかった理由を握りつぶさない");
+
+        assert!(
+            matches!(
+                &error,
+                ConnectionError::ServerFailure { method, failure }
+                    if method == "workspace/synchronize" && failure.code == -32603
+            ),
+            "{error:?}"
         );
     }
 

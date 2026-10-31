@@ -127,7 +127,8 @@ spread 引数の後ろも引数位置が確定しないため残す。テスト�
 Java の LSP サーバはまだ無いので、型シグネチャ・呼び出し元・呼び出し先は尋ねない。
 `.swift` は関数・メソッド・`init` / `deinit` をチャンクにし、`compare` で名指しすれば比べる。
 正規化トークンの表に Swift の種別がまだ無いので、`scan` / `check` は `--lang swift` を指定したときだけ走査する。
-Swift の候補は sourcekit-lsp に呼び出し元・呼び出し先を尋ねる。型シグネチャは hover の綴りを読む側がまだ無いので尋ねない（実サーバでの答えは未実測）。
+Swift の候補は sourcekit-lsp に呼び出し元・呼び出し先を尋ねる。型シグネチャは hover の綴りを読む側がまだ無いので尋ねない。
+sourcekit-lsp は index を作り終える前の参照元に空を返すので、セッションを始めるたびに index を作り終えるまで待つ（`compare` は実行ごと、`scan` / `check` は走査ごとに 1 回。`swift build` は要らない）。
 `compare` は `--lang` と拡張子が一致しなければ比べない（`--lang ts` と `.swift` / `.java`、`--lang java` と `.ts` など。`auto` は拡張子に従う）。
 CLI は拡張子から TypeScript・Rust・Swift の LSP サーバを選ぶ。`scan --lang auto` では
 言語ごとに候補を揃え、TypeScript は typescript-language-server、Rust は rust-analyzer の
