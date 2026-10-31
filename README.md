@@ -129,10 +129,11 @@ Java の LSP サーバはまだ無いので、型シグネチャ・呼び出し�
 正規化トークンの表に Swift の種別がまだ無いので、`scan` / `check` は `--lang swift` を指定したときだけ走査する。
 Swift の候補は sourcekit-lsp に呼び出し元・呼び出し先を尋ねる。型シグネチャは hover の綴りを読む側がまだ無いので尋ねない（実サーバでの答えは未実測）。
 `compare` は `--lang` と拡張子が一致しなければ比べない（`--lang ts` と `.swift` / `.java`、`--lang java` と `.ts` など。`auto` は拡張子に従う）。
-CLI は拡張子から TypeScript・Rust・Swift の LSP サーバを選ぶ。`scan` では
+CLI は拡張子から TypeScript・Rust・Swift の LSP サーバを選ぶ。`scan --lang auto` では
 言語ごとに候補を揃え、TypeScript は typescript-language-server、Rust は rust-analyzer の
-セッションで hover / references を問い合わせる。Swift は sourcekit-lsp のセッションで
-呼び出し元・呼び出し先だけを問い合わせる（`auto` の走査に入らないので、`compare` か `--lang swift` のとき）。Rust の型シグネチャ比較は #40 まで
+セッションで hover / references を問い合わせる。Swift の候補は sourcekit-lsp のセッションに
+尋ねるが、hover（型シグネチャ）は尋ねない。`auto` の走査には入らないので、尋ねるのは
+`compare` で名指ししたときと `--lang swift` で走査したとき。Rust の型シグネチャ比較は #40 まで
 「測れない」。
 
 `node_modules` / `dist` / `build` / `target` / `.git` /
