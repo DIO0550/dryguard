@@ -106,7 +106,7 @@ spread 引数の後ろも引数位置が確定しないため残す。テスト�
 
 - 候補ペアでないので尋ねなかったペア・サーバは答えたがシグナルが「測れない」だったペアは数えない
   （前者は Stage 2 で判定が変わらない。後者は理由が根拠の行に出る）
-- dryguard が LSP サーバを持たない言語の候補ペアも数えない（今は `--lang java` で走査した Java がこれに当たる。Swift は sourcekit-lsp に尋ねるので数える）
+- dryguard が LSP サーバを持たない言語の候補ペアも数えない（今はこれに当たる言語は無い。TypeScript・Rust・Swift・Java はそれぞれのサーバに尋ねるので数える。jdtls が入っていない環境で Java の候補ペアがあれば、`--fail-on` は 2 で終わる）
 - `--fail-on` が無ければ、LSP サーバが使えなくても判定を出して 0 で終わる
   （取れなかったシグナルは根拠に出る）
 
@@ -117,25 +117,26 @@ spread 引数の後ろも引数位置が確定しないため残す。テスト�
 **各シグナルに当てた閾値**。**既定でも判定に効いた根拠は出る**ので、`--explain` は
 結論に理由を足すのではなく、**閾値との突き合わせまで見せる**ためのもの。
 
-`scan` は `.ts` / `.tsx` / `.mts` / `.cts` / `.rs` を見る。`--lang ts` / `--lang rust` で
-対象を絞り、`auto` では両方を走査する（異なる言語の関数同士は比較しない）。
-`--lang swift` を指定したときだけ `.swift` を、`--lang java` を指定したときだけ `.java` を走査する（どちらも `auto` には入らない）。Rust の
+`scan` / `check` は `.ts` / `.tsx` / `.mts` / `.cts` / `.rs` / `.java` を見る。`--lang ts` / `--lang rust` / `--lang java` で
+対象を絞り、`auto` ではこの 3 つを走査する（異なる言語の関数同士は比較しない）。
+`--lang swift` を指定したときだけ `.swift` を走査する（`auto` には入らない）。Rust の
 自由関数・`impl` 内のメソッド・トレイト実装のメソッドをそれぞれ 1 チャンクにする。
 正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない関数（1〜3 行のアクセサ・委譲）は `scan` では比べず、
 外した数を走査量の行に出す（`compare` は名指しされれば比べる）。
-`.java` はメソッド・コンストラクタをチャンクにし、`compare` で名指しすれば比べる。
-Java の LSP サーバはまだ無いので、型シグネチャ・呼び出し元・呼び出し先は尋ねない。
+`.java` はメソッド・コンストラクタをチャンクにする。
+Java の候補は jdtls に呼び出し元・呼び出し先を尋ねる。型シグネチャは hover の綴りを読む側がまだ無いので尋ねない。
 `.swift` は関数・メソッド・`init` / `deinit` をチャンクにし、`compare` で名指しすれば比べる。
 正規化トークンの表に Swift の種別がまだ無いので、`scan` / `check` は `--lang swift` を指定したときだけ走査する。
 Swift の候補は sourcekit-lsp に呼び出し元・呼び出し先を尋ねる。型シグネチャは hover の綴りを読む側がまだ無いので尋ねない。
 sourcekit-lsp は index を作り終える前の参照元に空を返すので、セッションを始めるたびに index を作り終えるまで待つ（`compare` は実行ごと、`scan` / `check` は走査ごとに 1 回。`swift build` は要らない）。
 `compare` は `--lang` と拡張子が一致しなければ比べない（`--lang ts` と `.swift` / `.java`、`--lang java` と `.ts` など。`auto` は拡張子に従う）。
-CLI は拡張子から TypeScript・Rust・Swift の LSP サーバを選ぶ。`scan --lang auto` では
+CLI は拡張子から TypeScript・Rust・Swift・Java の LSP サーバを選ぶ。`scan --lang auto` では
 言語ごとに候補を揃え、TypeScript は typescript-language-server、Rust は rust-analyzer の
 セッションで hover / references を問い合わせる。Swift の候補は sourcekit-lsp のセッションに
 尋ねるが、hover（型シグネチャ）は尋ねない。`auto` の走査には入らないので、尋ねるのは
-`compare` で名指ししたときと `--lang swift` で走査したとき。Rust の型シグネチャ比較は #40 まで
-「測れない」。
+`compare` で名指ししたときと `--lang swift` で走査したとき。Java の候補は jdtls のセッションに
+尋ね（`compare` で名指ししたとき・`--lang java` と `auto` で走査したとき）、hover（型シグネチャ）は
+尋ねない。Rust の型シグネチャ比較は #40 まで「測れない」。
 
 `node_modules` / `dist` / `build` / `target` / `.git` /
 `.build` / `.swiftpm` / `Pods` / `DerivedData` / `.gradle` は降りない。
