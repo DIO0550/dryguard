@@ -82,7 +82,8 @@ fn test_scan_auto_asks_both_servers_without_comparing_across_languages() {
         stdout.contains("a.ts:1 <->") && stdout.contains("a.rs:1 <->"),
         "{stdout}"
     );
-    assert!(stdout.contains("対象 4 ファイル"), "{stdout}");
+    // `Discount.java` も集める。Java のチャンクは 1 つだけなので組を作らない
+    assert!(stdout.contains("対象 5 ファイル"), "{stdout}");
 }
 
 #[test]
@@ -258,7 +259,31 @@ fn test_compare_java_language_accepts_java_files() {
 }
 
 #[test]
-fn test_scan_java_language_walks_only_java_files() {
+fn test_compare_auto_uses_jdtls_for_java_files() {
+    // `PATH` を空にしてあるので jdtls は見つからない。尋ねに行ったことを、
+    // 見つからなかったサーバの名前が stderr に出ることで確かめる
+    let left = format!("{}:2", java_fixture("A.java"));
+    let right = format!("{}:2", java_fixture("B.java"));
+    let output = run(&["compare", &left, &right]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("A.java:2 <->"), "{stdout}");
+    assert!(
+        stderr.contains("jdtls"),
+        "Java の候補は jdtls に尋ねる: {stderr}"
+    );
+    assert!(
+        !stderr.contains("typescript-language-server")
+            && !stderr.contains("rust-analyzer")
+            && !stderr.contains("sourcekit-lsp"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_scan_java_only_asks_jdtls_and_excludes_typescript() {
     // 同じディレクトリに `.ts` を 1 つ置く。TypeScript も走査すると対象が 3 ファイルになり、
     // Java の腕を TypeScript へ写し違えると対象が 1 ファイルになる
     let root = java_fixture("");
@@ -270,4 +295,25 @@ fn test_scan_java_language_walks_only_java_files() {
     assert_eq!(stdout.matches(" <-> ").count(), 1, "{stdout}");
     assert!(stdout.contains("A.java:2 <->"), "{stdout}");
     assert!(stdout.contains("対象 2 ファイル"), "{stdout}");
+    assert!(stderr.contains("jdtls"), "{stderr}");
+    assert!(
+        !stderr.contains("typescript-language-server") && !stderr.contains("rust-analyzer"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_scan_auto_asks_jdtls_for_java_files() {
+    // `.ts` は 1 つだけなので TypeScript の組は作らない。
+    // `auto` が `.java` を拾わなければ対象 1 ファイル・0 組になる
+    let root = java_fixture("");
+    let output = run(&["scan", &root, "--lang", "auto"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stdout.matches(" <-> ").count(), 1, "{stdout}");
+    assert!(stdout.contains("A.java:2 <->"), "{stdout}");
+    assert!(stdout.contains("対象 3 ファイル"), "{stdout}");
+    assert!(stderr.contains("jdtls"), "{stderr}");
 }

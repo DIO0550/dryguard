@@ -307,7 +307,7 @@ fn rust_join(prefix: &str, name: &str) -> String {
 ///
 /// 同じパッケージのクラスは `import` を書かずに使えるので、ここで集まるのは
 /// **別のパッケージへの依存だけ**。同じパッケージの依存は Stage 2 の呼び出し先ドメインが
-/// 見るもので、Java の LSP サーバに対応するまでは尋ねていないまま残る。
+/// 見るもので、jdtls に尋ねる。
 ///
 /// tree-sitter-java 0.23.5 は `import module java.base;`（Java 25）を構文エラーにするので、
 /// 読めない宣言として測れない側へ倒す。

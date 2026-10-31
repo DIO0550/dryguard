@@ -558,7 +558,7 @@ fn test_compare_of_java_methods_does_not_ask_stage2() {
 
     assert!(
         measured.semantics_error().is_none(),
-        "Java のサーバはまだ無いので起動していない: {:?}",
+        "Java を受け持つサーバを渡していないので起動していない: {:?}",
         measured.semantics_error().map(ToString::to_string)
     );
     assert_eq!(
