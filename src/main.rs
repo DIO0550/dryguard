@@ -264,7 +264,11 @@ fn report_check(
 ///
 /// 並びの順が、サーバを使えなかった理由を stderr に出す順になる。
 fn language_servers() -> Vec<ServerCommand> {
-    vec![ServerCommand::typescript(), ServerCommand::rust()]
+    vec![
+        ServerCommand::typescript(),
+        ServerCommand::rust(),
+        ServerCommand::swift(),
+    ]
 }
 
 /// `--lang` から、走査するソースの言語。
