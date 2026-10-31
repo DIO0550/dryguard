@@ -268,6 +268,7 @@ fn language_servers() -> Vec<ServerCommand> {
         ServerCommand::typescript(),
         ServerCommand::rust(),
         ServerCommand::swift(),
+        ServerCommand::java(),
     ]
 }
 
