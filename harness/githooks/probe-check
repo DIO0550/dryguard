@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+#
+# commit に積む差分へ、調べるために足した一時のコードと、テストが生成した Cargo.lock が
+# 混ざっていないかを見る（pre-commit から呼ぶ）。
+#
+# 見るのは staged の追加行 / 追加ファイルだけ。`mod probe` / `mod scratch*` / `mod zz_*` の
+# 一時モジュール（pr-443 指摘 1・pr-450 指摘 9）と、`tests/fixtures/**/Cargo.lock`
+# （pr-346 指摘 17）。
+#
+# Why not（`println!` を禁じる）: CLI の本体が `println!` で出力するので、本物と区別できない。
+# 一時モジュールは名前の型が決まっているので、名前で見る。
+#
+# 終了コード: 混ざっていれば 1、無ければ 0。
+set -u
+
+cd "$(git rev-parse --show-toplevel)" || exit 0
+
+probe_module='^\+[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+(probe|scratch[A-Za-z0-9_]*|zz_[A-Za-z0-9_]*)[[:space:]]*\{'
+
+found=0
+if git diff --cached -U0 --no-color -- '*.rs' | grep -Eq "$probe_module"; then
+  echo "pre-commit: 調べるための一時モジュール（mod probe / scratch* / zz_*）が差分にあります。消してから commit してください" >&2
+  found=1
+fi
+
+if git diff --cached --name-only --diff-filter=A | grep -Eq '^tests/fixtures/.*Cargo\.lock$'; then
+  echo "pre-commit: テストが生成した tests/fixtures/**/Cargo.lock が差分にあります。stage から外してください" >&2
+  found=1
+fi
+
+exit "$found"

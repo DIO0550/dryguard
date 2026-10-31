@@ -247,6 +247,7 @@ bash harness/githooks/pre-push              # push 前の検査をまとめて�
 bash harness/ci/pr-body-diff-test.sh        # PR 本文の差分規模を突き合わせる検査のテスト
 bash .claude/hooks/pre-push-check-test.sh   # 層 3 の push 前検査フックのテスト
 bash .claude/hooks/post-edit-rust-test.sh   # 層 3 の編集後 fmt / clippy フックのテスト
+bash harness/githooks/probe-check-test.sh  # 層 2 の pre-commit が一時モジュール・生成した Cargo.lock を止めるかのテスト
 bash .claude/hooks/hook-canary-test.sh      # 層 3 のカナリア（フックの発火の確認）のテスト
 bash .claude/hooks/session-url-notice-test.sh  # 層 3 のセッション URL の通知のテスト
 bash .claude/hooks/post-merge-review-test.sh   # 層 3 のマージ後の振り返りを促すフックのテスト
