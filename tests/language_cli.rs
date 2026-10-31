@@ -82,7 +82,9 @@ fn test_scan_auto_asks_both_servers_without_comparing_across_languages() {
         stdout.contains("a.ts:1 <->") && stdout.contains("a.rs:1 <->"),
         "{stdout}"
     );
-    assert!(stdout.contains("対象 4 ファイル"), "{stdout}");
+    // `Discount.java` も集める。Java のチャンクは 1 つだけなので組を作らず、jdtls は起こさない
+    assert!(stdout.contains("対象 5 ファイル"), "{stdout}");
+    assert!(!stderr.contains("jdtls"), "{stderr}");
 }
 
 #[test]

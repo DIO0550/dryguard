@@ -479,15 +479,20 @@ fn test_java_scan_separates_two_maven_packages_by_their_directories() {
 
 #[test]
 fn test_auto_scan_does_not_compare_java_with_typescript() {
-    // `auto` が `.java` を集めない今の振る舞いを固定する（理由は `codebase::SourceLanguage`）
+    // `auto` は `.java` と `.ts` を両方集める。言語をまたぐ組を作ると、Java の 6 チャンクの組
+    // （6C2 = 15）に `.ts` の 1 チャンクとの 6 組が足されて 21 になる
     let scan = java_maven_scan_of(SourceLanguage::Auto, TestFunctions::Excluded);
 
-    assert_eq!(scan.file_count(), 1, "`.ts` だけを集める");
-    assert_eq!(scan.chunk_count(), 1);
+    assert_eq!(
+        scan.file_count(),
+        5,
+        "`.java` の 4 つと `.ts` の 1 つを集める"
+    );
+    assert_eq!(scan.chunk_count(), 7);
     assert_eq!(
         scan.compared_pair_count(),
-        0,
-        "チャンクが `.ts` の 1 つだけなので、組を作らない"
+        15,
+        "Java のチャンクどうしだけを組にし、`.ts` のチャンクとは組を作らない"
     );
 }
 

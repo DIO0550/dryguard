@@ -289,7 +289,7 @@ fn source_language_of(lang: LanguageOption) -> SourceLanguage {
 /// `--lang ts` が黙って受け付ける。
 ///
 /// Why not（`SourceLanguage::accepts` を引く）: あちらは走査に入れる grammar で、
-/// `auto` が Swift / Java を拾わない。`compare` は名指しされれば `auto` でも比べる。
+/// `auto` が Swift を拾わない。`compare` は名指しされれば `auto` でも比べる。
 fn accepts_grammar(lang: LanguageOption, grammar: Grammar) -> bool {
     match (lang, grammar) {
         (

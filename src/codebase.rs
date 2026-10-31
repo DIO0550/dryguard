@@ -58,7 +58,9 @@ impl SourceLanguage {
         // grammar 側も網羅 `match` にする。「Rust 以外」の否定で書くと、
         // grammar を足したときに TypeScript の走査が黙って拾う。
         match (self, grammar) {
-            (Self::Auto, Grammar::TypeScript | Grammar::Tsx | Grammar::Rust) => true,
+            (Self::Auto, Grammar::TypeScript | Grammar::Tsx | Grammar::Rust | Grammar::Java) => {
+                true
+            }
             (Self::TypeScript, Grammar::TypeScript | Grammar::Tsx) => true,
             (Self::TypeScript, Grammar::Rust) => false,
             (Self::Rust, Grammar::Rust) => true,
@@ -67,9 +69,7 @@ impl SourceLanguage {
             (Self::Swift, Grammar::TypeScript | Grammar::Tsx | Grammar::Rust) => false,
             (Self::Java, Grammar::Java) => true,
             (Self::Java, Grammar::TypeScript | Grammar::Tsx | Grammar::Rust) => false,
-            // `auto` は CLI から届くが、Java のチャンクに jdtls を選ぶ対応がまだ無いので、
-            // `auto` でも `.java` を拾わない
-            (Self::Auto | Self::TypeScript | Self::Rust | Self::Swift, Grammar::Java) => false,
+            (Self::TypeScript | Self::Rust | Self::Swift, Grammar::Java) => false,
             // Swift はチャンクを切り出せるが、正規化トークンの表に Swift の種別がまだ無いので、
             // `auto` でも走査に入れない
             (Self::Auto | Self::TypeScript | Self::Rust | Self::Java, Grammar::Swift) => false,
@@ -377,9 +377,9 @@ mod tests {
     }
 
     #[test]
-    fn test_source_paths_of_auto_leaves_out_java_files() {
-        // 対照は同じディレクトリの `.ts` / `.rs`。`.java` は `SourceLanguage::Java` なら集めるが、
-        // Java のチャンクに jdtls を選ぶ対応が入るまでは `auto` でも走査に入れない
+    fn test_source_paths_of_auto_includes_java_files() {
+        // 同じディレクトリの `.md` は読めない拡張子なので集めない。`auto` が `.java` を拾わないと、
+        // CLI が jdtls を選んでも `scan --lang auto` では Java の候補ペアが 1 組もできない
         let root = fixture("language-scan");
 
         let paths =
@@ -387,7 +387,7 @@ mod tests {
 
         assert_eq!(
             relative_paths_of(&root, &paths),
-            vec!["a.rs", "a.ts", "b.rs", "b.ts"]
+            vec!["Discount.java", "a.rs", "a.ts", "b.rs", "b.ts"]
         );
     }
 
