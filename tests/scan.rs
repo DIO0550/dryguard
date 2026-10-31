@@ -258,7 +258,7 @@ fn test_swift_scan_lists_functions_and_initializers_without_asking_a_server() {
     assert_eq!(scan.compared_pair_count(), 15);
     assert!(
         scan.semantics_error().is_none(),
-        "Swift のサーバはまだ無いので尋ねない"
+        "渡したサーバが Swift に対応しないので尋ねない"
     );
     assert!(
         scan.candidate_pairs().iter().any(|pair| is_pair_of(

@@ -189,7 +189,25 @@ fn test_compare_typescript_language_rejects_java_files() {
 }
 
 #[test]
-fn test_scan_swift_language_walks_only_swift_files() {
+fn test_compare_auto_uses_sourcekit_lsp_for_swift_files() {
+    let left = format!("{}:1", swift_fixture("a.swift"));
+    let right = format!("{}:1", swift_fixture("b.swift"));
+    let output = run(&["compare", &left, &right]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("sourcekit-lsp"),
+        "Swift の候補は sourcekit-lsp に尋ねる: {stderr}"
+    );
+    assert!(
+        !stderr.contains("typescript-language-server") && !stderr.contains("rust-analyzer"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_scan_swift_only_asks_sourcekit_lsp_and_excludes_typescript() {
     // 同じディレクトリに `.ts` を 1 つ置く。TypeScript を走査すると対象が 1 ファイルになる
     let root = swift_fixture("");
     let output = run(&["scan", &root, "--lang", "swift"]);
@@ -200,9 +218,10 @@ fn test_scan_swift_language_walks_only_swift_files() {
     assert_eq!(stdout.matches(" <-> ").count(), 1, "{stdout}");
     assert!(stdout.contains("a.swift:1 <->"), "{stdout}");
     assert!(stdout.contains("対象 2 ファイル"), "{stdout}");
+    assert!(stderr.contains("sourcekit-lsp"), "{stderr}");
     assert!(
         !stderr.contains("typescript-language-server") && !stderr.contains("rust-analyzer"),
-        "Swift のサーバはまだ無いので、どのサーバにも尋ねない: {stderr}"
+        "{stderr}"
     );
 }
 

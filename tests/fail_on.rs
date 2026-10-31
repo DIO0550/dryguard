@@ -227,6 +227,29 @@ fn test_scan_without_fail_on_succeeds_even_when_the_lsp_cannot_be_asked() {
 }
 
 #[test]
+fn test_scan_swift_with_fail_on_exits_with_two_when_sourcekit_lsp_cannot_be_asked() {
+    // Swift の候補ペアも sourcekit-lsp に尋ねるので、尋ね切れなければ検査は欠けている
+    let root = fixture("swift-language");
+    let output = run_without_an_lsp(&[
+        "scan",
+        &root,
+        "--lang",
+        "swift",
+        "--fail-on",
+        "do-not-extract",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(NOT_CLASSIFIED), "{stderr}");
+    assert!(stderr.contains("sourcekit-lsp"), "{stderr}");
+    assert!(
+        stdout.contains("a.swift:1 <->"),
+        "判定は出し終える: {stdout}"
+    );
+}
+
+#[test]
 fn test_scan_that_cannot_start_exits_with_two() {
     let root = fixture("does-not-exist");
     let output = run_without_an_lsp(&["scan", &root, "--fail-on", "do-not-extract"]);

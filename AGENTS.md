@@ -10,7 +10,7 @@
 - 言語: Rust（edition 2024）
 - 構成: `src/lib.rs` が本体、`src/main.rs` は引数を受けて呼ぶだけ
 - 外部依存: `clap` / `tree-sitter` / `tree-sitter-typescript` / `tree-sitter-rust` / `tree-sitter-java` / `tree-sitter-swift` / `rayon` / `lsp-types` / `serde_json`
-- LSP サーバ: TS は typescript-language-server、Rust は rust-analyzer（子プロセスで起動）
+- LSP サーバ: TS は typescript-language-server、Rust は rust-analyzer、Swift は sourcekit-lsp（子プロセスで起動）
 
 ## 規約一覧
 

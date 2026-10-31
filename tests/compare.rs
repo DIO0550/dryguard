@@ -526,7 +526,7 @@ fn test_compare_of_swift_functions_does_not_ask_stage2() {
 
     assert!(
         measured.semantics_error().is_none(),
-        "Swift のサーバはまだ無いので起動していない: {:?}",
+        "渡したサーバが Swift に対応しないので起動していない: {:?}",
         measured.semantics_error().map(ToString::to_string)
     );
     assert_eq!(
