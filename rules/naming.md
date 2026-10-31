@@ -93,7 +93,8 @@ if structurally_similar && domains_differ { ... }
 | `frame` | LSP のストリーム上の 1 通分。`Content-Length` ヘッダと、それが数えた本文 |
 | `payload` | frame の本文。JSON-RPC のメッセージ 1 通そのもの |
 | `handshake` | `initialize` 要求 → 応答 → `initialized` 通知。ここまでで 1 つ |
-| `session` | handshake を終えた接続。問い合わせを送れる状態。握手前は `client` |
+| `index synchronization` | handshake の後、サーバの index を作り終えるまで待つこと（sourcekit-lsp の `workspace/synchronize`）。**handshake には含めない** — handshake の後の往復なので、そこで接続が閉じても握手中に閉じたとは名乗らない。待つかはサーバごとに決まる（`ServerLanguage::synchronizes_index`） |
+| `session` | handshake（と、待つサーバでは `index synchronization`）を終えた接続。問い合わせを送れる状態。握手前は `client` |
 | `project marker` | そのサーバがプロジェクトの根と見なすファイルの名前（TS は `tsconfig.json` / `jsconfig.json`、Rust は `Cargo.toml`、Swift は `Package.swift`）。言語ごとに決まる |
 | `workspace root` | `initialize` でサーバに見せるディレクトリ |
 | `project root` | **ファイル 1 つずつ**について、そのディレクトリから上へ `project marker` を探した結果。`workspace root` と、**ファイルごとの印の有無**を持つ |

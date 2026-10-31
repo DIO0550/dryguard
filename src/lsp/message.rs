@@ -36,7 +36,9 @@ impl Payload {
 }
 
 /// 支えていないメソッドを要求されたときに返すコード（JSON-RPC の Method not found）。
-const METHOD_NOT_FOUND: i64 = -32601;
+///
+/// サーバがこちらの要求を支えていないときにも、同じコードで返ってくる。
+pub(super) const METHOD_NOT_FOUND: i64 = -32601;
 
 /// こちらが発番する要求の id。
 ///
