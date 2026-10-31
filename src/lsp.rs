@@ -18,6 +18,7 @@
 //! | `references` | references の応答から参照元のファイルを取り出す |
 //! | `call_hierarchy` | callHierarchy の応答から呼び出し先のファイルを取り出す |
 //! | `project_membership` | projectInfo の応答を読み、設定されたプロジェクトか見分ける |
+//! | `state_directory` | サーバが状態を書くディレクトリを、起動 1 回ごとに作って消す |
 //! | ここ | サーバの起動・パイプの配線・終了 |
 //!
 //! **外へ出すのは [`ServerCommand`] / [`Client`] / [`Session`]、渡す値
@@ -36,10 +37,12 @@ pub(crate) mod hover;
 pub(crate) mod message;
 pub(crate) mod project_membership;
 pub(crate) mod references;
+mod state_directory;
 pub(crate) mod uri;
 pub(crate) mod workspace;
 
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, BufReader};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -56,6 +59,7 @@ use crate::syntax::tree::Grammar;
 use child_input::IntakeLimitedWriter;
 use child_output::{SilenceLimitedReader, StderrTail};
 use connection::Connection;
+use state_directory::StateDirectory;
 
 // 開かせるドキュメントとワークスペースの根は、呼ぶ側が組み立てて渡す。
 pub use document::{DocumentError, SourceDocument};
@@ -90,6 +94,21 @@ const RUST_SERVER: &str = "rust-analyzer";
 /// Swift の LSP サーバの実行ファイル名。
 const SWIFT_SERVER: &str = "sourcekit-lsp";
 
+/// Java の LSP サーバ（Eclipse JDT Language Server）の実行ファイル名。
+///
+/// 配布物の `bin/jdtls`（Python 3.9 以上が要るラッパ）。launcher の jar を `java -jar` で
+/// 直接起動しないのは、jar の名前が版で変わり、OS ごとの設定ディレクトリと JVM の引数まで
+/// こちらで持つことになるため。ラッパはそれらを付け、POSIX では `os.execvp` で java に
+/// 置き換わる（1.64.0 の `jdtls.py`）ので、kill が JVM に届く。
+const JAVA_SERVER: &str = "jdtls";
+
+/// jdtls に、状態（取り込んだプロジェクト・索引）を書くディレクトリを渡すオプション。
+///
+/// **省くとラッパの既定（`~/.cache/jdtls/jdtls-<cwd のディレクトリ名の sha1>`）になる**
+/// （1.64.0 の `jdtls.py`）。cwd の名前だけで決まるので、並べて起こしたサーバが同じ場所を
+/// 取り合い、名前の同じ別のプロジェクトの状態が混ざる。
+const JAVA_STATE_DIRECTORY_FLAG: &str = "-data";
+
 /// stdio でしゃべらせる指定。付けないとサーバは使い方を表示して終わる。
 const STDIO_OPTION: &str = "--stdio";
 
@@ -108,6 +127,12 @@ const RUST_PROJECT_MARKERS: [&str; 1] = ["Cargo.toml"];
 /// 印の外のファイルはビルド設定を持てず、別ファイルの参照元が揃わない。sourcekit-lsp 6.4.2 で
 /// 実測すると、印の無いディレクトリでは index を待つ要求がすぐに答え、references は空のまま返った。
 const SWIFT_PROJECT_MARKERS: [&str; 1] = ["Package.swift"];
+
+/// jdtls が Maven / Gradle のプロジェクトとして取り込むためのビルドファイル。
+///
+/// 印の外のファイルは「invisible project」としてクラスパス無しで開かれる見込みで、
+/// 別ファイルの参照元が揃うかは**未実測**。実サーバで確かめるのは CI で jdtls を起動する回。
+const JAVA_PROJECT_MARKERS: [&str; 3] = ["pom.xml", "build.gradle", "build.gradle.kts"];
 
 /// サーバが何も送ってこないまま待つ上限。
 ///
@@ -204,6 +229,16 @@ const SWIFT_HOVER_FENCES: &[usize] = hover::LEADING_FENCE;
 /// 読み込みに当たらない。回数を増やしても、進捗が始まる前の空の答えは捨てられない。
 const SWIFT_SETTLED_ATTEMPTS: usize = connection::SETTLED_ATTEMPTS;
 
+/// jdtls の hover で、綴りを探すコードフェンスの試す順。
+///
+/// **未実測。** 応答の形を測るまでは TypeScript と同じ先頭のフェンスを置く。
+const JAVA_HOVER_FENCES: &[usize] = hover::LEADING_FENCE;
+
+/// jdtls で、落ち着いた答えを求めて尋ね直す回数の上限。
+///
+/// **未実測。** 測るまでは TypeScript と同じ値を置く。
+const JAVA_SETTLED_ATTEMPTS: usize = connection::SETTLED_ATTEMPTS;
+
 /// サーバの問い合わせ形式。**サーバごとの値を選ぶのは、ここの網羅 `match` だけ。**
 ///
 /// TypeScript の値は、バイト列で組む往復の既定として `hover` / `connection` が持ち、
@@ -214,6 +249,7 @@ pub(super) enum ServerLanguage {
     TypeScript,
     Rust,
     Swift,
+    Java,
 }
 
 impl ServerLanguage {
@@ -223,6 +259,7 @@ impl ServerLanguage {
             Self::TypeScript => hover::LEADING_FENCE,
             Self::Rust => RUST_HOVER_FENCES,
             Self::Swift => SWIFT_HOVER_FENCES,
+            Self::Java => JAVA_HOVER_FENCES,
         }
     }
 
@@ -232,6 +269,7 @@ impl ServerLanguage {
             Self::TypeScript => connection::SETTLED_ATTEMPTS,
             Self::Rust => RUST_SETTLED_ATTEMPTS,
             Self::Swift => SWIFT_SETTLED_ATTEMPTS,
+            Self::Java => JAVA_SETTLED_ATTEMPTS,
         }
     }
 
@@ -240,21 +278,22 @@ impl ServerLanguage {
     /// sourcekit-lsp だけが、index を作り終える前の references / callHierarchy に
     /// **進捗を始める前から**空を返す（[`Connection::synchronize_index`]）。
     /// rust-analyzer と tsserver は読み込みの途中を進捗で知らせるので、尋ね直しで足りる。
+    /// jdtls は未実測で、`workspace/synchronize` は sourcekit-lsp 固有の要求なので送らない。
     fn synchronizes_index(self) -> bool {
         match self {
             Self::Swift => true,
-            Self::TypeScript | Self::Rust => false,
+            Self::TypeScript | Self::Rust | Self::Java => false,
         }
     }
 
     /// `project membership` を尋ねるか。
     ///
-    /// Rust は Cargo.toml、Swift は Package.swift でワークスペースを決め、
-    /// どちらも tsserver の projectInfo を持たない。
+    /// Rust は Cargo.toml、Swift は Package.swift、Java は pom.xml / build.gradle で
+    /// ワークスペースを決め、どれも tsserver の projectInfo を持たない。
     fn asks_project_membership(self) -> bool {
         match self {
             Self::TypeScript => true,
-            Self::Rust | Self::Swift => false,
+            Self::Rust | Self::Swift | Self::Java => false,
         }
     }
 }
@@ -264,10 +303,15 @@ impl ServerLanguage {
 /// **起動方法・プロジェクトの印・言語はこの値で揃える。**
 /// (`docs/dryguard-plan.md`「LSPサーバ: TS は typescript-language-server、
 /// Rust は rust-analyzer」)。
+///
+/// **I/O は持たない。** 起動 1 回ごとに作るディレクトリが要るサーバ（jdtls）は、それを渡す
+/// オプション名だけを持ち、作って消すのは [`Client`] の側。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerCommand {
     program: String,
     args: Vec<String>,
+    /// 起動 1 回ごとに作ったディレクトリを、引数の末尾にこのオプションで渡す。要らなければ `None`。
+    state_directory_flag: Option<&'static str>,
     project_markers: Vec<String>,
     language: ServerLanguage,
     wait_limits: WaitLimits,
@@ -280,7 +324,7 @@ impl ServerCommand {
     /// **印で範囲を決めないサーバには空を渡す。** 根が範囲そのものになるので、
     /// 参照元は揃う扱いになる（`WorkspaceRoot::enclosing_project`）。
     /// 独自サーバは TypeScript の問い合わせ形式を使う。Rust は [`Self::rust`]、
-    /// Swift は [`Self::swift`] を使う。
+    /// Swift は [`Self::swift`]、Java は [`Self::java`] を使う。
     pub fn new(
         program: impl Into<String>,
         args: Vec<String>,
@@ -289,6 +333,7 @@ impl ServerCommand {
         Self {
             program: program.into(),
             args,
+            state_directory_flag: None,
             project_markers,
             language: ServerLanguage::TypeScript,
             wait_limits: WaitLimits::HARDCODED,
@@ -332,6 +377,23 @@ impl ServerCommand {
         }
     }
 
+    /// jdtls（Eclipse JDT Language Server）を stdio で起動する指定。
+    ///
+    /// jdtls は環境変数 `CLIENT_PORT` が無ければ stdio でしゃべる。状態を書くディレクトリは
+    /// 起動のたびに [`Client::start`] が作って `-data` で渡す。
+    /// **起動して確かめたことはまだ無い**（CI で jdtls を起動する回が測る）。
+    pub fn java() -> Self {
+        Self {
+            language: ServerLanguage::Java,
+            state_directory_flag: Some(JAVA_STATE_DIRECTORY_FLAG),
+            ..Self::new(
+                JAVA_SERVER,
+                Vec::new(),
+                JAVA_PROJECT_MARKERS.map(str::to_owned).to_vec(),
+            )
+        }
+    }
+
     /// 実行ファイル名。
     pub fn program(&self) -> &str {
         &self.program
@@ -361,6 +423,11 @@ impl ServerCommand {
                 Grammar::Java,
             ) => false,
             (ServerLanguage::TypeScript | ServerLanguage::Rust, Grammar::Swift) => false,
+            (ServerLanguage::Java, Grammar::Java) => true,
+            (
+                ServerLanguage::Java,
+                Grammar::TypeScript | Grammar::Tsx | Grammar::Rust | Grammar::Swift,
+            ) => false,
         }
     }
 }
@@ -373,7 +440,7 @@ impl ServerCommand {
 /// (rules/coding.md「不正な状態を型で表現できなくする」)。
 ///
 /// 子プロセスを抱えるので、[`Session::shutdown`] を通らずに落ちた経路では
-/// `Drop` が kill する。
+/// `Drop` が kill する。状態を書くディレクトリは、`Drop` が子プロセスを回収した後に消す。
 #[derive(Debug)]
 pub struct Client {
     child: Child,
@@ -383,6 +450,8 @@ pub struct Client {
     language: ServerLanguage,
     wait_limits: WaitLimits,
     terminated: bool,
+    /// このサーバのために作った、状態を書くディレクトリ。要らないサーバでは `None`。
+    state_directory: Option<StateDirectory>,
     /// 沈黙の上限・待つ合計の上限を超えて見限ったか、見限ったならどちらの上限か。
     /// 見限ったサーバは kill 済みで、以後は送らずに断る。
     ///
@@ -403,12 +472,28 @@ impl Client {
     /// 結果が読めなくなるため。起動直後に黙った場合は、その末尾を
     /// [`ClientError::ServerClosedDuringHandshake`] に載せる。
     ///
+    /// 状態を書くディレクトリが要るサーバ（jdtls）には、起動 1 回ごとに作って引数の末尾で渡す。
+    ///
     /// # Errors
     ///
-    /// 実行ファイルが見つからないとき、起動できないとき、パイプを取り出せないとき。
+    /// 状態を書くディレクトリを作れないとき、実行ファイルが見つからないとき、起動できないとき、
+    /// パイプを取り出せないとき。
     pub fn start(command: &ServerCommand) -> Result<Self, ClientError> {
+        let state_directory = command
+            .state_directory_flag
+            .map(|flag| {
+                StateDirectory::create()
+                    .map(|directory| (flag, directory))
+                    .map_err(ClientError::StateDirectoryNotCreated)
+            })
+            .transpose()?;
+        let state_directory_args = state_directory
+            .iter()
+            .flat_map(|(flag, directory)| [OsStr::new(flag), directory.path().as_os_str()]);
+
         let mut child = Command::new(&command.program)
             .args(&command.args)
+            .args(state_directory_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -459,6 +544,7 @@ impl Client {
             wait_limits: command.wait_limits,
             terminated: false,
             abandoned: None,
+            state_directory: state_directory.map(|(_, directory)| directory),
         })
     }
 
@@ -935,12 +1021,16 @@ impl Session {
 }
 
 impl Drop for Client {
-    /// 終了手順を通らずに落ちた経路で、子プロセスを残さない。
+    /// 終了手順を通らずに落ちた経路で、子プロセスを残さない。状態を書くディレクトリは
+    /// 終了手順を通ったときもここで消す。
     ///
     /// 失敗しても報告先が無いので捨てる。ここで報告できないことが、
     /// [`Client::shutdown`] を別に持つ理由でもある。
     fn drop(&mut self) {
         self.terminate();
+        // フィールドの drop 順に頼らず、回収した後に消すことをここで明示する。
+        // 動いているサーバが残っていると、消した後に書き直されて残る。
+        drop(self.state_directory.take());
     }
 }
 
@@ -1128,6 +1218,8 @@ pub enum ClientError {
     OutputNotDrained(io::Error),
     /// 子プロセスの入力へ書き込むスレッドを作れなかった。
     InputNotForwarded(io::Error),
+    /// サーバが状態を書くディレクトリを、一時ディレクトリの下に作れなかった。起動はしていない。
+    StateDirectoryNotCreated(io::Error),
     /// 起動はしたが、握手に答えないまま接続（stdout か stdin）を閉じた。
     ///
     /// 子プロセスが終了したかまでは見ていない。閉じた時点で会話は続けられないので、
@@ -1259,6 +1351,10 @@ impl fmt::Display for ClientError {
                 formatter,
                 "LSP サーバへ書き込むスレッドを作れません: {cause}"
             ),
+            Self::StateDirectoryNotCreated(cause) => write!(
+                formatter,
+                "LSP サーバが状態を書くディレクトリを作れません: {cause}"
+            ),
             Self::Conversation(cause) => write!(formatter, "{cause}"),
             Self::Wait(cause) => {
                 write!(formatter, "LSP サーバの終了を待てませんでした: {cause}")
@@ -1283,9 +1379,10 @@ impl Error for ClientError {
             | Self::AbnormalExit { .. } => None,
             Self::Spawn { cause, .. } => Some(cause),
             Self::Conversation(cause) => Some(cause),
-            Self::Wait(cause) | Self::OutputNotDrained(cause) | Self::InputNotForwarded(cause) => {
-                Some(cause)
-            }
+            Self::Wait(cause)
+            | Self::OutputNotDrained(cause)
+            | Self::InputNotForwarded(cause)
+            | Self::StateDirectoryNotCreated(cause) => Some(cause),
         }
     }
 }
@@ -1662,6 +1759,44 @@ mod tests {
             wait_limits,
             ..ServerCommand::new("sh", vec!["-c".to_owned(), script.to_owned()], Vec::new())
         }
+    }
+
+    /// 状態を書くディレクトリを `-data` で受け取る、台本どおりのフェイク。
+    ///
+    /// `sh -c <台本> -data <dir>` になるので、台本からは `$0` が `-data`、`$1` がディレクトリ。
+    fn fake_server_with_state_directory(script: &str) -> ServerCommand {
+        ServerCommand {
+            state_directory_flag: Some("-data"),
+            ..fake_server(script, GENEROUS_LIMITS)
+        }
+    }
+
+    /// フェイクのサーバが、受け取った引数を書き残すファイル。テストの名前ごとに分ける。
+    ///
+    /// 前の回が落ちて残したファイルは消しておく。残っていると、書かれなかったことに気づけない。
+    fn argument_record_of(test: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("dryguard-test-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// 受け取った引数（`$0` と `$1`）を書き残してから、握手に答える台本。
+    /// `$1` がディレクトリとして在るときだけ答える。
+    fn script_recording_arguments_to(record: &std::path::Path) -> String {
+        format!(
+            "printf '%s\\n%s' \"$0\" \"$1\" > '{}'; [ -d \"$1\" ] || exit 1; {}; exec sleep 30",
+            record.display(),
+            printed_frame(INITIALIZE_RESPONSE)
+        )
+    }
+
+    /// 書き残した引数の組（`$0` / `$1`）。
+    fn recorded_arguments(record: &std::path::Path) -> (String, String) {
+        let text = std::fs::read_to_string(record).expect("フェイクのサーバが書き残している");
+        let _ = std::fs::remove_file(record);
+        let (flag, directory) = text.split_once('\n').expect("2 行ある");
+        (flag.to_owned(), directory.to_owned())
     }
 
     /// payload を 1 フレームとして stdout へ書く台本。
@@ -2254,6 +2389,100 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn test_client_start_passes_an_existing_state_directory_after_its_flag() {
+        let record = argument_record_of("state-directory-passed");
+        let command = fake_server_with_state_directory(&script_recording_arguments_to(&record));
+
+        let session = Client::start(&command)
+            .expect("起動できる")
+            .handshake(&fixture_workspace_root());
+
+        assert!(
+            session.is_ok(),
+            "ディレクトリが在るときだけ答える: {session:?}"
+        );
+        let (flag, directory) = recorded_arguments(&record);
+        assert_eq!(flag, "-data");
+        assert!(
+            !directory.is_empty(),
+            "オプションの後ろにディレクトリが来る"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_client_start_without_a_state_directory_flag_adds_no_arguments() {
+        // 対照は上のテスト。要らないサーバの引数は増えない
+        let record = argument_record_of("state-directory-absent");
+        let command = fake_server(&script_recording_arguments_to(&record), GENEROUS_LIMITS);
+
+        let session = Client::start(&command)
+            .expect("起動できる")
+            .handshake(&fixture_workspace_root());
+
+        assert!(
+            matches!(
+                session,
+                Err(ClientError::ServerClosedDuringHandshake { .. })
+            ),
+            "ディレクトリを受け取らないので答えない: {session:?}"
+        );
+        assert_eq!(
+            recorded_arguments(&record),
+            ("sh".to_owned(), String::new())
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_client_start_gives_each_launch_its_own_state_directory() {
+        // 同じディレクトリを渡すと、並べて起こした jdtls が同じ場所を取り合う
+        let first_record = argument_record_of("state-directory-first");
+        let second_record = argument_record_of("state-directory-second");
+
+        let first = Client::start(&fake_server_with_state_directory(
+            &script_recording_arguments_to(&first_record),
+        ))
+        .expect("起動できる")
+        .handshake(&fixture_workspace_root())
+        .expect("握手できる");
+        let second = Client::start(&fake_server_with_state_directory(
+            &script_recording_arguments_to(&second_record),
+        ))
+        .expect("起動できる")
+        .handshake(&fixture_workspace_root())
+        .expect("握手できる");
+
+        let (_, first_directory) = recorded_arguments(&first_record);
+        let (_, second_directory) = recorded_arguments(&second_record);
+        assert_ne!(first_directory, second_directory);
+        drop((first, second));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_session_drop_removes_the_state_directory() {
+        // 消さないと、起動のたびに jdtls の索引が一時ディレクトリに残る
+        let record = argument_record_of("state-directory-removed");
+        let session = Client::start(&fake_server_with_state_directory(
+            &script_recording_arguments_to(&record),
+        ))
+        .expect("起動できる")
+        .handshake(&fixture_workspace_root())
+        .expect("握手できる");
+        let (_, directory) = recorded_arguments(&record);
+        assert!(
+            std::path::Path::new(&directory).is_dir(),
+            "動いているあいだは在る"
+        );
+
+        drop(session);
+
+        assert!(!std::path::Path::new(&directory).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn test_session_shutdown_with_a_server_that_exits_succeeds() {
         // 対照は上のテスト。期限より先に終わるサーバは通る。読まずに 1 秒で終わるが、
         // 送る 4 通はパイプのバッファに収まり、その間に書き終わる
@@ -2423,6 +2652,68 @@ mod tests {
         assert_eq!(command.program(), "sourcekit-lsp");
         assert!(command.args.is_empty(), "引数無しで stdio を使う");
         assert_eq!(command.project_markers(), ["Package.swift".to_owned()]);
+    }
+
+    #[test]
+    fn test_server_command_for_typescript_rust_or_swift_does_not_support_java() {
+        // 対照はそれぞれ自身の grammar。Java を受けると、そのサーバに
+        // Java のドキュメントを開かせて別の言語として尋ねる
+        for (command, own) in [
+            (ServerCommand::typescript(), Grammar::TypeScript),
+            (ServerCommand::rust(), Grammar::Rust),
+            (ServerCommand::swift(), Grammar::Swift),
+        ] {
+            assert!(command.supports(own), "{own:?} は受ける");
+            assert!(
+                !command.supports(Grammar::Java),
+                "{own:?} のサーバは Java を受けない"
+            );
+        }
+    }
+
+    #[test]
+    fn test_server_command_for_java_uses_jdtls_with_maven_or_gradle_builds() {
+        let command = ServerCommand::java();
+
+        assert_eq!(command.program(), "jdtls");
+        assert!(command.args.is_empty(), "ラッパは引数無しで stdio を使う");
+        assert_eq!(
+            command.project_markers(),
+            [
+                "pom.xml".to_owned(),
+                "build.gradle".to_owned(),
+                "build.gradle.kts".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_server_command_for_java_asks_for_a_state_directory_with_data() {
+        // 対照は他のサーバ。要らないサーバに渡すと、知らない引数で起動に失敗する
+        assert_eq!(ServerCommand::java().state_directory_flag, Some("-data"));
+        for command in [
+            ServerCommand::typescript(),
+            ServerCommand::rust(),
+            ServerCommand::swift(),
+        ] {
+            assert_eq!(command.state_directory_flag, None, "{}", command.program());
+        }
+    }
+
+    #[test]
+    fn test_server_command_for_java_supports_only_java() {
+        // 他の grammar を受けると、jdtls に別の言語のドキュメントを開かせて尋ねる
+        let command = ServerCommand::java();
+
+        assert!(command.supports(Grammar::Java));
+        for grammar in [
+            Grammar::TypeScript,
+            Grammar::Tsx,
+            Grammar::Rust,
+            Grammar::Swift,
+        ] {
+            assert!(!command.supports(grammar), "{grammar:?} は受けない");
+        }
     }
 
     #[test]

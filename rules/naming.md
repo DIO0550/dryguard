@@ -95,8 +95,9 @@ if structurally_similar && domains_differ { ... }
 | `handshake` | `initialize` 要求 → 応答 → `initialized` 通知。ここまでで 1 つ |
 | `index synchronization` | handshake の後、サーバの index を作り終えるまで待つこと（sourcekit-lsp の `workspace/synchronize`）。**handshake には含めない** — handshake の後の往復なので、そこで接続が閉じても握手中に閉じたとは名乗らない。待つかはサーバごとに決まる（`ServerLanguage::synchronizes_index`） |
 | `session` | handshake（と、待つサーバでは `index synchronization`）を終えた接続。問い合わせを送れる状態。握手前は `client` |
-| `project marker` | そのサーバがプロジェクトの根と見なすファイルの名前（TS は `tsconfig.json` / `jsconfig.json`、Rust は `Cargo.toml`、Swift は `Package.swift`）。言語ごとに決まる |
+| `project marker` | そのサーバがプロジェクトの根と見なすファイルの名前（TS は `tsconfig.json` / `jsconfig.json`、Rust は `Cargo.toml`、Swift は `Package.swift`、Java は `pom.xml` / `build.gradle` / `build.gradle.kts`）。言語ごとに決まる |
 | `workspace root` | `initialize` でサーバに見せるディレクトリ |
+| `state directory` | サーバが自分の状態（取り込んだプロジェクト・索引）を書くディレクトリ。jdtls の `-data`。**起動 1 回ごとに `Client::start` が一時ディレクトリの下に（Unix では持ち主だけが読み書きできる権限で）作り、`Client` が落ちるときに消す**（`lsp::state_directory`）。`ServerCommand` は渡すオプション名だけを持つ。`workspace` と呼ばない — `workspace root` は `initialize` でサーバに見せるディレクトリで、こちらはサーバの内側の作業場所 |
 | `project root` | **ファイル 1 つずつ**について、そのディレクトリから上へ `project marker` を探した結果。`workspace root` と、**ファイルごとの印の有無**を持つ |
 | `project membership` | そのファイルを、サーバがどのプロジェクトの一員として扱っているか。**サーバに尋ねた答え** |
 | `document` | サーバに開かせるソースファイル 1 つ分。URI・`language id`・中身の組 |
