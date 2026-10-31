@@ -76,7 +76,10 @@ enum Normalization {
 /// 型の違いは Stage 2 が見るため。`x: number` と `x: string` を別物にすると、
 /// 型注釈を書き換えただけで構造が違って見える。Java のプリミティブ型
 /// （`integral_type` など）と Rust の `primitive_type` も `predefined_type` と同じ理由で混ぜる。
-const NAME_KINDS: [&str; 14] = [
+///
+/// Swift の値の名前は `simple_identifier`（型名は `type_identifier`）。表に無いと種別のまま
+/// 構文として残り、名前の位置が型名と別のトークンになる。
+const NAME_KINDS: [&str; 15] = [
     "identifier",
     "property_identifier",
     "shorthand_property_identifier",
@@ -91,6 +94,7 @@ const NAME_KINDS: [&str; 14] = [
     "boolean_type",
     "void_type",
     "primitive_type",
+    "simple_identifier",
 ];
 
 /// リテラルのノード種別と、その型タグ。
@@ -100,7 +104,12 @@ const NAME_KINDS: [&str; 14] = [
 /// 文字の部分が `string_fragment` として出てくる。
 ///
 /// Java のテキストブロックは `string_literal` で潰れるので、中の `multiline_string_fragment` は要らない。
-const LITERAL_KINDS: [(&str, LiteralType); 23] = [
+///
+/// Swift の文字列（`line_string_literal` / `multi_line_string_literal`）は補間の式へ降りるため
+/// 潰さず、文字の部分（`line_str_text` / `multi_line_str_text` / `str_escaped_char`）を
+/// `string_fragment` と同じ扱いにする。生文字列は Rust と同じ種別名の `raw_string_literal` で、
+/// 補間ごと潰れる。`nil` は `nil_literal` という名前付きノードで返る。
+const LITERAL_KINDS: [(&str, LiteralType); 32] = [
     ("number", LiteralType::Number),
     ("string", LiteralType::Text),
     ("string_fragment", LiteralType::Text),
@@ -124,6 +133,15 @@ const LITERAL_KINDS: [(&str, LiteralType); 23] = [
     ("hex_floating_point_literal", LiteralType::Number),
     ("character_literal", LiteralType::Text),
     ("null_literal", LiteralType::Null),
+    ("hex_literal", LiteralType::Number),
+    ("oct_literal", LiteralType::Number),
+    ("bin_literal", LiteralType::Number),
+    ("real_literal", LiteralType::Number),
+    ("line_str_text", LiteralType::Text),
+    ("multi_line_str_text", LiteralType::Text),
+    ("str_escaped_char", LiteralType::Text),
+    ("nil_literal", LiteralType::Null),
+    ("regex_literal", LiteralType::Regex),
 ];
 
 /// コメントのノード種別。
@@ -527,6 +545,71 @@ mod tests {
             swift_tokens("let b = 2\nlet a = 1"),
             swift_tokens("let a = 1")
         );
+    }
+
+    #[test]
+    fn test_tokens_of_swift_integer_hex_and_real_literals_are_the_same() {
+        let integer = swift_tokens("let a = 1");
+
+        assert_eq!(swift_tokens("let a = 0x1F"), integer);
+        assert_eq!(swift_tokens("let a = 0o17"), integer);
+        assert_eq!(swift_tokens("let a = 0b101"), integer);
+        assert_eq!(swift_tokens("let a = 1.5"), integer);
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_number_literal_are_a_number_literal() {
+        assert!(swift_tokens("let a = 1.5").contains(&Token::Literal(LiteralType::Number)));
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_value_name_are_an_identifier() {
+        // 表に無いと `Syntax("simple_identifier")` のまま残り、型名（`type_identifier`）と別のトークンになる
+        assert!(swift_tokens("let a = 1").contains(&Token::Identifier));
+    }
+
+    #[test]
+    fn test_tokens_of_swift_nil_are_a_null_literal() {
+        assert!(swift_tokens("f(nil)").contains(&Token::Literal(LiteralType::Null)));
+    }
+
+    #[test]
+    fn test_tokens_of_swift_true_are_a_boolean_literal() {
+        assert!(swift_tokens("let a = true").contains(&Token::Literal(LiteralType::Boolean)));
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_string_text_are_a_text_literal() {
+        assert!(swift_tokens("let a = \"x\"").contains(&Token::Literal(LiteralType::Text)));
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_escaped_character_are_the_same_as_string_text() {
+        assert_eq!(
+            swift_tokens("let a = \"\\n\""),
+            swift_tokens("let a = \"x\"")
+        );
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_multi_line_string_text_are_a_text_literal() {
+        assert!(
+            swift_tokens("let a = \"\"\"\nx\n\"\"\"").contains(&Token::Literal(LiteralType::Text))
+        );
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_interpolated_string_keep_the_interpolated_expression() {
+        // 文字列へ降りるので、補間の式は構造に残る
+        assert_ne!(
+            swift_tokens("let a = \"\\(y)\""),
+            swift_tokens("let a = \"x\"")
+        );
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_regex_are_a_regex_literal() {
+        assert!(swift_tokens("let a = /ab+/").contains(&Token::Literal(LiteralType::Regex)));
     }
 
     #[test]
