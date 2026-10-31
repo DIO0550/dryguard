@@ -79,7 +79,7 @@ cargo run -- check --diff --staged   # ステージ済みの変更だけを起�
 `scan` は Rust のテスト属性（`#[test]` / `#[tokio::test]` など）付き関数と、
 TypeScript / TSX の `describe` / `it` / `test`（`.only` / `.skip` も対応）の第2引数に
 直接書いたアロー関数・関数式を除外する。コールバック側の括弧・型アサーション等は辿る。
-`--lang java` では注釈の名前が `Test` で終わるメソッド（`@Test` / `@ParameterizedTest` など）を、
+Java（`--lang java` と `auto`）では注釈の名前が `Test` で終わるメソッド（`@Test` / `@ParameterizedTest` など）を、
 `--lang swift` では `@Test` 付きの関数と、`XCTestCase` を継承したクラスに直接書いた引数を取らない `func test…` を除外する。
 ファイル名では除外せず、ヘルパーやテスト本体内の通常の関数は残す。除外数は走査結果に出る。
 `--include-tests` で再び比較対象にでき、`compare` での直接指定には影響しない。
@@ -118,7 +118,7 @@ spread 引数の後ろも引数位置が確定しないため残す。テスト�
 結論に理由を足すのではなく、**閾値との突き合わせまで見せる**ためのもの。
 
 `scan` / `check` は `.ts` / `.tsx` / `.mts` / `.cts` / `.rs` / `.java` を見る。`--lang ts` / `--lang rust` / `--lang java` で
-対象を絞り、`auto` ではこの 3 つを走査する（異なる言語の関数同士は比較しない）。
+対象を絞り、`auto` では TypeScript・Rust・Java の 3 言語を走査する（異なる言語の関数同士は比較しない）。
 `--lang swift` を指定したときだけ `.swift` を走査する（`auto` には入らない）。Rust の
 自由関数・`impl` 内のメソッド・トレイト実装のメソッドをそれぞれ 1 チャンクにする。
 正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない関数（1〜3 行のアクセサ・委譲）は `scan` では比べず、
