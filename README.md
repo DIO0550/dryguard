@@ -106,7 +106,7 @@ spread 引数の後ろも引数位置が確定しないため残す。テスト�
 
 - 候補ペアでないので尋ねなかったペア・サーバは答えたがシグナルが「測れない」だったペアは数えない
   （前者は Stage 2 で判定が変わらない。後者は理由が根拠の行に出る）
-- dryguard が LSP サーバを持たない言語の候補ペアも数えない（今は `--lang swift` / `--lang java` で走査した Swift / Java がこれに当たる）
+- dryguard が LSP サーバを持たない言語の候補ペアも数えない（今は `--lang java` で走査した Java がこれに当たる。Swift は sourcekit-lsp に尋ねるので数える）
 - `--fail-on` が無ければ、LSP サーバが使えなくても判定を出して 0 で終わる
   （取れなかったシグナルは根拠に出る）
 
@@ -127,11 +127,12 @@ spread 引数の後ろも引数位置が確定しないため残す。テスト�
 Java の LSP サーバはまだ無いので、型シグネチャ・呼び出し元・呼び出し先は尋ねない。
 `.swift` は関数・メソッド・`init` / `deinit` をチャンクにし、`compare` で名指しすれば比べる。
 正規化トークンの表に Swift の種別がまだ無いので、`scan` / `check` は `--lang swift` を指定したときだけ走査する。
-Swift の LSP サーバはまだ無いので、型シグネチャ・呼び出し元・呼び出し先は尋ねない。
+Swift の候補は sourcekit-lsp に呼び出し元・呼び出し先を尋ねる。型シグネチャは hover の綴りを読む側がまだ無いので尋ねない（実サーバでの答えは未実測）。
 `compare` は `--lang` と拡張子が一致しなければ比べない（`--lang ts` と `.swift` / `.java`、`--lang java` と `.ts` など。`auto` は拡張子に従う）。
-CLI は拡張子から TypeScript と Rust の LSP サーバを選ぶ。`scan --lang auto` では
+CLI は拡張子から TypeScript・Rust・Swift の LSP サーバを選ぶ。`scan` では
 言語ごとに候補を揃え、TypeScript は typescript-language-server、Rust は rust-analyzer の
-セッションで hover / references を問い合わせる。Rust の型シグネチャ比較は #40 まで
+セッションで hover / references を問い合わせる。Swift は sourcekit-lsp のセッションで
+呼び出し元・呼び出し先だけを問い合わせる（`auto` の走査に入らないので、`compare` か `--lang swift` のとき）。Rust の型シグネチャ比較は #40 まで
 「測れない」。
 
 `node_modules` / `dist` / `build` / `target` / `.git` /
