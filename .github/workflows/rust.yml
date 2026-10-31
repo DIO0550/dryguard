@@ -114,11 +114,16 @@ jobs:
       #
       # sourcekit-lsp には `--version` が無い（6.4.2 で Unknown option）。版は swift から読み、
       # sourcekit-lsp は起動できることだけを確かめる。
+      #
+      # イメージは swift だけを PATH に出し、sourcekit-lsp を出さない（6.4.1 のイメージで
+      # `command -v sourcekit-lsp` が落ちた）。swift の実体と同じツールチェーンの bin から取る。
       - name: sourcekit-lsp
         run: |
           swift --version
-          command -v sourcekit-lsp
-          sourcekit-lsp --help > /dev/null
+          swift_bin="$(dirname "$(readlink -f "$(command -v swift)")")"
+          test -x "$swift_bin/sourcekit-lsp"
+          echo "$swift_bin" >> "$GITHUB_PATH"
+          "$swift_bin/sourcekit-lsp" --help > /dev/null
 
       - name: cargo test (LSP)
         run: cargo test -- --ignored
