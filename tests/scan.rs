@@ -426,7 +426,7 @@ fn test_java_scan_lists_methods_and_constructors_without_asking_a_server() {
     assert_eq!(scan.compared_pair_count(), 15);
     assert!(
         scan.semantics_error().is_none(),
-        "Java のサーバはまだ無いので尋ねない"
+        "Java を受け持つサーバを渡していないので尋ねない"
     );
     assert!(
         scan.candidate_pairs().iter().any(|pair| is_pair_of(
