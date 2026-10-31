@@ -467,7 +467,7 @@ impl Client {
     /// `root` はサーバに見せるワークスペースの根。開くファイルを含む位置を渡す。
     ///
     /// sourcekit-lsp では、握手の後に index を作り終えるまで待ってから返す
-    /// （`index synchronization`。[`ServerLanguage::synchronizes_index`]）。
+    /// （`index synchronization`。待つかは `ServerLanguage::synchronizes_index` が決める）。
     ///
     /// 値を取るのは、握手を 2 回できないようにするため。`initialize` を 2 度送られた
     /// サーバは 2 通目を拒む。
@@ -487,7 +487,6 @@ impl Client {
             Err(cause) => return Err(self.handshake_error_of(cause)),
         };
 
-        // 握手の失敗として名乗らない。握手は終わっており、閉じたのはその後
         if self.language.synchronizes_index() {
             self.converse(Connection::synchronize_index)?;
         }
@@ -1957,13 +1956,10 @@ mod tests {
     /// 2 通目の要求（握手の直後の `workspace/synchronize`）への応答。
     const SYNCHRONIZE_RESPONSE: &str = r#"{"jsonrpc":"2.0","id":2,"result":{}}"#;
 
-    #[test]
-    #[cfg(unix)]
-    fn test_client_handshake_with_sourcekit_lsp_waits_for_the_index() {
-        // initialize には答えるが、index を待つ要求には答えないサーバ。待たずに Session を
-        // 返していると、index を作り終える前の空の references を答えとして採る
+    /// initialize には答えるが、index を待つ要求には答えないサーバを、`language` として握手させた結果。
+    fn handshake_unsynchronized_as(language: ServerLanguage) -> Result<Session, ClientError> {
         let command = ServerCommand {
-            language: ServerLanguage::Swift,
+            language,
             ..fake_server(
                 &format!("{}; exec sleep 30", printed_frame(INITIALIZE_RESPONSE)),
                 WaitLimits {
@@ -1972,10 +1968,16 @@ mod tests {
                 },
             )
         };
-
-        let error = Client::start(&command)
+        Client::start(&command)
             .expect("起動できる")
             .handshake(&fixture_workspace_root())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_client_handshake_with_sourcekit_lsp_waits_for_the_index() {
+        // 待たずに Session を返していると、index を作り終える前の空の references を答えとして採る
+        let error = handshake_unsynchronized_as(ServerLanguage::Swift)
             .expect_err("index を待ち終えるまで Session にならない");
 
         assert!(
@@ -1986,11 +1988,35 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_client_handshake_with_rust_analyzer_does_not_wait_for_the_index() {
-        // 対照: 同じ台本でも rust-analyzer には送らない（送ると答えの来ない要求で止まる）
-        let session = handshake_as(ServerLanguage::Rust, "");
+    fn test_client_handshake_with_rust_analyzer_or_tsserver_does_not_wait_for_the_index() {
+        // 対照: 同じ台本でも待たない。送っていると、答えの来ない要求で沈黙の上限に触れる
+        for language in [ServerLanguage::Rust, ServerLanguage::TypeScript] {
+            let handshake = handshake_unsynchronized_as(language);
 
-        assert!(!session.needs_project_membership_query());
+            assert!(handshake.is_ok(), "{language:?}: {:?}", handshake.err());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_client_handshake_with_sourcekit_lsp_closing_while_indexing_is_not_a_handshake_failure()
+    {
+        // initialize に答え、initialized を受け取れるだけ居てから終わるサーバ。すぐ終わると
+        // initialized の書き込みが握手の中で落ちる。閉じたのは握手の後の往復
+        let command = ServerCommand {
+            language: ServerLanguage::Swift,
+            ..fake_server(
+                &format!("{}; sleep 1; exit 0", printed_frame(INITIALIZE_RESPONSE)),
+                GENEROUS_LIMITS,
+            )
+        };
+
+        let error = Client::start(&command)
+            .expect("起動できる")
+            .handshake(&fixture_workspace_root())
+            .expect_err("index を待つ要求に答えない");
+
+        assert!(matches!(&error, ClientError::Conversation(_)), "{error:?}");
     }
 
     #[test]

@@ -232,11 +232,15 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     /// **Why not（最初の進捗の終わりを待つ）**: `Package.swift` の外では進捗が来ないので、
     /// 沈黙の上限まで待ってサーバを kill する。この要求はその場合すぐに答える。
     ///
+    /// 待つ間も [`super::SILENCE_LIMIT`] / [`super::STREAMING_LIMIT`] が効く。フィクスチャ
+    /// （2 ファイル）では待ちが約 3 秒・最長の沈黙が約 2 秒で、**大きなパッケージでは未実測**。
+    ///
     /// # Errors
     ///
     /// 送受信が失敗したとき、サーバが error を返したとき。**この要求を持たない
     /// （`MethodNotFound` を返す）サーバは失敗にしない** — 待てないだけで、問い合わせは送れる。
-    /// 待てなかった結果の空の references は、後段が答えの無かった側に数える。
+    /// 待てなかった結果の空の references は [`ReferencesOutcome::NoAnswer`] になる
+    /// （呼び出し元が本当に無いときと区別しない。空配列を受けたときの既存の扱い）。
     pub fn synchronize_index(&mut self) -> Result<(), ConnectionError> {
         match self.request(SYNCHRONIZE_METHOD, Some(json!({ "index": true }))) {
             Ok(_) => Ok(()),
