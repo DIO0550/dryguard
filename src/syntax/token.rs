@@ -548,6 +548,71 @@ mod tests {
     }
 
     #[test]
+    fn test_tokens_of_swift_integer_hex_and_real_literals_are_the_same() {
+        let integer = swift_tokens("let a = 1");
+
+        assert_eq!(swift_tokens("let a = 0x1F"), integer);
+        assert_eq!(swift_tokens("let a = 0o17"), integer);
+        assert_eq!(swift_tokens("let a = 0b101"), integer);
+        assert_eq!(swift_tokens("let a = 1.5"), integer);
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_number_literal_are_a_number_literal() {
+        assert!(swift_tokens("let a = 1.5").contains(&Token::Literal(LiteralType::Number)));
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_value_name_are_an_identifier() {
+        // 表に無いと `Syntax("simple_identifier")` のまま残り、型名（`type_identifier`）と別のトークンになる
+        assert!(swift_tokens("let a = 1").contains(&Token::Identifier));
+    }
+
+    #[test]
+    fn test_tokens_of_swift_nil_are_a_null_literal() {
+        assert!(swift_tokens("f(nil)").contains(&Token::Literal(LiteralType::Null)));
+    }
+
+    #[test]
+    fn test_tokens_of_swift_true_are_a_boolean_literal() {
+        assert!(swift_tokens("let a = true").contains(&Token::Literal(LiteralType::Boolean)));
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_string_text_are_a_text_literal() {
+        assert!(swift_tokens("let a = \"x\"").contains(&Token::Literal(LiteralType::Text)));
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_escaped_character_are_the_same_as_string_text() {
+        assert_eq!(
+            swift_tokens("let a = \"\\n\""),
+            swift_tokens("let a = \"x\"")
+        );
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_multi_line_string_text_are_a_text_literal() {
+        assert!(
+            swift_tokens("let a = \"\"\"\nx\n\"\"\"").contains(&Token::Literal(LiteralType::Text))
+        );
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_interpolated_string_keep_the_interpolated_expression() {
+        // 文字列へ降りるので、補間の式は構造に残る
+        assert_ne!(
+            swift_tokens("let a = \"\\(y)\""),
+            swift_tokens("let a = \"x\"")
+        );
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_regex_are_a_regex_literal() {
+        assert!(swift_tokens("let a = /ab+/").contains(&Token::Literal(LiteralType::Regex)));
+    }
+
+    #[test]
     fn test_tokens_of_rust_sources_skip_a_line_comment() {
         assert_eq!(rust_tokens("// c\n 1;"), rust_tokens("1;"));
     }
