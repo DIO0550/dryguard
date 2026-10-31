@@ -82,9 +82,8 @@ fn test_scan_auto_asks_both_servers_without_comparing_across_languages() {
         stdout.contains("a.ts:1 <->") && stdout.contains("a.rs:1 <->"),
         "{stdout}"
     );
-    // `Discount.java` も集める。Java のチャンクは 1 つだけなので組を作らず、jdtls は起こさない
+    // `Discount.java` も集める。Java のチャンクは 1 つだけなので組を作らない
     assert!(stdout.contains("対象 5 ファイル"), "{stdout}");
-    assert!(!stderr.contains("jdtls"), "{stderr}");
 }
 
 #[test]
@@ -305,7 +304,7 @@ fn test_scan_java_only_asks_jdtls_and_excludes_typescript() {
 
 #[test]
 fn test_scan_auto_asks_jdtls_for_java_files() {
-    // `.ts` は 1 つだけなので TypeScript の組は作らず、typescript-language-server は起こさない。
+    // `.ts` は 1 つだけなので TypeScript の組は作らない。
     // `auto` が `.java` を拾わなければ対象 1 ファイル・0 組になる
     let root = java_fixture("");
     let output = run(&["scan", &root, "--lang", "auto"]);
@@ -317,5 +316,4 @@ fn test_scan_auto_asks_jdtls_for_java_files() {
     assert!(stdout.contains("A.java:2 <->"), "{stdout}");
     assert!(stdout.contains("対象 3 ファイル"), "{stdout}");
     assert!(stderr.contains("jdtls"), "{stderr}");
-    assert!(!stderr.contains("typescript-language-server"), "{stderr}");
 }

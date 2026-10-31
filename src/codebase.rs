@@ -378,8 +378,8 @@ mod tests {
 
     #[test]
     fn test_source_paths_of_auto_includes_java_files() {
-        // 同じディレクトリの `.md` は読めない拡張子なので集めない。`auto` が `.java` を拾わないと、
-        // CLI が jdtls を選んでも `scan --lang auto` では Java の候補ペアが 1 組もできない
+        // `auto` が `.java` を拾わないと、CLI が jdtls を選んでも `scan --lang auto` では
+        // Java の候補ペアが 1 組もできない
         let root = fixture("language-scan");
 
         let paths =
