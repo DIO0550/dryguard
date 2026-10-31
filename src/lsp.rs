@@ -18,6 +18,7 @@
 //! | `references` | references の応答から参照元のファイルを取り出す |
 //! | `call_hierarchy` | callHierarchy の応答から呼び出し先のファイルを取り出す |
 //! | `project_membership` | projectInfo の応答を読み、設定されたプロジェクトか見分ける |
+//! | `state_directory` | サーバが状態を書くディレクトリを、起動 1 回ごとに作って消す |
 //! | ここ | サーバの起動・パイプの配線・終了 |
 //!
 //! **外へ出すのは [`ServerCommand`] / [`Client`] / [`Session`]、渡す値
@@ -97,7 +98,8 @@ const SWIFT_SERVER: &str = "sourcekit-lsp";
 ///
 /// 配布物の `bin/jdtls`（Python 3.9 以上が要るラッパ）。launcher の jar を `java -jar` で
 /// 直接起動しないのは、jar の名前が版で変わり、OS ごとの設定ディレクトリと JVM の引数まで
-/// こちらで持つことになるため。ラッパはそれらを付けて `exec` する（1.64.0 の `jdtls.py`）。
+/// こちらで持つことになるため。ラッパはそれらを付け、POSIX では `os.execvp` で java に
+/// 置き換わる（1.64.0 の `jdtls.py`）ので、kill が JVM に届く。
 const JAVA_SERVER: &str = "jdtls";
 
 /// jdtls に、状態（取り込んだプロジェクト・索引）を書くディレクトリを渡すオプション。
@@ -362,7 +364,7 @@ impl ServerCommand {
 
     /// jdtls（Eclipse JDT Language Server）を stdio で起動する指定。
     ///
-    /// ラッパは `CLIENT_PORT` が無ければ stdio でしゃべる。状態を書くディレクトリは
+    /// jdtls は環境変数 `CLIENT_PORT` が無ければ stdio でしゃべる。状態を書くディレクトリは
     /// 起動のたびに [`Client::start`] が作って `-data` で渡す。
     /// **起動して確かめたことはまだ無い**（CI で jdtls を起動する回が測る）。
     pub fn java() -> Self {
@@ -1002,7 +1004,8 @@ impl Drop for Client {
     /// [`Client::shutdown`] を別に持つ理由でもある。
     fn drop(&mut self) {
         self.terminate();
-        // 回収した後に消す。先に消すと、動いているサーバが書き直して残る。
+        // フィールドの drop 順に頼らず、回収した後に消すことをここで明示する。
+        // 動いているサーバが残っていると、消した後に書き直されて残る。
         drop(self.state_directory.take());
     }
 }
@@ -1745,6 +1748,8 @@ mod tests {
     }
 
     /// フェイクのサーバが、受け取った引数を書き残すファイル。テストの名前ごとに分ける。
+    ///
+    /// 前の回が落ちて残したファイルは消しておく。残っていると、書かれなかったことに気づけない。
     fn argument_record_of(test: &str) -> std::path::PathBuf {
         let path =
             std::env::temp_dir().join(format!("dryguard-test-{}-{test}", std::process::id()));

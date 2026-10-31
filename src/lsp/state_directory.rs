@@ -4,7 +4,7 @@
 //! 値なので、どのオプションで渡すかだけを持つ。
 
 use std::env;
-use std::fs;
+use std::fs::{self, DirBuilder};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -15,8 +15,15 @@ static NEXT_SUFFIX: AtomicU64 = AtomicU64::new(0);
 
 /// 名前が既にあったときに、番号を進めて作り直す回数の上限。
 ///
-/// 既にあるのは、同じ pid の前のプロセスが消さずに落ちたときだけ。
+/// 既にあるのは、同じ pid の前のプロセスが消さずに落ちたときか、共有の一時ディレクトリに
+/// 他の誰かが同じ名前を作ったとき。後者が続けば上限で諦めて起動しない。
 const CREATE_ATTEMPTS: usize = 16;
+
+/// 作ったディレクトリの権限。持ち主だけが読み書きできる。
+///
+/// サーバはソースから取り込んだ内容を書くので、共有の一時ディレクトリで他のユーザーに読ませない。
+#[cfg(unix)]
+const OWNER_ONLY_MODE: u32 = 0o700;
 
 /// 起動 1 回のためだけに作った、サーバの状態を書くディレクトリ。`Drop` で中身ごと消す。
 ///
@@ -35,13 +42,21 @@ impl StateDirectory {
     /// 作れなかったとき。番号を進めても既にある名前しか当たらなかったときは、
     /// 最後の `AlreadyExists`。
     pub(super) fn create() -> io::Result<Self> {
-        let parent = env::temp_dir();
+        Self::create_in(&env::temp_dir())
+    }
+
+    /// `parent` の下に、まだ無い名前で作る。
+    ///
+    /// # Errors
+    ///
+    /// [`Self::create`] と同じ。
+    fn create_in(parent: &Path) -> io::Result<Self> {
         let mut last_cause = io::Error::from(io::ErrorKind::AlreadyExists);
         for _ in 0..CREATE_ATTEMPTS {
             let suffix = NEXT_SUFFIX.fetch_add(1, Ordering::Relaxed);
             let path = parent.join(format!("dryguard-lsp-{}-{suffix}", process::id()));
             // `create_dir` は既にあれば失敗するので、他の誰かのディレクトリを奪わない。
-            match fs::create_dir(&path) {
+            match owner_only_builder().create(&path) {
                 Ok(()) => return Ok(Self { path }),
                 Err(cause) if cause.kind() == io::ErrorKind::AlreadyExists => last_cause = cause,
                 Err(cause) => return Err(cause),
@@ -54,6 +69,14 @@ impl StateDirectory {
     pub(super) fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// 持ち主だけが読み書きできるディレクトリを、既にあれば失敗する形で作る。
+fn owner_only_builder() -> DirBuilder {
+    let mut builder = DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, OWNER_ONLY_MODE);
+    builder
 }
 
 impl Drop for StateDirectory {
@@ -77,6 +100,31 @@ mod tests {
         drop(directory);
 
         assert!(!path.exists(), "中身ごと消える");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_create_makes_a_directory_only_its_owner_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = StateDirectory::create().expect("作れる");
+        let mode = fs::metadata(directory.path())
+            .expect("在る")
+            .permissions()
+            .mode();
+
+        assert_eq!(mode & 0o777, OWNER_ONLY_MODE);
+    }
+
+    #[test]
+    fn test_create_in_a_missing_parent_reports_why_it_could_not() {
+        // 対照は上のテスト。作れなかった理由を握りつぶさずに返す
+        let parent =
+            env::temp_dir().join(format!("dryguard-test-{}-missing-parent", process::id()));
+
+        let error = StateDirectory::create_in(&parent).expect_err("親が無いので作れない");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
