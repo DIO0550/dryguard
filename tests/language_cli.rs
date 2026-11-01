@@ -155,7 +155,7 @@ fn test_compare_swift_language_rejects_typescript_files() {
 
 #[test]
 fn test_compare_auto_accepts_swift_files() {
-    // `auto` の走査は Swift を拾わないが、`compare` は名指しされれば比べる
+    // `compare` は拡張子に従って Swift を比べる。拒否の腕へ写し違えると不一致で落ちる
     let left = format!("{}:1", swift_fixture("a.swift"));
     let right = format!("{}:1", swift_fixture("b.swift"));
     let output = run(&["compare", &left, &right]);
@@ -224,6 +224,23 @@ fn test_scan_swift_only_asks_sourcekit_lsp_and_excludes_typescript() {
         !stderr.contains("typescript-language-server") && !stderr.contains("rust-analyzer"),
         "{stderr}"
     );
+}
+
+#[test]
+fn test_scan_auto_asks_sourcekit_lsp_for_swift_files() {
+    // `.ts` は 1 つだけなので TypeScript の組は作らない。
+    // `auto` が `.swift` を拾わなければ対象 1 ファイル・0 組になり、sourcekit-lsp も起こさない
+    let root = swift_fixture("");
+    let output = run(&["scan", &root, "--lang", "auto"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stdout.matches(" <-> ").count(), 1, "{stdout}");
+    assert!(stdout.contains("a.swift:1 <->"), "{stdout}");
+    assert!(stdout.contains("対象 3 ファイル"), "{stdout}");
+    assert!(stderr.contains("sourcekit-lsp"), "{stderr}");
+    assert!(!stderr.contains("typescript-language-server"), "{stderr}");
 }
 
 fn java_fixture(name: &str) -> String {
