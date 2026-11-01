@@ -191,7 +191,8 @@ jobs:
               ts = time.time()
               while True:
                   m = q.get()
-                  if m is None: print("CLOSED"); sys.exit(1)
+                  if m is None:
+                      print("CLOSED"); print("stderr tail:"); print(open(data + ".stderr").read()[-3000:]); sys.exit(1)
                   if "method" in m:
                       counts[m["method"]] = counts.get(m["method"], 0) + 1
                       if m["method"] != "window/logMessage": log(m)
@@ -240,6 +241,8 @@ jobs:
           cp "$fixture/src/main/java/shop/"*.java "$standalone/"
           echo "##### without pom.xml (root = parent of shop/)"
           timeout 300 python3 "$RUNNER_TEMP/probe.py" "$RUNNER_TEMP/standalone" "$standalone/Total.java" 7,12 || true
+          echo "##### jdtls configuration logs"
+          for log in "$RUNNER_TEMP"/jdtls/configuration/*.log; do echo "--- $log"; head -c 6000 "$log"; echo; done || true
           echo "##### ~/.m2"
           find ~/.m2 -maxdepth 4 2>/dev/null | head -50 || true
           echo "##### dryguard"
