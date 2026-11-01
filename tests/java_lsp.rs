@@ -15,7 +15,7 @@ use dryguard::source_position::SourcePosition;
 
 #[test]
 #[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
-fn test_jdtls_answers_both_candidates_in_one_session() {
+fn test_jdtls_answers_references_but_leaves_hover_unreadable_and_callees_unsettled() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/java-lsp");
     let path = fixture.join("src/main/java/shop/Total.java");
     let caller = fixture.join("src/main/java/shop/Checkout.java");
@@ -44,6 +44,7 @@ fn test_jdtls_answers_both_candidates_in_one_session() {
             .expect("hover を尋ねられる");
         // jdtls 1.63.0 は `contents` を MarkedString の配列（`{language: "java", value: 綴り}`・Javadoc・
         // `Source:` の行）で返し、`markdown` を宣言しても MarkupContent にしない。読めない形として扱う
+        // （`Unreadable` はフェンスの無い Markup でも返るので、この assert は形までは見分けない）
         assert!(
             matches!(hover, HoverOutcome::Unreadable),
             "{name}: {hover:?}"

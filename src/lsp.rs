@@ -135,7 +135,8 @@ const SWIFT_PROJECT_MARKERS: [&str; 1] = ["Package.swift"];
 /// jdtls が Maven / Gradle のプロジェクトとして取り込むためのビルドファイル。
 ///
 /// 印の外では別ファイルの参照元が揃わない。jdtls 1.63.0 で実測すると、`pom.xml` の無い
-/// ディレクトリでは references が空配列を返し、宣言したパッケージが期待と違うという診断が出た。
+/// ディレクトリ（2 ファイルのフィクスチャ）では references が空配列を返し、宣言したパッケージが
+/// 期待と違うという診断が出た。Gradle の印は未確認。
 const JAVA_PROJECT_MARKERS: [&str; 3] = ["pom.xml", "build.gradle", "build.gradle.kts"];
 
 /// サーバが何も送ってこないまま待つ上限。
@@ -235,17 +236,18 @@ const SWIFT_SETTLED_ATTEMPTS: usize = connection::SETTLED_ATTEMPTS;
 
 /// jdtls の hover で、綴りを探すコードフェンスの試す順。
 ///
-/// **今は使われない。** jdtls 1.63.0 は `contents` を `MarkedString` の配列
-/// （`{language: "java", value: 綴り}`・Javadoc・`Source:` の行）で返し、`markdown` を宣言しても
-/// `MarkupContent` にしないので、フェンスを探す前に読めない形になる。読む形を足すまでは
-/// TypeScript と同じ先頭のフェンスを置く。
+/// **今は使われない。** `pipeline` は Java の hover を尋ねない（型シグネチャを読む側が無い）。
+/// しかも jdtls 1.63.0 は `contents` を `MarkedString` の配列（`{language: "java", value: 綴り}`・
+/// Javadoc・`Source:` の行）で返し、コードフェンスを持たないので、尋ねてもフェンスを探す前に
+/// 読めない形になる。網羅 `match` が値を要るので、TypeScript と同じ先頭のフェンスを置く。
 const JAVA_HOVER_FENCES: &[usize] = hover::LEADING_FENCE;
 
 /// jdtls で、落ち着いた答えを求めて尋ね直す回数の上限。
 ///
-/// **既定の回数で足りる。** jdtls 1.63.0 は読み込みを `$/progress` で知らせ、1 回目の hover /
-/// references は読み込みの進捗に触れて答えるが、2 回目は触れない。ただし callHierarchy は
-/// 尋ねるたびに応答の前に作業（`Background task`）を始めて終えるので、回数を増やしても落ち着かない。
+/// **hover / references は既定の回数で足りる。** jdtls 1.63.0 は読み込みを `$/progress` で知らせ、
+/// 1 回目の hover / references は読み込みの進捗に触れて答えるが、2 回目は触れない。
+/// callHierarchy は尋ねるたびに応答の前に作業（`Background task`）を始めて終えるので、
+/// 尋ね直すという仕組みでは落ち着かない（既定の回数で `ServerStillWorking` になることを実測）。
 const JAVA_SETTLED_ATTEMPTS: usize = connection::SETTLED_ATTEMPTS;
 
 /// サーバの問い合わせ形式。**サーバごとの値を選ぶのは、ここの網羅 `match` だけ。**
@@ -287,8 +289,9 @@ impl ServerLanguage {
     /// sourcekit-lsp だけが、index を作り終える前の references / callHierarchy に
     /// **進捗を始める前から**空を返す（[`Connection::synchronize_index`]）。
     /// rust-analyzer と tsserver は読み込みの途中を進捗で知らせるので、尋ね直しで足りる。
-    /// jdtls も読み込み（Maven の取り込み・索引）を `$/progress` で知らせるので尋ね直しで足りる
-    /// （1.63.0 で実測）。`workspace/synchronize` は sourcekit-lsp 固有の要求なので送らない。
+    /// jdtls も読み込み（Maven の取り込み・索引）を `$/progress` で知らせるので、読み込みの待ちは
+    /// 尋ね直しで足りる（1.63.0 の hover / references で実測）。`workspace/synchronize` は
+    /// sourcekit-lsp 固有の要求なので送らない。
     fn synchronizes_index(self) -> bool {
         match self {
             Self::Swift => true,
@@ -392,7 +395,8 @@ impl ServerCommand {
     /// jdtls は環境変数 `CLIENT_PORT` が無ければ stdio でしゃべる。状態を書くディレクトリは
     /// 起動のたびに [`Client::start`] が作って `-data` で渡す。
     ///
-    /// jdtls 1.63.0 で、握手・references は実サーバで動くことを確かめてある（`tests/java_lsp.rs`）。
+    /// jdtls 1.63.0 で、握手と、`pom.xml` の下での references は実サーバで動くことを確かめてある
+    /// （`tests/java_lsp.rs`）。
     /// hover は `MarkedString` で返るので読めず、callHierarchy は落ち着いた答えが得られない。
     pub fn java() -> Self {
         Self {

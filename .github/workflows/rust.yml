@@ -139,7 +139,7 @@ jobs:
       # 「An error has occurred. See the log file」を標準出力に出して終わる（Temurin 21.0.13 で実測）。
       #
       # **残った緩み: JDK と python3 の版はイメージに従い、こちらで固定できない**（sourcekit-lsp と同じ）。
-      # jdtls には `--version` が無いので、版は tar.gz の名前と sha256 で固定し、ここでは実行できることだけを見る。
+      # ラッパ（jdtls.py）に版を出すオプションが無いので、版は tar.gz の名前と sha256 で固定し、ここでは実行できることだけを見る。
       #
       # Why not（actions/setup-java）: ランナーのイメージに JDK 25 が入っているので、取ってくる段を増やさない。
       - name: jdtls
@@ -150,13 +150,13 @@ jobs:
           python3 --version
           # 版と配布物の中身を固定する（rust-analyzer と同じ形）。
           curl --fail --location --silent --show-error --retry 3 \
-            --output jdtls.tar.gz \
+            --output "$RUNNER_TEMP/jdtls.tar.gz" \
             https://download.eclipse.org/jdtls/milestones/1.63.0/jdt-language-server-1.63.0-202610191322.tar.gz
-          echo 'b1f2abe0b3cccb462cf64fb4a5587c7d09df60cf8be7748b152cbd89d018bdc4  jdtls.tar.gz' | sha256sum --check
-          # チェックアウトの外に展開する。リポジトリの下に置くと、ソースを走査するテストの対象に入りうる
+          echo "b1f2abe0b3cccb462cf64fb4a5587c7d09df60cf8be7748b152cbd89d018bdc4  $RUNNER_TEMP/jdtls.tar.gz" | sha256sum --check
+          # チェックアウトの外に置く。リポジトリの下に置くと、ソースを走査するテストの対象に入りうる
           jdtls_home="$RUNNER_TEMP/jdtls"
           mkdir "$jdtls_home"
-          tar --extract --gzip --file jdtls.tar.gz --directory "$jdtls_home"
+          tar --extract --gzip --file "$RUNNER_TEMP/jdtls.tar.gz" --directory "$jdtls_home"
           test -x "$jdtls_home/bin/jdtls"
           echo "$jdtls_home/bin" >> "$GITHUB_PATH"
 
