@@ -288,8 +288,8 @@ fn source_language_of(lang: LanguageOption) -> SourceLanguage {
 /// grammar 側も網羅 `match` にする。「Rust 以外」の否定で書くと、grammar を足したときに
 /// `--lang ts` が黙って受け付ける。
 ///
-/// Why not（`SourceLanguage::accepts` を引く）: あちらは走査に入れる grammar で、名指しを受け付けるかとは
-/// 別の問い。今は答えが揃うが、正規化が揃うまで `auto` の走査から外す言語があっても `compare` は比べる。
+/// Why not（`SourceLanguage::accepts` を引く）: あちらは走査に入れる grammar を決める側で、
+/// 名指しされたファイルを受け付けるかを決めるこちらとは、変える理由が別。
 fn accepts_grammar(lang: LanguageOption, grammar: Grammar) -> bool {
     match (lang, grammar) {
         (
