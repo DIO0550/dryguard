@@ -163,7 +163,7 @@ jobs:
           lines = [int(x) for x in sys.argv[3].split(",")]
           data = tempfile.mkdtemp()
           t0 = time.time()
-          p = subprocess.Popen(["jdtls", "-data", data], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+          p = subprocess.Popen(["jdtls", "-data", data], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(data + ".stderr", "w"))
           q = queue.Queue(); last = [time.time()]; gaps = []
           def reader():
               f = p.stdout
@@ -172,9 +172,12 @@ jobs:
                   while True:
                       l = f.readline()
                       if not l: q.put(None); return
-                      l = l.decode().strip()
-                      if not l: break
-                      k, v = l.split(":", 1); h[k.lower()] = v.strip()
+                      l = l.decode(errors="replace").rstrip("\r\n")
+                      if not l and h: break
+                      if ":" in l and l.split(":", 1)[0].lower() in ("content-length", "content-type"):
+                          k, v = l.split(":", 1); h[k.lower()] = v.strip()
+                      else:
+                          print("%7.2f RAW STDOUT: %r" % (time.time() - t0, l[:2000]), flush=True)
                   body = f.read(int(h["content-length"]))
                   now = time.time(); gaps.append((now - last[0], now - t0)); last[0] = now
                   q.put(json.loads(body))
@@ -227,15 +230,16 @@ jobs:
           log(req("shutdown", None)); send({"jsonrpc": "2.0", "method": "exit"}); te = time.time(); p.wait()
           print("exit took %.2f, code %s" % (time.time() - te, p.returncode))
           print("total %.2f" % (time.time() - t0))
+          print("stderr tail:"); print(open(data + ".stderr").read()[-3000:])
           PY
           fixture=tests/fixtures/java-lsp
           echo "##### with pom.xml"
-          timeout 900 python3 "$RUNNER_TEMP/probe.py" "$fixture" "$fixture/src/main/java/shop/Total.java" 7,12 || true
+          timeout 300 python3 "$RUNNER_TEMP/probe.py" "$fixture" "$fixture/src/main/java/shop/Total.java" 7,12 || true
           standalone="$RUNNER_TEMP/standalone/shop"
           mkdir -p "$standalone"
           cp "$fixture/src/main/java/shop/"*.java "$standalone/"
           echo "##### without pom.xml (root = parent of shop/)"
-          timeout 900 python3 "$RUNNER_TEMP/probe.py" "$RUNNER_TEMP/standalone" "$standalone/Total.java" 7,12 || true
+          timeout 300 python3 "$RUNNER_TEMP/probe.py" "$RUNNER_TEMP/standalone" "$standalone/Total.java" 7,12 || true
           echo "##### ~/.m2"
           find ~/.m2 -maxdepth 4 2>/dev/null | head -50 || true
           echo "##### dryguard"
