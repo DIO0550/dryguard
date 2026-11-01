@@ -138,6 +138,9 @@ jobs:
       # （org.eclipse.core.filesystem など）は `osgi.ee=JavaSE 25` を要求し、21 では解決できずに
       # 「An error has occurred. See the log file」を標準出力に出して終わる（Temurin 21.0.13 で実測）。
       #
+      # **残った緩み: JDK と python3 の版はイメージに従い、こちらで固定できない**（sourcekit-lsp と同じ）。
+      # jdtls には `--version` が無いので、版は tar.gz の名前と sha256 で固定し、ここでは実行できることだけを見る。
+      #
       # Why not（actions/setup-java）: ランナーのイメージに JDK 25 が入っているので、取ってくる段を増やさない。
       - name: jdtls
         run: |
@@ -156,102 +159,6 @@ jobs:
           tar --extract --gzip --file jdtls.tar.gz --directory "$jdtls_home"
           test -x "$jdtls_home/bin/jdtls"
           echo "$jdtls_home/bin" >> "$GITHUB_PATH"
-
-      # TEMPORARY(#394): 生のメッセージを時刻付きで記録する。実測を Issue に書いたら消す。
-      - name: jdtls probe (temporary)
-        run: |
-          cat > "$RUNNER_TEMP/probe.py" <<'PY'
-          import json, subprocess, sys, time, os, threading, tempfile, queue
-          root = os.path.abspath(sys.argv[1]); target = os.path.abspath(sys.argv[2])
-          lines = [int(x) for x in sys.argv[3].split(",")]
-          data = tempfile.mkdtemp()
-          t0 = time.time()
-          p = subprocess.Popen(["jdtls", "-data", data], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(data + ".stderr", "w"))
-          q = queue.Queue(); last = [time.time()]; gaps = []
-          def reader():
-              f = p.stdout
-              while True:
-                  h = {}
-                  while True:
-                      l = f.readline()
-                      if not l: q.put(None); return
-                      l = l.decode(errors="replace").rstrip("\r\n")
-                      if not l and h: break
-                      if ":" in l and l.split(":", 1)[0].lower() in ("content-length", "content-type"):
-                          k, v = l.split(":", 1); h[k.lower()] = v.strip()
-                      else:
-                          print("%7.2f RAW STDOUT: %r" % (time.time() - t0, l[:2000]), flush=True)
-                  body = f.read(int(h["content-length"]))
-                  now = time.time(); gaps.append((now - last[0], now - t0)); last[0] = now
-                  q.put(json.loads(body))
-          threading.Thread(target=reader, daemon=True).start()
-          nid = [0]; waits = []; counts = {}
-          def send(m):
-              b = json.dumps(m).encode(); p.stdin.write(b"Content-Length: %d\r\n\r\n" % len(b) + b); p.stdin.flush()
-          def log(m): print("%7.2f %s" % (time.time() - t0, json.dumps(m, ensure_ascii=False)[:4000]), flush=True)
-          def req(method, params):
-              nid[0] += 1; i = nid[0]; send({"jsonrpc": "2.0", "id": i, "method": method, "params": params})
-              ts = time.time()
-              while True:
-                  m = q.get()
-                  if m is None:
-                      print("CLOSED"); print("stderr tail:"); print(open(data + ".stderr").read()[-3000:]); sys.exit(1)
-                  if "method" in m:
-                      counts[m["method"]] = counts.get(m["method"], 0) + 1
-                      if m["method"] != "window/logMessage": log(m)
-                      if "id" in m:
-                          if m["method"] == "window/workDoneProgress/create": send({"jsonrpc": "2.0", "id": m["id"], "result": None})
-                          else: send({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32601, "message": "not supported"}})
-                      continue
-                  if m.get("id") == i:
-                      waits.append((time.time() - ts, method)); print("   %s took %.2fs" % (method, time.time() - ts)); return m
-                  log(m)
-          uri = lambda path: "file://" + path
-          log(req("initialize", {"processId": os.getpid(), "rootUri": uri(root),
-              "capabilities": {"window": {"workDoneProgress": True}, "textDocument": {"callHierarchy": {"dynamicRegistration": False}, "hover": {"contentFormat": ["markdown"]}}}}))
-          send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
-          text = open(target).read()
-          send({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": uri(target), "languageId": "java", "version": 1, "text": text}}})
-          src = text.split("\n")
-          for rnd in range(3):
-              print("=== round", rnd, flush=True)
-              for ln in lines:
-                  col = src[ln - 1].index("int ") + 4
-                  pos = {"textDocument": {"uri": uri(target)}, "position": {"line": ln - 1, "character": col}}
-                  for m in ["textDocument/hover", "textDocument/typeDefinition", "textDocument/definition"]:
-                      log(req(m, pos))
-                  log(req("textDocument/references", dict(pos, context={"includeDeclaration": False})))
-                  tcol = src[ln - 1].index("List<") + 1
-                  tpos = {"textDocument": {"uri": uri(target)}, "position": {"line": ln - 1, "character": tcol}}
-                  for m in ["textDocument/hover", "textDocument/typeDefinition", "textDocument/definition"]:
-                      print("   (at List)"); log(req(m, tpos))
-                  pr = req("textDocument/prepareCallHierarchy", pos); log(pr)
-                  if pr.get("result"):
-                      log(req("callHierarchy/outgoingCalls", {"item": pr["result"][0]}))
-          print("longest silences", sorted(gaps, reverse=True)[:5])
-          print("longest waits", sorted(waits, reverse=True)[:5])
-          print("notification counts", counts)
-          log(req("shutdown", None)); send({"jsonrpc": "2.0", "method": "exit"}); te = time.time(); p.wait()
-          print("exit took %.2f, code %s" % (time.time() - te, p.returncode))
-          print("total %.2f" % (time.time() - t0))
-          print("stderr tail:"); print(open(data + ".stderr").read()[-3000:])
-          PY
-          fixture=tests/fixtures/java-lsp
-          echo "##### with pom.xml"
-          timeout 300 python3 "$RUNNER_TEMP/probe.py" "$fixture" "$fixture/src/main/java/shop/Total.java" 7,12 || true
-          standalone="$RUNNER_TEMP/standalone/shop"
-          mkdir -p "$standalone"
-          cp "$fixture/src/main/java/shop/"*.java "$standalone/"
-          echo "##### without pom.xml (root = parent of shop/)"
-          timeout 300 python3 "$RUNNER_TEMP/probe.py" "$RUNNER_TEMP/standalone" "$standalone/Total.java" 7,12 || true
-          echo "##### jdtls configuration logs"
-          for log in "$RUNNER_TEMP"/jdtls/configuration/*.log; do echo "--- $log"; head -c 6000 "$log"; echo; done || true
-          echo "##### ~/.m2"
-          find ~/.m2 -maxdepth 4 2>/dev/null | head -50 || true
-          echo "##### dryguard"
-          cargo test --test java_lsp -- --ignored --nocapture || true
-          echo "##### git status"
-          git status --porcelain --ignored tests/fixtures/java-lsp
 
       - name: cargo test (LSP)
         run: cargo test -- --ignored
