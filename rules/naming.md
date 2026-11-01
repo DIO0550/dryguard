@@ -62,7 +62,7 @@ if structurally_similar && domains_differ { ... }
 | `array length` | Rust の配列型の要素数。宣言側で評価した整数で比較し、定数名や未評価の式の綴りは比較に使わない |
 | `array length correspondence` | ソースと hover の配列長の出現番号を持つ型構造が一致した組。出現の個数だけでは対応したと扱わない |
 | `generic alias` | Rust の型パラメータ・既定値・右辺を持ち、使用側の型引数を当てはめて展開する型エイリアス |
-| `enclosing type` | Swift のメンバー（メソッド・`init` / `deinit`）を直接囲む型（`extension` を含む）の名前。hover の綴りに出ないレシーバと `init` の値の型を足すのに使う（`Chunk::swift_enclosing_type`）。関数の本体の中の関数は持たない |
+| `enclosing type` | Swift のメンバー（メソッド・`init` / `deinit`）を直接囲む型（`extension` を含む）の名前。hover の綴りに出ないレシーバと `init` の値の型を足すのに使う（`Chunk::swift_enclosing_type`）。関数の本体の中の関数は持たない。**`where` や型引数を書いた `extension` は名前で持たない**（`SwiftEnclosingType::Constrained`）— レシーバが `Array<Int>` なのか `Array<Double>` なのかを名前だけでは言えないので、型シグネチャを読まない |
 | `impl header` | Rust メソッドが直接所属する impl の本体より前のソース。対象型・型変数・境界・実装トレイトを、そのスコープのまま運ぶ |
 | `accessor` | プロパティのように読み書きされるメンバーを実装する関数（`get` / `set`）。**チャンクとしては関数**だが、`hover` が返すのは**メンバーとしての型** |
 | `test function` | Rust のテスト属性（パス末尾が `test`）付き関数、Java の宣言直下の `modifiers` にある注釈の名前（修飾付きも綴り全体）が `Test` で終わるメソッド（`@Test` / `@ParameterizedTest` / `@org.junit.Test`。`@TestFactory` は当たらず、`@BeforeTest` は当たる。型パラメータの後ろの注釈は見ない）、TypeScript / TSX の `describe` / `it` / `test`（`.only` / `.skip` を含む）の第2引数に直接書いたアロー関数・関数式、または Swift の `@Test`（Swift Testing。`@Testing.Test` も末尾で見る）付きの関数と、`XCTestCase`（末尾で見る）を継承したクラスに直接書いた引数を取らない `func test…`（XCTest）。callback 側の透過ラッパーは辿るが、spread で位置が確定しない形・別名・namespace・未知の修飾は残す。TS は呼び出し名のヒューリスティックで、同名の業務 API も対象。Swift の XCTest は直接囲むクラスの継承だけを見るので、`extension` の中のメソッドと `XCTestCase` を間接に継承したクラスのメソッドは残る。**`scan` / `check` は既定でチャンクにしない**（`--include-tests` で入れる）。ファイル名や囲むテストでは判定せず（XCTest の継承の確かめは印の一部で、囲むテストによる判定ではない）、印の付かないヘルパー・内部の関数は残す |
