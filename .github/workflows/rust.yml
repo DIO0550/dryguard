@@ -182,7 +182,7 @@ jobs:
           nid = [0]; waits = []; counts = {}
           def send(m):
               b = json.dumps(m).encode(); p.stdin.write(b"Content-Length: %d\r\n\r\n" % len(b) + b); p.stdin.flush()
-          def log(m): print("%7.2f %s" % (time.time() - t0, json.dumps(m, ensure_ascii=False)[:900]), flush=True)
+          def log(m): print("%7.2f %s" % (time.time() - t0, json.dumps(m, ensure_ascii=False)[:4000]), flush=True)
           def req(method, params):
               nid[0] += 1; i = nid[0]; send({"jsonrpc": "2.0", "id": i, "method": method, "params": params})
               ts = time.time()
@@ -192,7 +192,9 @@ jobs:
                   if "method" in m:
                       counts[m["method"]] = counts.get(m["method"], 0) + 1
                       if m["method"] != "window/logMessage": log(m)
-                      if "id" in m: send({"jsonrpc": "2.0", "id": m["id"], "result": None})
+                      if "id" in m:
+                          if m["method"] == "window/workDoneProgress/create": send({"jsonrpc": "2.0", "id": m["id"], "result": None})
+                          else: send({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32601, "message": "not supported"}})
                       continue
                   if m.get("id") == i:
                       waits.append((time.time() - ts, method)); print("   %s took %.2fs" % (method, time.time() - ts)); return m
@@ -212,6 +214,10 @@ jobs:
                   for m in ["textDocument/hover", "textDocument/typeDefinition", "textDocument/definition"]:
                       log(req(m, pos))
                   log(req("textDocument/references", dict(pos, context={"includeDeclaration": False})))
+                  tcol = src[ln - 1].index("List<") + 1
+                  tpos = {"textDocument": {"uri": uri(target)}, "position": {"line": ln - 1, "character": tcol}}
+                  for m in ["textDocument/hover", "textDocument/typeDefinition", "textDocument/definition"]:
+                      print("   (at List)"); log(req(m, tpos))
                   pr = req("textDocument/prepareCallHierarchy", pos); log(pr)
                   if pr.get("result"):
                       log(req("callHierarchy/outgoingCalls", {"item": pr["result"][0]}))
@@ -230,8 +236,12 @@ jobs:
           cp "$fixture/src/main/java/shop/"*.java "$standalone/"
           echo "##### without pom.xml (root = parent of shop/)"
           timeout 900 python3 "$RUNNER_TEMP/probe.py" "$RUNNER_TEMP/standalone" "$standalone/Total.java" 7,12 || true
+          echo "##### ~/.m2"
+          find ~/.m2 -maxdepth 4 2>/dev/null | head -50 || true
           echo "##### dryguard"
           cargo test --test java_lsp -- --ignored --nocapture || true
+          echo "##### git status"
+          git status --porcelain --ignored tests/fixtures/java-lsp
 
       - name: cargo test (LSP)
         run: cargo test -- --ignored
