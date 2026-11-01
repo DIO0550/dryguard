@@ -58,9 +58,10 @@ impl SourceLanguage {
         // grammar 側も網羅 `match` にする。「Rust 以外」の否定で書くと、
         // grammar を足したときに TypeScript の走査が黙って拾う。
         match (self, grammar) {
-            (Self::Auto, Grammar::TypeScript | Grammar::Tsx | Grammar::Rust | Grammar::Java) => {
-                true
-            }
+            (
+                Self::Auto,
+                Grammar::TypeScript | Grammar::Tsx | Grammar::Rust | Grammar::Java | Grammar::Swift,
+            ) => true,
             (Self::TypeScript, Grammar::TypeScript | Grammar::Tsx) => true,
             (Self::TypeScript, Grammar::Rust) => false,
             (Self::Rust, Grammar::Rust) => true,
@@ -70,9 +71,7 @@ impl SourceLanguage {
             (Self::Java, Grammar::Java) => true,
             (Self::Java, Grammar::TypeScript | Grammar::Tsx | Grammar::Rust) => false,
             (Self::TypeScript | Self::Rust | Self::Swift, Grammar::Java) => false,
-            // Swift はチャンクを切り出せるが、正規化トークンの表に Swift の種別がまだ無いので、
-            // `auto` でも走査に入れない
-            (Self::Auto | Self::TypeScript | Self::Rust | Self::Java, Grammar::Swift) => false,
+            (Self::TypeScript | Self::Rust | Self::Java, Grammar::Swift) => false,
         }
     }
 }
@@ -255,13 +254,13 @@ mod tests {
     }
 
     #[test]
-    fn test_source_language_auto_does_not_accept_swift_yet() {
-        // 対照は Rust。正規化トークンの表に Swift の種別がまだ無いので、`auto` が拾うと
-        // Swift の種別を表に持たないトークン列のまま候補を数える
-        assert!(SourceLanguage::Auto.accepts(Grammar::Rust));
-        assert!(!SourceLanguage::Auto.accepts(Grammar::Swift));
+    fn test_source_language_other_than_swift_and_auto_does_not_accept_swift() {
+        // 対照は `SourceLanguage::Swift`。`auto` と同じ受け付ける腕へ写し違えると、
+        // `--lang ts` / `--lang rust` / `--lang java` の走査に Swift のチャンクが混ざる
+        assert!(SourceLanguage::Swift.accepts(Grammar::Swift));
         assert!(!SourceLanguage::TypeScript.accepts(Grammar::Swift));
         assert!(!SourceLanguage::Rust.accepts(Grammar::Swift));
+        assert!(!SourceLanguage::Java.accepts(Grammar::Swift));
     }
 
     #[test]
@@ -388,6 +387,21 @@ mod tests {
         assert_eq!(
             relative_paths_of(&root, &paths),
             vec!["Discount.java", "a.rs", "a.ts", "b.rs", "b.ts"]
+        );
+    }
+
+    #[test]
+    fn test_source_paths_of_auto_includes_swift_files() {
+        // `auto` が `.swift` を拾わないと、CLI が sourcekit-lsp を選んでも `scan --lang auto` では
+        // Swift の候補ペアが 1 組もできない。同じディレクトリの `.ts` / `.rs` も一緒に集める
+        let root = fixture("swift-scan/Sources");
+
+        let paths =
+            source_paths_of(&root, SourceLanguage::Auto).expect("フィクスチャのディレクトリはある");
+
+        assert_eq!(
+            relative_paths_of(&root, &paths),
+            vec!["App/Rate.swift", "App/rate.rs", "App/rate.ts"]
         );
     }
 

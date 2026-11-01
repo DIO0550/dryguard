@@ -325,15 +325,25 @@ fn test_swift_scan_separates_two_swiftpm_targets_by_their_directories() {
 
 #[test]
 fn test_auto_scan_does_not_compare_swift_with_typescript() {
-    // `auto` が `.swift` を集めない今の振る舞いを固定する（理由は `codebase::SourceLanguage`）
+    // `auto` は `.swift` と `.ts` を両方集める。言語をまたぐ組を作ると、Swift の 6 チャンクの組
+    // （6C2 = 15）に `.ts` の 1 チャンクとの 6 組が足されて 21 になる
     let scan = swift_package_scan_of(SourceLanguage::Auto, TestFunctions::Excluded);
 
-    assert_eq!(scan.file_count(), 1, "`.ts` だけを集める");
-    assert_eq!(scan.chunk_count(), 1);
+    assert_eq!(
+        scan.file_count(),
+        5,
+        "`.swift` の 4 つと `.ts` の 1 つを集める"
+    );
+    assert_eq!(scan.chunk_count(), 7);
     assert_eq!(
         scan.compared_pair_count(),
-        0,
-        "チャンクが `.ts` の 1 つだけなので、組を作らない"
+        15,
+        "Swift のチャンクどうしだけを組にし、`.ts` のチャンクとは組を作らない"
+    );
+    assert_eq!(
+        scan.excluded_test_function_count(),
+        2,
+        "`auto` でも `@Test` と XCTest のメソッドを 1 つずつ外す"
     );
 }
 
