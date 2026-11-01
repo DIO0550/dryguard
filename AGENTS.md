@@ -242,6 +242,7 @@ cargo run -- compare <locA> <locB>          # 実行
 cargo fmt                                   # フォーマット
 cargo fmt --check                           # フォーマット検査（CI と同じ）
 cargo clippy --all-targets -- -D warnings   # Lint（テストコードも対象・警告をエラー扱い）
+RUSTDOCFLAGS="-D rustdoc::private_intra_doc_links" cargo doc --no-deps  # doc 検査（CI と同じ）
 cargo test                                  # テスト
 bash harness/githooks/pre-push              # push 前の検査をまとめて走らせる
 bash harness/ci/pr-body-diff-test.sh        # PR 本文の差分規模を突き合わせる検査のテスト

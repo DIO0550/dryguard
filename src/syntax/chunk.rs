@@ -357,7 +357,7 @@ pub struct FileChunks {
 /// **外す既定を持たない。** 既定は入口（`scan` の `--include-tests`）が決め、
 /// `compare` は位置を名指ししているので外さない（[`Chunk::find_enclosing`] は見ない）。
 ///
-/// TypeScript は呼び出しの綴りで見分ける（[`is_typescript_test_callback`]）。
+/// TypeScript は呼び出しの綴りで見分ける（`is_typescript_test_callback`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestFunctions {
     /// `test function` をチャンクにしない。数だけを残す。

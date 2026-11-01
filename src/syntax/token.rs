@@ -5,7 +5,7 @@
 //! （`docs/dryguard-plan.md`「Stage 1: 候補抽出」の Type-2 相当）。
 //! 名前そのものが要る判定（依存先のドメインなど）は `syntax::import` と Stage 2 / Stage 3 の担当。
 //!
-//! **正規化の粒度は [`normalization_of`] の表 1 箇所で決まる。** どこまで潰すかを
+//! **正規化の粒度は `normalization_of` の表 1 箇所で決まる。** どこまで潰すかを
 //! 後から変えられるようにするのが、Stage 1 を外部ツールへ委譲しない理由の 1 つ
 //! （`docs/dryguard-plan.md`「差別化ポイント」）。
 
@@ -256,14 +256,14 @@ impl TokenSequence {
         Some(Self(tokens))
     }
 
-    /// 比べるのに要る長さ（[`MINIMUM_TOKEN_COUNT`]）に届いているか。
+    /// 比べるのに要る長さ（`MINIMUM_TOKEN_COUNT`）に届いているか。
     pub fn is_long_enough_to_compare(&self) -> bool {
         self.0.len() >= MINIMUM_TOKEN_COUNT
     }
 
     /// 2 つのトークン列の似かた。1.0 が完全一致。
     ///
-    /// 長さ [`GRAM_LENGTH`] の並び（gram）を**出現回数を数えたまま**突き合わせ、
+    /// 長さ `GRAM_LENGTH` の並び（gram）を**出現回数を数えたまま**突き合わせ、
     /// 共通している分が合わせたうちの何割かを返す。
     ///
     /// **回数を数えるのは、同じ並びの繰り返し回数だけが違うペアを見分けるため。**
