@@ -31,6 +31,7 @@
 //! 残る型名は宣言の場所ごと比べる。開けないエイリアスは理由付きで測れないとする。
 //! Swift の候補は sourcekit-lsp へ尋ねる。`scan --lang auto` は `.swift` を走査しないので、
 //! 尋ねるのは `compare` で名指ししたときと `--lang swift` のとき。
+//! Java の候補は jdtls へ尋ねる。`scan` / `check` の `auto` は `.java` も走査する。
 //!
 //! `syntax` はチャンク化・AST 正規化・import 収集のすべてを tree-sitter の構文木から採る。
 //! 構造類似度は、正規化トークン列に現れる並びの重なりで測る。
