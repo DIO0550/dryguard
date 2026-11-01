@@ -96,8 +96,8 @@ pub(super) fn outcome_of(hover: &Hover) -> HoverOutcome {
 /// サーバごとに決まるので、ここでは選ばずに受け取る（サーバの指定は `lsp` が持つ）。
 pub(super) fn outcome_of_fences(hover: &Hover, fences: &[usize]) -> HoverOutcome {
     let HoverContents::Markup(content) = &hover.contents else {
-        // `MarkedString` は LSP 3.15 で非推奨になった形。今つないでいるサーバは
-        // どれも `Markup` を返すので、読める形は要る相手が現れたときに足す。
+        // `MarkedString` は LSP 3.15 で非推奨になった形。jdtls 1.63.0 だけがこれを返す
+        // （`{language: "java", value: 綴り}` を含む配列）。読む形はまだ足していない。
         // **黙って「答えが無かった」にはしない。**
         return HoverOutcome::Unreadable;
     };
