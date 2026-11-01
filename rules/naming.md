@@ -62,6 +62,7 @@ if structurally_similar && domains_differ { ... }
 | `array length` | Rust の配列型の要素数。宣言側で評価した整数で比較し、定数名や未評価の式の綴りは比較に使わない |
 | `array length correspondence` | ソースと hover の配列長の出現番号を持つ型構造が一致した組。出現の個数だけでは対応したと扱わない |
 | `generic alias` | Rust の型パラメータ・既定値・右辺を持ち、使用側の型引数を当てはめて展開する型エイリアス |
+| `enclosing type` | Swift のメンバー（メソッド・`init` / `deinit`）を直接囲む型（`extension` を含む）の名前。hover の綴りに出ないレシーバと `init` の値の型を足すのに使う（`Chunk::swift_enclosing_type`）。関数の本体の中の関数は持たない |
 | `impl header` | Rust メソッドが直接所属する impl の本体より前のソース。対象型・型変数・境界・実装トレイトを、そのスコープのまま運ぶ |
 | `accessor` | プロパティのように読み書きされるメンバーを実装する関数（`get` / `set`）。**チャンクとしては関数**だが、`hover` が返すのは**メンバーとしての型** |
 | `test function` | Rust のテスト属性（パス末尾が `test`）付き関数、Java の宣言直下の `modifiers` にある注釈の名前（修飾付きも綴り全体）が `Test` で終わるメソッド（`@Test` / `@ParameterizedTest` / `@org.junit.Test`。`@TestFactory` は当たらず、`@BeforeTest` は当たる。型パラメータの後ろの注釈は見ない）、TypeScript / TSX の `describe` / `it` / `test`（`.only` / `.skip` を含む）の第2引数に直接書いたアロー関数・関数式、または Swift の `@Test`（Swift Testing。`@Testing.Test` も末尾で見る）付きの関数と、`XCTestCase`（末尾で見る）を継承したクラスに直接書いた引数を取らない `func test…`（XCTest）。callback 側の透過ラッパーは辿るが、spread で位置が確定しない形・別名・namespace・未知の修飾は残す。TS は呼び出し名のヒューリスティックで、同名の業務 API も対象。Swift の XCTest は直接囲むクラスの継承だけを見るので、`extension` の中のメソッドと `XCTestCase` を間接に継承したクラスのメソッドは残る。**`scan` / `check` は既定でチャンクにしない**（`--include-tests` で入れる）。ファイル名や囲むテストでは判定せず（XCTest の継承の確かめは印の一部で、囲むテストによる判定ではない）、印の付かないヘルパー・内部の関数は残す |
@@ -124,7 +125,7 @@ if structurally_similar && domains_differ { ... }
 | `streaming limit` | 要求 1 本の応答・始まった作業の終わりを、通知を受け取りながら待つ合計の上限。**`silence limit` が捉えない、応答以外のもの（通知・サーバの要求）だけ、または 1 フレームの続きだけが少しずつ届き続けて終わらない形を有限にする安全網**で、待っているものでない 1 通を捌いた後と、フレームの途中で続きを受け取った後に確かめる（`lsp::framing` の `payload_of`）。フレームの途中で確かめるのは読み口から補充するたびなので、待っている応答・作業の終わりのフレームでも、上限を過ぎた後に 2 塊以上に分かれて届けば（上限の後に届き始めたものを含む）落とす。上限を過ぎてから戻るまでは、フレームの最初のバイトと続き 1 回分の受け取り（それぞれ `silence limit` まで）に収まる。`silence limit` の考え方（合計で切ると正常に遅いサーバを殺す）を覆さないよう、実測より桁違いに広く取る。尋ね直し（`progress` に触れた答えを捨てて尋ね直す）の全体ではなく、1 回の待ちごとに数える。超えたサーバは kill し、以後は送らずに断る（`lsp::connection` の `Connection::with_streaming_limit`）。語に `settle` を使わないのは、`progress` に触れない答えが得られることを指す「落ち着いた答え」（`settled_outcome_of`）とぶつかるため |
 | `intake limit` | こちらが送ったものを、サーバが受け取らないまま待つ上限。`silence limit` の書き込み側で、**フレーム全体ではなく、書き込みの 1 塊（パイプのバッファより小さい）が受け取られないまま待つ時間**で数える。超えたサーバは kill し、書き口が以後の書き込みを待たずに断る（`lsp::child_input` の `IntakeLimitedWriter`） |
 | `source position` | ファイルの中の 1 点。行と、**UTF-16 のコード単位で数えた**列 |
-| `signature text` | hover に由来する型の綴り。Rust の配列長をソースから復元した後も含み、引数名・型変数名などの**型構造の正規化前** |
+| `signature text` | hover に由来する型の綴り。Rust の配列長をソースから復元した後も含み、引数名・型変数名などの**型構造の正規化前**。Swift では引数の外部名（ラベル）と内部名の両方を含む（sourcekit-lsp は書かれたとおりに綴る） |
 | `type spelling` | 型 1 つ分の綴り。`signature text` を割った先の 1 つ（引数の型・戻り値の型・制約） |
 | `type reference` | チャンクのシグネチャに書かれた型名 1 つ分と、その位置。**解決前** |
 | `open` | 型名を宣言まで辿り、エイリアスの右辺の綴りを取ること |
@@ -136,11 +137,11 @@ if structurally_similar && domains_differ { ... }
 | `annotatable position` | チャンクの宣言が `type annotation` を省ける位置。**`value type` 1 つと、引数ごとに 1 つ**。TypeScript の引数は既定値を書くと省ける（Swift の引数は省けないので、いつも「書かれている」） |
 | `value type annotation` | `value type` の位置の `type annotation` |
 | `parameter annotation` | 引数 1 つ分の `type annotation`。**引数ごとに答えが違う** |
-| `site-dependent spelling` | **型名にならないのに、指す先が書かれた場所で決まる**綴り（`typeof localValue` / `{ [key]: string }` / `import("./local").T` / `this`）。型名のノードにならないので、尋ねる位置そのものを作れない。**Rust では直接囲む impl で置換できない Self を数える**。Self を含む関連型は末尾の位置を尋ね、解決できなければその理由を出す。impl の対象型へ置換できた Self / レシーバ（関連型 RHS の Self を含む）と、展開できた関連型は数えない |
+| `site-dependent spelling` | **型名にならないのに、指す先が書かれた場所で決まる**綴り（`typeof localValue` / `{ [key]: string }` / `import("./local").T` / `this`）。型名のノードにならないので、尋ねる位置そのものを作れない。**Rust では直接囲む impl で置換できない Self を数える**。Self を含む関連型は末尾の位置を尋ね、解決できなければその理由を出す。impl の対象型へ置換できた Self / レシーバ（関連型 RHS の Self を含む）と、展開できた関連型は数えない。**Swift では `Self` を数える**（プロトコルの拡張では採用する型ごとに違う） |
 | `bound value name` | そのシグネチャの引数が束縛した値の名前。`typeof x` の `x` がこれなら、指す先は**書かれた場所ではなくシグネチャ**が決める。**比較に残る形には持ち込まない**（引数の名前は型を変えない） |
-| `type structure` | `type spelling` を構文木から読んだ形。**書かれ方の違い**（括弧・引数名・タプルのラベル・共用体の並び）を落としてある |
+| `type structure` | `type spelling` を構文木から読んだ形。**書かれ方の違い**（括弧・引数名・タプルのラベル・共用体の並び）を落としてある。**Swift は引数のラベルを残し、内部名を落とす**（`syntax::swift_callable`）。省略形（`T?` / `[T]` / `[K: V]` / `()`）は、標準ライブラリを指すと辿れた名前の形と同じにする |
 | `callable` | 呼べる型（関数型・構築型）1 つ分の `type structure`。型変数・引数・戻り値を持つ |
-| `trait bound` | 型（多くは関数が束縛した型変数）に課された、満たすべきトレイト 1 つ。**左辺の型と境界 1 つの組**で持ち、inline と `where` の書き分け・`+` の並び・同じ左辺への述語の分け方を落としてある（`syntax::rust_callable`） |
+| `trait bound` | 型（多くは関数が束縛した型変数）に課された、満たすべきトレイト 1 つ。**左辺の型と境界 1 つの組**で持ち、inline と `where` の書き分け・`+` の並び・同じ左辺への述語の分け方を落としてある（`syntax::rust_callable`）。Swift の境界（プロトコルへの準拠と `==`）も同じ形で持ち、`P & Q` は 2 つの組に割る（`syntax::swift_callable`） |
 | `spelled type` | `type structure` のうち、**分解せず綴りのまま持つ**もの。比較も綴りで行う |
 | `chunk type` | チャンクが外から使われる形。呼べる型（`callable`）・読める型（getter）・書ける型（setter）のどれか |
 | `type signature` | `chunk type` から引数名を落とし、型変数を出現順に付け替えた形。**正規化後** |
@@ -275,6 +276,17 @@ Java はフィールドとメソッドの名前も `identifier` なので、**�
 （rust-analyzer 1.94.1 で実測: `T: Display + Clone` と `T: Clone + Display` は別の綴りで返る）。
 どれも同じ要求の書き分けなので、綴りのまま比べると**同じ境界の 2 つが単一化不能に出る**。
 境界を落とすと、要求している能力の違う 2 つ（`T: Display` と `T: Serialize`）が単一化可能に出る。
+
+**Swift の引数のラベルを `type structure` に残す。** `func move(to x: Int)` の `to` は
+呼び出しの綴り（`move(to: 1)`）の一部で、`_` で消せる。落とすと**ラベルだけ違う 2 つが単一化可能に出る**が、
+呼び出し側は綴りを書き換えない限り差し替えられない（偽陽性）。内部名は本体の中でだけ意味を持つので
+落とす（TypeScript・Rust の引数名と同じ）。外部名を書かなければ内部名がそのままラベルになるので、
+`f(x: Int)` と `f(x y: Int)` は重なり、`f(_ x: Int)` とは重ならない。**関数型の引数の名前は落とす** —
+Swift の関数型はラベルを持てない（`(_ x: Int) -> Int` の `x` は書き手の覚え書き）。
+
+**Swift の省略形を、名前で書いた形と同じにするのは標準ライブラリを指すと辿れたときだけ。**
+`Optional` / `Array` / `Dictionary` / `Void` は予約語ではなく、利用者のモジュールが宣言し直せる。
+名前の綴りだけで省略形と重ねると、宣言し直した `Optional<Int>` と `Int?` が単一化可能に出る。
 
 **ライフタイムは `'static` を除いて落とす。** 省略した綴り（`fn(x: &str) -> &str`）と
 書いた綴り（`fn<'a>(x: &'a str) -> &'a str`）は同じシグネチャだが、hover は書かれたとおりに
