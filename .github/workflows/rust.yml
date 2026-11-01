@@ -55,6 +55,13 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # 公開項目の doc から非公開項目へ intra-doc link を張ると、リンクが解決しない。
+      # 他の rustdoc の警告までは落とさない（`broken_intra_doc_links` が 1 件残っている）。
+      - name: cargo doc
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D rustdoc::private_intra_doc_links
+
       - name: cargo test
         run: cargo test
 

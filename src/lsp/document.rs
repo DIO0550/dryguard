@@ -34,7 +34,7 @@ impl SourceDocument {
     /// `text` を渡してもらうのは、ファイルを読むのが `codebase` / `location` の責務のため
     /// (rules/coding.md「I/O を持ってよい場所」)。**サーバへ渡す URI は絶対パスでなければ
     /// ならない**ので、ここでは渡されたパスを絶対パスに直すところまでを行う
-    /// （リンクは辿らない。理由は [`uri::absolute_path_of`]）。
+    /// （リンクは辿らない。理由は `uri::absolute_path_of`）。
     ///
     /// # Errors
     ///

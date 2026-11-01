@@ -26,5 +26,8 @@ cargo fmt --check
 echo "pre-push: clippy"
 cargo clippy --all-targets -- -D warnings
 
+echo "pre-push: doc"
+RUSTDOCFLAGS="-D rustdoc::private_intra_doc_links" cargo doc --no-deps
+
 echo "pre-push: test"
 cargo test
