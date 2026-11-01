@@ -132,15 +132,18 @@ jobs:
           echo "$swift_bin" >> "$GITHUB_PATH"
           "$swift_bin/sourcekit-lsp" --help > /dev/null
 
-      # jdtls は配布物の `bin/jdtls`（Python 3 のラッパ）で起動する。ラッパは JAVA_HOME の java を選び、
-      # 21 より前なら起動を断る（1.63.0 の `jdtls.py`）。ランナーの既定の java は 21 とは限らないので、
-      # イメージが持つ 21 を JAVA_HOME に出す。
+      # jdtls は配布物の `bin/jdtls`（Python 3 のラッパ）で起動する。ラッパは JAVA_HOME の java を選ぶ。
       #
-      # Why not（actions/setup-java）: ランナーのイメージに JDK 21 が入っているので、取ってくる段を増やさない。
+      # **JDK は 25 を使う。** ラッパの版の検査は 21 以上で通すが、1.63.0 の同梱バンドル
+      # （org.eclipse.core.filesystem など）は `osgi.ee=JavaSE 25` を要求し、21 では解決できずに
+      # 「An error has occurred. See the log file」を標準出力に出して終わる（Temurin 21.0.13 で実測）。
+      #
+      # Why not（actions/setup-java）: ランナーのイメージに JDK 25 が入っているので、取ってくる段を増やさない。
       - name: jdtls
         run: |
-          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
-          "$JAVA_HOME_21_X64/bin/java" -version
+          test -n "$JAVA_HOME_25_X64"
+          echo "JAVA_HOME=$JAVA_HOME_25_X64" >> "$GITHUB_ENV"
+          "$JAVA_HOME_25_X64/bin/java" -version
           python3 --version
           # 版と配布物の中身を固定する（rust-analyzer と同じ形）。
           curl --fail --location --silent --show-error --retry 3 \
