@@ -36,6 +36,7 @@ pub mod line_range;
 pub mod module_distance;
 pub(crate) mod rust_callable;
 pub(crate) mod rust_test_scope;
+pub(crate) mod swift_callable;
 pub mod token;
 pub mod tree;
 pub mod type_reference;
