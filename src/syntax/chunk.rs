@@ -21,6 +21,7 @@ use crate::syntax::import::{ImportSet, ImportsUnavailable};
 use crate::syntax::leaf_divergence::ChunkLeaves;
 use crate::syntax::line_range::LineRange;
 use crate::syntax::rust_callable;
+use crate::syntax::swift_callable;
 use crate::syntax::token::TokenSequence;
 use crate::syntax::tree::{
     Grammar, SyntaxTree, source_position_of, transparent_wrappers_of, unwrapped_parent_of,
@@ -47,6 +48,7 @@ pub struct Chunk {
     overload_declarations: Vec<OverloadDeclaration>,
     type_references: Vec<TypeReference>,
     rust_impl_header: Option<String>,
+    swift_enclosing_type: Option<String>,
     source: String,
     tokens: Option<TokenSequence>,
     leaves: ChunkLeaves,
@@ -200,13 +202,19 @@ impl Chunk {
             type_references: match grammar {
                 Grammar::TypeScript | Grammar::Tsx => chunk_type_references_of(node, source),
                 Grammar::Rust => rust_callable::type_references_of(node, source),
+                Grammar::Swift => swift_type_references_of(node, source),
                 // 集めない。Java は綴りを読む側がまだ無く、`pipeline` が hover を送らずに
                 // 「尋ねていない」と答えるので、ここが空でも答えには効かない
-                Grammar::Java | Grammar::Swift => Vec::new(),
+                Grammar::Java => Vec::new(),
             },
             rust_impl_header: match grammar {
                 Grammar::Rust => rust_callable::impl_header_of(node, source),
                 Grammar::TypeScript | Grammar::Tsx | Grammar::Java | Grammar::Swift => None,
+            },
+            swift_enclosing_type: match grammar {
+                Grammar::Swift => swift_callable::enclosing_type_reference_of(node, source)
+                    .map(|reference| reference.name().to_owned()),
+                Grammar::TypeScript | Grammar::Tsx | Grammar::Rust | Grammar::Java => None,
             },
             source: source_of_lines(source, lines),
             tokens: TokenSequence::from_node(node),
@@ -218,6 +226,18 @@ impl Chunk {
             ),
             imports,
         }
+    }
+
+    /// Swift のメンバーを直接囲む型（`extension` を含む）の名前。それ以外は `None`。
+    ///
+    /// **hover の綴りに出ない型を運ぶ。** sourcekit-lsp はメソッドのレシーバも、`init` が
+    /// 初期化する型も綴らない（`init(base: Int)`）。型名の位置は [`Chunk::type_references`] に
+    /// 入れてあり、ここは綴りに差し込む名前だけを持つ。
+    ///
+    /// **Why not（`type_references` の先頭に置いて区別する）**: 並びに意味を持たせると、
+    /// 集める順を変えたときに黙ってレシーバを取り違える。
+    pub fn swift_enclosing_type(&self) -> Option<&str> {
+        self.swift_enclosing_type.as_deref()
     }
 
     /// Rust メソッドが直接所属する impl のヘッダー。それ以外は `None`。
@@ -929,11 +949,27 @@ fn swift_name_node_of(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name(NAME_FIELD)
 }
 
+/// Swift のチャンクのシグネチャに書かれた型名と、メンバーを直接囲む型の名前。
+///
+/// **囲む型も尋ねる。** hover の綴りには出ないが、`syntax::swift_callable` がレシーバ・
+/// `init` の値の型として綴りに足すので、比較に残る型名になる。
+fn swift_type_references_of(node: Node<'_>, source: &str) -> Vec<TypeReference> {
+    let mut references = swift_callable::type_references_of(node, source);
+    if let Some(enclosing) = swift_callable::enclosing_type_reference_of(node, source)
+        && !references
+            .iter()
+            .any(|reference| reference.name() == enclosing.name())
+    {
+        references.push(enclosing);
+    }
+    references
+}
+
 /// Swift のチャンクが、注釈を省ける位置それぞれに注釈を書いたか。
 ///
 /// 引数の型は省けないので、引数はどれも「書かれている」。省けるのは関数の戻り値だけ
 /// （省くと `Void`）。省いた戻り値は推論ではなく `Void` に決まるが、書いたかどうかを構文のまま
-/// 運び、綴りに `Void` が現れたときの扱いは hover の綴りを読む側で決める。`init` / `deinit` は戻り値を**注釈できない**位置で、`init` は囲む型の
+/// 運ぶ。型シグネチャの側は省いた戻り値を `()` と読み、この答えを使わない（`syntax::swift_callable`）。`init` / `deinit` は戻り値を**注釈できない**位置で、`init` は囲む型の
 /// 宣言が値の型を書いているので「書かれている」に数える（TypeScript のコンストラクタと同じ）。
 fn swift_annotated_positions_of(node: Node<'_>) -> AnnotatedPositions {
     let omits_return_type =
