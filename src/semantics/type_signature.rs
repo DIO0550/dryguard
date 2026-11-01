@@ -24,7 +24,7 @@ use crate::semantics::resolved_type::{
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{AnnotatedPositions, OverloadDeclaration, TypeAnnotation};
 use crate::syntax::rust_callable::RustCallable;
-use crate::syntax::swift_callable::SwiftCallable;
+use crate::syntax::swift_callable::{SwiftCallable, SwiftEnclosingType};
 use crate::syntax::type_reference::TypeReference;
 use crate::syntax::type_spelling::{names_only_types, substituted_spelling_of, type_name_spans_of};
 use crate::syntax::type_structure::{Callable, SignatureKind, TypeStructure};
@@ -416,7 +416,7 @@ pub fn swift_type_signature_outcome_of(
     document: &SourceDocument,
     position: SourcePosition,
     type_references: &[TypeReference],
-    enclosing_type: Option<&str>,
+    enclosing_type: Option<&SwiftEnclosingType>,
 ) -> Result<TypeSignatureOutcome, ClientError> {
     let signature_text = match asked_signature_text_of(session, document, position)? {
         Ok(signature_text) => signature_text,
@@ -442,7 +442,7 @@ pub fn swift_type_signature_outcome_of(
 pub fn swift_normalized_outcome_of(
     signature_text: &SignatureText,
     traced: &TracedTypeNames,
-    enclosing_type: Option<&str>,
+    enclosing_type: Option<&SwiftEnclosingType>,
 ) -> TypeSignatureOutcome {
     let is_standard = |name: &str| {
         traced.declared().iter().any(|declaration| {
@@ -4166,7 +4166,7 @@ mod tests {
             swift_normalized_outcome_of(
                 &signature_text("func copy() -> Self"),
                 &traced,
-                Some("Wallet")
+                Some(&SwiftEnclosingType::Named("Wallet".to_owned()))
             ),
             TypeSignatureOutcome::SiteDependentSpelling
         );

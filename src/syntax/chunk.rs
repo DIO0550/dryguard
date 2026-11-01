@@ -21,7 +21,7 @@ use crate::syntax::import::{ImportSet, ImportsUnavailable};
 use crate::syntax::leaf_divergence::ChunkLeaves;
 use crate::syntax::line_range::LineRange;
 use crate::syntax::rust_callable;
-use crate::syntax::swift_callable;
+use crate::syntax::swift_callable::{self, SwiftEnclosingType};
 use crate::syntax::token::TokenSequence;
 use crate::syntax::tree::{
     Grammar, SyntaxTree, source_position_of, transparent_wrappers_of, unwrapped_parent_of,
@@ -48,7 +48,7 @@ pub struct Chunk {
     overload_declarations: Vec<OverloadDeclaration>,
     type_references: Vec<TypeReference>,
     rust_impl_header: Option<String>,
-    swift_enclosing_type: Option<String>,
+    swift_enclosing_type: Option<SwiftEnclosingType>,
     source: String,
     tokens: Option<TokenSequence>,
     leaves: ChunkLeaves,
@@ -212,8 +212,7 @@ impl Chunk {
                 Grammar::TypeScript | Grammar::Tsx | Grammar::Java | Grammar::Swift => None,
             },
             swift_enclosing_type: match grammar {
-                Grammar::Swift => swift_callable::enclosing_type_reference_of(node, source)
-                    .map(|reference| reference.name().to_owned()),
+                Grammar::Swift => swift_callable::enclosing_type_of(node, source),
                 Grammar::TypeScript | Grammar::Tsx | Grammar::Rust | Grammar::Java => None,
             },
             source: source_of_lines(source, lines),
@@ -228,7 +227,7 @@ impl Chunk {
         }
     }
 
-    /// Swift のメンバーを直接囲む型（`extension` を含む）の名前。それ以外は `None`。
+    /// Swift のメンバーを直接囲む型（`extension` を含む）。それ以外は `None`。
     ///
     /// **hover の綴りに出ない型を運ぶ。** sourcekit-lsp はメソッドのレシーバも、`init` が
     /// 初期化する型も綴らない（`init(base: Int)`）。型名の位置は [`Chunk::type_references`] に
@@ -236,8 +235,8 @@ impl Chunk {
     ///
     /// **Why not（`type_references` の先頭に置いて区別する）**: 並びに意味を持たせると、
     /// 集める順を変えたときに黙ってレシーバを取り違える。
-    pub fn swift_enclosing_type(&self) -> Option<&str> {
-        self.swift_enclosing_type.as_deref()
+    pub fn swift_enclosing_type(&self) -> Option<&SwiftEnclosingType> {
+        self.swift_enclosing_type.as_ref()
     }
 
     /// Rust メソッドが直接所属する impl のヘッダー。それ以外は `None`。

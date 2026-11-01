@@ -71,6 +71,12 @@ const PARAMETER_MODIFIERS_KIND: &str = "parameter_modifiers";
 /// `throws` / `rethrows`。
 const THROWS_KIND: &str = "throws";
 
+/// `rethrows` の綴り。
+const RETHROWS_TOKEN: &str = "rethrows";
+
+/// 型に付いた属性（`@Sendable` / `@MainActor`）。
+const TYPE_MODIFIERS_KIND: &str = "type_modifiers";
+
 /// typed throws（`throws(MyError)`）。**読まない**（下の [`SwiftCallable::from_spelling`]）。
 const THROWS_CLAUSE_KIND: &str = "throws_clause";
 
@@ -201,8 +207,30 @@ struct SwiftParameter {
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct SwiftEffects {
     asynchronous: bool,
-    /// `throws` / `rethrows`。投げなければ `None`。
-    throwing: Option<String>,
+    /// 投げなければ `None`。
+    throwing: Option<Throwing>,
+}
+
+/// 投げ方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Throwing {
+    /// `throws`。
+    Throws,
+    /// `rethrows`。引数のクロージャが投げたときだけ投げるので、`throws` と重ねない。
+    Rethrows,
+}
+
+/// メンバーを直接囲む型。
+///
+/// **制約付きの `extension` を名前と分ける。** `extension Array where Element == Int` の
+/// メンバーのレシーバは `Array<Int>` で、名前（`Array`）だけで持つと `Element == Double` の
+/// 拡張のメンバーと重なる（偽陽性）。制約を型として読む側はまだ無いので、読まない側へ倒す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwiftEnclosingType {
+    /// 名前だけで決まる型。`extension` に書かれたパスの綴りを含む（`Shop.Wallet`）。
+    Named(String),
+    /// `where` の付いた `extension`、または型引数を書いた `extension`（`extension Array<Int>`）。
+    Constrained,
 }
 
 /// 境界 1 つの関係。
@@ -256,16 +284,21 @@ impl SwiftCallable {
     /// `is_standard` は、省略形を持つ名前（[`STANDARD_SUGAR_NAMES`]）の型名が
     /// **標準ライブラリの宣言を指すと確かめられたか**を答える。確かめられなければ、
     /// その名前は利用者の型として型名に残る（`Optional` を宣言し直したモジュールもありうる）。
-    /// `enclosing_type` は、そのメンバーを直接囲む型の名前（`Chunk::swift_enclosing_type`）。
+    /// `enclosing_type` は、そのメンバーを直接囲む型（`Chunk::swift_enclosing_type`）。
     /// 型の外の関数では `None`。
     ///
     /// **読めない形は `None`**（偽陰性側）: typed throws（`throws(E)`）、未知の型の構文、
-    /// 囲む型の分からない `init` / `deinit`。
+    /// 囲む型の分からない `init` / `deinit`、制約付きの `extension` のメンバー。
     pub(crate) fn from_spelling(
         spelling: &str,
         is_standard: &dyn Fn(&str) -> bool,
-        enclosing_type: Option<&str>,
+        enclosing_type: Option<&SwiftEnclosingType>,
     ) -> Option<Self> {
+        let enclosing_name = match enclosing_type {
+            None => None,
+            Some(SwiftEnclosingType::Named(name)) => Some(name.as_str()),
+            Some(SwiftEnclosingType::Constrained) => return None,
+        };
         let wrapped = format!("{MEMBER_WRAPPER_START}{spelling}{MEMBER_WRAPPER_END}");
         let tree = SyntaxTree::from_source(&wrapped, Grammar::Swift).ok()?;
         if tree.has_error() {
@@ -278,7 +311,7 @@ impl SwiftCallable {
 
         let mut reader = SwiftSpelling::new(&wrapped, is_standard);
         let mut callable = reader.callable_of(declaration)?;
-        let enclosing = enclosing_type.map(|name| {
+        let enclosing = enclosing_name.map(|name| {
             reader.note_type_name(name);
             SwiftType::Named(
                 name.split('.')
@@ -360,20 +393,41 @@ pub(crate) fn type_references_of(function: Node<'_>, source: &str) -> Vec<TypeRe
     reader.references
 }
 
-/// そのメンバーを直接囲む型の名前と、その位置。型のメンバーでなければ `None`。
+/// そのメンバーを直接囲む型。型のメンバーでなければ `None`。
 ///
-/// **`extension` も囲む型に数える。** 名前は `extension` に書かれたパスの綴りで、
-/// 型の宣言のほうは名前の識別子 1 つ。どちらの位置から辿っても型の宣言へ届く。
+/// 制約付きの `extension` は名前を持たない [`SwiftEnclosingType::Constrained`] にする。
+pub(crate) fn enclosing_type_of(function: Node<'_>, source: &str) -> Option<SwiftEnclosingType> {
+    let declaration = enclosing_declaration_of(function)?;
+    let name = declaration.child_by_field_name("name")?;
+    let constrained_by_where = !children_of_kind(declaration, TYPE_CONSTRAINTS_KIND).is_empty();
+    let constrained_by_arguments = !children_of_kind(name, TYPE_ARGUMENTS_KIND).is_empty();
+    if constrained_by_where || constrained_by_arguments {
+        return Some(SwiftEnclosingType::Constrained);
+    }
+    let reference = enclosing_type_reference_of(function, source)?;
+    Some(SwiftEnclosingType::Named(reference.name().to_owned()))
+}
+
+/// メンバーを直接囲む型の宣言（`extension` を含む）。
+///
 /// 関数の本体の中の関数は、型の本体の直下に無いので囲む型を持たない。
-pub(crate) fn enclosing_type_reference_of(
-    function: Node<'_>,
-    source: &str,
-) -> Option<TypeReference> {
+fn enclosing_declaration_of(function: Node<'_>) -> Option<Node<'_>> {
     let body = function.parent()?;
     if !TYPE_BODY_KINDS.contains(&body.kind()) {
         return None;
     }
-    let declaration = body.parent()?;
+    body.parent()
+}
+
+/// そのメンバーを直接囲む型の名前と、その位置。型のメンバーでなければ `None`。
+///
+/// **`extension` も囲む型に数える。** 名前は `extension` に書かれたパスの綴りで、
+/// 型の宣言のほうは名前の識別子 1 つ。どちらの位置から辿っても型の宣言へ届く。
+pub(crate) fn enclosing_type_reference_of(
+    function: Node<'_>,
+    source: &str,
+) -> Option<TypeReference> {
+    let declaration = enclosing_declaration_of(function)?;
     let name = declaration.child_by_field_name("name")?;
     let named = |node: Node<'_>| source.get(node.byte_range()).map(str::to_owned);
     match name.kind() {
@@ -474,10 +528,7 @@ impl<'source> SwiftSpelling<'source> {
             }
         }
 
-        let value_type = match declaration.child_by_field_name(RETURN_TYPE_FIELD) {
-            Some(written) => self.type_of(written)?,
-            None => SwiftType::Tuple(Vec::new()),
-        };
+        let value_type = self.value_type_of(declaration)?;
 
         let mut constraints = BTreeSet::new();
         for list in children
@@ -500,7 +551,7 @@ impl<'source> SwiftSpelling<'source> {
             }
         }
 
-        // 使われない型変数も数える。番号は使われたものの後ろに宣言順で振る
+        // 使われない型変数も数える（`f<T>()` の呼び方が変わる）
         let type_parameter_count = self.declared.len();
 
         Some(SwiftCallable {
@@ -515,6 +566,28 @@ impl<'source> SwiftSpelling<'source> {
             type_names: BTreeSet::new(),
             refers_to_self: false,
         })
+    }
+
+    /// 戻り値の型。省けば `()`。
+    ///
+    /// **`-> Int!` の `!` は戻り値のフィールドに付く別の子になる**（tree-sitter-swift 0.7）。
+    /// 先頭の 1 つだけを読むと `-> Int` と重なる。
+    /// **型に付いた属性（`-> @Sendable () -> Void`）は読まない**（`None`）。
+    fn value_type_of(&mut self, declaration: Node<'_>) -> Option<SwiftType> {
+        let Some(written) = declaration.child_by_field_name(RETURN_TYPE_FIELD) else {
+            return Some(SwiftType::Tuple(Vec::new()));
+        };
+        if written.kind() == TYPE_MODIFIERS_KIND {
+            return None;
+        }
+        let value = self.type_of(written)?;
+        let unwrapped = written.next_sibling().is_some_and(|next| {
+            !next.is_named() && self.text(next) == Some(IMPLICITLY_UNWRAPPED_TOKEN)
+        });
+        if unwrapped {
+            return Some(SwiftType::ImplicitlyUnwrapped(Box::new(value)));
+        }
+        Some(value)
     }
 
     /// 宣言の字句（`func` / `init` / `deinit`）より前の修飾子。可視性は落とす。
@@ -578,12 +651,16 @@ impl<'source> SwiftSpelling<'source> {
         })
     }
 
+    /// 引数・関数型の引数に付いた修飾子と属性。
+    ///
+    /// **`type_modifiers` も読む。** tree-sitter-swift は `@MainActor` / `@Sendable` と、
+    /// それらの後ろに書いた `@escaping` を `parameter_modifiers` ではなく `type_modifiers` に置く。
+    /// 読み落とすと `@MainActor @escaping () -> Void` が `() -> Void` と重なる。
     fn parameter_modifiers_of(&self, children: &[Node<'_>]) -> Option<BTreeSet<String>> {
         let mut modifiers = BTreeSet::new();
-        for list in children
-            .iter()
-            .filter(|child| child.kind() == PARAMETER_MODIFIERS_KIND)
-        {
+        for list in children.iter().filter(|child| {
+            child.kind() == PARAMETER_MODIFIERS_KIND || child.kind() == TYPE_MODIFIERS_KIND
+        }) {
             let mut cursor = list.walk();
             for modifier in list.named_children(&mut cursor) {
                 modifiers.insert(collapsed(self.text(modifier)?));
@@ -827,6 +904,13 @@ impl<'source> SwiftSpelling<'source> {
 
     fn function_type_of(&mut self, node: Node<'_>) -> Option<SwiftType> {
         let children = all_children_of(node);
+        // 戻り値の型に付いた属性（`() -> @Sendable () -> Void`）は読まない
+        if children
+            .iter()
+            .any(|child| child.kind() == TYPE_MODIFIERS_KIND)
+        {
+            return None;
+        }
         let parameter_list = node.child_by_field_name("params")?;
         let mut parameters = Vec::new();
         let mut cursor = parameter_list.walk();
@@ -891,8 +975,10 @@ fn effects_of(children: &[Node<'_>], source: &str) -> SwiftEffects {
         throwing: children
             .iter()
             .find(|child| child.kind() == THROWS_KIND)
-            .and_then(text)
-            .map(str::to_owned),
+            .map(|throws| match text(throws) {
+                Some(RETHROWS_TOKEN) => Throwing::Rethrows,
+                _ => Throwing::Throws,
+            }),
     }
 }
 
@@ -919,7 +1005,6 @@ fn is_type_kind(kind: &str) -> bool {
         "opaque_type",
         "existential_type",
         "protocol_composition_type",
-        "metatype",
     ]
     .contains(&kind)
 }
@@ -984,7 +1069,12 @@ mod tests {
     }
 
     fn method_of(spelling: &str, enclosing: &str) -> SwiftCallable {
-        SwiftCallable::from_spelling(spelling, &standard, Some(enclosing)).expect("読める綴り")
+        SwiftCallable::from_spelling(
+            spelling,
+            &standard,
+            Some(&SwiftEnclosingType::Named(enclosing.to_owned())),
+        )
+        .expect("読める綴り")
     }
 
     #[test]
@@ -1139,6 +1229,38 @@ mod tests {
     }
 
     #[test]
+    fn test_from_spelling_keeps_attributes_written_on_a_function_type() {
+        // tree-sitter-swift は `@MainActor` / `@Sendable` を `type_modifiers` に、先頭の
+        // `@escaping` を `parameter_modifiers` に置く。どちらも呼び出しの約束を変える
+        let plain = callable_of("func f(y: () -> Void)");
+
+        assert_ne!(
+            callable_of("func f(y: @MainActor @escaping () -> Void)"),
+            plain
+        );
+        assert_ne!(
+            callable_of("func f(y: @MainActor @escaping () -> Void)"),
+            callable_of("func f(y: @escaping () -> Void)")
+        );
+        assert_ne!(
+            callable_of("func f(y: @escaping @Sendable () -> Void)"),
+            callable_of("func f(y: @escaping () -> Void)")
+        );
+        assert_ne!(
+            callable_of("func f(w: (@Sendable () -> Void) -> Int)"),
+            callable_of("func f(w: (() -> Void) -> Int)")
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_does_not_read_an_implicitly_unwrapped_return_as_plain() {
+        assert_ne!(
+            callable_of("func f() -> Int!"),
+            callable_of("func f() -> Int")
+        );
+    }
+
+    #[test]
     fn test_from_spelling_keeps_whether_a_parameter_has_a_default_value() {
         assert_eq!(
             callable_of("func f(x: Int = 3)"),
@@ -1218,6 +1340,20 @@ mod tests {
     fn test_from_spelling_does_not_read_an_initializer_without_its_enclosing_type() {
         assert_eq!(
             SwiftCallable::from_spelling("init(base: Int)", &standard, None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_does_not_read_a_member_of_a_constrained_extension() {
+        // `extension Array where Element == Int` のレシーバは `Array<Int>`。名前だけでは
+        // `Element == Double` の拡張のメソッドと重なる
+        assert_eq!(
+            SwiftCallable::from_spelling(
+                "func total() -> Int",
+                &standard,
+                Some(&SwiftEnclosingType::Constrained)
+            ),
             None
         );
     }
@@ -1347,6 +1483,32 @@ mod tests {
                 FUNCTION_KIND
             ),
             Some("Coin".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_enclosing_type_of_a_constrained_extension_is_constrained() {
+        let enclosing_of = |source: &str| {
+            let tree = SyntaxTree::from_source(source, Grammar::Swift).expect("Swift の木にできる");
+            let member = tree
+                .named_descendants()
+                .into_iter()
+                .find(|node| node.kind() == FUNCTION_KIND)
+                .expect("メンバーがある");
+            enclosing_type_of(member, source)
+        };
+
+        assert_eq!(
+            enclosing_of("extension Array where Element == Int {\n    func f() {}\n}\n"),
+            Some(SwiftEnclosingType::Constrained)
+        );
+        assert_eq!(
+            enclosing_of("extension Array<Int> {\n    func f() {}\n}\n"),
+            Some(SwiftEnclosingType::Constrained)
+        );
+        assert_eq!(
+            enclosing_of("extension Array {\n    func f() {}\n}\n"),
+            Some(SwiftEnclosingType::Named("Array".to_owned()))
         );
     }
 
