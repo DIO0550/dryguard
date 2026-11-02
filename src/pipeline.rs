@@ -39,7 +39,8 @@ use crate::semantics::resolved_type::{
     traced_type_names_of,
 };
 use crate::semantics::type_signature::{
-    TypeSignatureOutcome, UntracedReason, rust_type_signature_outcome_of, type_signature_outcome_of,
+    TypeSignatureOutcome, UntracedReason, rust_type_signature_outcome_of,
+    swift_type_signature_outcome_of, type_signature_outcome_of,
 };
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks, TestFunctions};
@@ -760,7 +761,8 @@ fn asked_semantics_of(
 /// （`semantics::resolved_type`）。**Rust は hover の後に宣言の場所とエイリアスの右辺を
 /// 集める。** 順序は `semantics::type_signature::rust_type_signature_outcome_of` が
 /// 中に持つ（読み込み前の definition は空を返すので、hover が落ち着くのを先に待つ）。
-/// 綴りを読む側がまだ無い grammar（Swift）は、尋ねずに
+/// **Swift も hover の後に definition で型名を辿る**（`swift_type_signature_outcome_of`）。
+/// 綴りを読む側がまだ無い grammar（Java）は、尋ねずに
 /// [`TypeSignatureOutcome::NoSignatureReader`] を返す。
 ///
 /// `declarations_cache` は同じセッションで尋ねるチャンクのあいだで共有する、Rust の
@@ -803,8 +805,15 @@ fn resolved_type_signature_outcome_of(
                 &traced,
             )
         }
+        Grammar::Swift => swift_type_signature_outcome_of(
+            session,
+            document,
+            position,
+            chunk.type_references(),
+            chunk.swift_enclosing_type(),
+        ),
         // 綴りを読む側がまだ無い。hover を送らずに、そのことを理由として返す
-        Grammar::Java | Grammar::Swift => Ok(TypeSignatureOutcome::NoSignatureReader),
+        Grammar::Java => Ok(TypeSignatureOutcome::NoSignatureReader),
     }
 }
 

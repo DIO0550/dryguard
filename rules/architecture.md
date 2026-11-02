@@ -327,6 +327,15 @@ implementation の候補のうち対象型の綴りが等しい impl（`RustImpl
   等しい impl が無ければ上の 0 件と同じ順（`UnselectedImpls::reason_with`）
 - **短縮形の入れ子（`Self::Item::Out`）は扱わない。** rustc が E0223 で拒否する形
 
+**Swift の型名は definition で辿り、`typealias` は辿るところまで。** sourcekit-lsp の typeDefinition は
+型名の位置に `null` を返すので、Rust と同じく definition を尋ねる（`semantics::resolved_type` の
+`swift_traced_type_names_of`）。辿った先がエイリアスかは**使用位置への hover**（`typealias Amount = Int`）で
+見分け、右辺の展開はまだ持たないので `UnopenableAlias` で「測れない」にする（宣言の場所のまま比べると、
+`Amount` と `Int` が重ならないと確かめた答えになる）。標準ライブラリの省略形を持つ名前
+（`Void` = `()` など）は、エイリアスかを見る前に標準ライブラリの `.swiftinterface` を指すかで通す
+（`is_swift_standard_library_site`）。hover の綴りに出ないレシーバと `init` の値の型は、
+`syntax::chunk` が運ぶ直接囲む型の名前で足す（`Chunk::swift_enclosing_type`）。
+
 **書かれた型名がここに来ることはある。** `syntax` が集めた型名は必ず尋ねる（TypeScript は
 `pipeline`、Rust は hover の後に `semantics::type_signature` が尋ねる）が、
 **集める場所の一覧に漏れがあれば、書かれた型名が集まらない**（名前付き関数式が代入先の

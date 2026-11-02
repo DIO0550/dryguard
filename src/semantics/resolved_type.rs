@@ -33,6 +33,7 @@ use crate::syntax::rust_callable::{
     RustTypeResolution, associated_owner_position_of, primitive_references_of_alias,
     primitive_spelling_of,
 };
+use crate::syntax::swift_callable::STANDARD_SUGAR_NAMES;
 use crate::syntax::type_reference::TypeReference;
 
 mod array_length;
@@ -171,6 +172,9 @@ pub enum UnopenedReason {
     /// サーバが hover を提供していない。
     HoverNotProvided,
     /// 宣言は型エイリアスだが、右辺を差し込める形にできなかった。
+    ///
+    /// **Swift の `typealias` はすべてここに来る。** 右辺の展開をまだ持たない
+    /// （`swift_traced_type_names_of`）。
     ///
     /// **サーバは右辺を返している。** 開けないのは dryguard 側の都合（型引数の当てはめが
     /// 要るライフタイム・const 引数や未対応の型構文など）なので、開く先が無い `interface` / `class` とは
@@ -364,6 +368,119 @@ pub(crate) fn rust_traced_type_names_of(
         }
     }
     Ok(traced)
+}
+
+/// Swift の型エイリアスの宣言を導く語。sourcekit-lsp は使用位置への hover にこれを綴る
+/// （`typealias Amount = Int`。6.4.2 で実測）。
+const SWIFT_ALIAS_KEYWORD: &str = "typealias ";
+
+/// sourcekit-lsp が標準ライブラリの宣言を置くインタフェースの拡張子。
+const SWIFT_INTERFACE_EXTENSION: &str = "swiftinterface";
+
+/// 標準ライブラリのモジュールの名前。インタフェースのファイル名・`.swiftmodule` の名前になる。
+const SWIFT_STANDARD_LIBRARY_MODULE: &str = "Swift";
+
+/// Swift のシグネチャに書かれた型名の宣言が、どこにあるかを尋ねる。
+///
+/// **definition で辿る。** sourcekit-lsp の typeDefinition は型名の位置にも `null` を返す
+/// （6.4.2 で実測。#406）。
+///
+/// **辿った先が型エイリアスなら、開けなかったものとして返す**（`UnopenableAlias`）。
+/// 右辺の展開はまだ持たないので、宣言の場所のまま比べると `Amount`（= `Int`）と `Int` が
+/// 「重ならないと確かめた」答えになる（`rules/architecture.md`「どこまでを「取れなかった」に
+/// 数えるか」）。見分けるのは**使用位置への hover**で、宣言のファイルを開かせずに済む。
+///
+/// **標準ライブラリの省略形の名前は、エイリアスかを見る前に通す。** `Void` は標準ライブラリの
+/// `typealias Void = ()` で、先にエイリアスとして倒すと関数型の `-> Void` がすべて測れない側へ落ちる。
+/// 省略形を開くのは `syntax::swift_callable` で、ここは宣言の場所を持つだけ。
+///
+/// # Errors
+///
+/// そのドキュメントを開かせていないとき、往復が失敗したとき。
+pub(crate) fn swift_traced_type_names_of(
+    session: &mut Session,
+    document: &SourceDocument,
+    type_references: &[TypeReference],
+) -> Result<TracedTypeNames, ClientError> {
+    let mut declared = Vec::new();
+    let mut unopened = Vec::new();
+
+    for reference in type_references {
+        let name = reference.name().to_owned();
+        let site =
+            match DeclarationQuery::Definition.site_of(session, document, reference.position())? {
+                Ok(site) => site,
+                Err(reason) => {
+                    unopened.push(UnopenedTypeName::new(name, reason));
+                    continue;
+                }
+            };
+
+        let standard_sugar = is_swift_standard_library_site(&site)
+            && STANDARD_SUGAR_NAMES.contains(&swift_last_segment_of(&name));
+        if standard_sugar {
+            declared.push(TypeDeclaration::new(name, site));
+            continue;
+        }
+
+        match swift_alias_check_of(session.hover(document, reference.position())?) {
+            Ok(false) => declared.push(TypeDeclaration::new(name, site)),
+            Ok(true) => unopened.push(UnopenedTypeName::new(name, UnopenedReason::UnopenableAlias)),
+            Err(reason) => unopened.push(UnopenedTypeName::new(name, reason)),
+        }
+    }
+
+    Ok(TracedTypeNames::new(declared, unopened))
+}
+
+/// 使用位置への hover が型エイリアスを綴ったか。綴りが取れなければその理由。
+///
+/// **綴りが取れなければ、エイリアスでないとは言わない。** 確かめていないものを
+/// 「エイリアスでなかった」として宣言の場所で比べると、確かめなかったことを答えにする。
+fn swift_alias_check_of(hover: HoverOutcome) -> Result<bool, UnopenedReason> {
+    match hover {
+        HoverOutcome::Answered(text) => {
+            Ok(text.as_str().trim_start().starts_with(SWIFT_ALIAS_KEYWORD))
+        }
+        HoverOutcome::NoAnswer => Err(UnopenedReason::NoSpellingAtDeclaration),
+        HoverOutcome::Unreadable => Err(UnopenedReason::UnreadableDeclarationHover),
+        HoverOutcome::ServerStillWorking => Err(UnopenedReason::ServerStillWorking),
+        HoverOutcome::NotSupported => Err(UnopenedReason::HoverNotProvided),
+    }
+}
+
+/// パスで書かれた型名（`Swift.Optional`）の末尾の名前。
+fn swift_last_segment_of(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// その宣言の場所が、Swift の標準ライブラリのインタフェースの中にあるか。
+///
+/// sourcekit-lsp はソースの無いモジュールの宣言を `.swiftinterface` で返す。標準ライブラリなら
+/// ファイル名が `Swift.swiftinterface`（生成したインタフェース）か、`Swift.swiftmodule` の下に
+/// 置かれる（ツールチェーンのインタフェース）。
+///
+/// **場所で見分ける。** 利用者のモジュールも `Optional` / `Void` を宣言でき、その宣言は
+/// 利用者のソースにあるので、名前だけで標準ライブラリとは言えない。
+pub(crate) fn is_swift_standard_library_site(site: &DeclarationSite) -> bool {
+    let path = site.path();
+    let interface = path
+        .extension()
+        .is_some_and(|extension| extension == SWIFT_INTERFACE_EXTENSION);
+    if !interface {
+        return false;
+    }
+    let generated = path.file_stem().is_some_and(|stem| {
+        stem.to_str().is_some_and(|stem| {
+            stem == SWIFT_STANDARD_LIBRARY_MODULE
+                || stem.starts_with(&format!("{SWIFT_STANDARD_LIBRARY_MODULE}."))
+        })
+    });
+    let module = format!("{SWIFT_STANDARD_LIBRARY_MODULE}.swiftmodule");
+    let in_toolchain = path
+        .components()
+        .any(|component| component.as_os_str() == module.as_str());
+    generated || in_toolchain
 }
 
 /// 再帰展開できるエイリアスの宣言と、関連型の投影を合わせた数。
