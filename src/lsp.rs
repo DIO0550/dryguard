@@ -244,11 +244,16 @@ const JAVA_HOVER_FENCES: &[usize] = hover::LEADING_FENCE;
 
 /// jdtls で、落ち着いた答えを求めて尋ね直す回数の上限。
 ///
-/// **hover / references は既定の回数で足りる。** jdtls 1.63.0 は読み込みを `$/progress` で知らせ、
-/// 1 回目の hover / references は読み込みの進捗に触れて答えるが、2 回目は触れない。
+/// **既定の 3 回では足りない。** jdtls 1.63.0 は握手の後の読み込みを、続けて始まる複数の作業
+/// （`Building` / `Refreshing workspace` / `Searching...` / `Validate documents` /
+/// `Publish Diagnostics` など）として `$/progress` で知らせ、最初の hover が 3 回とも
+/// そのどれかに触れて `ServerStillWorking` になった回がある（PR の CI で、通った回の後に 1 度）。
+/// rust-analyzer と同じ形なので同じ上限にする。読み込みが終わった後の hover / references は
+/// 作業に触れないので、回数を増やしても待つのは読み込みの間だけ。
+///
 /// callHierarchy は尋ねるたびに応答の前に作業（`Background task`）を始めて終えるので、
-/// 尋ね直すという仕組みでは落ち着かない（既定の回数で `ServerStillWorking` になることを実測）。
-const JAVA_SETTLED_ATTEMPTS: usize = connection::SETTLED_ATTEMPTS;
+/// 尋ね直すという仕組みでは何回でも落ち着かない（上限まで尋ねて `ServerStillWorking` になる）。
+const JAVA_SETTLED_ATTEMPTS: usize = RUST_SETTLED_ATTEMPTS;
 
 /// サーバの問い合わせ形式。**サーバごとの値を選ぶのは、ここの網羅 `match` だけ。**
 ///
