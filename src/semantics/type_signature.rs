@@ -19,11 +19,12 @@ use std::num::NonZeroUsize;
 use crate::lsp::{ClientError, HoverOutcome, Session, SignatureText, SourceDocument};
 use crate::semantics::resolved_type::{
     ResolvedTypes, RustDeclarationCache, TracedTypeNames, TypeDeclaration, UnopenedReason,
-    rust_traced_type_names_of,
+    is_swift_standard_library_site, rust_traced_type_names_of, swift_traced_type_names_of,
 };
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{AnnotatedPositions, OverloadDeclaration, TypeAnnotation};
 use crate::syntax::rust_callable::RustCallable;
+use crate::syntax::swift_callable::{SwiftCallable, SwiftEnclosingType};
 use crate::syntax::type_reference::TypeReference;
 use crate::syntax::type_spelling::{names_only_types, substituted_spelling_of, type_name_spans_of};
 use crate::syntax::type_structure::{Callable, SignatureKind, TypeStructure};
@@ -389,6 +390,95 @@ pub fn rust_type_signature_outcome_of(
         &traced,
         impl_header,
     ))
+}
+
+/// Swift の関数・`init`・`deinit` の型シグネチャを尋ね、書かれた型名を宣言まで辿って、
+/// 正規化した形にする。
+///
+/// `document` は先に [`Session::open_document`] で開かせておく。`position` は
+/// `Chunk::name_position`、`type_references` は `Chunk::type_references`、`enclosing_type` は
+/// `Chunk::swift_enclosing_type`。
+///
+/// **注釈の有無もオーバーロードも見ない。** Swift の引数は型を省けず、省いた戻り値は推論ではなく
+/// `()` に決まる（`syntax::chunk` の `swift_annotated_positions_of`）。同じ名前の関数は
+/// ラベルか型で別の宣言になり、hover は宣言 1 つを綴る。
+///
+/// **hover を先に尋ねる**（Rust と同じ順）。sourcekit-lsp は握手の後に index を待つので
+/// （`lsp` の `index synchronization`）、順で答えが変わることは実測していないが、hover が
+/// 落ちたら definition を送らずに済む。
+///
+/// # Errors
+///
+/// そのドキュメントを開かせていないとき、往復が失敗したとき。
+/// **答えが無い / 読めないは `Err` にしない**（[`type_signature_outcome_of`] と同じ）。
+pub fn swift_type_signature_outcome_of(
+    session: &mut Session,
+    document: &SourceDocument,
+    position: SourcePosition,
+    type_references: &[TypeReference],
+    enclosing_type: Option<&SwiftEnclosingType>,
+) -> Result<TypeSignatureOutcome, ClientError> {
+    let signature_text = match asked_signature_text_of(session, document, position)? {
+        Ok(signature_text) => signature_text,
+        Err(outcome) => return Ok(outcome),
+    };
+
+    let traced = swift_traced_type_names_of(session, document, type_references)?;
+    Ok(swift_normalized_outcome_of(
+        &signature_text,
+        &traced,
+        enclosing_type,
+    ))
+}
+
+/// sourcekit-lsp が返した綴り 1 本を、1 本だけの集合へ正規化した結果。
+///
+/// **答えの並びは Rust と同じ**（[`rust_normalized_outcome_of`]）。開けなかった型名 →
+/// `Self` → 辿った記録の無い型名の順に見て、どれにも当たらなければ比べられる形にする。
+///
+/// **省略形の名前が標準ライブラリを指すかは、辿った宣言の場所で決める**
+/// （`semantics::resolved_type` の `is_swift_standard_library_site`）。辿れなかった名前は
+/// 利用者の型として型名に残り、下の順で測れない側へ倒れる。
+pub fn swift_normalized_outcome_of(
+    signature_text: &SignatureText,
+    traced: &TracedTypeNames,
+    enclosing_type: Option<&SwiftEnclosingType>,
+) -> TypeSignatureOutcome {
+    let is_standard = |name: &str| {
+        traced.declared().iter().any(|declaration| {
+            declaration.name() == name && is_swift_standard_library_site(declaration.site())
+        })
+    };
+    let Some(callable) =
+        SwiftCallable::from_spelling(signature_text.as_str(), &is_standard, enclosing_type)
+    else {
+        return TypeSignatureOutcome::UnreadableSignature;
+    };
+
+    let type_names = callable.type_names();
+    if let Some(reason) = type_names
+        .iter()
+        .find_map(|name| traced.unopened_reason_of(name))
+    {
+        return TypeSignatureOutcome::UnopenedTypeName { reason };
+    }
+
+    // `Self` は囲む型で決まるが、プロトコルの拡張では採用する型ごとに違う
+    if callable.refers_to_self() {
+        return TypeSignatureOutcome::SiteDependentSpelling;
+    }
+
+    if type_names.iter().any(|name| !is_traced(name, traced)) {
+        return TypeSignatureOutcome::UntracedTypeName {
+            reason: UntracedReason::NoTracedRecord,
+        };
+    }
+
+    let declarations = declarations_named_in(type_names, traced.declared());
+    TypeSignatureOutcome::Normalized(OverloadSet::of_one(TypeSignature {
+        chunk_type: ComparedChunkType::Swift(callable),
+        declarations,
+    }))
 }
 
 /// rust-analyzer が返した関数の綴り 1 本を、1 本だけの集合へ正規化した結果。
@@ -988,6 +1078,7 @@ pub struct TypeSignature {
 enum ComparedChunkType {
     TypeScript(ChunkType),
     Rust(RustCallable),
+    Swift(SwiftCallable),
 }
 
 /// 正規化した型シグネチャと、**比較に残る綴りに現れた型名**。
@@ -3931,6 +4022,174 @@ mod tests {
                 reason: UnopenedReason::UnopenableAlias
             }
         );
+    }
+
+    /// 標準ライブラリのインタフェースの宣言の場所（sourcekit-lsp が返す形）。
+    const SWIFT_INTERFACE: &str =
+        "/toolchain/usr/lib/swift/linux/Swift.swiftmodule/x86_64-unknown-linux-gnu.swiftinterface";
+
+    /// Swift の綴りを、型名を渡した記録のとおりに正規化した集合。
+    fn swift_signature(text: &str, traced: &TracedTypeNames) -> OverloadSet {
+        let TypeSignatureOutcome::Normalized(signature) =
+            swift_normalized_outcome_of(&signature_text(text), traced, None)
+        else {
+            panic!("テストが渡す Swift の綴りは読み取れる: {text}");
+        };
+
+        signature
+    }
+
+    /// 標準ライブラリの `Int` / `Optional` / `Void` を辿った記録。
+    fn swift_standard() -> TracedTypeNames {
+        TracedTypeNames::new(
+            vec![
+                declared("Int", SWIFT_INTERFACE, 10),
+                declared("Optional", SWIFT_INTERFACE, 20),
+                declared("Void", SWIFT_INTERFACE, 30),
+            ],
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn test_swift_standard_library_sites_are_the_swift_module_interfaces() {
+        assert!(is_swift_standard_library_site(&declaration_site(
+            SWIFT_INTERFACE,
+            1
+        )));
+        assert!(is_swift_standard_library_site(&declaration_site(
+            "/tmp/sourcekit-lsp/GeneratedInterfaces/Swift.swiftinterface",
+            1
+        )));
+        assert!(!is_swift_standard_library_site(&declaration_site(
+            "/tmp/sourcekit-lsp/GeneratedInterfaces/SwiftUI.swiftinterface",
+            1
+        )));
+        assert!(!is_swift_standard_library_site(&declaration_site(
+            "/repo/Sources/Swift/Optional.swift",
+            1
+        )));
+    }
+
+    #[test]
+    fn test_swift_functions_differing_only_in_internal_names_are_unifiable() {
+        let traced = swift_standard();
+
+        let first = swift_signature("func total(items xs: Int) -> Int", &traced);
+        let second = swift_signature("func sum(items values: Int) -> Int", &traced);
+
+        assert!(first.is_unifiable_with(&second));
+    }
+
+    #[test]
+    fn test_swift_standard_optional_and_its_sugar_are_unifiable() {
+        let traced = swift_standard();
+
+        let sugar = swift_signature("func f(x: Int?) -> Int", &traced);
+        let named = swift_signature("func f(x: Optional<Int>) -> Int", &traced);
+
+        assert!(sugar.is_unifiable_with(&named));
+    }
+
+    #[test]
+    fn test_swift_optional_declared_in_user_code_is_not_the_sugar() {
+        // 利用者のモジュールが `Optional` を宣言し直した形。名前だけで省略形と重ねない
+        let traced = TracedTypeNames::new(
+            vec![
+                declared("Int", SWIFT_INTERFACE, 10),
+                declared("Optional", "/repo/Sources/Shop/Optional.swift", 1),
+            ],
+            Vec::new(),
+        );
+
+        let sugar = swift_signature("func f(x: Int?) -> Int", &traced);
+        let named = swift_signature("func f(x: Optional<Int>) -> Int", &traced);
+
+        assert!(!sugar.is_unifiable_with(&named));
+    }
+
+    #[test]
+    fn test_swift_same_spelling_declared_in_different_files_is_not_unifiable() {
+        let in_shop = TracedTypeNames::new(
+            vec![declared("Money", "/repo/Sources/Shop/Money.swift", 1)],
+            Vec::new(),
+        );
+        let in_bank = TracedTypeNames::new(
+            vec![declared("Money", "/repo/Sources/Bank/Money.swift", 1)],
+            Vec::new(),
+        );
+
+        let shop = swift_signature("func f(x: Money)", &in_shop);
+        let bank = swift_signature("func f(x: Money)", &in_bank);
+
+        assert!(!shop.is_unifiable_with(&bank));
+        assert!(shop.is_unifiable_with(&swift_signature("func g(x: Money)", &in_shop)));
+    }
+
+    #[test]
+    fn test_swift_alias_that_is_not_expanded_is_unmeasurable() {
+        let traced = swift_standard().with_unopened(vec![UnopenedTypeName::new(
+            "Amount".to_owned(),
+            UnopenedReason::UnopenableAlias,
+        )]);
+
+        assert_eq!(
+            swift_normalized_outcome_of(&signature_text("func f(x: Amount)"), &traced, None),
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::UnopenableAlias
+            }
+        );
+    }
+
+    #[test]
+    fn test_swift_type_name_without_traced_record_is_untraced() {
+        assert_eq!(
+            swift_normalized_outcome_of(
+                &signature_text("func f(x: Money)"),
+                &swift_standard(),
+                None
+            ),
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord
+            }
+        );
+    }
+
+    #[test]
+    fn test_swift_self_is_site_dependent() {
+        let traced = TracedTypeNames::new(
+            vec![declared("Wallet", "/repo/Sources/Shop/Wallet.swift", 1)],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            swift_normalized_outcome_of(
+                &signature_text("func copy() -> Self"),
+                &traced,
+                Some(&SwiftEnclosingType::Named("Wallet".to_owned()))
+            ),
+            TypeSignatureOutcome::SiteDependentSpelling
+        );
+    }
+
+    #[test]
+    fn test_swift_unreadable_spelling_is_unreadable_signature() {
+        assert_eq!(
+            swift_normalized_outcome_of(
+                &signature_text("func f() throws(Failure)"),
+                &swift_standard(),
+                None
+            ),
+            TypeSignatureOutcome::UnreadableSignature
+        );
+    }
+
+    #[test]
+    fn test_swift_and_rust_signatures_of_the_same_shape_are_not_unifiable() {
+        let swift = swift_signature("func f()", &swift_standard());
+        let rust = rust_signature("fn f()", &TracedTypeNames::default());
+
+        assert!(!swift.is_unifiable_with(&rust));
     }
 
     /// Rust の綴りを、型名を渡した記録のとおりに正規化した集合。

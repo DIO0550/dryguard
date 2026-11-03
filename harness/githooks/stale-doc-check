@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+#
+# 定義の行を触った識別子を名指しする doc / コメントのうち、差分に載っていないものを出す。
+#
+# `comment-mismatch` の再発は、変えた関数・定数・型を名指しする既存の doc が、差分に
+# 載らないまま古くなる形が大半で、実装の検証の観点（層 4）が書いてあっても繰り返している。
+# ここは**突き合わせるべき箇所を一覧にして目の前に出す**だけで、食い違っているかは見ない。
+# 止めない（終了コードは常に 0）: 名指しの有無は食い違いの有無ではなく、止めると
+# 正しい doc まで毎回書き換えさせる。
+#
+# 使い方: stale-doc-check [基準のリビジョン]（既定は origin/main との merge-base）
+set -uo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+base="${1:-$(git merge-base origin/main HEAD 2>/dev/null || true)}"
+if [ -z "$base" ]; then
+  echo "stale-doc-check: 基準のリビジョンが無いため飛ばします"
+  exit 0
+fi
+
+diff_text="$(git diff -U0 "$base" HEAD -- '*.rs')"
+
+definition_pattern='^[+-][[:space:]]*(pub(\([a-z]+\))?[[:space:]]+)?(const|static|fn|enum|struct|type|trait)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*'
+symbols="$(printf '%s\n' "$diff_text" | grep -E "$definition_pattern" \
+  | sed -E 's/^[+-][[:space:]]*(pub(\([a-z]+\))?[[:space:]]+)?(const|static|fn|enum|struct|type|trait)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*).*/\4/' \
+  | awk 'length($0) >= 4' | sort -u)"
+
+[ -z "$symbols" ] && exit 0
+
+# 差分で足された行そのものは、書き直した側なので出さない。
+added="$(printf '%s\n' "$diff_text" | grep -E '^\+[^+]' | sed 's/^+//')"
+
+found=0
+for symbol in $symbols; do
+  hits="$(git grep -nE "^[[:space:]]*//.*\\b${symbol}\\b" -- '*.rs' 2>/dev/null || true)"
+  [ -z "$hits" ] && continue
+  while IFS= read -r hit; do
+    text="${hit#*:*:}"
+    printf '%s\n' "$added" | grep -qxF -- "$text" && continue
+    if [ "$found" -eq 0 ]; then
+      echo "stale-doc-check: 定義を触った識別子を名指しする、差分に載っていないコメント（食い違いが無いか 1 文ずつ確かめる）:"
+      found=1
+    fi
+    echo "  [$symbol] $hit"
+  done <<< "$hits"
+done
+exit 0

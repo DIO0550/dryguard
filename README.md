@@ -125,14 +125,13 @@ spread 引数の後ろも引数位置が確定しないため残す。テスト�
 `.java` はメソッド・コンストラクタをチャンクにする。
 Java の候補は jdtls に呼び出し元・呼び出し先を尋ねる。型シグネチャは hover の綴りを読む側がまだ無いので尋ねない。
 `.swift` は関数・メソッド・`init` / `deinit` をチャンクにする。
-Swift の候補は sourcekit-lsp に呼び出し元・呼び出し先を尋ねる。型シグネチャは hover の綴りを読む側がまだ無いので尋ねない。
+Swift の候補は sourcekit-lsp に型シグネチャ・呼び出し元・呼び出し先を尋ねる。型シグネチャは引数のラベルを型の一部として残し（内部名は落とす）、型名は definition で宣言まで辿る。`typealias` はまだ展開しないので、エイリアスを通る型シグネチャは「測れない」になる。
 sourcekit-lsp は index を作り終える前の参照元に空を返すので、セッションを始めるたびに index を作り終えるまで待つ（`compare` は実行ごと、`scan` / `check` は走査ごとに 1 回。`swift build` は要らない）。
 `compare` は `--lang` と拡張子が一致しなければ比べない（`--lang ts` と `.swift` / `.java`、`--lang java` と `.ts` など。`auto` は拡張子に従う）。
 CLI は拡張子から TypeScript・Rust・Swift・Java の LSP サーバを選ぶ。`scan --lang auto` では
 言語ごとに候補を揃え、TypeScript は typescript-language-server、Rust は rust-analyzer の
 セッションで hover / references を問い合わせる。Swift の候補は sourcekit-lsp のセッションに
-尋ね（`compare` で名指ししたとき・`--lang swift` と `auto` で走査したとき）、hover（型シグネチャ）は
-尋ねない。Java の候補は jdtls のセッションに
+同じく尋ねる（`compare` で名指ししたとき・`--lang swift` と `auto` で走査したとき）。Java の候補は jdtls のセッションに
 尋ね（`compare` で名指ししたとき・`--lang java` と `auto` で走査したとき）、hover（型シグネチャ）は
 尋ねない。Rust の型シグネチャ比較は #40 まで「測れない」。
 
