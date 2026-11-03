@@ -86,11 +86,12 @@ fn test_jdtls_answers_references_but_leaves_hover_unreadable_and_callees_unsettl
 
     let called = started.elapsed();
     session.shutdown().expect("正常終了できる");
+    // 終わった時点を 1 度だけ取る。呼ぶたびに取ると shutdown と total が別の時点を指す
+    let total = started.elapsed();
     eprintln!(
-        "jdtls: handshake={handshake:?}, hover/references x2={:?}, callHierarchy={:?}, shutdown={:?}, total={:?}",
+        "jdtls: handshake={handshake:?}, open+hover/references x2={:?}, open+callHierarchy={:?}, shutdown={:?}, total={total:?}",
         queried - handshake,
         called - queried,
-        started.elapsed() - called,
-        started.elapsed()
+        total - called,
     );
 }
