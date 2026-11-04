@@ -227,11 +227,12 @@ impl Chunk {
         }
     }
 
-    /// Swift のメンバーを直接囲む型（`extension` を含む）。それ以外は `None`。
+    /// Swift のメンバーを直接囲む型（`extension` を含む）の、型と `where` 節の綴り。
+    /// それ以外は `None`。
     ///
     /// **hover の綴りに出ない型を運ぶ。** sourcekit-lsp はメソッドのレシーバも、`init` が
-    /// 初期化する型も綴らない（`init(base: Int)`）。型名の位置は [`Chunk::type_references`] に
-    /// 入れてあり、ここは綴りに差し込む名前だけを持つ。
+    /// 初期化する型も、囲む `extension` の `where` も綴らない（`init(base: Int)`）。
+    /// 型名の位置は [`Chunk::type_references`] に入れてあり、ここは綴りに足す型と制約だけを持つ。
     ///
     /// **Why not（`type_references` の先頭に置いて区別する）**: 並びに意味を持たせると、
     /// 集める順を変えたときに黙ってレシーバを取り違える。
@@ -948,18 +949,20 @@ fn swift_name_node_of(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name(NAME_FIELD)
 }
 
-/// Swift のチャンクのシグネチャに書かれた型名と、メンバーを直接囲む型の名前。
+/// Swift のチャンクのシグネチャに書かれた型名と、メンバーを直接囲む型の綴りに書かれた型名。
 ///
 /// **囲む型も尋ねる。** hover の綴りには出ないが、`syntax::swift_callable` がレシーバ・
-/// `init` の値の型として綴りに足すので、比較に残る型名になる。
+/// `init` の値の型・レシーバの制約として綴りに足すので、比較に残る型名になる
+/// （型引数と `where` の右辺を含む）。
 fn swift_type_references_of(node: Node<'_>, source: &str) -> Vec<TypeReference> {
     let mut references = swift_callable::type_references_of(node, source);
-    if let Some(enclosing) = swift_callable::enclosing_type_reference_of(node, source)
-        && !references
+    for enclosing in swift_callable::enclosing_type_references_of(node, source) {
+        if !references
             .iter()
             .any(|reference| reference.name() == enclosing.name())
-    {
-        references.push(enclosing);
+        {
+            references.push(enclosing);
+        }
     }
     references
 }

@@ -180,6 +180,41 @@ fn test_sourcekit_lsp_optional_sugar_and_named_optional_are_unifiable() {
 
 #[test]
 #[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
+fn test_sourcekit_lsp_members_of_extensions_with_different_constraints_are_not_unifiable() {
+    // hover はどちらも `func …(by scale: Int) -> Int` で、`where` を綴らない
+    assert_eq!(
+        type_signature_match_of("summed", "weighted"),
+        TypeSignatureMatch::NotUnifiable
+    );
+    // `Element == [Int]` は型名（`Array` / `Int`）が揃うので、制約の形だけで分かれる
+    assert_eq!(
+        type_signature_match_of("summed", "flattened"),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
+fn test_sourcekit_lsp_members_of_extensions_with_the_same_constraint_are_unifiable() {
+    // 別々の `extension Array where Element == Int` に書いた、ラベルと型が同じメソッド
+    assert_eq!(
+        type_signature_match_of("summed", "totalled"),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
+fn test_sourcekit_lsp_members_of_bound_extensions_with_and_without_sugar_are_unifiable() {
+    // `extension Array<Int>` と `extension [Int]`。`Array` が標準ライブラリを指すと辿れるので重なる
+    assert_eq!(
+        type_signature_match_of("counted", "sugared"),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
 fn test_sourcekit_lsp_definition_of_standard_types_points_at_a_swift_interface() {
     // 標準ライブラリを宣言の場所で見分ける前提（`semantics::resolved_type` の
     // `is_swift_standard_library_site`）を、実サーバの答えで確かめる
