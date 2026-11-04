@@ -105,8 +105,7 @@ pub(super) fn outcome_of_answer(hover: &Hover, fences: &[usize]) -> HoverOutcome
             .find_map(|&index| fenced_text_of(&content.value, index)),
         HoverContents::Array(elements) => language_text_of(elements),
         // 単独の `MarkedString` を返すサーバは今つないでいる中に無く、形を実測していない。
-        // 言語付きの要素だけでも綴りと決めずに、読めない側へ倒す。
-        // **黙って「答えが無かった」にはしない。**
+        // 言語付きでも綴りと決めずに、読めない側へ倒す
         HoverContents::Scalar(_) => None,
     };
     match text.and_then(SignatureText::new) {
@@ -334,6 +333,53 @@ mod tests {
     }
 
     #[test]
+    fn test_hover_outcome_of_a_marked_array_reads_the_first_of_two_language_elements() {
+        // 言語付きの要素が 2 つあれば、先に置かれたほうを綴りとして読む
+        let hover = marked_hover(vec![
+            MarkedString::from_language_code(
+                "java".to_owned(),
+                "int shop.Total.total(List<Integer> items, double discount)".to_owned(),
+            ),
+            MarkedString::from_language_code("java".to_owned(), "int sum".to_owned()),
+        ]);
+
+        assert_eq!(
+            outcome_of(&hover),
+            HoverOutcome::Answered(signature_text(
+                "int shop.Total.total(List<Integer> items, double discount)"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_hover_outcome_of_answer_ignores_fences_for_a_marked_array() {
+        // Rust と同じ試す順（2 つ目から）を渡しても、配列の 2 つ目の要素を選ばない
+        let hover = marked_hover(vec![
+            MarkedString::from_language_code(
+                "java".to_owned(),
+                "int shop.Total.total(List<Integer> items, double discount)".to_owned(),
+            ),
+            MarkedString::from_language_code("java".to_owned(), "int sum".to_owned()),
+        ]);
+
+        assert_eq!(
+            outcome_of_answer(&hover, &[1, 0]),
+            HoverOutcome::Answered(signature_text(
+                "int shop.Total.total(List<Integer> items, double discount)"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_hover_outcome_of_an_empty_marked_array_is_unreadable() {
+        // 要素が無い配列は答えを読めない。`NoAnswer`（応答が null）とは別
+        assert_eq!(
+            outcome_of(&marked_hover(Vec::new())),
+            HoverOutcome::Unreadable
+        );
+    }
+
+    #[test]
     fn test_hover_outcome_of_a_marked_array_without_a_language_element_is_unreadable() {
         // 対照は jdtls の形のテスト。同じ配列の綴りの要素から言語の印だけを外している。
         // 位置で読む実装ならここで綴りを答えにする
@@ -375,8 +421,8 @@ mod tests {
     }
 
     #[test]
-    fn test_hover_outcome_of_a_deprecated_content_form_is_unreadable_not_absent() {
-        // `MarkedString` は読めないが、サーバは答えを持っている。`NoAnswer` にすると
+    fn test_hover_outcome_of_a_single_plain_string_is_unreadable_not_absent() {
+        // 単独の `MarkedString` は読めないが、サーバは答えを持っている。`NoAnswer` にすると
         // 「その位置に型が無い」と区別が付かず、こちら側の穴が見えなくなる
         let hover = Hover {
             contents: HoverContents::Scalar(MarkedString::String(
