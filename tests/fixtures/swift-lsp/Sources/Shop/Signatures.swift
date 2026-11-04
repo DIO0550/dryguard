@@ -54,6 +54,12 @@ extension Array<Int> {
     }
 }
 
+extension Array<Double> {
+    func measured(by scale: Int) -> Int {
+        count * scale
+    }
+}
+
 extension [Int] {
     func sugared(by scale: Int) -> Int {
         count * scale

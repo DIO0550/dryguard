@@ -211,6 +211,11 @@ fn test_sourcekit_lsp_members_of_bound_extensions_with_and_without_sugar_are_uni
         type_signature_match_of("counted", "sugared"),
         TypeSignatureMatch::Unifiable
     );
+    // 対照: 型引数が違えば重ならない
+    assert_eq!(
+        type_signature_match_of("counted", "measured"),
+        TypeSignatureMatch::NotUnifiable
+    );
 }
 
 #[test]

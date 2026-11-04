@@ -746,12 +746,7 @@ impl<'source> SwiftSpelling<'source> {
         predicate: Node<'_>,
         constraints: &mut BTreeSet<SwiftConstraint>,
     ) -> Option<()> {
-        let (constrained, relation, right) = self.predicate_parts_of(predicate)?;
-        let path: Vec<String> = self
-            .text(constrained)?
-            .split('.')
-            .map(|segment| segment.trim().to_owned())
-            .collect();
+        let (path, relation, right) = self.predicate_parts_of(predicate)?;
         let left = self.path_type_of(
             path.into_iter()
                 .map(|segment| (segment, Vec::new()))
@@ -786,23 +781,18 @@ impl<'source> SwiftSpelling<'source> {
                 list,
                 &[INHERITANCE_CONSTRAINT_KIND, EQUALITY_CONSTRAINT_KIND],
             ) {
-                let (constrained, relation, right) = self.predicate_parts_of(predicate)?;
-                let left = self
-                    .text(constrained)?
-                    .split('.')
-                    .map(|segment| segment.trim().to_owned())
-                    .collect();
+                let (left, relation, right) = self.predicate_parts_of(predicate)?;
                 push_split_constraint(&mut constraints, left, relation, right);
             }
         }
         Some(constraints)
     }
 
-    /// 述語 1 つの左辺のノード・関係・右辺の型。
-    fn predicate_parts_of<'tree>(
+    /// 述語 1 つの左辺のパス（`Element.Index` なら 2 区切り）・関係・右辺の型。
+    fn predicate_parts_of(
         &mut self,
-        predicate: Node<'tree>,
-    ) -> Option<(Node<'tree>, ConstraintRelation, SwiftType)> {
+        predicate: Node<'_>,
+    ) -> Option<(Vec<String>, ConstraintRelation, SwiftType)> {
         let relation = match predicate.kind() {
             INHERITANCE_CONSTRAINT_KIND => ConstraintRelation::Conforms,
             _ => ConstraintRelation::Equals,
@@ -814,7 +804,12 @@ impl<'source> SwiftSpelling<'source> {
             .filter(|child| child.id() != constrained.id())
             .find(|child| is_type_kind(child.kind()))?;
         let right = self.type_of(right_node)?;
-        Some((constrained, relation, right))
+        let left = self
+            .text(constrained)?
+            .split('.')
+            .map(|segment| segment.trim().to_owned())
+            .collect();
+        Some((left, relation, right))
     }
 
     /// 型 1 つ分のノードを読む。読めない構文なら `None`。
@@ -1544,6 +1539,69 @@ mod tests {
     }
 
     #[test]
+    fn test_from_spelling_reads_receiver_constraints_on_an_associated_type_path() {
+        // 左辺のパスは区切りごとに持つ。`Element.Index` と `Element` は別の制約
+        assert_ne!(
+            method_of("func total() -> Int", "Array where Element.Index == Int"),
+            method_of("func total() -> Int", "Array where Element == Int")
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_keeps_how_the_left_side_of_receiver_constraints_is_spelled() {
+        // 左辺は辿らずに綴りで比べるので、`Self.Element` と `Element` は重ならない（偽陰性側）
+        assert_ne!(
+            method_of(
+                "func total() -> Int",
+                "Collection where Self.Element == Int"
+            ),
+            method_of("func total() -> Int", "Collection where Element == Int")
+        );
+        // 左辺の `Self` はレシーバ自身で、書かれた場所で決まる綴りに数えない
+        assert!(
+            !method_of("func total() -> Int", "Collection where Self: Equatable").refers_to_self()
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_refers_to_self_on_the_right_side_of_receiver_constraints() {
+        // 右辺の `Self` はプロトコルの拡張では採用する型ごとに違う
+        assert!(
+            method_of("func total() -> Int", "Collection where Element == Self").refers_to_self()
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_does_not_read_a_member_under_a_suppressed_constraint() {
+        // `~Copyable` は型として読まない（偽陰性側）
+        assert_eq!(
+            SwiftCallable::from_spelling(
+                "func total() -> Int",
+                &standard,
+                Some(&SwiftEnclosingType::new("Array where Element: ~Copyable"))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_reads_members_of_a_constrained_type_declaration_and_a_nested_extension() {
+        // どちらも main では型シグネチャを読まなかった形
+        assert_ne!(
+            method_of("func total() -> Int", "Box where T: Equatable"),
+            method_of("func total() -> Int", "Box where T: Hashable")
+        );
+        assert_ne!(
+            method_of("func total() -> Int", "Outer<Int>.Inner"),
+            method_of("func total() -> Int", "Outer<[Int]>.Inner")
+        );
+        assert_eq!(
+            method_of("func total() -> Int", "Outer<Int>.Inner").type_names(),
+            &BTreeSet::from(["Int", "Outer.Inner"].map(str::to_owned))
+        );
+    }
+
+    #[test]
     fn test_from_spelling_does_not_read_a_member_of_an_unreadable_enclosing_type() {
         assert_eq!(
             SwiftCallable::from_spelling(
@@ -1709,6 +1767,20 @@ mod tests {
         assert_eq!(
             enclosing_names_of("extension [Int] {\n    func f() {}\n}\n", FUNCTION_KIND),
             ["Int"]
+        );
+        assert_eq!(
+            enclosing_names_of(
+                "struct Box<T> where T: Equatable {\n    func f() {}\n}\n",
+                FUNCTION_KIND
+            ),
+            ["Box", "Equatable"]
+        );
+        assert_eq!(
+            enclosing_names_of(
+                "extension Outer<Int>.Inner {\n    func f() {}\n}\n",
+                FUNCTION_KIND
+            ),
+            ["Int", "Outer.Inner"]
         );
     }
 
