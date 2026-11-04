@@ -96,16 +96,20 @@ const SWIFT_SERVER: &str = "sourcekit-lsp";
 
 /// Java の LSP サーバ（Eclipse JDT Language Server）の実行ファイル名。
 ///
-/// 配布物の `bin/jdtls`（Python 3.9 以上が要るラッパ）。launcher の jar を `java -jar` で
+/// 配布物の `bin/jdtls`（Python 3 のラッパ）。launcher の jar を `java -jar` で
 /// 直接起動しないのは、jar の名前が版で変わり、OS ごとの設定ディレクトリと JVM の引数まで
 /// こちらで持つことになるため。ラッパはそれらを付け、POSIX では `os.execvp` で java に
-/// 置き換わる（1.64.0 の `jdtls.py`）ので、kill が JVM に届く。
+/// 置き換わる（1.63.0 の `jdtls.py`）ので、kill が JVM に届く。
+///
+/// **JDK 25 が要る。** ラッパの版の検査は 21 以上で通すが、1.63.0 の同梱バンドルは
+/// `JavaSE 25` を要求し、21 では標準出力にフレームでない行を出して終わる（握手は
+/// `Framing(TruncatedFrame)` で落ちる）。
 const JAVA_SERVER: &str = "jdtls";
 
 /// jdtls に、状態（取り込んだプロジェクト・索引）を書くディレクトリを渡すオプション。
 ///
 /// **省くとラッパの既定（`~/.cache/jdtls/jdtls-<cwd のディレクトリ名の sha1>`）になる**
-/// （1.64.0 の `jdtls.py`）。cwd の名前だけで決まるので、並べて起こしたサーバが同じ場所を
+/// （1.63.0 の `jdtls.py`）。cwd の名前だけで決まるので、並べて起こしたサーバが同じ場所を
 /// 取り合い、名前の同じ別のプロジェクトの状態が混ざる。
 const JAVA_STATE_DIRECTORY_FLAG: &str = "-data";
 
@@ -130,8 +134,9 @@ const SWIFT_PROJECT_MARKERS: [&str; 1] = ["Package.swift"];
 
 /// jdtls が Maven / Gradle のプロジェクトとして取り込むためのビルドファイル。
 ///
-/// 印の外のファイルは「invisible project」としてクラスパス無しで開かれる見込みで、
-/// 別ファイルの参照元が揃うかは**未実測**。実サーバで確かめるのは CI で jdtls を起動する回。
+/// 印の外では別ファイルの参照元が揃わない。jdtls 1.63.0 で実測すると、`pom.xml` の無い
+/// ディレクトリ（2 ファイルのフィクスチャ）では references が空配列を返し、宣言したパッケージが
+/// 期待と違うという診断が出た。Gradle の印は未確認。
 const JAVA_PROJECT_MARKERS: [&str; 3] = ["pom.xml", "build.gradle", "build.gradle.kts"];
 
 /// サーバが何も送ってこないまま待つ上限。
@@ -231,13 +236,24 @@ const SWIFT_SETTLED_ATTEMPTS: usize = connection::SETTLED_ATTEMPTS;
 
 /// jdtls の hover で、綴りを探すコードフェンスの試す順。
 ///
-/// **未実測。** 応答の形を測るまでは TypeScript と同じ先頭のフェンスを置く。
+/// **今は使われない。** `pipeline` は Java の hover を尋ねない（型シグネチャを読む側が無い）。
+/// しかも jdtls 1.63.0 は `contents` を `MarkedString` の配列（`{language: "java", value: 綴り}`・
+/// Javadoc・`Source:` の行）で返し、コードフェンスを持たないので、尋ねてもフェンスを探す前に
+/// 読めない形になる。網羅 `match` が値を要るので、TypeScript と同じ先頭のフェンスを置く。
 const JAVA_HOVER_FENCES: &[usize] = hover::LEADING_FENCE;
 
 /// jdtls で、落ち着いた答えを求めて尋ね直す回数の上限。
 ///
-/// **未実測。** 測るまでは TypeScript と同じ値を置く。
-const JAVA_SETTLED_ATTEMPTS: usize = connection::SETTLED_ATTEMPTS;
+/// **既定の 3 回では足りない。** jdtls 1.63.0 は握手の後の読み込みを、続けて始まる複数の作業
+/// （`Building` / `Refreshing workspace` / `Searching...` / `Validate documents` /
+/// `Publish Diagnostics` など）として `$/progress` で知らせ、最初の hover が 3 回とも
+/// そのどれかに触れて `ServerStillWorking` になった回がある（PR の CI で、通った回の後に 1 度）。
+/// rust-analyzer と同じ形なので同じ上限にする。読み込みが終わった後の hover / references は
+/// 作業に触れないので、回数を増やしても待つのは読み込みの間だけ。
+///
+/// callHierarchy は尋ねるたびに応答の前に作業（`Background task`）を始めて終えるので、
+/// 尋ね直すという仕組みでは何回でも落ち着かない（上限まで尋ねて `ServerStillWorking` になる）。
+const JAVA_SETTLED_ATTEMPTS: usize = RUST_SETTLED_ATTEMPTS;
 
 /// サーバの問い合わせ形式。**サーバごとの値を選ぶのは、ここの網羅 `match` だけ。**
 ///
@@ -278,7 +294,9 @@ impl ServerLanguage {
     /// sourcekit-lsp だけが、index を作り終える前の references / callHierarchy に
     /// **進捗を始める前から**空を返す（[`Connection::synchronize_index`]）。
     /// rust-analyzer と tsserver は読み込みの途中を進捗で知らせるので、尋ね直しで足りる。
-    /// jdtls は未実測で、`workspace/synchronize` は sourcekit-lsp 固有の要求なので送らない。
+    /// jdtls も読み込み（Maven の取り込み・索引）を `$/progress` で知らせるので、読み込みの待ちは
+    /// 尋ね直しで足りる（1.63.0 の hover / references で実測）。`workspace/synchronize` は
+    /// sourcekit-lsp 固有の要求なので送らない。
     fn synchronizes_index(self) -> bool {
         match self {
             Self::Swift => true,
@@ -381,7 +399,10 @@ impl ServerCommand {
     ///
     /// jdtls は環境変数 `CLIENT_PORT` が無ければ stdio でしゃべる。状態を書くディレクトリは
     /// 起動のたびに [`Client::start`] が作って `-data` で渡す。
-    /// **起動して確かめたことはまだ無い**（CI で jdtls を起動する回が測る）。
+    ///
+    /// jdtls 1.63.0 で、握手と、`pom.xml` の下での references は実サーバで動くことを確かめてある
+    /// （`tests/java_lsp.rs`）。
+    /// hover は `MarkedString` で返るので読めず、callHierarchy は落ち着いた答えが得られない。
     pub fn java() -> Self {
         Self {
             language: ServerLanguage::Java,

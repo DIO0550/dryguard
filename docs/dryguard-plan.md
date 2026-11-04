@@ -246,7 +246,7 @@ dryguard check --diff --staged   # ステージ済みの変更だけ (pre-commit
 - 単一バイナリで配布が楽、Rust解析対象なので dogfooding できる
 - その他: `rayon` (Stage 1 並列化), `serde`, `clap`
 
-LSPサーバ: TS は typescript-language-server、Rust は rust-analyzer。Phase 6 で Python は pyright、Java は Eclipse JDT Language Server（jdtls）、Swift は sourcekit-lsp を足す（配布形は言語ごとの親 Issue #368 / #369 / #370。hover の綴りの形・references / callHierarchy の対応・読み込みの待ち時間は、各言語の「実サーバで確かめる」Issue が最初に測る。Swift は #406 で測り、sourcekit-lsp は index を作り終える前の references / callHierarchy に進捗を始める前から空を返すので、握手の後に `workspace/synchronize` で index を待つ。pyright と jdtls は未実測）。
+LSPサーバ: TS は typescript-language-server、Rust は rust-analyzer。Phase 6 で Python は pyright、Java は Eclipse JDT Language Server（jdtls）、Swift は sourcekit-lsp を足す（配布形は言語ごとの親 Issue #368 / #369 / #370。hover の綴りの形・references / callHierarchy の対応・読み込みの待ち時間は、各言語の「実サーバで確かめる」Issue が最初に測る。Swift は #406 で測り、sourcekit-lsp は index を作り終える前の references / callHierarchy に進捗を始める前から空を返すので、握手の後に `workspace/synchronize` で index を待つ。jdtls は #394 で測り、1.63.0 は JDK 25 を要し、references は `pom.xml` の下では別ファイルから返るが印の無いディレクトリでは返らず（Gradle は未確認）、hover は `MarkedString` の配列で返り、callHierarchy は尋ねるたびに作業の進捗を始める。pyright は未実測）。
 
 ---
 
