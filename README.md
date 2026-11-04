@@ -80,7 +80,7 @@ cargo run -- check --diff --staged   # ステージ済みの変更だけを起�
 TypeScript / TSX の `describe` / `it` / `test`（`.only` / `.skip` も対応）の第2引数に
 直接書いたアロー関数・関数式を除外する。コールバック側の括弧・型アサーション等は辿る。
 Java（`--lang java` と `auto`）では注釈の名前が `Test` で終わるメソッド（`@Test` / `@ParameterizedTest` など）を、
-`--lang swift` では `@Test` 付きの関数と、`XCTestCase` を継承したクラスに直接書いた引数を取らない `func test…` を除外する。
+Swift（`--lang swift` と `auto`）では `@Test` 付きの関数と、`XCTestCase` を継承したクラスに直接書いた引数を取らない `func test…` を除外する。
 ファイル名では除外せず、ヘルパーやテスト本体内の通常の関数は残す。除外数は走査結果に出る。
 `--include-tests` で再び比較対象にでき、`compare` での直接指定には影響しない。
 
@@ -117,9 +117,8 @@ spread 引数の後ろも引数位置が確定しないため残す。テスト�
 **各シグナルに当てた閾値**。**既定でも判定に効いた根拠は出る**ので、`--explain` は
 結論に理由を足すのではなく、**閾値との突き合わせまで見せる**ためのもの。
 
-`scan` / `check` は `.ts` / `.tsx` / `.mts` / `.cts` / `.rs` / `.java` を見る。`--lang ts` / `--lang rust` / `--lang java` で
-対象を絞り、`auto` では TypeScript・Rust・Java の 3 言語を走査する（異なる言語の関数同士は比較しない）。
-`--lang swift` を指定したときだけ `.swift` を走査する（`auto` には入らない）。Rust の
+`scan` / `check` は `.ts` / `.tsx` / `.mts` / `.cts` / `.rs` / `.java` / `.swift` を見る。`--lang ts` / `--lang rust` / `--lang java` / `--lang swift` で
+対象を絞り、`auto` では TypeScript・Rust・Java・Swift の 4 言語を走査する（異なる言語の関数同士は比較しない）。Rust の
 自由関数・`impl` 内のメソッド・トレイト実装のメソッドをそれぞれ 1 チャンクにする。
 正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない関数（1〜3 行のアクセサ・委譲）は `scan` では比べず、
 外した数を走査量の行に出す（`compare` は名指しされれば比べる）。
@@ -127,16 +126,14 @@ spread 引数の後ろも引数位置が確定しないため残す。テスト�
 Java の候補は jdtls に呼び出し元・呼び出し先を尋ねる。型シグネチャは hover の綴りを読む側がまだ無いので尋ねない。
 jdtls 1.63.0 は JDK 25 が要る。呼び出し先は問い合わせのたびにサーバが作業を始めるので、今は落ち着いた答えが取れず「測れない」になる。
 呼び出し元は印（`pom.xml` / `build.gradle` / `build.gradle.kts`）の外のファイルでは尋ねない（`pom.xml` の無いディレクトリでは別ファイルの参照元が返らないことを実測した。Gradle は未確認）。
-`.swift` は関数・メソッド・`init` / `deinit` をチャンクにし、`compare` で名指しすれば比べる。
-正規化トークンの表に Swift の種別がまだ無いので、`scan` / `check` は `--lang swift` を指定したときだけ走査する。
+`.swift` は関数・メソッド・`init` / `deinit` をチャンクにする。
 Swift の候補は sourcekit-lsp に型シグネチャ・呼び出し元・呼び出し先を尋ねる。型シグネチャは引数のラベルを型の一部として残し（内部名は落とす）、型名は definition で宣言まで辿る。`typealias` はまだ展開しないので、エイリアスを通る型シグネチャは「測れない」になる。
 sourcekit-lsp は index を作り終える前の参照元に空を返すので、セッションを始めるたびに index を作り終えるまで待つ（`compare` は実行ごと、`scan` / `check` は走査ごとに 1 回。`swift build` は要らない）。
 `compare` は `--lang` と拡張子が一致しなければ比べない（`--lang ts` と `.swift` / `.java`、`--lang java` と `.ts` など。`auto` は拡張子に従う）。
 CLI は拡張子から TypeScript・Rust・Swift・Java の LSP サーバを選ぶ。`scan --lang auto` では
 言語ごとに候補を揃え、TypeScript は typescript-language-server、Rust は rust-analyzer の
 セッションで hover / references を問い合わせる。Swift の候補は sourcekit-lsp のセッションに
-同じく尋ねる。`auto` の走査には入らないので、尋ねるのは
-`compare` で名指ししたときと `--lang swift` で走査したとき。Java の候補は jdtls のセッションに
+同じく尋ねる（`compare` で名指ししたとき・`--lang swift` と `auto` で走査したとき）。Java の候補は jdtls のセッションに
 尋ね（`compare` で名指ししたとき・`--lang java` と `auto` で走査したとき）、hover（型シグネチャ）は
 尋ねない。Rust の型シグネチャ比較は #40 まで「測れない」。
 
