@@ -96,9 +96,10 @@ pub(super) fn outcome_of(hover: &Hover) -> HoverOutcome {
 /// サーバごとに決まるので、ここでは選ばずに受け取る（サーバの指定は `lsp` が持つ）。
 pub(super) fn outcome_of_fences(hover: &Hover, fences: &[usize]) -> HoverOutcome {
     let HoverContents::Markup(content) = &hover.contents else {
-        // `MarkedString` は LSP 3.15 で非推奨になった形。今つないでいるサーバは
-        // どれも `Markup` を返すので、読める形は要る相手が現れたときに足す。
-        // **黙って「答えが無かった」にはしない。**
+        // `MarkedString` は LSP 3.15 で非推奨になった形。今つないでいるサーバのうち、
+        // jdtls（1.63.0 で実測）が `{language: "java", value: 綴り}` を含む配列で返す。
+        // 要素のどれが綴りかを決めずに読むと別の要素（Javadoc）を綴りとして比べうるので、
+        // 測れない側へ倒す。**黙って「答えが無かった」にはしない。**
         return HoverOutcome::Unreadable;
     };
 

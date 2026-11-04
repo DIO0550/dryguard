@@ -30,3 +30,8 @@ harness/phase0/out/
 
 # sourcekit-lsp の background indexing がフィクスチャの下に作る
 tests/fixtures/swift-lsp/.build/
+
+# jdtls（m2e）が Maven のプロジェクトを取り込むときにフィクスチャの下へ書く
+tests/fixtures/java-lsp/.classpath
+tests/fixtures/java-lsp/.project
+tests/fixtures/java-lsp/.settings/
