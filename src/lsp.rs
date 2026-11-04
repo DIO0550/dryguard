@@ -236,10 +236,11 @@ const SWIFT_SETTLED_ATTEMPTS: usize = connection::SETTLED_ATTEMPTS;
 
 /// jdtls の hover で、綴りを探すコードフェンスの試す順。
 ///
-/// **今は使われない。** `pipeline` は Java の hover を尋ねない（型シグネチャを読む側が無い）。
-/// しかも jdtls 1.63.0 は `contents` を `MarkedString` の配列（`{language: "java", value: 綴り}`・
-/// Javadoc・`Source:` の行）で返し、コードフェンスを持たないので、尋ねてもフェンスを探す前に
-/// 読めない形になる。網羅 `match` が値を要るので、TypeScript と同じ先頭のフェンスを置く。
+/// **今は使われない。** jdtls 1.63.0 は `contents` を `MarkedString` の配列
+/// （`{language: "java", value: 綴り}`・Javadoc・`Source:` の行）で返し、コードフェンスを持たない。
+/// 綴りは配列の言語付きの要素から読むので（`hover::outcome_of_answer`）、フェンスの順は効かない。
+/// 網羅 `match` が値を要るので、TypeScript と同じ先頭のフェンスを置く
+/// （`pipeline` は綴りを型シグネチャとして読む側が無いので、Java の hover をまだ尋ねない）。
 const JAVA_HOVER_FENCES: &[usize] = hover::LEADING_FENCE;
 
 /// jdtls で、落ち着いた答えを求めて尋ね直す回数の上限。
@@ -402,7 +403,8 @@ impl ServerCommand {
     ///
     /// jdtls 1.63.0 で、握手と、`pom.xml` の下での references は実サーバで動くことを確かめてある
     /// （`tests/java_lsp.rs`）。
-    /// hover は `MarkedString` で返るので読めず、callHierarchy は落ち着いた答えが得られない。
+    /// hover は `MarkedString` の配列の言語付きの要素から綴りを読める。callHierarchy は落ち着いた
+    /// 答えが得られない。
     pub fn java() -> Self {
         Self {
             language: ServerLanguage::Java,

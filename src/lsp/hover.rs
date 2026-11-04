@@ -4,7 +4,7 @@
 //! こちらが読める形へ直す変換だけなので、サーバを起動せずに確かめられる
 //! (rules/tdd.md「`lsp` は『応答を受け取ってから先』を切り出す」)。
 
-use lsp_types::{Hover, HoverContents};
+use lsp_types::{Hover, HoverContents, MarkedString};
 
 /// マークダウンのコードフェンスの印。
 const FENCE: &str = "```";
@@ -63,8 +63,8 @@ pub enum HoverOutcome {
     /// 答えは返ったが、dryguard が読める形ではない。
     ///
     /// コードフェンスが無い（サーバが散文で返した）か、`MarkedString`
-    /// （LSP 3.15 で非推奨になった形）で返ってきたか。**どちらもこちら側の穴**で、
-    /// サーバは答えを持っている。
+    /// （LSP 3.15 で非推奨になった形）の配列に言語付きの要素が無いか、単独の `MarkedString` で
+    /// 返ってきたか。**どれもこちら側の穴**で、サーバは答えを持っている。
     Unreadable,
     /// 尋ねるたびにサーバが作業を始めるので、落ち着いた答えを受け取れなかった。
     ///
@@ -87,29 +87,44 @@ pub enum HoverOutcome {
 /// 読むところまで。
 #[cfg(test)]
 pub(super) fn outcome_of(hover: &Hover) -> HoverOutcome {
-    outcome_of_fences(hover, LEADING_FENCE)
+    outcome_of_answer(hover, LEADING_FENCE)
 }
 
-/// `fences` の順にコードフェンスを試し、最初に見つかったものからシグネチャを読む。
+/// サーバが返した hover の答えからシグネチャを読む。
+///
+/// - `MarkupContent`: `fences` の順にコードフェンスを試し、最初に見つかったものを読む
+/// - `MarkedString` の配列: 最初の言語付きの要素（`{language, value}`）の `value` を読む。
+///   **`fences` は効かない**
 ///
 /// `fences` は何番目のフェンス（0 始まり）を試すかの並び。どのフェンスに綴りがあるかは
 /// サーバごとに決まるので、ここでは選ばずに受け取る（サーバの指定は `lsp` が持つ）。
-pub(super) fn outcome_of_fences(hover: &Hover, fences: &[usize]) -> HoverOutcome {
-    let HoverContents::Markup(content) = &hover.contents else {
-        // `MarkedString` は LSP 3.15 で非推奨になった形。今つないでいるサーバのうち、
-        // jdtls（1.63.0 で実測）が `{language: "java", value: 綴り}` を含む配列で返す。
-        // 要素のどれが綴りかを決めずに読むと別の要素（Javadoc）を綴りとして比べうるので、
-        // 測れない側へ倒す。**黙って「答えが無かった」にはしない。**
-        return HoverOutcome::Unreadable;
+pub(super) fn outcome_of_answer(hover: &Hover, fences: &[usize]) -> HoverOutcome {
+    let text = match &hover.contents {
+        HoverContents::Markup(content) => fences
+            .iter()
+            .find_map(|&index| fenced_text_of(&content.value, index)),
+        HoverContents::Array(elements) => language_text_of(elements),
+        // 単独の `MarkedString` を返すサーバは今つないでいる中に無く、形を実測していない。
+        // 言語付きの要素だけでも綴りと決めずに、読めない側へ倒す。
+        // **黙って「答えが無かった」にはしない。**
+        HoverContents::Scalar(_) => None,
     };
-
-    let text = fences
-        .iter()
-        .find_map(|&index| fenced_text_of(&content.value, index));
     match text.and_then(SignatureText::new) {
         Some(signature_text) => HoverOutcome::Answered(signature_text),
         None => HoverOutcome::Unreadable,
     }
+}
+
+/// `MarkedString` の配列のうち、最初の言語付きの要素の中身。無ければ `None`。
+///
+/// **要素は種類で選び、位置でも言語名でも選ばない。** jdtls 1.63.0 は綴りを
+/// `{language: "java", value}` に置き、Javadoc と `Source:` の行を言語の無い文字列で続ける。
+/// 位置で読むと散文を綴りとして比べうる。言語名を見ないのは [`fenced_text_of`] と同じ理由。
+fn language_text_of(elements: &[MarkedString]) -> Option<String> {
+    elements.iter().find_map(|element| match element {
+        MarkedString::LanguageString(code) => Some(code.value.clone()),
+        MarkedString::String(_) => None,
+    })
 }
 
 /// 指定したコードフェンスの中身。無ければ `None`。
@@ -141,7 +156,7 @@ fn fenced_text_of(markdown: &str, index: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lsp_types::{MarkedString, MarkupContent, MarkupKind};
+    use lsp_types::{MarkupContent, MarkupKind};
 
     use crate::test_support::signature_text;
 
@@ -168,23 +183,23 @@ mod tests {
     }
 
     #[test]
-    fn test_hover_outcome_of_fences_reads_the_declaration_after_the_crate_name() {
+    fn test_hover_outcome_of_answer_reads_the_declaration_after_the_crate_name() {
         let hover = markdown_hover(
             "```rust\ndryguard_fixture\n```\n\n```rust\npub fn first(value: i32) -> i32\n```",
         );
 
         assert_eq!(
-            outcome_of_fences(&hover, &[1, 0]),
+            outcome_of_answer(&hover, &[1, 0]),
             HoverOutcome::Answered(signature_text("pub fn first(value: i32) -> i32"))
         );
     }
 
     #[test]
-    fn test_hover_outcome_of_fences_reads_alias_after_the_module_path() {
+    fn test_hover_outcome_of_answer_reads_alias_after_the_module_path() {
         let hover =
             markdown_hover("```rust\nfixture::model\n```\n\n```rust\npub type Amount = u64\n```");
         assert_eq!(
-            outcome_of_fences(&hover, &[1, 0]),
+            outcome_of_answer(&hover, &[1, 0]),
             HoverOutcome::Answered(signature_text("pub type Amount = u64"))
         );
     }
@@ -269,6 +284,94 @@ mod tests {
             padded.map(|text| text.as_str().to_owned()),
             Some("  function decl(): void  ".to_owned())
         );
+    }
+
+    /// jdtls が返す形の hover。`MarkedString` の配列。
+    fn marked_hover(elements: Vec<MarkedString>) -> Hover {
+        Hover {
+            contents: HoverContents::Array(elements),
+            range: None,
+        }
+    }
+
+    #[test]
+    fn test_hover_outcome_of_a_marked_array_reads_the_language_element_not_the_javadoc() {
+        // jdtls 1.63.0 が実際に返す形。Javadoc と `Source:` は言語の印を持たない文字列で続く
+        let hover = marked_hover(vec![
+            MarkedString::from_language_code(
+                "java".to_owned(),
+                "int shop.Total.total(List<Integer> items, double discount)".to_owned(),
+            ),
+            MarkedString::String("品目の合計から割引を引く。".to_owned()),
+            MarkedString::String("Source: *[shop](file:///shop/Total.java#7)*".to_owned()),
+        ]);
+
+        assert_eq!(
+            outcome_of(&hover),
+            HoverOutcome::Answered(signature_text(
+                "int shop.Total.total(List<Integer> items, double discount)"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_hover_outcome_of_a_marked_array_skips_leading_prose_before_the_language_element() {
+        // 先頭の要素を位置で読むと、散文を綴りとして比べる
+        let hover = marked_hover(vec![
+            MarkedString::String("品目の合計から割引を引く。".to_owned()),
+            MarkedString::from_language_code(
+                "java".to_owned(),
+                "int shop.Total.subtotal(List<Integer> items, double rate)".to_owned(),
+            ),
+        ]);
+
+        assert_eq!(
+            outcome_of(&hover),
+            HoverOutcome::Answered(signature_text(
+                "int shop.Total.subtotal(List<Integer> items, double rate)"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_hover_outcome_of_a_marked_array_without_a_language_element_is_unreadable() {
+        // 対照は jdtls の形のテスト。同じ配列の綴りの要素から言語の印だけを外している。
+        // 位置で読む実装ならここで綴りを答えにする
+        let hover = marked_hover(vec![
+            MarkedString::String(
+                "int shop.Total.total(List<Integer> items, double discount)".to_owned(),
+            ),
+            MarkedString::String("品目の合計から割引を引く。".to_owned()),
+            MarkedString::String("Source: *[shop](file:///shop/Total.java#7)*".to_owned()),
+        ]);
+
+        assert_eq!(outcome_of(&hover), HoverOutcome::Unreadable);
+    }
+
+    #[test]
+    fn test_hover_outcome_of_a_marked_array_with_an_empty_language_element_is_unreadable() {
+        // 空の綴りを答えにすると、後段は「型が空だった」と読む
+        let hover = marked_hover(vec![MarkedString::from_language_code(
+            "java".to_owned(),
+            "  ".to_owned(),
+        )]);
+
+        assert_eq!(outcome_of(&hover), HoverOutcome::Unreadable);
+    }
+
+    #[test]
+    fn test_hover_outcome_of_a_single_language_element_is_unreadable() {
+        // 対照は jdtls の形のテスト。同じ要素を配列で包まずに返す形は実測していないので、
+        // 読めない側へ倒す
+        let hover = Hover {
+            contents: HoverContents::Scalar(MarkedString::from_language_code(
+                "java".to_owned(),
+                "int shop.Total.total(List<Integer> items, double discount)".to_owned(),
+            )),
+            range: None,
+        };
+
+        assert_eq!(outcome_of(&hover), HoverOutcome::Unreadable);
     }
 
     #[test]
