@@ -37,7 +37,9 @@ const FUNCTION_KIND: &str = "function_declaration";
 const INITIALIZER_KIND: &str = "init_declaration";
 const DEINITIALIZER_KIND: &str = "deinit_declaration";
 
-/// 型の宣言（`struct` / `class` / `actor` / `enum` / `extension`）。
+/// 型の宣言の、tree-sitter-swift のノードの種別。**`struct` / `class` / `actor` / `enum` /
+/// `extension` はどれもこの 1 種別になる**（tree-sitter-swift 0.7 で確かめた。宣言の字句は
+/// 種別ではなく子として残る）ので、種別を増やさずに全部を読む。
 const TYPE_DECLARATION_KIND: &str = "class_declaration";
 
 /// 型の本体。`struct` / `class` / `actor` / `extension` は `class_body`、`enum` は `enum_class_body`。
