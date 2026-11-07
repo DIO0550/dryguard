@@ -423,7 +423,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             })?;
 
         Ok(match answered.as_ref() {
-            Some(hover) => hover::outcome_of_fences(hover, self.hover_fences),
+            Some(hover) => hover::outcome_of_answer(hover, self.hover_fences),
             None => HoverOutcome::NoAnswer,
         })
     }
