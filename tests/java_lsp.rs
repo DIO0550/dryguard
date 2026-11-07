@@ -15,7 +15,7 @@ use dryguard::source_position::SourcePosition;
 
 #[test]
 #[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
-fn test_jdtls_answers_references_but_leaves_hover_unreadable_and_callees_unsettled() {
+fn test_jdtls_answers_hover_and_references_but_leaves_callees_unsettled() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/java-lsp");
     let path = fixture.join("src/main/java/shop/Total.java");
     let caller = fixture.join("src/main/java/shop/Checkout.java");
@@ -34,7 +34,18 @@ fn test_jdtls_answers_references_but_leaves_hover_unreadable_and_callees_unsettl
     let handshake = started.elapsed();
     session.open_document(&document).expect("ファイルを開ける");
 
-    for (line, name) in [(7, "total"), (12, "subtotal")] {
+    for (line, name, spelling) in [
+        (
+            7,
+            "total",
+            "int shop.Total.total(List<Integer> items, double discount)",
+        ),
+        (
+            12,
+            "subtotal",
+            "int shop.Total.subtotal(List<Integer> items, double rate)",
+        ),
+    ] {
         let position = SourcePosition::from_preceding_text(
             LineNumber::new(line).expect("正の行番号"),
             "    public static int ",
@@ -43,12 +54,11 @@ fn test_jdtls_answers_references_but_leaves_hover_unreadable_and_callees_unsettl
             .hover(&document, position)
             .expect("hover を尋ねられる");
         // jdtls 1.63.0 は `contents` を MarkedString の配列（`{language: "java", value: 綴り}`・Javadoc・
-        // `Source:` の行）で返し、`markdown` を宣言しても MarkupContent にしない。読めない形として扱う
-        // （`Unreadable` はフェンスの無い Markup でも返るので、この assert は形までは見分けない）
-        assert!(
-            matches!(hover, HoverOutcome::Unreadable),
-            "{name}: {hover:?}"
-        );
+        // `Source:` の行）で返す。Javadoc を持つ `total` でも、綴りの要素だけを読む
+        let HoverOutcome::Answered(text) = hover else {
+            panic!("{name} の綴りが返る: {hover:?}");
+        };
+        assert_eq!(text.as_str(), spelling, "{name}");
 
         let references = session
             .references(&document, position)
