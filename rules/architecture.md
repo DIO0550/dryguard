@@ -334,7 +334,10 @@ implementation の候補のうち対象型の綴りが等しい impl（`RustImpl
 `Amount` と `Int` が重ならないと確かめた答えになる）。標準ライブラリの省略形を持つ名前
 （`Void` = `()` など）は、エイリアスかを見る前に標準ライブラリの `.swiftinterface` を指すかで通す
 （`is_swift_standard_library_site`）。hover の綴りに出ないレシーバと `init` の値の型は、
-`syntax::chunk` が運ぶ直接囲む型の名前で足す（`Chunk::swift_enclosing_type`）。
+`syntax::chunk` が運ぶ直接囲む型の綴りで足す（`Chunk::swift_enclosing_type`）。hover は囲む
+`extension` の `where` も綴らないので、型引数（`Array<Int>` / `[Int]`）と `where` 節も同じ綴りで運び、
+`where` の右辺と型引数の型名は使用位置から辿る。**`where` の左辺は辿らない** — レシーバの型変数で、
+sourcekit-lsp 6.4.2 の definition は宣言ではない位置（そのモジュールの生成インタフェースの先頭）を返す。
 
 **書かれた型名がここに来ることはある。** `syntax` が集めた型名は必ず尋ねる（TypeScript は
 `pipeline`、Rust は hover の後に `semantics::type_signature` が尋ねる）が、
