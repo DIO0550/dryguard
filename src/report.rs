@@ -538,6 +538,9 @@ fn unopened_text_of(reason: UnopenedReason) -> &'static str {
         UnopenedReason::NoDefinitionSite => {
             "測れない (比較に残る型名を開けない: サーバが definition に宣言の場所を答えない。std / core の型なら rust-src が要る)"
         }
+        UnopenedReason::NoJavaDefinitionSite => {
+            "測れない (比較に残る型名を開けない: jdtls が definition に宣言の場所を答えない。JDK の型にはまだ答えられない)"
+        }
         UnopenedReason::UnreadableTypeDefinition => {
             "測れない (比較に残る型名を開けない: typeDefinition の応答を読めない)"
         }
