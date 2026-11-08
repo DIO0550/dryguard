@@ -19,10 +19,12 @@ use std::num::NonZeroUsize;
 use crate::lsp::{ClientError, HoverOutcome, Session, SignatureText, SourceDocument};
 use crate::semantics::resolved_type::{
     ResolvedTypes, RustDeclarationCache, TracedTypeNames, TypeDeclaration, UnopenedReason,
-    is_swift_standard_library_site, rust_traced_type_names_of, swift_traced_type_names_of,
+    is_swift_standard_library_site, java_traced_type_names_of, rust_traced_type_names_of,
+    swift_traced_type_names_of,
 };
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{AnnotatedPositions, OverloadDeclaration, TypeAnnotation};
+use crate::syntax::java_callable::{JavaCallable, JavaEnclosingType};
 use crate::syntax::rust_callable::RustCallable;
 use crate::syntax::swift_callable::{SwiftCallable, SwiftEnclosingType};
 use crate::syntax::type_reference::TypeReference;
@@ -477,6 +479,79 @@ pub fn swift_normalized_outcome_of(
     let declarations = declarations_named_in(type_names, traced.declared());
     TypeSignatureOutcome::Normalized(OverloadSet::of_one(TypeSignature {
         chunk_type: ComparedChunkType::Swift(callable),
+        declarations,
+    }))
+}
+
+/// Java のメソッド・コンストラクタの型シグネチャを尋ね、書かれた型名を宣言まで辿って、
+/// 正規化した形にする。
+///
+/// `document` は先に [`Session::open_document`] で開かせておく。`position` は
+/// `Chunk::name_position`、`type_references` は `Chunk::type_references`、`enclosing_type` は
+/// `Chunk::java_enclosing_type`。
+///
+/// **注釈の有無もオーバーロードも見ない。** Java の引数と戻り値は型を省けず
+/// （`syntax::chunk` は `AnnotatedPositions::AllWritten`）、同じ名前のメソッドは引数の型で
+/// 別の宣言になり、hover は名前の位置の宣言 1 つを綴る。
+///
+/// **hover を先に尋ねる**（Rust・Swift と同じ順）。hover が落ちたら definition を送らずに済む。
+///
+/// # Errors
+///
+/// そのドキュメントを開かせていないとき、往復が失敗したとき。
+/// **答えが無い / 読めないは `Err` にしない**（[`type_signature_outcome_of`] と同じ）。
+pub fn java_type_signature_outcome_of(
+    session: &mut Session,
+    document: &SourceDocument,
+    position: SourcePosition,
+    type_references: &[TypeReference],
+    enclosing_type: Option<&JavaEnclosingType>,
+) -> Result<TypeSignatureOutcome, ClientError> {
+    let signature_text = match asked_signature_text_of(session, document, position)? {
+        Ok(signature_text) => signature_text,
+        Err(outcome) => return Ok(outcome),
+    };
+
+    let traced = java_traced_type_names_of(session, document, type_references)?;
+    Ok(java_normalized_outcome_of(
+        &signature_text,
+        &traced,
+        enclosing_type,
+    ))
+}
+
+/// jdtls が返した綴り 1 本を、1 本だけの集合へ正規化した結果。
+///
+/// **答えの並びは Swift と同じ**（[`swift_normalized_outcome_of`]）から `Self` を除いたもの。
+/// 開けなかった型名 → 辿った記録の無い型名の順に見て、どれにも当たらなければ比べられる形にする。
+/// Java の綴りに、書かれた場所で指す先が変わる型（Swift の `Self`）は無い。
+pub fn java_normalized_outcome_of(
+    signature_text: &SignatureText,
+    traced: &TracedTypeNames,
+    enclosing_type: Option<&JavaEnclosingType>,
+) -> TypeSignatureOutcome {
+    let Some(callable) = JavaCallable::from_spelling(signature_text.as_str(), enclosing_type)
+    else {
+        return TypeSignatureOutcome::UnreadableSignature;
+    };
+
+    let type_names = callable.type_names();
+    if let Some(reason) = type_names
+        .iter()
+        .find_map(|name| traced.unopened_reason_of(name))
+    {
+        return TypeSignatureOutcome::UnopenedTypeName { reason };
+    }
+
+    if type_names.iter().any(|name| !is_traced(name, traced)) {
+        return TypeSignatureOutcome::UntracedTypeName {
+            reason: UntracedReason::NoTracedRecord,
+        };
+    }
+
+    let declarations = declarations_named_in(type_names, traced.declared());
+    TypeSignatureOutcome::Normalized(OverloadSet::of_one(TypeSignature {
+        chunk_type: ComparedChunkType::Java(callable),
         declarations,
     }))
 }
@@ -1079,6 +1154,7 @@ enum ComparedChunkType {
     TypeScript(ChunkType),
     Rust(RustCallable),
     Swift(SwiftCallable),
+    Java(JavaCallable),
 }
 
 /// 正規化した型シグネチャと、**比較に残る綴りに現れた型名**。
@@ -4381,5 +4457,129 @@ mod tests {
         );
 
         assert_eq!(outcome, TypeSignatureOutcome::UnreadableSignature);
+    }
+
+    /// Java の綴りを、型名を渡した記録のとおりに正規化した集合。static メソッドとして読む。
+    fn java_signature(text: &str, traced: &TracedTypeNames) -> OverloadSet {
+        let enclosing = JavaEnclosingType::new("Total", true);
+        let TypeSignatureOutcome::Normalized(set) =
+            java_normalized_outcome_of(&signature_text(text), traced, Some(&enclosing))
+        else {
+            panic!("テストが渡す Java の綴りは読み取れる: {text}");
+        };
+        set
+    }
+
+    /// `Priced` と `Named` を `shop` に宣言した記録。
+    fn java_shop() -> TracedTypeNames {
+        TracedTypeNames::new(
+            vec![
+                declared("Priced", "/repo/src/main/java/shop/Priced.java", 3),
+                declared("Named", "/repo/src/main/java/shop/Named.java", 3),
+            ],
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn test_java_methods_differing_only_in_names_are_unifiable() {
+        let traced = java_shop();
+
+        assert!(
+            java_signature("<T extends Priced> T shop.Total.cheaper(T a, T b)", &traced)
+                .is_unifiable_with(&java_signature(
+                    "<U extends Priced> U shop.Total.lower(U left, U right)",
+                    &traced
+                ))
+        );
+    }
+
+    #[test]
+    fn test_java_type_parameters_with_different_bounds_are_not_unifiable() {
+        let traced = java_shop();
+
+        assert!(
+            !java_signature("<T extends Priced> T shop.Total.cheaper(T a, T b)", &traced)
+                .is_unifiable_with(&java_signature(
+                    "<T extends Named> T shop.Total.cheaper(T a, T b)",
+                    &traced
+                ))
+        );
+    }
+
+    #[test]
+    fn test_java_same_spelling_declared_in_different_files_is_not_unifiable() {
+        let in_shop = TracedTypeNames::new(
+            vec![declared("Money", "/repo/src/main/java/shop/Money.java", 3)],
+            Vec::new(),
+        );
+        let in_bank = TracedTypeNames::new(
+            vec![declared("Money", "/repo/src/main/java/bank/Money.java", 3)],
+            Vec::new(),
+        );
+
+        let shop = java_signature("int shop.Total.f(Money x)", &in_shop);
+        assert!(!shop.is_unifiable_with(&java_signature("int shop.Total.f(Money x)", &in_bank)));
+        assert!(shop.is_unifiable_with(&java_signature("int shop.Total.g(Money y)", &in_shop)));
+    }
+
+    #[test]
+    fn test_java_type_name_without_declaration_site_is_unopened_with_the_java_reason() {
+        let traced = TracedTypeNames::new(
+            Vec::new(),
+            vec![unopened("List", UnopenedReason::NoJavaDefinitionSite)],
+        );
+
+        assert_eq!(
+            java_normalized_outcome_of(
+                &signature_text("int shop.Total.total(List<Integer> items, double discount)"),
+                &traced,
+                Some(&JavaEnclosingType::new("Total", true))
+            ),
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::NoJavaDefinitionSite
+            }
+        );
+    }
+
+    #[test]
+    fn test_java_type_name_without_traced_record_is_untraced() {
+        assert_eq!(
+            java_normalized_outcome_of(
+                &signature_text("int shop.Total.f(Money x)"),
+                &TracedTypeNames::default(),
+                Some(&JavaEnclosingType::new("Total", true))
+            ),
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord
+            }
+        );
+    }
+
+    #[test]
+    fn test_java_instance_method_needs_the_enclosing_type_traced() {
+        // レシーバの `Total` は綴りに出ないが、比較に残るので辿った記録が要る
+        assert_eq!(
+            java_normalized_outcome_of(
+                &signature_text("int shop.Total.f(int x)"),
+                &TracedTypeNames::default(),
+                Some(&JavaEnclosingType::new("Total", false))
+            ),
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord
+            }
+        );
+    }
+
+    #[test]
+    fn test_java_unreadable_spelling_is_unreadable_signature() {
+        assert_eq!(
+            java_normalized_outcome_of(
+                &signature_text("int shop.Total.f"),
+                &TracedTypeNames::default(),
+                Some(&JavaEnclosingType::new("Total", true))
+            ),
+            TypeSignatureOutcome::UnreadableSignature
+        );
     }
 }
