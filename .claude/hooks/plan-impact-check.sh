@@ -49,8 +49,21 @@ if [ -n "$source_line" ]; then
       *) missing="$missing $root" ;;
     esac
   done
+  # 同じ事実の言い回しは 1 つとは限らない（pr-494 指摘 5 / 6・pr-502 指摘 22 は、grep した語に
+  # 当たらない言い回しの箇所が漏れた）。コマンド側（`→` より前）に言い回しを 2 つ以上
+  # 並べた形（`a|b` か `-e a -e b`）かだけを見る。語が足りているかは見ない。
+  # Why not（語の数や中身まで見る）: 足りているかは機械で言えず、数だけ合わせる儀式になる。
+  command_part="${source_line%%→*}"
   if [ -z "$missing" ]; then
-    exit 0
+    case "$command_part" in
+      *"|"*) exit 0 ;;
+      *" -e "*" -e "*) exit 0 ;;
+    esac
+    {
+      echo "plan-impact-check: 影響範囲の出どころの行が、言い回しを 1 つしか grep していません。"
+      echo "変える事実の別の言い回し（例: 「未実測」と「まだ無い」）を '語A|語B' か -e を重ねて足し、grep し直してください。"
+    } >&2
+    exit 2
   fi
   {
     echo "plan-impact-check: 影響範囲の出どころの行が、grep の対象に次を含んでいません:$missing"
