@@ -40,4 +40,18 @@ public class Signatures {
         }
         return base + values[0];
     }
+
+    public int shifted(int[] values) throws OutOfStock {
+        if (values.length == 0) {
+            throw new OutOfStock();
+        }
+        return base - values[0];
+    }
+
+    public int rounded(int... values) {
+        if (values.length == 0) {
+            return base;
+        }
+        return base * values[0];
+    }
 }

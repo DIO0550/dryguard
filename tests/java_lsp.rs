@@ -204,9 +204,9 @@ fn test_jdtls_type_parameters_with_different_bounds_are_not_unifiable() {
 
 #[test]
 #[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
-fn test_jdtls_constructor_and_instance_method_with_varargs_and_throws_are_read() {
-    // 綴りを読めない側があれば単一化不能ではなく「測れない」になる。コンストラクタ・インスタンス
-    // メソッド・可変長・`throws` の hover の綴りを読めることを、比べられた答えで確かめる
+fn test_jdtls_constructor_and_instance_method_are_read() {
+    // 綴りを読めない側があれば単一化不能ではなく「測れない」になる。コンストラクタと
+    // インスタンスメソッドの hover の綴りを読めることを、比べられた答えで確かめる
     assert_eq!(
         type_signature_match_of("Signatures", "offset"),
         TypeSignatureMatch::NotUnifiable
@@ -215,7 +215,29 @@ fn test_jdtls_constructor_and_instance_method_with_varargs_and_throws_are_read()
 
 #[test]
 #[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
-fn test_jdtls_hover_spells_generic_constructor_and_throwing_members() {
+fn test_jdtls_varargs_and_array_parameters_are_not_unifiable() {
+    // `offset(int... values)` と `shifted(int[] values)`。可変長かだけが違う。jdtls が `int...` を
+    // `int[]` と綴ると単一化可能に出る
+    assert_eq!(
+        type_signature_match_of("offset", "shifted"),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
+fn test_jdtls_methods_differing_only_in_throws_are_not_unifiable() {
+    // `offset(int...) throws OutOfStock` と `rounded(int...)`。jdtls が `throws` を綴らないと
+    // 単一化可能に出る
+    assert_eq!(
+        type_signature_match_of("offset", "rounded"),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
+fn test_jdtls_hover_spells_constructor_generic_method_and_throwing_method() {
     // 綴りの形の実測を CI のログに残す（`syntax::java_callable` が読む前提）
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/java-lsp");
     let path = fixture.join("src/main/java/shop/Signatures.java");
