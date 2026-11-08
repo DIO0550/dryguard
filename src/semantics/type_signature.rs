@@ -4166,10 +4166,72 @@ mod tests {
             swift_normalized_outcome_of(
                 &signature_text("func copy() -> Self"),
                 &traced,
-                Some(&SwiftEnclosingType::Named("Wallet".to_owned()))
+                Some(&SwiftEnclosingType::new("Wallet"))
             ),
             TypeSignatureOutcome::SiteDependentSpelling
         );
+    }
+
+    /// 標準ライブラリの記録に、`Array` と、`module` に宣言した `Money` を足した記録。
+    fn swift_with_money(module: &str) -> TracedTypeNames {
+        TracedTypeNames::new(
+            vec![
+                declared("Int", SWIFT_INTERFACE, 10),
+                declared("Array", SWIFT_INTERFACE, 40),
+                declared("Money", &format!("/repo/Sources/{module}/Money.swift"), 1),
+            ],
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn test_swift_untraced_right_side_of_a_receiver_constraint_is_untraced() {
+        // 右辺の `Money` はどのファイルの `Money` か綴りでは言えないので、辿った記録が要る
+        let enclosing = SwiftEnclosingType::new("Array where Element == Money");
+        let without_money = TracedTypeNames::new(
+            vec![
+                declared("Int", SWIFT_INTERFACE, 10),
+                declared("Array", SWIFT_INTERFACE, 40),
+            ],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            swift_normalized_outcome_of(
+                &signature_text("func total() -> Int"),
+                &without_money,
+                Some(&enclosing)
+            ),
+            TypeSignatureOutcome::UntracedTypeName {
+                reason: UntracedReason::NoTracedRecord
+            }
+        );
+        assert!(matches!(
+            swift_normalized_outcome_of(
+                &signature_text("func total() -> Int"),
+                &swift_with_money("Shop"),
+                Some(&enclosing)
+            ),
+            TypeSignatureOutcome::Normalized(_)
+        ));
+    }
+
+    #[test]
+    fn test_swift_receiver_constraints_naming_types_of_different_modules_are_not_unifiable() {
+        let enclosing = SwiftEnclosingType::new("Array where Element == Money");
+        let signature_in = |module: &str| {
+            let TypeSignatureOutcome::Normalized(signature) = swift_normalized_outcome_of(
+                &signature_text("func total() -> Int"),
+                &swift_with_money(module),
+                Some(&enclosing),
+            ) else {
+                panic!("辿った記録が揃っていれば読める");
+            };
+            signature
+        };
+
+        assert!(!signature_in("Shop").is_unifiable_with(&signature_in("Bank")));
+        assert!(signature_in("Shop").is_unifiable_with(&signature_in("Shop")));
     }
 
     #[test]
