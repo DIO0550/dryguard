@@ -238,7 +238,8 @@ fn test_jdtls_methods_differing_only_in_throws_are_not_unifiable() {
 #[test]
 #[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
 fn test_jdtls_hover_spells_constructor_generic_method_and_throwing_method() {
-    // 綴りの形の実測を CI のログに残す（`syntax::java_callable` が読む前提）
+    // `syntax::java_callable` が読む前提（綴りが返ること）を確かめる。綴りそのものは
+    // `eprintln!` で出すが、通ったテストの stderr は捕まるので、見るには `--nocapture` を付ける
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/java-lsp");
     let path = fixture.join("src/main/java/shop/Signatures.java");
     let root = WorkspaceRoot::enclosing(&[path.clone(), fixture.join("pom.xml")])
