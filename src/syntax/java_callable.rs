@@ -35,6 +35,7 @@ const MEMBER_WRAPPER_END: &str = " {}\n}\n";
 /// チャンクになる宣言の種別。`syntax::chunk` の Java のチャンクと同じ。
 const METHOD_KIND: &str = "method_declaration";
 const CONSTRUCTOR_KIND: &str = "constructor_declaration";
+const COMPACT_CONSTRUCTOR_KIND: &str = "compact_constructor_declaration";
 
 /// 型の宣言の種別。メンバーを直接囲む型を探すときに止まる先。
 const TYPE_DECLARATION_KINDS: [&str; 4] = [
@@ -90,7 +91,11 @@ const DIMENSION_OPEN_TOKEN: &str = "[";
 /// Java のメソッド・コンストラクタ 1 つ分の、単一化の可否を比べられる形。
 ///
 /// メソッド名・引数名・修飾子・注釈を落とし、メソッド自身が束縛した型変数を
-/// 出現順に付け替える（引数 → 戻り値 → `throws`、現れなかったものは宣言順）。
+/// **宣言の順の番号**に付け替える。
+///
+/// **Why not（出現順に付け替える）**: 明示した型引数（`X.<String, Integer>f(1, "s")`）は
+/// 宣言の順に当たるので、`<A, B> void f(B b, A a)` と `<A, B> void f(A a, B b)` は
+/// 差し替えられない。出現順だとこの 2 つが重なる（偽陽性）。
 /// **クラスが束縛した型変数は付け替えない** — メソッドの綴りからは辿れず、型名として
 /// 宣言の場所で比べる（`rules/architecture.md`「外側のスコープが束縛した型変数は外さない」）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,7 +144,7 @@ enum JavaType {
     Primitive(String),
     /// 名前で書かれた型。パスの区切りごとに型引数を持つ（`Outer<A>.Inner<B>`）。
     Named(JavaPath),
-    /// メソッド自身が束縛した型変数。番号は出現順。
+    /// メソッド自身が束縛した型変数。番号は宣言の順。
     Parameter(usize),
     /// 配列の 1 次元。
     Array(Box<JavaType>),
@@ -173,6 +178,8 @@ pub struct JavaEnclosingType {
 
 impl JavaEnclosingType {
     /// 囲む型の名前と、メンバーが static かから作る。
+    ///
+    /// **コンストラクタは static かを見ない**（レシーバを持たず、値の型が囲む型になる）。
     pub(crate) fn new(name: impl Into<String>, static_member: bool) -> Self {
         Self {
             name: name.into(),
@@ -189,15 +196,15 @@ impl JavaCallable {
     /// hover が返した綴りから読む。宣言として読めなければ `None`。
     ///
     /// `enclosing_type` は、そのメンバーを直接囲む型（`Chunk::java_enclosing_type`）。
+    /// 囲む型を名前で言えないメンバー（匿名クラス・enum 定数の本体）は、呼び出し側が
+    /// hover を尋ねる前に外す。
     ///
     /// **読めない形は `None`**（偽陰性側）: 修飾した名前の後ろに引数リストが無い綴り、
-    /// tree-sitter-java が構文エラーにする綴り、囲む型を名前で言えないメンバー
-    /// （匿名クラス・enum 定数の本体）。
+    /// tree-sitter-java が構文エラーにする綴り。
     pub(crate) fn from_spelling(
         spelling: &str,
-        enclosing_type: Option<&JavaEnclosingType>,
+        enclosing_type: &JavaEnclosingType,
     ) -> Option<Self> {
-        let enclosing = enclosing_type?;
         let declaration_text = unqualified_declaration_of(spelling)?;
         let wrapped = format!("{MEMBER_WRAPPER_START}{declaration_text}{MEMBER_WRAPPER_END}");
         let tree = SyntaxTree::from_source(&wrapped, Grammar::Java).ok()?;
@@ -210,21 +217,8 @@ impl JavaCallable {
             .find(|node| is_callable_kind(node.kind()))?;
 
         let mut reader = JavaSpelling::new(&wrapped);
-        let mut callable = reader.callable_of(declaration)?;
-        let mut type_names = reader.type_names;
-        match callable.kind {
-            JavaCallableKind::Method => {
-                if !enclosing.static_member {
-                    callable.receiver = Some(enclosing.to_type());
-                    type_names.insert(enclosing.name.clone());
-                }
-            }
-            JavaCallableKind::Constructor => {
-                callable.value_type = enclosing.to_type();
-                type_names.insert(enclosing.name.clone());
-            }
-        }
-        callable.type_names = type_names;
+        let mut callable = reader.callable_of(declaration, enclosing_type)?;
+        callable.type_names = reader.type_names;
         Some(callable)
     }
 
@@ -262,6 +256,11 @@ fn unqualified_declaration_of(spelling: &str) -> Option<String> {
         .last()
         .map(|(index, _)| index)?;
     let qualified = before.get(start..)?;
+    // `shop.Box<T>.Box(` のように修飾の途中に型引数が挟まると、名前が `.` で始まる。
+    // 末尾だけを残すと手前の `shop.Box<T>` が戻り値の型に見えるので、読まない
+    if qualified.starts_with('.') {
+        return None;
+    }
     let name = qualified.rsplit('.').next()?;
     if name.is_empty() {
         return None;
@@ -289,35 +288,32 @@ fn is_callable_kind(kind: &str) -> bool {
 /// **インスタンスメソッドとコンストラクタは、囲む型の名前も集める** — 位置は型の宣言の名前。
 /// [`JavaCallable::from_spelling`] がその名前をレシーバ・構築する型として比較に残す。
 ///
-/// コンパクトコンストラクタ（record の `Point { … }`）は引数リストを持たないので読めず、空。
+/// コンパクトコンストラクタ（record の `Point { … }`）は、record の宣言の引数リストを読む。
+/// 囲む型を名前で言えないメンバーは空（hover を尋ねないので要らない）。
 pub(crate) fn type_references_of(function: Node<'_>, source: &str) -> Vec<TypeReference> {
+    let Some(enclosing) = enclosing_type_of(function, source) else {
+        return Vec::new();
+    };
     let mut reader = JavaSpelling::new(source);
     reader.recording = true;
-    let Some(callable) = reader.callable_of(function) else {
+    let Some(callable) = reader.callable_of(function, &enclosing) else {
         return Vec::new();
     };
     let mut references = reader.references;
 
-    let takes_enclosing = match callable.kind {
-        JavaCallableKind::Method => !is_static_member(function, source),
-        JavaCallableKind::Constructor => true,
-    };
-    if !takes_enclosing {
-        return references;
-    }
-    let Some(name) = enclosing_declaration_of(function)
-        .and_then(|declaration| declaration.child_by_field_name("name"))
-    else {
-        return references;
-    };
-    let Some(spelled) = source.get(name.byte_range()) else {
-        return references;
-    };
+    let takes_enclosing =
+        callable.receiver.is_some() || callable.kind == JavaCallableKind::Constructor;
     let recorded = references
         .iter()
-        .any(|reference| reference.name() == spelled);
-    if !recorded && let Some(position) = source_position_of(name, source) {
-        references.push(TypeReference::new(spelled.to_owned(), position));
+        .any(|reference| reference.name() == enclosing.name);
+    if !takes_enclosing || recorded {
+        return references;
+    }
+    let position = enclosing_declaration_of(function)
+        .and_then(|declaration| declaration.child_by_field_name("name"))
+        .and_then(|name| source_position_of(name, source));
+    if let Some(position) = position {
+        references.push(TypeReference::new(enclosing.name, position));
     }
     references
 }
@@ -373,10 +369,8 @@ fn named_children_of(node: Node<'_>) -> Vec<Node<'_>> {
 /// 1 つの宣言の綴りを読み進める途中の状態。
 struct JavaSpelling<'source> {
     source: &'source str,
-    /// メソッド自身が束縛した型変数の名前。宣言された順。
+    /// メソッド自身が束縛した型変数の名前。宣言された順で、添字が番号になる。
     declared: Vec<String>,
-    /// 付け替えた型変数の名前。**番号の順**。
-    numbered: Vec<String>,
     type_names: BTreeSet<String>,
     /// ソースを読むときだけ、型名の位置を残す。
     recording: bool,
@@ -388,7 +382,6 @@ impl<'source> JavaSpelling<'source> {
         Self {
             source,
             declared: Vec::new(),
-            numbered: Vec::new(),
             type_names: BTreeSet::new(),
             recording: false,
             references: Vec::new(),
@@ -401,11 +394,27 @@ impl<'source> JavaSpelling<'source> {
 
     /// 宣言を読む。読めない形なら `None`。
     ///
-    /// コンストラクタの値の型とレシーバは、呼び出し側が囲む型で埋める。
-    fn callable_of(&mut self, declaration: Node<'_>) -> Option<JavaCallable> {
-        let kind = match declaration.kind() {
-            METHOD_KIND => JavaCallableKind::Method,
-            CONSTRUCTOR_KIND => JavaCallableKind::Constructor,
+    /// `enclosing` はレシーバ（static でないメソッド）とコンストラクタの値の型になり、
+    /// その名前は比較に残る型名に入る。
+    fn callable_of(
+        &mut self,
+        declaration: Node<'_>,
+        enclosing: &JavaEnclosingType,
+    ) -> Option<JavaCallable> {
+        let (kind, parameter_list) = match declaration.kind() {
+            METHOD_KIND => (
+                JavaCallableKind::Method,
+                declaration.child_by_field_name("parameters")?,
+            ),
+            CONSTRUCTOR_KIND => (
+                JavaCallableKind::Constructor,
+                declaration.child_by_field_name("parameters")?,
+            ),
+            // 引数は record の宣言の側に書かれる
+            COMPACT_CONSTRUCTOR_KIND => (
+                JavaCallableKind::Constructor,
+                enclosing_declaration_of(declaration)?.child_by_field_name("parameters")?,
+            ),
             _ => return None,
         };
         let type_parameters = match declaration.child_by_field_name("type_parameters") {
@@ -423,13 +432,19 @@ impl<'source> JavaSpelling<'source> {
             self.declared.push(name);
         }
 
-        let (parameters, variadic) =
-            self.parameters_of(declaration.child_by_field_name("parameters")?)?;
-        let value_type = match kind {
-            JavaCallableKind::Method => self.type_of(declaration.child_by_field_name("type")?)?,
-            // 呼び出し側が囲む型で埋める
-            JavaCallableKind::Constructor => JavaType::Primitive(String::new()),
+        let (parameters, variadic) = self.parameters_of(parameter_list)?;
+        let (receiver, value_type) = match kind {
+            JavaCallableKind::Method => {
+                let value_type = self.type_of(declaration.child_by_field_name("type")?)?;
+                let receiver = (!enclosing.static_member).then(|| enclosing.to_type());
+                (receiver, value_type)
+            }
+            JavaCallableKind::Constructor => (None, enclosing.to_type()),
         };
+        let takes_enclosing = receiver.is_some() || kind == JavaCallableKind::Constructor;
+        if takes_enclosing {
+            self.type_names.insert(enclosing.name.clone());
+        }
         let mut exceptions = BTreeSet::new();
         for clause in children_of(declaration)
             .into_iter()
@@ -440,13 +455,8 @@ impl<'source> JavaSpelling<'source> {
             }
         }
 
-        // 引数・戻り値・`throws` に現れなかった型変数は、宣言の順に番号を振る
-        for name in self.declared.clone() {
-            self.parameter_index_of(&name);
-        }
         let mut bounds = BTreeSet::new();
-        for parameter in &type_parameters {
-            let index = self.parameter_index_of(self.type_parameter_name_of(*parameter)?);
+        for (index, parameter) in type_parameters.iter().enumerate() {
             for bound in named_children_of(*parameter)
                 .into_iter()
                 .filter(|node| node.kind() == TYPE_BOUND_KIND)
@@ -459,7 +469,7 @@ impl<'source> JavaSpelling<'source> {
 
         Some(JavaCallable {
             kind,
-            receiver: None,
+            receiver,
             parameters,
             variadic,
             value_type,
@@ -475,15 +485,6 @@ impl<'source> JavaSpelling<'source> {
             .into_iter()
             .find(|node| node.kind() == TYPE_IDENTIFIER_KIND)?;
         self.text_of(name)
-    }
-
-    /// 型変数の番号。初めて現れたら次の番号を振る。
-    fn parameter_index_of(&mut self, name: &str) -> usize {
-        if let Some(index) = self.numbered.iter().position(|numbered| numbered == name) {
-            return index;
-        }
-        self.numbered.push(name.to_owned());
-        self.numbered.len() - 1
     }
 
     /// 引数の型の並びと、最後の引数が可変長か。読めない形なら `None`。
@@ -617,10 +618,9 @@ impl<'source> JavaSpelling<'source> {
     fn named_type_of(&mut self, path: JavaPath, position_node: Node<'_>) -> JavaType {
         if let [(head, arguments)] = path.as_slice()
             && arguments.is_empty()
-            && self.declared.contains(head)
+            && let Some(index) = self.declared.iter().position(|declared| declared == head)
         {
-            let head = head.clone();
-            return JavaType::Parameter(self.parameter_index_of(&head));
+            return JavaType::Parameter(index);
         }
 
         let name = path
@@ -678,7 +678,7 @@ mod tests {
     }
 
     fn read(spelling: &str, enclosing: &JavaEnclosingType) -> JavaCallable {
-        let Some(callable) = JavaCallable::from_spelling(spelling, Some(enclosing)) else {
+        let Some(callable) = JavaCallable::from_spelling(spelling, enclosing) else {
             panic!("読める綴り: {spelling}");
         };
         callable
@@ -738,15 +738,16 @@ mod tests {
     }
 
     #[test]
-    fn test_java_type_parameters_are_numbered_by_appearance_not_by_declaration() {
-        // 宣言の順は違うが、引数に現れる順で付け替えると同じ形になる
-        assert!(same_shape(
-            "<K, V> V shop.Total.get(K key, V fallback)",
-            "<V, K> K shop.Total.get(V key, K fallback)",
-        ));
+    fn test_java_type_parameters_are_numbered_by_declaration_not_by_appearance() {
+        // `X.<String, Integer>f(…)` の明示した型引数は宣言の順に当たるので、引数の並びが
+        // 入れ替わった 2 つは差し替えられない。出現順で付け替えると同じ形になる入力
         assert!(!same_shape(
-            "<K, V> V shop.Total.get(K key, V fallback)",
-            "<K, V> K shop.Total.get(K key, V fallback)",
+            "<A, B> void shop.Total.f(B b, A a)",
+            "<A, B> void shop.Total.f(A a, B b)",
+        ));
+        assert!(same_shape(
+            "<A, B> void shop.Total.f(B b, A a)",
+            "<X, Y> void shop.Total.g(Y y, X x)",
         ));
     }
 
@@ -851,18 +852,51 @@ mod tests {
     }
 
     #[test]
-    fn test_java_spelling_without_parameter_list_is_unreadable() {
+    fn test_java_unreadable_spellings_are_none() {
+        let enclosing = static_member_of("Total");
+        for spelling in [
+            // 引数リストが無い
+            "int shop.Total.total",
+            // 可変長の後ろに引数がある
+            "int shop.Total.total(int... a, int b)",
+            // 同じ名前の型変数を 2 度束縛している
+            "<T, T> T shop.Total.pick(T a)",
+            // 修飾した名前に型引数が挟まる（宣言として読めない）
+            "shop.Box<T>.Box(T value)",
+        ] {
+            assert_eq!(
+                JavaCallable::from_spelling(spelling, &enclosing),
+                None,
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_java_receiver_parameter_is_dropped() {
+        let enclosing = instance_member_of("Total");
+
         assert_eq!(
-            JavaCallable::from_spelling("int shop.Total.total", Some(&static_member_of("Total"))),
-            None
+            read("int shop.Total.f(Total this, int a)", &enclosing),
+            read("int shop.Total.f(int a)", &enclosing)
         );
     }
 
     #[test]
-    fn test_java_member_without_named_enclosing_type_is_unreadable() {
+    fn test_java_nested_generic_path_keeps_type_arguments_per_segment() {
+        assert!(!same_shape(
+            "int shop.Total.f(Outer<Item>.Inner<Money> a)",
+            "int shop.Total.f(Outer<Money>.Inner<Item> a)",
+        ));
         assert_eq!(
-            JavaCallable::from_spelling("int shop.Total.total(int items)", None),
-            None
+            read(
+                "int shop.Total.f(Outer<Item>.Inner<Money> a)",
+                &static_member_of("Total")
+            )
+            .type_names()
+            .iter()
+            .collect::<Vec<_>>(),
+            vec!["Item", "Money", "Outer.Inner"]
         );
     }
 
@@ -898,6 +932,34 @@ mod tests {
     }
 
     #[test]
+    fn test_java_source_references_of_a_constructor_include_the_enclosing_type_once() {
+        // 引数の型に囲む型の名前があっても、2 度は集めない
+        let source = "class Total {\n    Total(Total other, Item item) {}\n}\n";
+
+        let mut names = reference_names_of(source);
+        names.sort();
+        assert_eq!(names, vec!["Item", "Total"]);
+    }
+
+    #[test]
+    fn test_java_source_references_of_a_compact_constructor_read_the_record_parameters() {
+        let source = "record Point(Money x, int y) {\n    Point {\n        y = 0;\n    }\n}\n";
+        let tree = SyntaxTree::from_source(source, Grammar::Java).expect("木にできる");
+        let compact = tree
+            .named_descendants()
+            .into_iter()
+            .find(|node| node.kind() == COMPACT_CONSTRUCTOR_KIND)
+            .expect("コンパクトコンストラクタがある");
+
+        let mut names = type_references_of(compact, source)
+            .iter()
+            .map(|reference| reference.name().to_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["Money", "Point"]);
+    }
+
+    #[test]
     fn test_java_source_references_of_a_static_method_leave_out_the_enclosing_type() {
         let source = "class Total {\n    static int total(Item item) { return 0; }\n}\n";
 
@@ -912,6 +974,52 @@ mod tests {
             with_first_member(source, |member| enclosing_type_of(member, source)),
             None
         );
+    }
+
+    #[test]
+    fn test_java_enclosing_type_of_a_method_in_an_enum_constant_body_is_absent() {
+        let source = "enum Level {\n    LOW {\n        int f(int a) { return a; }\n    };\n    int f(int a) { return 0; }\n}\n";
+
+        assert_eq!(
+            with_first_member(source, |member| enclosing_type_of(member, source)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_java_enclosing_type_is_the_nearest_named_declaration() {
+        for (source, name) in [
+            (
+                "interface Shop {\n    default int f(int a) { return a; }\n}\n",
+                "Shop",
+            ),
+            (
+                "record Point(int x) {\n    int f(int a) { return a; }\n}\n",
+                "Point",
+            ),
+            (
+                "enum Level {\n    LOW;\n    int f(int a) { return a; }\n}\n",
+                "Level",
+            ),
+            // 局所クラスは外側のクラスまで上がらない
+            (
+                "class Outer {\n    void run() {\n        class Local {\n            int f(int a) { return a; }\n        }\n    }\n}\n",
+                "Local",
+            ),
+        ] {
+            let tree = SyntaxTree::from_source(source, Grammar::Java).expect("木にできる");
+            let method = tree
+                .named_descendants()
+                .into_iter()
+                .rfind(|node| node.kind() == METHOD_KIND)
+                .expect("メソッドがある");
+
+            assert_eq!(
+                enclosing_type_of(method, source),
+                Some(JavaEnclosingType::new(name, false)),
+                "{source}"
+            );
+        }
     }
 
     #[test]
