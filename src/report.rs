@@ -468,7 +468,7 @@ fn type_signature_text_of(signal: TypeSignatureMatch, explanation: Explanation) 
         TypeSignatureMatch::UnreadableSignature => "測れない (返った綴りを読み解けない)",
         TypeSignatureMatch::HoverNotProvided => "測れない (サーバが hover を提供していない)",
         TypeSignatureMatch::NoSignatureReader => {
-            "測れない (この言語の型シグネチャを読む側がまだ無い)"
+            "測れない (このチャンクの型シグネチャを読む側がまだ無い。名前の無い型のメンバーなど)"
         }
         TypeSignatureMatch::UnopenedTypeName { reason } => unopened_text_of(reason),
         TypeSignatureMatch::UntracedTypeName { reason } => untraced_text_of(reason),
@@ -1746,7 +1746,7 @@ mod tests {
 
         assert!(
             text.contains(
-                "型シグネチャ: 測れない (この言語の型シグネチャを読む側がまだ無い) → どちらでもない"
+                "型シグネチャ: 測れない (このチャンクの型シグネチャを読む側がまだ無い。名前の無い型のメンバーなど) → どちらでもない"
             ),
             "読む側が無いことが理由として出る: {text}"
         );

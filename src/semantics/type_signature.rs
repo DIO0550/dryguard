@@ -132,7 +132,8 @@ pub enum TypeSignatureOutcome {
     UnreadableSignature,
     /// サーバが hover を提供していない。
     HoverNotProvided,
-    /// その言語の hover の綴りを読む側が、dryguard にまだ無い。hover は尋ねていない。
+    /// そのチャンクの hover の綴りを読む側が、dryguard にまだ無い。hover は尋ねていない。
+    /// 今は Java の、名前で言える型に囲まれていないメンバー（匿名クラス・enum 定数の本体）。
     ///
     /// **[`TypeSignatureOutcome::UnreadableSignature`] と混ぜない。** あちらは綴りが返った
     /// うえで読み解けなかったもので、利用者はサーバの綴りを疑う。こちらは
@@ -495,6 +496,8 @@ pub fn swift_normalized_outcome_of(
 /// 別の宣言になり、hover は名前の位置の宣言 1 つを綴る。
 ///
 /// **hover を先に尋ねる**（Rust・Swift と同じ順）。hover が落ちたら definition を送らずに済む。
+/// 囲む型を名前で言えないメンバーは、hover も送らずに [`TypeSignatureOutcome::NoSignatureReader`]
+/// を返す（レシーバを綴れないので、綴りが返っても読めない）。
 ///
 /// # Errors
 ///
@@ -507,6 +510,9 @@ pub fn java_type_signature_outcome_of(
     type_references: &[TypeReference],
     enclosing_type: Option<&JavaEnclosingType>,
 ) -> Result<TypeSignatureOutcome, ClientError> {
+    if enclosing_type.is_none() {
+        return Ok(TypeSignatureOutcome::NoSignatureReader);
+    }
     let signature_text = match asked_signature_text_of(session, document, position)? {
         Ok(signature_text) => signature_text,
         Err(outcome) => return Ok(outcome),
@@ -525,11 +531,17 @@ pub fn java_type_signature_outcome_of(
 /// **答えの並びは Swift と同じ**（[`swift_normalized_outcome_of`]）から `Self` を除いたもの。
 /// 開けなかった型名 → 辿った記録の無い型名の順に見て、どれにも当たらなければ比べられる形にする。
 /// Java の綴りに、書かれた場所で指す先が変わる型（Swift の `Self`）は無い。
+///
+/// 囲む型を名前で言えないメンバー（`enclosing_type` が `None`）は
+/// [`TypeSignatureOutcome::NoSignatureReader`]。
 pub fn java_normalized_outcome_of(
     signature_text: &SignatureText,
     traced: &TracedTypeNames,
     enclosing_type: Option<&JavaEnclosingType>,
 ) -> TypeSignatureOutcome {
+    let Some(enclosing_type) = enclosing_type else {
+        return TypeSignatureOutcome::NoSignatureReader;
+    };
     let Some(callable) = JavaCallable::from_spelling(signature_text.as_str(), enclosing_type)
     else {
         return TypeSignatureOutcome::UnreadableSignature;
@@ -4568,6 +4580,19 @@ mod tests {
             TypeSignatureOutcome::UntracedTypeName {
                 reason: UntracedReason::NoTracedRecord
             }
+        );
+    }
+
+    #[test]
+    fn test_java_member_without_named_enclosing_type_has_no_signature_reader() {
+        // 匿名クラスのメソッド。綴りは読める形でも、レシーバを綴れない
+        assert_eq!(
+            java_normalized_outcome_of(
+                &signature_text("int shop.Total.f(int x)"),
+                &TracedTypeNames::default(),
+                None
+            ),
+            TypeSignatureOutcome::NoSignatureReader
         );
     }
 

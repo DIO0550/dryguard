@@ -1018,8 +1018,8 @@ fn type_signature_match_of(
             TypeSignatureOutcome::Normalized(normalized_a),
             TypeSignatureOutcome::Normalized(normalized_b),
         ) => unifiable_match_of(normalized_a.is_unifiable_with(normalized_b)),
-        // **読む側が無いことを、サーバの答えに由来する理由より先に出す。** 言語で決まる
-        // 答えなので、サーバを替えても変わらない。後ろに置くと、直せない相手の案内が出る
+        // **読む側が無いことを、サーバの答えに由来する理由より先に出す。** チャンクの形で
+        // 決まる答えなので、サーバを替えても変わらない。後ろに置くと、直せない相手の案内が出る
         (TypeSignatureOutcome::NoSignatureReader, _)
         | (_, TypeSignatureOutcome::NoSignatureReader) => TypeSignatureMatch::NoSignatureReader,
         (TypeSignatureOutcome::SiteDependentSpelling, _)
