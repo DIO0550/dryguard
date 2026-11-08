@@ -144,7 +144,7 @@ if structurally_similar && domains_differ { ... }
 | `trait bound` | 型（多くは関数が束縛した型変数）に課された、満たすべきトレイト 1 つ。**左辺の型と境界 1 つの組**で持ち、inline と `where` の書き分け・`+` の並び・同じ左辺への述語の分け方を落としてある（`syntax::rust_callable`）。Swift の境界（プロトコルへの準拠と `==`）も同じ形で持ち、`P & Q` は 2 つの組に割る（`syntax::swift_callable`）。Java の型変数の境界（`<T extends A & B>`）も同じ形で持ち、`&` の並びを落とす（`syntax::java_callable`） |
 | `spelled type` | `type structure` のうち、**分解せず綴りのまま持つ**もの。比較も綴りで行う |
 | `chunk type` | チャンクが外から使われる形。呼べる型（`callable`）・読める型（getter）・書ける型（setter）のどれか |
-| `type signature` | `chunk type` から引数名を落とし、型変数を出現順に付け替えた形。**正規化後** |
+| `type signature` | `chunk type` から引数名を落とし、型変数を出現順に付け替えた形。**正規化後**。Java のメソッド自身の型変数は宣言の順に付け替える（明示した型引数 `X.<A, B>f()` は宣言の順に当たる。`syntax::java_callable`） |
 | `overload declaration` | 本体を持たない同名のシグネチャの宣言。実装と同じスコープに並ぶ |
 | `overload count` | hover が綴りの末尾に付ける、**綴られていない**オーバーロードの本数の要約（`(+1 overload)`） |
 | `overload set` | 1 つの名前が持つ `type signature` の並び。オーバーロードされていなければ 1 本（アクセサは常に 1 本）。**比較はこれで行う** |

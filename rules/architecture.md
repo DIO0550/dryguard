@@ -345,8 +345,9 @@ sourcekit-lsp 6.4.2 の definition は宣言ではない位置（そのモジュ
 jdtls は `List` の位置の definition に空を返し（#394 で実測）、その型名は `NoJavaDefinitionSite` で
 「測れない」に倒れる（Rust の rust-src の案内を出さないよう `NoDefinitionSite` と分ける）。
 hover は `static` を綴らないので、インスタンスメソッドのレシーバとコンストラクタの値の型は
-`syntax::chunk` が運ぶ直接囲む型の名前で足す（`Chunk::java_enclosing_type`）。付け替えるのは
-メソッド自身の `<T>` だけで、クラスの型変数は型名として辿る。
+`syntax::chunk` が運ぶ直接囲む型の名前で足す（`Chunk::java_enclosing_type`）。囲む型を名前で
+言えないメンバー（匿名クラス・enum 定数の本体）は hover を送らずに `NoSignatureReader` にする。
+付け替えるのはメソッド自身の `<T>` だけ（宣言の順）で、クラスの型変数は型名として辿る。
 
 **書かれた型名がここに来ることはある。** `syntax` が集めた型名は必ず尋ねる（TypeScript は
 `pipeline`、Rust は hover の後に `semantics::type_signature` が尋ねる）が、
