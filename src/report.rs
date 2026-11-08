@@ -1734,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn test_text_of_without_a_signature_reader_says_dryguard_cannot_read_the_language_yet() {
+    fn test_text_of_without_a_signature_reader_says_dryguard_cannot_read_the_chunk_yet() {
         // 対照は「返った綴りを読み解けない」。あちらはサーバの綴りを疑う案内で、
         // こちらはどのサーバに替えても変わらない dryguard 側の未対応
         let text = text_of_accidental_duplication_with_semantics(
