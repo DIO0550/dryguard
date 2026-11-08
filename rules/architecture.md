@@ -339,6 +339,15 @@ implementation の候補のうち対象型の綴りが等しい impl（`RustImpl
 `where` の右辺と型引数の型名は使用位置から辿る。**`where` の左辺は辿らない** — レシーバの型変数で、
 sourcekit-lsp 6.4.2 の definition は宣言ではない位置（そのモジュールの生成インタフェースの先頭）を返す。
 
+**Java の型名は definition で辿り、宣言の場所でそのまま比べる。** jdtls 1.63.0 の typeDefinition は
+結果を持たない応答を返すので definition を尋ねる（`semantics::resolved_type` の
+`java_traced_type_names_of`）。Java にエイリアスは無いので開く段は無い。**JDK の型は辿れない** —
+jdtls は `List` の位置の definition に空を返し（#394 で実測）、その型名は `NoJavaDefinitionSite` で
+「測れない」に倒れる（Rust の rust-src の案内を出さないよう `NoDefinitionSite` と分ける）。
+hover は `static` を綴らないので、インスタンスメソッドのレシーバとコンストラクタの値の型は
+`syntax::chunk` が運ぶ直接囲む型の名前で足す（`Chunk::java_enclosing_type`）。付け替えるのは
+メソッド自身の `<T>` だけで、クラスの型変数は型名として辿る。
+
 **書かれた型名がここに来ることはある。** `syntax` が集めた型名は必ず尋ねる（TypeScript は
 `pipeline`、Rust は hover の後に `semantics::type_signature` が尋ねる）が、
 **集める場所の一覧に漏れがあれば、書かれた型名が集まらない**（名前付き関数式が代入先の

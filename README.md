@@ -123,7 +123,7 @@ spread 引数の後ろも引数位置が確定しないため残す。テスト�
 正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない関数（1〜3 行のアクセサ・委譲）は `scan` では比べず、
 外した数を走査量の行に出す（`compare` は名指しされれば比べる）。
 `.java` はメソッド・コンストラクタをチャンクにする。
-Java の候補は jdtls に呼び出し元・呼び出し先を尋ねる。型シグネチャは hover の綴りを読む側がまだ無いので尋ねない。
+Java の候補は jdtls に型シグネチャ・呼び出し元・呼び出し先を尋ねる。型シグネチャは引数名・型変数名・修飾子・注釈を落とし、`throws`・可変長・配列の次元・ワイルドカードを残す。型名は definition で宣言まで辿るが、jdtls は JDK の型（`List` / `String` など）の宣言の場所を返さないので、JDK の型を含む型シグネチャは「測れない」になる。
 jdtls 1.63.0 は JDK 25 が要る。呼び出し先は問い合わせのたびにサーバが作業を始めるので、今は落ち着いた答えが取れず「測れない」になる。
 呼び出し元は印（`pom.xml` / `build.gradle` / `build.gradle.kts`）の外のファイルでは尋ねない（`pom.xml` の無いディレクトリでは別ファイルの参照元が返らないことを実測した。Gradle は未確認）。
 `.swift` は関数・メソッド・`init` / `deinit` をチャンクにする。
@@ -134,8 +134,7 @@ CLI は拡張子から TypeScript・Rust・Swift・Java の LSP サーバを選�
 言語ごとに候補を揃え、TypeScript は typescript-language-server、Rust は rust-analyzer の
 セッションで hover / references を問い合わせる。Swift の候補は sourcekit-lsp のセッションに
 同じく尋ねる（`compare` で名指ししたとき・`--lang swift` と `auto` で走査したとき）。Java の候補は jdtls のセッションに
-尋ね（`compare` で名指ししたとき・`--lang java` と `auto` で走査したとき）、hover（型シグネチャ）は
-尋ねない。Rust の型シグネチャ比較は #40 まで「測れない」。
+同じく尋ねる（`compare` で名指ししたとき・`--lang java` と `auto` で走査したとき）。Rust の型シグネチャ比較は #40 まで「測れない」。
 
 `node_modules` / `dist` / `build` / `target` / `.git` /
 `.build` / `.swiftpm` / `Pods` / `DerivedData` / `.gradle` は降りない。
