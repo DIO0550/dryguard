@@ -16,6 +16,7 @@ use dryguard::lsp::{
     SourceDocument, WorkspaceRoot,
 };
 use dryguard::pipeline::{chunk_pair_of, measured_pair_of};
+use dryguard::semantics::resolved_type::UnopenedReason;
 use dryguard::source_position::SourcePosition;
 use dryguard::threshold::Threshold;
 
@@ -266,4 +267,58 @@ fn test_sourcekit_lsp_definition_of_standard_types_points_at_a_swift_interface()
     }
 
     session.shutdown().expect("正常終了できる");
+}
+
+#[test]
+#[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
+fn test_sourcekit_lsp_function_through_a_typealias_and_its_right_side_are_unifiable() {
+    // `charged(value: Money)` と `doubled(value: Int)`。`Money` は別ファイルの `typealias Money = Int`
+    assert_eq!(
+        type_signature_match_of("charged", "doubled"),
+        TypeSignatureMatch::Unifiable
+    );
+    // 対照: 右辺と別の型とは重ならない
+    assert_eq!(
+        type_signature_match_of("charged", "halved"),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
+fn test_sourcekit_lsp_typealias_with_modifiers_is_opened() {
+    // hover は `public typealias Cost = Double` と修飾子ごと綴る
+    assert_eq!(
+        type_signature_match_of("costed", "halved"),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
+fn test_sourcekit_lsp_chained_typealias_is_opened_to_the_end() {
+    // `Fee = Money`、`Money = Int`。右辺の `Money` は宣言側のファイルの位置から辿る
+    assert_eq!(
+        type_signature_match_of("feed", "doubled"),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
+fn test_sourcekit_lsp_typealias_that_may_name_type_variables_is_not_opened() {
+    // 型引数を取る `typealias` は開かない（Issue #527）
+    assert_eq!(
+        type_signature_match_of("coupled", "doubled"),
+        TypeSignatureMatch::UnopenedTypeName {
+            reason: UnopenedReason::UnopenableAlias
+        }
+    );
+    // 型引数を持つ型の中の `typealias Item = T`。開くと `Box<Int>.Item` と `Box<String>.Item` が重なる
+    assert_eq!(
+        type_signature_match_of("boxed", "doubled"),
+        TypeSignatureMatch::UnopenedTypeName {
+            reason: UnopenedReason::UnopenableAlias
+        }
+    );
 }

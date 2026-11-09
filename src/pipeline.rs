@@ -35,8 +35,8 @@ use crate::semantics::caller_domain::{
     CallerDomainsOutcome, ReferenceSources, caller_domains_outcome_of,
 };
 use crate::semantics::resolved_type::{
-    RustDeclarationCache, TypeDeclaration, UnopenedReason, UnopenedTypeName, opened_type_names_of,
-    traced_type_names_of,
+    RustDeclarationCache, SwiftDeclarationCache, TypeDeclaration, UnopenedReason, UnopenedTypeName,
+    opened_type_names_of, traced_type_names_of,
 };
 use crate::semantics::type_signature::{
     TypeSignatureOutcome, UntracedReason, rust_type_signature_outcome_of,
@@ -705,12 +705,14 @@ fn asked_semantics_of(
     // 型シグネチャの失敗を先に採るのと揃える。所属を先に尋ねると、そこで接続が切れた
     // ときに**後から落ちた hover の失敗が報告される**。
     let mut declarations_cache = RustDeclarationCache::default();
+    let mut swift_declarations_cache = SwiftDeclarationCache::default();
     let signature_a = resolved_type_signature_outcome_of(
         session,
         chunk_a,
         document_a,
         position_a,
         &mut declarations_cache,
+        &mut swift_declarations_cache,
     );
     let signature_b = resolved_type_signature_outcome_of(
         session,
@@ -718,6 +720,7 @@ fn asked_semantics_of(
         document_b,
         position_b,
         &mut declarations_cache,
+        &mut swift_declarations_cache,
     );
 
     // 所属はファイルごとに 1 度だけ確かめる（走査側と同じ形。[`AskedMembership`]）。
@@ -768,7 +771,8 @@ fn asked_semantics_of(
 /// `declarations_cache` は同じセッションで尋ねるチャンクのあいだで共有する、Rust の
 /// 宣言側の答え。**チャンクごとに作らない** — 答えはチャンクではなく宣言のファイルと
 /// trait で決まる（`rules/architecture.md`「ファイル単位で決まる答えをチャンク単位で
-/// 問い合わせない」）。
+/// 問い合わせない」）。`swift_declarations_cache` は同じ理由で共有する、Swift の
+/// `typealias` を開いた答え。
 ///
 /// # Errors
 ///
@@ -779,6 +783,7 @@ fn resolved_type_signature_outcome_of(
     document: &SourceDocument,
     position: SourcePosition,
     declarations_cache: &mut RustDeclarationCache,
+    swift_declarations_cache: &mut SwiftDeclarationCache,
 ) -> Result<TypeSignatureOutcome, ClientError> {
     // 網羅 `match` にする。「Rust でなければ TypeScript」と書くと、grammar を足したときに
     // その言語の綴りを TypeScript の系統で読みにいく
@@ -807,6 +812,7 @@ fn resolved_type_signature_outcome_of(
         }
         Grammar::Swift => swift_type_signature_outcome_of(
             session,
+            swift_declarations_cache,
             document,
             position,
             chunk.type_references(),
@@ -2202,6 +2208,7 @@ fn asked_scan_semantics_of(
 
     let askable = askable_chunks_of(chunks, asked, documents);
     let mut declarations_cache = RustDeclarationCache::default();
+    let mut swift_declarations_cache = SwiftDeclarationCache::default();
     let signatures: Vec<Result<TypeSignatureOutcome, ClientError>> = askable
         .iter()
         .map(|askable| {
@@ -2211,6 +2218,7 @@ fn asked_scan_semantics_of(
                 askable.document,
                 askable.position,
                 &mut declarations_cache,
+                &mut swift_declarations_cache,
             )
         })
         .collect();

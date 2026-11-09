@@ -65,3 +65,24 @@ extension [Int] {
         count * scale
     }
 }
+
+/// `Money.swift` の `typealias` を通る関数。
+func charged(value: Money) -> Int {
+    value * 2
+}
+
+func costed(value: Cost) -> Int {
+    Int(value / 2)
+}
+
+func feed(value: Fee) -> Int {
+    value * 2
+}
+
+func coupled(value: Couple<Int>) -> Int {
+    value.0
+}
+
+func boxed(value: Box<Int>.Item) -> Int {
+    value * 2
+}
