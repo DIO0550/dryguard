@@ -160,6 +160,46 @@ inventory = ["src/inventory/**", "src/**/product*.ts"]
 1. **準備（言語に依存しない）**: 「Rust か、そうでなければ TypeScript」の 2 択で書かれた分岐を、網羅 `match` か grammar ごとに引く並びに直す。3 つ目の grammar を足したとき、2 択のままだと**コンパイルエラーにならずに TypeScript 側へ倒れる**。先に直すと、言語ごとの作業は「variant を足して、コンパイラが指す場所を埋める」形になる
 2. **言語ごと**: Phase 4（Rust、Issue #37 → #41）と同じ順で縦に通す。Stage 1（grammar・チャンク・正規化・import・葉の綴り）→ 走査と CLI → Stage 2（サーバ・CI・型シグネチャ）→ 実コーパスで測る。言語の順番は決めない（3 言語は互いに独立で、準備だけが共通の前提）
 
+#### Swift の実コーパス（Issue #408）
+
+apple/swift-argument-parser 1.6.1（SwiftPM の単一パッケージ。`Sources` / `Tests` / `Examples` / `Plugins` / `Tools` を含むルートを渡す）に、`main` 14f7401 の release ビルドで `scan --lang swift --explain --format json` を走らせた。sourcekit-lsp は Swift 6.4.2。
+
+| 項目 | 数 |
+|---|---|
+| ファイル / チャンク | 160 / 964 |
+| 外した `test function` / `undersized chunk` | 66 / 118 |
+| 候補ペア | 10,291（うち `Tests` 同士 9,625） |
+| 判定 | EXTRACT-CANDIDATE 2,257 / DO-NOT-EXTRACT 65 / REVIEW 7,969 |
+| 型シグネチャ | 単一化可能 3,724 / 単一化不能 6,176 / 測れない 391（`untraced-type-name` 227・`unopened-type-name` 156・`no-type-there` 8） |
+| 呼び出し元ドメイン | 測れた 519 / `no-references` 9,772 |
+
+sourcekit-lsp の時間（中継スクリプトがフレームの受け渡し時刻を記録。最長の沈黙は、応答を待っている要求があるあいだにサーバから何も届かなかった最長の間隔）:
+
+| 条件 | 握手から最後の答え | index の同期 | 最長の沈黙 | 参照元 |
+|---|---|---|---|---|
+| background indexing 有効・`.build` 無し・ツールチェーンの初回起動 | 104.75 秒 | 32.6 秒 | 18.20 秒（`initialize`） | 測れる |
+| 同じ・2 回目以降 | 62.16 秒 | 12.7 秒 | 1.17 秒 | 測れる |
+| 無効・`.build` 無し | 49.51 秒 | 0.24 秒 | 1.19 秒 | **全件空** |
+| 無効・`swift build --build-tests`（既定の swiftbuild）の後 | 57.28 秒 | 1.91 秒 | 0.85 秒 | **全件空**（index store が作られない） |
+| 無効・`swift build --build-tests --build-system native` の後 | 65.54 秒 | 0.21 秒 | 1.58 秒 | 測れる（ただし `.build` の生成物が参照元に入る） |
+
+最長の沈黙は `silence limit`（120 秒）に対して十分小さい。出力の JSON は有効の回の 1 回目と 3 回目で同じだった。
+
+読んだペアと原因の分類:
+
+| ペア | 判定 | 読み | 原因 |
+|---|---|---|---|
+| `Tests/…/EqualsEndToEndTests.swift:60` / `:78` ほか 9,625 件 | REVIEW / EXTRACT-CANDIDATE | `extension XxxTests` に書いたテストメソッドが外れない | `test function` の印（Issue #521） |
+| `Sources/ArgumentParserTestHelpers/TestHelpers.swift:124` / `:138` | EXTRACT-CANDIDATE | 呼び出し元の重なりがテストからの参照だけで作られている | テスト内の参照元（Issue #520） |
+| `Sources/ArgumentParserTestHelpers/StringHelpers.swift:22` / `:29` | DO-NOT-EXTRACT | 答えは妥当だが、決めたのは別々のテストから呼ばれていること | テスト内の参照元（Issue #520） |
+| `Plugins/GenerateManual/PackagePlugin+Helpers.swift` と `Plugins/GenerateDoccReference/` の同名ファイル（7 件） | REVIEW（偽陰性） | コピーしたファイルなのに型シグネチャが単一化不能。`PackagePlugin` の型の definition が、問い合わせたモジュールごとに別の生成インタフェースを指す | 言語固有: ソースの無いモジュール（Issue #522） |
+| `Sources/ArgumentParser/Parsable Properties/Option.swift:735` / `:775` ほか `init<T>` の群 | REVIEW | hover の `where Value == [T]` の `Value`（囲む型の型変数）が「尋ねていない」 | `init` の定型（Issue #523） |
+| `Parsable Types/CommandGroup.swift:21` / `ArgumentParserToolInfo/ToolInfo.swift:127`（フィールドへ代入するだけの `init`） | DO-NOT-EXTRACT | 妥当 | `init` の定型 |
+| `Parsing/InputOrigin.swift:117` / `Parsing/SplitArguments.swift:143`（別々の型の `Comparable` の `<`） | DO-NOT-EXTRACT | 妥当 | protocol 準拠の定型 |
+| `Tools/generate-docc-reference/Extensions/ArgumentParser+Markdown.swift:114` / `:154`（`usage()` / `identity()`） | EXTRACT-CANDIDATE | 妥当（名前の組み立てが重複している） | — |
+
+同じモジュールのファイルどうしは `import` を書かないので、`Sources` 同士の 564 ペアのうち 544 ペアで依存先の重なりは `no-declarations`（測れない）だった。判定は呼び出し先ドメインとモジュール距離が持つ。
+
 #### 言語を足すときに触る場所
 
 言語ごとの作業の順（Stage 1 の `syntax` → 走査と CLI → Stage 2 の `lsp` / `semantics` / `pipeline` → CI）に、モジュールの責務（`rules/architecture.md`「3 ステージのパイプライン」）ごとにまとめて並べる。**行番号ではなく関数名・定数名で指す** — 準備の Issue が入るたびに行も形も変わるため。「今の形」の欄は Issue #360 の時点（`main` 6b99873）のもので、準備が済んだ行から古くなる。
