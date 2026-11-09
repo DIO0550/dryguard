@@ -27,10 +27,12 @@
 //! それを受け取る `semantics::type_signature` の側。
 //!
 //! Rust の関数の綴りは `rust_callable` が読む。**文法が別なので `type_structure` とは分ける**
-//! （境界・ライフタイムの書き分けを落とすのが目的なのは同じ）。
+//! （境界・ライフタイムの書き分けを落とすのが目的なのは同じ）。Swift は `swift_callable`、
+//! Java は `java_callable` が読む。
 
 pub mod chunk;
 pub mod import;
+pub(crate) mod java_callable;
 pub mod leaf_divergence;
 pub mod line_range;
 pub mod module_distance;

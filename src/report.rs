@@ -468,7 +468,7 @@ fn type_signature_text_of(signal: TypeSignatureMatch, explanation: Explanation) 
         TypeSignatureMatch::UnreadableSignature => "測れない (返った綴りを読み解けない)",
         TypeSignatureMatch::HoverNotProvided => "測れない (サーバが hover を提供していない)",
         TypeSignatureMatch::NoSignatureReader => {
-            "測れない (この言語の型シグネチャを読む側がまだ無い)"
+            "測れない (このチャンクの型シグネチャを読む側がまだ無い。名前の無い型のメンバーなど)"
         }
         TypeSignatureMatch::UnopenedTypeName { reason } => unopened_text_of(reason),
         TypeSignatureMatch::UntracedTypeName { reason } => untraced_text_of(reason),
@@ -537,6 +537,9 @@ fn unopened_text_of(reason: UnopenedReason) -> &'static str {
         // rust-src が無いと std / core の名前にも空を返す（1.94.1 で実測）
         UnopenedReason::NoDefinitionSite => {
             "測れない (比較に残る型名を開けない: サーバが definition に宣言の場所を答えない。std / core の型なら rust-src が要る)"
+        }
+        UnopenedReason::NoJavaDefinitionSite => {
+            "測れない (比較に残る型名を開けない: jdtls が definition に宣言の場所を答えない。JDK の型にはまだ答えられない)"
         }
         UnopenedReason::UnreadableTypeDefinition => {
             "測れない (比較に残る型名を開けない: typeDefinition の応答を読めない)"
@@ -1731,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn test_text_of_without_a_signature_reader_says_dryguard_cannot_read_the_language_yet() {
+    fn test_text_of_without_a_signature_reader_says_dryguard_cannot_read_the_chunk_yet() {
         // 対照は「返った綴りを読み解けない」。あちらはサーバの綴りを疑う案内で、
         // こちらはどのサーバに替えても変わらない dryguard 側の未対応
         let text = text_of_accidental_duplication_with_semantics(
@@ -1743,7 +1746,7 @@ mod tests {
 
         assert!(
             text.contains(
-                "型シグネチャ: 測れない (この言語の型シグネチャを読む側がまだ無い) → どちらでもない"
+                "型シグネチャ: 測れない (このチャンクの型シグネチャを読む側がまだ無い。名前の無い型のメンバーなど) → どちらでもない"
             ),
             "読む側が無いことが理由として出る: {text}"
         );

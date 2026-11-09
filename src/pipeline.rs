@@ -39,8 +39,8 @@ use crate::semantics::resolved_type::{
     traced_type_names_of,
 };
 use crate::semantics::type_signature::{
-    TypeSignatureOutcome, UntracedReason, rust_type_signature_outcome_of,
-    swift_type_signature_outcome_of, type_signature_outcome_of,
+    TypeSignatureOutcome, UntracedReason, java_type_signature_outcome_of,
+    rust_type_signature_outcome_of, swift_type_signature_outcome_of, type_signature_outcome_of,
 };
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks, TestFunctions};
@@ -761,9 +761,8 @@ fn asked_semantics_of(
 /// （`semantics::resolved_type`）。**Rust は hover の後に宣言の場所とエイリアスの右辺を
 /// 集める。** 順序は `semantics::type_signature::rust_type_signature_outcome_of` が
 /// 中に持つ（読み込み前の definition は空を返すので、hover が落ち着くのを先に待つ）。
-/// **Swift も hover の後に definition で型名を辿る**（`swift_type_signature_outcome_of`）。
-/// 綴りを読む側がまだ無い grammar（Java）は、尋ねずに
-/// [`TypeSignatureOutcome::NoSignatureReader`] を返す。
+/// **Swift・Java も hover の後に definition で型名を辿る**（`swift_type_signature_outcome_of` /
+/// `java_type_signature_outcome_of`）。
 ///
 /// `declarations_cache` は同じセッションで尋ねるチャンクのあいだで共有する、Rust の
 /// 宣言側の答え。**チャンクごとに作らない** — 答えはチャンクではなく宣言のファイルと
@@ -812,8 +811,13 @@ fn resolved_type_signature_outcome_of(
             chunk.type_references(),
             chunk.swift_enclosing_type(),
         ),
-        // 綴りを読む側がまだ無い。hover を送らずに、そのことを理由として返す
-        Grammar::Java => Ok(TypeSignatureOutcome::NoSignatureReader),
+        Grammar::Java => java_type_signature_outcome_of(
+            session,
+            document,
+            position,
+            chunk.type_references(),
+            chunk.java_enclosing_type(),
+        ),
     }
 }
 
@@ -1014,8 +1018,8 @@ fn type_signature_match_of(
             TypeSignatureOutcome::Normalized(normalized_a),
             TypeSignatureOutcome::Normalized(normalized_b),
         ) => unifiable_match_of(normalized_a.is_unifiable_with(normalized_b)),
-        // **読む側が無いことを、サーバの答えに由来する理由より先に出す。** 言語で決まる
-        // 答えなので、サーバを替えても変わらない。後ろに置くと、直せない相手の案内が出る
+        // **読む側が無いことを、サーバの答えに由来する理由より先に出す。** チャンクの形で
+        // 決まる答えなので、サーバを替えても変わらない。後ろに置くと、直せない相手の案内が出る
         (TypeSignatureOutcome::NoSignatureReader, _)
         | (_, TypeSignatureOutcome::NoSignatureReader) => TypeSignatureMatch::NoSignatureReader,
         (TypeSignatureOutcome::SiteDependentSpelling, _)

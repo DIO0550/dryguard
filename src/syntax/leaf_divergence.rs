@@ -410,9 +410,8 @@ impl<'tree> SpellingContext<'tree, '_> {
 ///
 /// **型シグネチャ（Stage 2）が見る範囲だけを外す。** 引数の既定値はシグネチャに書かれるが
 /// 型ではない（式）ので外さない。一覧から漏れたシグネチャの形は比べる側へ倒れ、
-/// 型の違いが綴りの違いとしても出るだけ（REVIEW 側）。Java は Stage 2 の綴りを読む側が
-/// まだ無いが、TypeScript・Rust でサーバに尋ねられなかったときと同じく、型の違いは
-/// 葉の綴りではなく型シグネチャの答えとして扱う。
+/// 型の違いが綴りの違いとしても出るだけ（REVIEW 側）。サーバに尋ねられなかったときも、
+/// 型の違いは葉の綴りではなく型シグネチャの答えとして扱う。
 fn signature_type_nodes_of(node: Node<'_>, grammar: Grammar) -> Vec<Node<'_>> {
     let mut types: Vec<Node<'_>> = ["return_type", "type_parameters"]
         .into_iter()

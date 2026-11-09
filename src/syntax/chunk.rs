@@ -18,6 +18,7 @@ use crate::line_number::LineNumber;
 use crate::location::Location;
 use crate::source_position::SourcePosition;
 use crate::syntax::import::{ImportSet, ImportsUnavailable};
+use crate::syntax::java_callable::{self, JavaEnclosingType};
 use crate::syntax::leaf_divergence::ChunkLeaves;
 use crate::syntax::line_range::LineRange;
 use crate::syntax::rust_callable;
@@ -49,6 +50,7 @@ pub struct Chunk {
     type_references: Vec<TypeReference>,
     rust_impl_header: Option<String>,
     swift_enclosing_type: Option<SwiftEnclosingType>,
+    java_enclosing_type: Option<JavaEnclosingType>,
     source: String,
     tokens: Option<TokenSequence>,
     leaves: ChunkLeaves,
@@ -203,9 +205,7 @@ impl Chunk {
                 Grammar::TypeScript | Grammar::Tsx => chunk_type_references_of(node, source),
                 Grammar::Rust => rust_callable::type_references_of(node, source),
                 Grammar::Swift => swift_type_references_of(node, source),
-                // 集めない。Java は綴りを読む側がまだ無く、`pipeline` が hover を送らずに
-                // 「尋ねていない」と答えるので、ここが空でも答えには効かない
-                Grammar::Java => Vec::new(),
+                Grammar::Java => java_callable::type_references_of(node, source),
             },
             rust_impl_header: match grammar {
                 Grammar::Rust => rust_callable::impl_header_of(node, source),
@@ -214,6 +214,10 @@ impl Chunk {
             swift_enclosing_type: match grammar {
                 Grammar::Swift => swift_callable::enclosing_type_of(node, source),
                 Grammar::TypeScript | Grammar::Tsx | Grammar::Rust | Grammar::Java => None,
+            },
+            java_enclosing_type: match grammar {
+                Grammar::Java => java_callable::enclosing_type_of(node, source),
+                Grammar::TypeScript | Grammar::Tsx | Grammar::Rust | Grammar::Swift => None,
             },
             source: source_of_lines(source, lines),
             tokens: TokenSequence::from_node(node),
@@ -238,6 +242,16 @@ impl Chunk {
     /// 集める順を変えたときに黙ってレシーバを取り違える。
     pub fn swift_enclosing_type(&self) -> Option<&SwiftEnclosingType> {
         self.swift_enclosing_type.as_ref()
+    }
+
+    /// Java のメンバーを直接囲む型の名前と、そのメンバーが static か。それ以外と、
+    /// 囲む型を名前で言えない Java のメンバー（匿名クラス・enum 定数の本体）は `None`。
+    ///
+    /// **hover の綴りに出ないことを運ぶ。** jdtls は `static` を綴らないので、
+    /// インスタンスメソッドのレシーバを綴りだけでは決められない（`syntax::java_callable`）。
+    /// 型名の位置は [`Chunk::type_references`] に入れてある。
+    pub fn java_enclosing_type(&self) -> Option<&JavaEnclosingType> {
+        self.java_enclosing_type.as_ref()
     }
 
     /// Rust メソッドが直接所属する impl のヘッダー。それ以外は `None`。
