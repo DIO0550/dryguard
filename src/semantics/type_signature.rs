@@ -1074,6 +1074,7 @@ pub struct TypeSignature {
     /// **書かれ方の違いが型の違いに見える**（`syntax::type_structure`）。
     chunk_type: ComparedChunkType,
     /// 綴りに残った型名が、それぞれどこで宣言されているか。**名前順**。
+    /// **Swift では空。** 宣言の場所は型名の位置に置いてある（`swift_declared_resolution_of`）。
     ///
     /// **綴りは書いた人の位置に依存する。** 別々のモジュールが同じ局所名で構造の違う型を
     /// export していると、hover はどちらも `User` と返す。綴りだけを比べると、

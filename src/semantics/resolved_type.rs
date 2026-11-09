@@ -586,12 +586,12 @@ impl SwiftAliasOpener<'_> {
         if let Some((_, right, depth)) =
             self.cache.opened.iter().find(|(cached, ..)| cached == site)
         {
-            if self.active.len() + depth > MAXIMUM_ALIAS_DEPTH {
+            if exceeds_alias_depth(self.active.len(), *depth) {
                 return Ok(Err(UnopenedReason::AliasExpansionLimit));
             }
             return Ok(Ok((right.clone(), *depth)));
         }
-        if self.active.len() >= MAXIMUM_ALIAS_DEPTH {
+        if exceeds_alias_depth(self.active.len(), 1) {
             return Ok(Err(UnopenedReason::AliasExpansionLimit));
         }
         // 生成インタフェース（標準ライブラリ・フレームワーク）の右辺を辿れるかは確かめていない
@@ -660,6 +660,14 @@ impl SwiftAliasOpener<'_> {
     }
 }
 
+/// 辿っている連鎖（`chain` 段）の先で `depth` 段の展開を使うと、上限を超えるか。
+///
+/// **開き直すときもキャッシュを使うときも、これ 1 つで決める。** 2 つの判定がずれると、
+/// 同じ連鎖が尋ねた順で開けたり開けなかったりする。
+fn exceeds_alias_depth(chain: usize, depth: usize) -> bool {
+    chain + depth > MAXIMUM_ALIAS_DEPTH
+}
+
 /// 使用位置への hover が型エイリアスを綴ったか。綴りが取れなければその理由。
 ///
 /// **修飾子の後ろの語で見る。** sourcekit-lsp は宣言の修飾子ごと綴る
@@ -678,9 +686,13 @@ fn swift_alias_check_of(hover: HoverOutcome) -> Result<bool, UnopenedReason> {
     }
 }
 
-/// hover の綴りが `typealias` の宣言か。宣言の名前より前（`=` より前の語）に `typealias` があるかで見る。
+/// hover の綴りが `typealias` の宣言か。先頭の行の、宣言の名前より前（`=` より前の語）に
+/// `typealias` があるかで見る（後ろの行に doc の本文が続いても、その中の語を拾わない）。
 fn is_swift_alias_spelling(text: &str) -> bool {
-    text.split_whitespace()
+    text.lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
         .take_while(|word| !word.contains('='))
         .any(|word| word == SWIFT_ALIAS_KEYWORD)
 }
@@ -2046,6 +2058,19 @@ mod tests {
         assert!(!is_swift_alias_spelling(
             "struct Wrapper<T> where T == typealias"
         ));
+        // 先頭の行の後ろに続く doc の本文の語は拾わない
+        assert!(!is_swift_alias_spelling(
+            "struct Ledger\nWraps a typealias over Int"
+        ));
+    }
+
+    #[test]
+    fn test_swift_alias_depth_limit_counts_the_chain_and_the_cached_depth_together() {
+        assert!(!exceeds_alias_depth(MAXIMUM_ALIAS_DEPTH - 1, 1));
+        assert!(exceeds_alias_depth(MAXIMUM_ALIAS_DEPTH, 1));
+        // キャッシュした展開を別の連鎖の途中で使うときも、段数の和で決める
+        assert!(!exceeds_alias_depth(MAXIMUM_ALIAS_DEPTH - 3, 3));
+        assert!(exceeds_alias_depth(MAXIMUM_ALIAS_DEPTH - 2, 3));
     }
 
     #[test]

@@ -345,6 +345,8 @@ pub(crate) struct SwiftCallable {
     /// 書き分けなので、組に割ってから集合にする。
     constraints: BTreeSet<SwiftConstraint>,
     /// 比較に残る綴りに現れた型名。名前順。**パスで書かれた型はパスごと 1 つの名前。**
+    /// 辿った記録・開けなかった理由を引くのに使い、**比較には使わない**（形は宣言の場所で持つ。
+    /// [`PartialEq`] の実装）。
     ///
     /// 束縛した型変数・標準ライブラリを指すと確かめた省略形の名前・`Self` は入らない。
     type_names: BTreeSet<String>,
@@ -1288,20 +1290,22 @@ impl<'source> SwiftSpelling<'source> {
     }
 }
 
-/// 名前のパスを、宣言の場所の綴り 1 区切りにする。**型引数は区切りの順に並べて残す**
-/// （`Outer<Int>.Inner` の `Int`）。
+/// 名前のパスの末尾の名前を、宣言の場所の綴りに置き換える。**前の区切りは綴りのまま残す。**
 ///
-/// **区切りの数は落とす。** `Inner` と `Holder.Inner` は同じ宣言を指し、どの区切りが型引数を取るかは
-/// 宣言で決まるので、並べた型引数だけで `Outer<Int>.Inner` と `Outer<String>.Inner` を分けられる。
+/// **Why**: 尋ねるのは末尾の名前の位置で、宣言の場所が決まるのは末尾だけ。前の区切りを落とすと、
+/// 末尾がプロトコルの `associatedtype` を指す `IntBag.Element` と `StrBag.Element` が同じ形になる
+/// （偽陽性）。
+///
+/// **Why not（区切りを落として `Inner` と `Holder.Inner` を重ねる）**: 上の偽陽性と引き換えになる。
+/// 前の区切りが残っても、同じ綴りで書いた 2 つは今までどおり重なる（偽陰性は綴りの違いだけ）。
 fn declared_path_of(
     identity: String,
-    path: Vec<(String, Vec<SwiftType>)>,
+    mut path: Vec<(String, Vec<SwiftType>)>,
 ) -> Vec<(String, Vec<SwiftType>)> {
-    let arguments = path
-        .into_iter()
-        .flat_map(|(_, arguments)| arguments)
-        .collect();
-    vec![(identity, arguments)]
+    if let Some((last, _)) = path.last_mut() {
+        *last = identity;
+    }
+    path
 }
 
 /// 境界の右辺が `P & Q` なら、組に割ってから入れる。
@@ -2313,16 +2317,40 @@ mod tests {
     }
 
     #[test]
-    fn test_from_spelling_unifies_different_spellings_of_the_same_declaration() {
+    fn test_from_spelling_keeps_the_qualifying_segments_of_a_declared_path() {
+        // 末尾がプロトコルの `associatedtype` を指すと、宣言の場所は 2 つで同じになりうる
+        let element = declared_at("@Sequence.Element");
+
+        let int_bag = resolved_callable_of(
+            "func f(x: IntBag.Element)",
+            &[("IntBag.Element", element.clone())],
+        );
+        let text_bag = resolved_callable_of(
+            "func g(x: TextBag.Element)",
+            &[("TextBag.Element", element.clone())],
+        );
+
+        assert_ne!(int_bag, text_bag);
+        // 対照: 同じ綴りで同じ宣言なら重なる
+        assert_eq!(
+            int_bag,
+            resolved_callable_of("func h(x: IntBag.Element)", &[("IntBag.Element", element)])
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_compares_a_single_name_by_its_declaration() {
         let inner = declared_at("@Holder.Inner");
 
-        let short = resolved_callable_of("func f(x: Inner)", &[("Inner", inner.clone())]);
-        let qualified = resolved_callable_of("func g(x: Holder.Inner)", &[("Holder.Inner", inner)]);
+        let one = resolved_callable_of("func f(x: Inner)", &[("Inner", inner.clone())]);
 
-        assert_eq!(short, qualified);
+        assert_eq!(
+            one,
+            resolved_callable_of("func g(x: Inner)", &[("Inner", inner)])
+        );
         // 対照: 別の宣言なら綴りが同じでも重ならない
         assert_ne!(
-            short,
+            one,
             resolved_callable_of(
                 "func h(x: Inner)",
                 &[("Inner", declared_at("@Other.Inner"))]
