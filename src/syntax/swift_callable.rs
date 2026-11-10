@@ -13,13 +13,14 @@
 //! `Optional` / `Array` / `Dictionary` / `Void` を同じ形にする。
 //!
 //! **LSP を知らない。** 綴りを受け取って形を返すだけなので、`semantics` へ依存しない
-//! （`rules/architecture.md`「依存方向のルール」）。標準ライブラリを指すかは
-//! 呼び出し側が答える。
+//! （`rules/architecture.md`「依存方向のルール」）。型名ごとに宣言まで辿った答え
+//! （[`SwiftTypeResolution`]）は呼び出し側が渡す。
 
 use std::collections::BTreeSet;
 
 use tree_sitter::Node;
 
+use crate::source_position::SourcePosition;
 use crate::syntax::tree::{Grammar, SyntaxTree, source_position_of};
 use crate::syntax::type_reference::TypeReference;
 
@@ -139,6 +140,169 @@ const VOID_NAME: &str = "Void";
 pub(crate) const STANDARD_SUGAR_NAMES: [&str; 4] =
     [OPTIONAL_NAME, ARRAY_NAME, DICTIONARY_NAME, VOID_NAME];
 
+/// `typealias` の宣言の種別。
+const TYPEALIAS_KIND: &str = "typealias_declaration";
+
+/// 型の宣言の字句のフィールド（`struct` / `class` / `extension` など）。
+const DECLARATION_KIND_FIELD: &str = "declaration_kind";
+
+/// `typealias` を開いてよい、囲む宣言の字句。**`extension` は入れない** — 拡張した型の
+/// 型変数（`extension Array { typealias E = Element }`）を右辺が指しうる。
+const OPENABLE_ENCLOSING_KINDS: [&str; 4] = ["struct", "class", "enum", "actor"];
+
+/// `typealias` を開いてよい、宣言の祖先のノードの種別。**許可リスト** — 一覧に無い祖先
+/// （`protocol` / 関数の本体など。型変数や関連型を右辺が指しうる）の中の宣言は開かない
+/// （偽陰性側。`rules/coding.md`「列挙で判定を組むときは、漏れの倒れる向きを選ぶ」）。
+const OPENABLE_ANCESTOR_KINDS: [&str; 4] = [
+    "source_file",
+    TYPE_DECLARATION_KIND,
+    TYPE_BODY_KINDS[0],
+    TYPE_BODY_KINDS[1],
+];
+
+/// 型名 1 つを宣言まで辿った答え。[`SwiftCallable::from_spelling`] がその名前の位置に置く形を決める。
+///
+/// **辿った型名は綴りではなく宣言の場所で比べる**（`rules/naming.md` の `declared type identity`）。
+/// `typealias` の右辺の型名は**宣言側のファイルの綴り**で、使用側の同じ綴りが同じ型とは限らない。
+/// 右辺と直接書いた型名を同じ形で比べるには、どちらも宣言の場所へ寄せるしかない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SwiftTypeResolution {
+    /// 宣言まで辿れた型。`identity` は宣言の場所から作った綴り、`standard` はその宣言が
+    /// 標準ライブラリにあるか（省略形と重ねてよいか）。
+    Declared { identity: String, standard: bool },
+    /// 型引数を取らない `typealias` を開いた右辺。
+    Opened(SwiftOpenedType),
+}
+
+/// `typealias` を開いた右辺の型。右辺の型名は宣言の場所へ置き換えてある。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SwiftOpenedType(SwiftType);
+
+impl SwiftOpenedType {
+    /// 型を形作るノードの数。展開した右辺の大きさの上限に使う
+    /// （`typealias B = (A, A)` の連鎖は段ごとに倍になる）。
+    pub(crate) fn size(&self) -> usize {
+        self.0.size()
+    }
+}
+
+/// 宣言側のソースに書かれた、型引数を取らない `typealias` 1 つ。
+///
+/// **右辺の型名は宣言側の位置から辿る。** 使用側の同じ綴りの型と同じとは限らない
+/// （`rules/architecture.md`「Rust の引数のないエイリアスの右辺の型名は…」と同じ線）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SwiftAliasSource {
+    right: String,
+    references: Vec<TypeReference>,
+}
+
+impl SwiftAliasSource {
+    /// `source` の中で、名前が `position` にある `typealias` を読む。
+    ///
+    /// `None`: その位置に `typealias` の名前が無い、型引数を取る、右辺に属性が付く・
+    /// 読めない構文、右辺に `Self` がある、**囲む宣言が型変数を持ちうる**（型引数を持つ型・
+    /// `extension` / `protocol` / 関数の中）。最後のものは型引数を取らない宣言でも、右辺が囲む型の
+    /// 型変数を指すと `Box<Int>.Item` と `Box<String>.Item` が同じ型に開く（偽陽性）。
+    pub(crate) fn from_source(source: &str, position: SourcePosition) -> Option<Self> {
+        let tree = SyntaxTree::from_source(source, Grammar::Swift).ok()?;
+        let declaration = tree.named_descendants().into_iter().find(|node| {
+            node.kind() == TYPEALIAS_KIND
+                && node
+                    .child_by_field_name("name")
+                    .and_then(|name| source_position_of(name, source))
+                    == Some(position)
+        })?;
+        if declaration.has_error()
+            || !children_of_kind(declaration, TYPE_PARAMETERS_KIND).is_empty()
+            || !is_openable_context(declaration, source)
+        {
+            return None;
+        }
+        let value = alias_value_of(declaration)?;
+
+        let unresolved = |_: &str| None;
+        let mut reader = SwiftSpelling::new(source, &unresolved);
+        reader.recording = true;
+        reader.type_of(value)?;
+        if reader.refers_to_self {
+            return None;
+        }
+        Some(Self {
+            right: source.get(value.byte_range())?.to_owned(),
+            references: reader.references,
+        })
+    }
+
+    /// 右辺に書かれた型名と、宣言側のソースでの位置。**名前ごとに最初の 1 つ。**
+    pub(crate) fn references(&self) -> &[TypeReference] {
+        &self.references
+    }
+
+    /// 右辺の型名を `resolve` で引いて、右辺を型にする。読めなければ `None`。
+    ///
+    /// `resolve` は右辺の型名を**宣言側の位置から**辿った答え。省略形を開くかもそれで決まる。
+    pub(crate) fn opened_with(
+        &self,
+        resolve: &dyn Fn(&str) -> Option<SwiftTypeResolution>,
+    ) -> Option<SwiftOpenedType> {
+        let wrapped = format!("typealias _ = {}\n", self.right);
+        let tree = SyntaxTree::from_source(&wrapped, Grammar::Swift).ok()?;
+        if tree.has_error() {
+            return None;
+        }
+        let declaration = tree
+            .named_descendants()
+            .into_iter()
+            .find(|node| node.kind() == TYPEALIAS_KIND)?;
+        let value = alias_value_of(declaration)?;
+        let mut reader = SwiftSpelling::new(&wrapped, resolve);
+        let opened = reader.type_of(value)?;
+        if reader.refers_to_self || reader.has_unopenable_alias {
+            return None;
+        }
+        Some(SwiftOpenedType(opened))
+    }
+}
+
+/// `typealias` の右辺の型のノード。属性（`@Sendable`）が付く・型が 1 つでなければ `None`。
+///
+/// **フィールドではなく、名前より後ろの子で探す。** tree-sitter-swift 0.7.4 の `node-types.json` は
+/// 右辺を `value` のフィールドと書くが、構文木はそのフィールドを付けない（確かめた）。
+fn alias_value_of(declaration: Node<'_>) -> Option<Node<'_>> {
+    let name = declaration.child_by_field_name("name")?;
+    let mut cursor = declaration.walk();
+    let after_name: Vec<Node<'_>> = declaration
+        .named_children(&mut cursor)
+        .filter(|child| child.start_byte() >= name.end_byte())
+        .collect();
+    match after_name.as_slice() {
+        [value] if is_type_kind(value.kind()) => Some(*value),
+        _ => None,
+    }
+}
+
+/// その `typealias` の祖先が、型変数を持ちえない宣言だけか。
+fn is_openable_context(declaration: Node<'_>, source: &str) -> bool {
+    let mut current = declaration.parent();
+    while let Some(ancestor) = current {
+        if !OPENABLE_ANCESTOR_KINDS.contains(&ancestor.kind()) {
+            return false;
+        }
+        if ancestor.kind() == TYPE_DECLARATION_KIND {
+            let kind = ancestor
+                .child_by_field_name(DECLARATION_KIND_FIELD)
+                .and_then(|kind| source.get(kind.byte_range()));
+            let generic = !children_of_kind(ancestor, TYPE_PARAMETERS_KIND).is_empty();
+            let openable = kind.is_some_and(|kind| OPENABLE_ENCLOSING_KINDS.contains(&kind));
+            if generic || !openable {
+                return false;
+            }
+        }
+        current = ancestor.parent();
+    }
+    true
+}
+
 /// Swift の関数・`init`・`deinit` 1 つ分の、単一化の可否を比べられる形。
 ///
 /// 関数名・引数の内部名・可視性を落とし、型変数を出現順に付け替える
@@ -148,7 +312,7 @@ pub(crate) const STANDARD_SUGAR_NAMES: [&str; 4] =
 /// （`move(to: 1)`）の一部で、ラベルだけ違う 2 つは呼び出し側で差し替えられない。
 /// 内部名は本体の中でだけ意味を持つので落とす（`rules/naming.md`「`signature text` と
 /// `type signature` を混ぜない」）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct SwiftCallable {
     kind: SwiftCallableKind,
     /// `static` / `class` / `mutating` / `@MainActor` など。**並びは落とす**（書く順は自由）。
@@ -181,12 +345,36 @@ pub(crate) struct SwiftCallable {
     /// 書き分けなので、組に割ってから集合にする。
     constraints: BTreeSet<SwiftConstraint>,
     /// 比較に残る綴りに現れた型名。名前順。**パスで書かれた型はパスごと 1 つの名前。**
+    /// 辿った記録・開けなかった理由を引くのに使い、**比較には使わない**（形は宣言の場所で持つ。
+    /// [`PartialEq`] の実装）。
     ///
     /// 束縛した型変数・標準ライブラリを指すと確かめた省略形の名前・`Self` は入らない。
     type_names: BTreeSet<String>,
     /// `Self` が残るか。囲む型で決まるので、綴りだけで比べない。
     refers_to_self: bool,
+    /// 開いた `typealias` を、型引数の付いたパスに当てることになったか。
+    /// 型引数を取らない宣言にだけ右辺を持たせるので、当たれば型引数を落とすことになる。
+    has_unopenable_alias: bool,
 }
+
+/// **比べるのは形だけ。** 型名の綴り（`type_names`）と、測れない側へ倒すための印は比べない。
+/// 辿った型名は宣言の場所で形に入っているので、`Inner` と `Holder.Inner`、`typealias` の名前と
+/// その右辺のように、**同じ型を別の綴りで書いた 2 つ**を綴りで分けない。
+impl PartialEq for SwiftCallable {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.modifiers == other.modifiers
+            && self.parameters == other.parameters
+            && self.effects == other.effects
+            && self.value_type == other.value_type
+            && self.receiver == other.receiver
+            && self.receiver_constraints == other.receiver_constraints
+            && self.type_parameter_count == other.type_parameter_count
+            && self.constraints == other.constraints
+    }
+}
+
+impl Eq for SwiftCallable {}
 
 /// 呼び出しの仕方。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,11 +452,15 @@ struct EnclosingReceiver {
     constraints: BTreeSet<ReceiverConstraint>,
     type_names: BTreeSet<String>,
     refers_to_self: bool,
+    has_unopenable_alias: bool,
 }
 
 impl EnclosingReceiver {
     /// 囲む型の綴りを `extension` の宣言として読む。読めなければ `None`。
-    fn from_header(header: &str, is_standard: &dyn Fn(&str) -> bool) -> Option<Self> {
+    fn from_header(
+        header: &str,
+        resolve: &dyn Fn(&str) -> Option<SwiftTypeResolution>,
+    ) -> Option<Self> {
         let wrapped = format!("extension {header} {{}}\n");
         let tree = SyntaxTree::from_source(&wrapped, Grammar::Swift).ok()?;
         if tree.has_error() {
@@ -278,7 +470,7 @@ impl EnclosingReceiver {
             .named_descendants()
             .into_iter()
             .find(|node| node.kind() == TYPE_DECLARATION_KIND)?;
-        let mut reader = SwiftSpelling::new(&wrapped, is_standard);
+        let mut reader = SwiftSpelling::new(&wrapped, resolve);
         let value = reader.receiver_type_of(declaration)?;
         let constraints = reader.receiver_constraints_of(declaration)?;
         Some(Self {
@@ -286,6 +478,7 @@ impl EnclosingReceiver {
             constraints,
             type_names: reader.type_names,
             refers_to_self: reader.refers_to_self,
+            has_unopenable_alias: reader.has_unopenable_alias,
         })
     }
 }
@@ -335,11 +528,44 @@ enum SwiftType {
     Composition(BTreeSet<SwiftType>),
 }
 
+impl SwiftType {
+    /// この型を形作るノードの数（自分を含む）。
+    fn size(&self) -> usize {
+        let inner: usize = match self {
+            Self::Named(path) => path
+                .iter()
+                .flat_map(|(_, arguments)| arguments)
+                .map(Self::size)
+                .sum(),
+            Self::Parameter(_) | Self::Member(..) => 0,
+            Self::Optional(wrapped)
+            | Self::ImplicitlyUnwrapped(wrapped)
+            | Self::Array(wrapped)
+            | Self::Opaque(wrapped)
+            | Self::Existential(wrapped) => wrapped.size(),
+            Self::Dictionary(key, value) => key.size() + value.size(),
+            Self::Tuple(elements) => elements.iter().map(|(_, element)| element.size()).sum(),
+            Self::Function {
+                parameters, value, ..
+            } => {
+                parameters
+                    .iter()
+                    .map(|(_, _, parameter)| parameter.size())
+                    .sum::<usize>()
+                    + value.size()
+            }
+            Self::Composition(members) => members.iter().map(Self::size).sum(),
+        };
+        inner + 1
+    }
+}
+
 impl SwiftCallable {
     /// hover が返した綴りから読む。宣言として読めなければ `None`。
     ///
-    /// `is_standard` は、省略形を持つ名前（[`STANDARD_SUGAR_NAMES`]）の型名が
-    /// **標準ライブラリの宣言を指すと確かめられたか**を答える。確かめられなければ、
+    /// `resolve` は型名ごとに、宣言まで辿った答えを返す。辿れた名前は宣言の場所の綴りに、
+    /// 開いた `typealias` は右辺に置き換える。省略形を持つ名前（[`STANDARD_SUGAR_NAMES`]）は
+    /// **標準ライブラリの宣言を指すと確かめられたとき**だけ省略形と重ねる。確かめられなければ、
     /// その名前は利用者の型として型名に残る（`Optional` を宣言し直したモジュールもありうる）。
     /// `enclosing_type` は、そのメンバーを直接囲む型（`Chunk::swift_enclosing_type`）。
     /// 型の外の関数では `None`。
@@ -348,15 +574,12 @@ impl SwiftCallable {
     /// 囲む型の分からない `init` / `deinit`、囲む型の綴りを読めないメンバー。
     pub(crate) fn from_spelling(
         spelling: &str,
-        is_standard: &dyn Fn(&str) -> bool,
+        resolve: &dyn Fn(&str) -> Option<SwiftTypeResolution>,
         enclosing_type: Option<&SwiftEnclosingType>,
     ) -> Option<Self> {
         let enclosing = match enclosing_type {
             None => None,
-            Some(enclosing) => Some(EnclosingReceiver::from_header(
-                &enclosing.header,
-                is_standard,
-            )?),
+            Some(enclosing) => Some(EnclosingReceiver::from_header(&enclosing.header, resolve)?),
         };
         let wrapped = format!("{MEMBER_WRAPPER_START}{spelling}{MEMBER_WRAPPER_END}");
         let tree = SyntaxTree::from_source(&wrapped, Grammar::Swift).ok()?;
@@ -368,13 +591,15 @@ impl SwiftCallable {
             .into_iter()
             .find(|node| is_callable_kind(node.kind()))?;
 
-        let mut reader = SwiftSpelling::new(&wrapped, is_standard);
+        let mut reader = SwiftSpelling::new(&wrapped, resolve);
         let mut callable = reader.callable_of(declaration)?;
         let mut type_names = reader.type_names;
         let mut refers_to_self = reader.refers_to_self;
+        let mut has_unopenable_alias = reader.has_unopenable_alias;
         let enclosing = enclosing.map(|receiver| {
             type_names.extend(receiver.type_names);
             refers_to_self |= receiver.refers_to_self;
+            has_unopenable_alias |= receiver.has_unopenable_alias;
             callable.receiver_constraints = receiver.constraints;
             receiver.value
         });
@@ -394,6 +619,7 @@ impl SwiftCallable {
         }
         callable.type_names = type_names;
         callable.refers_to_self = refers_to_self;
+        callable.has_unopenable_alias = has_unopenable_alias;
         Some(callable)
     }
 
@@ -405,6 +631,11 @@ impl SwiftCallable {
     /// `Self` が残るか。
     pub(crate) fn refers_to_self(&self) -> bool {
         self.refers_to_self
+    }
+
+    /// 開いた `typealias` を、型引数の付いたパスに当てることになったか。
+    pub(crate) fn has_unopenable_alias(&self) -> bool {
+        self.has_unopenable_alias
     }
 }
 
@@ -443,8 +674,8 @@ fn is_callable_kind(kind: &str) -> bool {
 /// **標準ライブラリの省略形の名前（`Optional` など）も集める** — 標準ライブラリを
 /// 指すかは辿ってみるまで分からない。
 pub(crate) fn type_references_of(function: Node<'_>, source: &str) -> Vec<TypeReference> {
-    let never_standard = |_: &str| false;
-    let mut reader = SwiftSpelling::new(source, &never_standard);
+    let unresolved = |_: &str| None;
+    let mut reader = SwiftSpelling::new(source, &unresolved);
     reader.recording = true;
     if reader.callable_of(function).is_none() {
         return Vec::new();
@@ -491,8 +722,8 @@ pub(crate) fn enclosing_type_references_of(function: Node<'_>, source: &str) -> 
     let Some(declaration) = enclosing_declaration_of(function) else {
         return Vec::new();
     };
-    let never_standard = |_: &str| false;
-    let mut reader = SwiftSpelling::new(source, &never_standard);
+    let unresolved = |_: &str| None;
+    let mut reader = SwiftSpelling::new(source, &unresolved);
     reader.recording = true;
     let read = reader
         .receiver_type_of(declaration)
@@ -506,27 +737,32 @@ pub(crate) fn enclosing_type_references_of(function: Node<'_>, source: &str) -> 
 /// 1 つの宣言の綴りを読み進める途中の状態。
 struct SwiftSpelling<'source> {
     source: &'source str,
-    is_standard: &'source dyn Fn(&str) -> bool,
+    resolve: &'source dyn Fn(&str) -> Option<SwiftTypeResolution>,
     /// 関数が束縛した型変数の名前。宣言された順。
     declared: Vec<String>,
     /// 付け替えた型変数の名前。**番号の順**。
     numbered: Vec<String>,
     type_names: BTreeSet<String>,
     refers_to_self: bool,
+    has_unopenable_alias: bool,
     /// ソースを読むときだけ、型名の位置を残す。
     recording: bool,
     references: Vec<TypeReference>,
 }
 
 impl<'source> SwiftSpelling<'source> {
-    fn new(source: &'source str, is_standard: &'source dyn Fn(&str) -> bool) -> Self {
+    fn new(
+        source: &'source str,
+        resolve: &'source dyn Fn(&str) -> Option<SwiftTypeResolution>,
+    ) -> Self {
         Self {
             source,
-            is_standard,
+            resolve,
             declared: Vec::new(),
             numbered: Vec::new(),
             type_names: BTreeSet::new(),
             refers_to_self: false,
+            has_unopenable_alias: false,
             recording: false,
             references: Vec::new(),
         }
@@ -616,6 +852,7 @@ impl<'source> SwiftSpelling<'source> {
             constraints,
             type_names: BTreeSet::new(),
             refers_to_self: false,
+            has_unopenable_alias: false,
         })
     }
 
@@ -907,7 +1144,8 @@ impl<'source> SwiftSpelling<'source> {
             .map(|(segment, _)| segment.as_str())
             .collect::<Vec<_>>()
             .join(".");
-        if let Some(opened) = self.standard_sugar_of(&name, &path) {
+        let resolution = (self.resolve)(&name);
+        if let Some(opened) = Self::standard_sugar_of(resolution.as_ref(), &path) {
             return opened;
         }
 
@@ -920,13 +1158,24 @@ impl<'source> SwiftSpelling<'source> {
                 .push(TypeReference::new(name.clone(), position));
         }
         self.type_names.insert(name);
-        SwiftType::Named(path)
+        match resolution {
+            None => SwiftType::Named(path),
+            Some(SwiftTypeResolution::Declared { identity, .. }) => {
+                SwiftType::Named(declared_path_of(identity, path))
+            }
+            Some(SwiftTypeResolution::Opened(opened)) => {
+                if path.iter().any(|(_, arguments)| !arguments.is_empty()) {
+                    self.has_unopenable_alias = true;
+                    return SwiftType::Named(path);
+                }
+                opened.0
+            }
+        }
     }
 
     /// 標準ライブラリの省略形を持つ型を、省略形を開いた形にする。当たらなければ `None`。
     fn standard_sugar_of(
-        &self,
-        name: &str,
+        resolution: Option<&SwiftTypeResolution>,
         path: &[(String, Vec<SwiftType>)],
     ) -> Option<SwiftType> {
         let (last, arguments) = path.last()?;
@@ -938,7 +1187,11 @@ impl<'source> SwiftSpelling<'source> {
             _ => false,
         };
         let sugar = qualified && STANDARD_SUGAR_NAMES.contains(&last.as_str());
-        if !sugar || !(self.is_standard)(name) {
+        let standard = matches!(
+            resolution,
+            Some(SwiftTypeResolution::Declared { standard: true, .. })
+        );
+        if !sugar || !standard {
             return None;
         }
         match (last.as_str(), arguments.as_slice()) {
@@ -1035,6 +1288,24 @@ impl<'source> SwiftSpelling<'source> {
             value: Box::new(value),
         })
     }
+}
+
+/// 名前のパスの末尾の名前を、宣言の場所の綴りに置き換える。**前の区切りは綴りのまま残す。**
+///
+/// **Why**: 尋ねるのは末尾の名前の位置で、宣言の場所が決まるのは末尾だけ。前の区切りを落とすと、
+/// 末尾がプロトコルの `associatedtype` を指す `IntBag.Element` と `StrBag.Element` が同じ形になる
+/// （偽陽性）。
+///
+/// **Why not（区切りを落として `Inner` と `Holder.Inner` を重ねる）**: 上の偽陽性と引き換えになる。
+/// 前の区切りが残っても、同じ綴りで書いた 2 つは今までどおり重なる（偽陰性は綴りの違いだけ）。
+fn declared_path_of(
+    identity: String,
+    mut path: Vec<(String, Vec<SwiftType>)>,
+) -> Vec<(String, Vec<SwiftType>)> {
+    if let Some((last, _)) = path.last_mut() {
+        *last = identity;
+    }
+    path
 }
 
 /// 境界の右辺が `P & Q` なら、組に割ってから入れる。
@@ -1150,12 +1421,20 @@ fn collapsed(text: &str) -> String {
 mod tests {
     use super::*;
 
-    fn standard(_: &str) -> bool {
-        true
+    /// どの型名も標準ライブラリの宣言まで辿れた、とする答え。宣言の場所の綴りは名前のまま。
+    fn standard(name: &str) -> Option<SwiftTypeResolution> {
+        Some(SwiftTypeResolution::Declared {
+            identity: name.to_owned(),
+            standard: true,
+        })
     }
 
-    fn user_declared(_: &str) -> bool {
-        false
+    /// どの型名も利用者の宣言まで辿れた、とする答え。
+    fn user_declared(name: &str) -> Option<SwiftTypeResolution> {
+        Some(SwiftTypeResolution::Declared {
+            identity: name.to_owned(),
+            standard: false,
+        })
     }
 
     fn callable_of(spelling: &str) -> SwiftCallable {
@@ -1831,5 +2110,298 @@ mod tests {
             ),
             ["W"]
         );
+    }
+
+    /// `source` の `line` 行目で、`preceding` の直後に名前がある `typealias`。
+    fn alias_at(source: &str, line: usize, preceding: &str) -> Option<SwiftAliasSource> {
+        let position = SourcePosition::from_preceding_text(
+            crate::line_number::LineNumber::new(line).expect("正の行番号"),
+            preceding,
+        );
+        SwiftAliasSource::from_source(source, position)
+    }
+
+    /// 型名ごとの答えを表から引く。表に無い名前は辿れなかったことにする。
+    fn resolving<'a>(
+        table: &'a [(&'a str, SwiftTypeResolution)],
+    ) -> impl Fn(&str) -> Option<SwiftTypeResolution> + 'a {
+        move |name: &str| {
+            table
+                .iter()
+                .find(|(written, _)| *written == name)
+                .map(|(_, resolution)| resolution.clone())
+        }
+    }
+
+    /// 宣言の場所 `identity` まで辿れた、利用者の型。
+    fn declared_at(identity: &str) -> SwiftTypeResolution {
+        SwiftTypeResolution::Declared {
+            identity: identity.to_owned(),
+            standard: false,
+        }
+    }
+
+    /// 標準ライブラリの宣言 `identity` まで辿れた型。
+    fn standard_at(identity: &str) -> SwiftTypeResolution {
+        SwiftTypeResolution::Declared {
+            identity: identity.to_owned(),
+            standard: true,
+        }
+    }
+
+    /// `typealias _ = right` を、右辺の型名を `table` で引いて開いた答え。
+    fn opened(right: &str, table: &[(&str, SwiftTypeResolution)]) -> SwiftTypeResolution {
+        let source = format!("typealias Alias = {right}\n");
+        let alias = alias_at(&source, 1, "typealias ").expect("読める typealias");
+        SwiftTypeResolution::Opened(alias.opened_with(&resolving(table)).expect("開ける右辺"))
+    }
+
+    fn resolved_callable_of(
+        spelling: &str,
+        table: &[(&str, SwiftTypeResolution)],
+    ) -> SwiftCallable {
+        SwiftCallable::from_spelling(spelling, &resolving(table), None).expect("読める綴り")
+    }
+
+    #[test]
+    fn test_alias_source_records_right_side_names_at_the_declaring_positions() {
+        let source = "struct Shop {}\ntypealias Ledger = [Shop.Money: Rate]\n";
+
+        let alias = alias_at(source, 2, "typealias ").expect("読める typealias");
+
+        let names: Vec<(&str, SourcePosition)> = alias
+            .references()
+            .iter()
+            .map(|reference| (reference.name(), reference.position()))
+            .collect();
+        let at = |preceding: &str| {
+            SourcePosition::from_preceding_text(
+                crate::line_number::LineNumber::new(2).expect("正の行番号"),
+                preceding,
+            )
+        };
+        // 位置はパスの末尾の名前（`Money`）。使用側と同じく、そこへ definition を尋ねる
+        assert_eq!(
+            names,
+            [
+                ("Shop.Money", at("typealias Ledger = [Shop.")),
+                ("Rate", at("typealias Ledger = [Shop.Money: ")),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_alias_source_reads_only_the_declaration_named_at_the_position() {
+        let source = "typealias Money = Int\ntypealias Rate = Double\n";
+
+        assert!(alias_at(source, 2, "typealias ").is_some());
+        // 名前ではなく `=` の後ろを指しても読まない
+        assert!(alias_at(source, 2, "typealias Rate = ").is_none());
+    }
+
+    #[test]
+    fn test_alias_source_reads_a_declaration_nested_in_a_non_generic_type() {
+        let source = "struct Holder {\n    typealias Inner = Int\n}\n";
+
+        assert!(alias_at(source, 2, "    typealias ").is_some());
+    }
+
+    #[test]
+    fn test_alias_source_does_not_read_declarations_that_may_name_type_variables() {
+        // 型引数を取る宣言は #527 で開く
+        assert!(alias_at("typealias Pair<T> = (T, T)\n", 1, "typealias ").is_none());
+        // 囲む型の型変数を指しうる: `Box<Int>.Item` と `Box<String>.Item` が同じ型に開くと偽陽性
+        assert!(
+            alias_at(
+                "struct Box<T> {\n    typealias Item = T\n}\n",
+                2,
+                "    typealias "
+            )
+            .is_none()
+        );
+        assert!(
+            alias_at(
+                "struct Box<T> {\n    struct Inner {\n        typealias Item = Int\n    }\n}\n",
+                3,
+                "        typealias "
+            )
+            .is_none()
+        );
+        assert!(
+            alias_at(
+                "extension Array {\n    typealias Item = Element\n}\n",
+                2,
+                "    typealias "
+            )
+            .is_none()
+        );
+        assert!(
+            alias_at(
+                "protocol Shelf {\n    typealias Item = Int\n}\n",
+                2,
+                "    typealias "
+            )
+            .is_none()
+        );
+        assert!(
+            alias_at(
+                "func f<T>(x: T) {\n    typealias Item = T\n}\n",
+                2,
+                "    typealias "
+            )
+            .is_none()
+        );
+        // 対照: 型引数を持たない型の中は開く
+        assert!(
+            alias_at(
+                "struct Box {\n    typealias Item = Int\n}\n",
+                2,
+                "    typealias "
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn test_alias_source_does_not_read_a_right_side_naming_self_or_with_attributes() {
+        assert!(
+            alias_at(
+                "class Node {\n    typealias Me = Self\n}\n",
+                2,
+                "    typealias "
+            )
+            .is_none()
+        );
+        assert!(
+            alias_at(
+                "typealias Handler = @Sendable () -> Void\n",
+                1,
+                "typealias "
+            )
+            .is_none()
+        );
+        assert!(alias_at("typealias Handler = () -> Void\n", 1, "typealias ").is_some());
+    }
+
+    #[test]
+    fn test_from_spelling_reads_an_opened_alias_as_its_right_side() {
+        let int = standard_at("@Int");
+        let money = opened("Int", &[("Int", int.clone())]);
+
+        let through_alias = resolved_callable_of(
+            "func f(x: Money) -> Int",
+            &[("Money", money), ("Int", int.clone())],
+        );
+        let direct = resolved_callable_of("func g(x: Int) -> Int", &[("Int", int)]);
+
+        assert_eq!(through_alias, direct);
+    }
+
+    #[test]
+    fn test_from_spelling_compares_right_side_names_by_their_declarations() {
+        // 右辺の `Money` は宣言側のファイルの `Money`。使用側の同じ綴りとは別の型
+        let bank_money = declared_at("@Bank.Money");
+        let shop_money = declared_at("@Shop.Money");
+        let ledger = opened("[Money]", &[("Money", bank_money.clone())]);
+        let array = standard_at("@Array");
+
+        let through_alias = resolved_callable_of("func f(x: Ledger)", &[("Ledger", ledger)]);
+        let same_declaration = resolved_callable_of("func g(x: [Money])", &[("Money", bank_money)]);
+        let other_declaration = resolved_callable_of(
+            "func g(x: Array<Money>)",
+            &[("Money", shop_money), ("Array", array)],
+        );
+
+        assert_eq!(through_alias, same_declaration);
+        assert_ne!(through_alias, other_declaration);
+    }
+
+    #[test]
+    fn test_from_spelling_keeps_the_qualifying_segments_of_a_declared_path() {
+        // 末尾がプロトコルの `associatedtype` を指すと、宣言の場所は 2 つで同じになりうる
+        let element = declared_at("@Sequence.Element");
+
+        let int_bag = resolved_callable_of(
+            "func f(x: IntBag.Element)",
+            &[("IntBag.Element", element.clone())],
+        );
+        let text_bag = resolved_callable_of(
+            "func g(x: TextBag.Element)",
+            &[("TextBag.Element", element.clone())],
+        );
+
+        assert_ne!(int_bag, text_bag);
+        // 対照: 同じ綴りで同じ宣言なら重なる
+        assert_eq!(
+            int_bag,
+            resolved_callable_of("func h(x: IntBag.Element)", &[("IntBag.Element", element)])
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_compares_a_single_name_by_its_declaration() {
+        let inner = declared_at("@Holder.Inner");
+
+        let one = resolved_callable_of("func f(x: Inner)", &[("Inner", inner.clone())]);
+
+        assert_eq!(
+            one,
+            resolved_callable_of("func g(x: Inner)", &[("Inner", inner)])
+        );
+        // 対照: 別の宣言なら綴りが同じでも重ならない
+        assert_ne!(
+            one,
+            resolved_callable_of(
+                "func h(x: Inner)",
+                &[("Inner", declared_at("@Other.Inner"))]
+            )
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_reads_standard_sugar_in_an_opened_right_side() {
+        let int = standard_at("@Int");
+        let optional = standard_at("@Optional");
+        let maybe = opened(
+            "Optional<Int>",
+            &[("Optional", optional), ("Int", int.clone())],
+        );
+
+        let through_alias = resolved_callable_of("func f(x: Maybe)", &[("Maybe", maybe)]);
+        let sugar = resolved_callable_of("func g(x: Int?)", &[("Int", int)]);
+
+        assert_eq!(through_alias, sugar);
+    }
+
+    #[test]
+    fn test_from_spelling_marks_an_opened_alias_with_type_arguments_unopenable() {
+        let int = standard_at("@Int");
+        let money = opened("Int", &[("Int", int.clone())]);
+
+        let with_arguments = resolved_callable_of(
+            "func f(x: Money<Int>)",
+            &[("Money", money.clone()), ("Int", int)],
+        );
+        let without = resolved_callable_of("func f(x: Money)", &[("Money", money)]);
+
+        assert!(with_arguments.has_unopenable_alias());
+        assert!(!without.has_unopenable_alias());
+    }
+
+    #[test]
+    fn test_opened_type_size_counts_every_node_of_the_right_side() {
+        let int = standard_at("@Int");
+        let Some(SwiftTypeResolution::Opened(single)) =
+            Some(opened("Int", &[("Int", int.clone())]))
+        else {
+            panic!("開いた右辺");
+        };
+        let Some(SwiftTypeResolution::Opened(pair)) = Some(opened("(Int, Int)", &[("Int", int)]))
+        else {
+            panic!("開いた右辺");
+        };
+
+        assert_eq!(single.size(), 1);
+        assert_eq!(pair.size(), 3);
     }
 }

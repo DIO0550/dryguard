@@ -327,11 +327,22 @@ implementation の候補のうち対象型の綴りが等しい impl（`RustImpl
   等しい impl が無ければ上の 0 件と同じ順（`UnselectedImpls::reason_with`）
 - **短縮形の入れ子（`Self::Item::Out`）は扱わない。** rustc が E0223 で拒否する形
 
-**Swift の型名は definition で辿り、`typealias` は辿るところまで。** sourcekit-lsp の typeDefinition は
-型名の位置に `null` を返すので、Rust と同じく definition を尋ねる（`semantics::resolved_type` の
-`swift_traced_type_names_of`）。辿った先がエイリアスかは**使用位置への hover**（`typealias Amount = Int`）で
-見分け、右辺の展開はまだ持たないので `UnopenableAlias` で「測れない」にする（宣言の場所のまま比べると、
-`Amount` と `Int` が重ならないと確かめた答えになる）。標準ライブラリの省略形を持つ名前
+**Swift の型名は definition で辿り、型引数を取らない `typealias` は右辺へ開く。** sourcekit-lsp の
+typeDefinition は型名の位置に `null` を返すので、Rust と同じく definition を尋ねる（`semantics::resolved_type` の
+`swift_traced_type_names_of`）。辿った型名は綴りではなく `declared type identity` で比べる
+（`swift_declared_resolution_of`。標準ライブラリの生成インタフェースは、sourcekit-lsp 6.4.2 が尋ねたドキュメントごとに
+別のディレクトリへ置くので、ファイル名と位置で持つ）。辿った先がエイリアスかは**使用位置への hover**
+（`typealias Amount = Int` / `public typealias Cost = Double`。修飾子の後ろの語で見る）で見分け、
+`syntax::swift_callable::SwiftAliasSource` が宣言側のソースの右辺を読み、右辺の型名を**宣言側の位置から**
+辿って再帰的に開く。開くのは**利用者のソースにあり、型引数を取らず、祖先が型引数を持たない
+`struct` / `class` / `enum` / `actor` かファイルの直下だけ**の宣言（許可リスト。`extension` / `protocol` /
+関数の中の宣言は、右辺が型変数を指すと `Box<Int>.Item` と `Box<String>.Item` が同じ型に開く）。
+それ以外・`.swiftinterface` の宣言・右辺に `Self` や属性がある宣言は `UnopenableAlias` で「測れない」にする
+（宣言の場所のまま比べると、`Amount` と `Int` が重ならないと確かめた答えになる）。循環は宣言の場所で
+`CyclicAlias`、32 段か展開した型が 4096 ノードを超えると `AliasExpansionLimit`（循環した宣言の使用位置には
+sourcekit-lsp 6.4.2 が答えないので、`CyclicAlias` はサーバが答えたときの防御）。開いた答えは
+`SwiftDeclarationCache` が宣言の場所ごとに、展開に使った段数と一緒に持ち、別の連鎖の途中で使うときは
+今の段数との和で上限を確かめ直す（尋ねる順で答えが変わらない）。標準ライブラリの省略形を持つ名前
 （`Void` = `()` など）は、エイリアスかを見る前に標準ライブラリの `.swiftinterface` を指すかで通す
 （`is_swift_standard_library_site`）。hover の綴りに出ないレシーバと `init` の値の型は、
 `syntax::chunk` が運ぶ直接囲む型の綴りで足す（`Chunk::swift_enclosing_type`）。hover は囲む
@@ -529,6 +540,7 @@ pr-155 と同じ形だと自己申告している）。
 | チャンクごとに `project membership` を尋ねる | ファイルごとに 1 回だけ尋ね、同じファイルのチャンクへ配る |
 | チャンクごとに Rust の型名解決・配列長の評価器が宣言側のソースを読み、同じ trait に implementation を尋ねる | `RustDeclarationCache` をセッションごとに 1 つ作り、ファイル・trait の宣言位置をキーに共有する |
 | チャンクごとに短縮形の投影の supertrait の閉包を definition で辿る | 実装している trait と関連型の宣言の組をキーに、`RustDeclarationCache` で共有する |
+| チャンクごとに Swift の `typealias` の右辺の型名を宣言側から辿り直す | `SwiftDeclarationCache` をセッションごとに 1 つ作り、宣言の場所をキーに開いた答えを共有する |
 
 **Why**: LSP への問い合わせは同期的な往復を伴うプロセス外呼び出しで、
 `project marker` 探索も印が無い木では毎回ファイルシステムの根まで辿る。

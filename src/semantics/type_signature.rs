@@ -18,15 +18,15 @@ use std::num::NonZeroUsize;
 
 use crate::lsp::{ClientError, HoverOutcome, Session, SignatureText, SourceDocument};
 use crate::semantics::resolved_type::{
-    ResolvedTypes, RustDeclarationCache, TracedTypeNames, TypeDeclaration, UnopenedReason,
-    is_swift_standard_library_site, java_traced_type_names_of, rust_traced_type_names_of,
-    swift_traced_type_names_of,
+    ResolvedTypes, RustDeclarationCache, SwiftDeclarationCache, TracedTypeNames, TypeDeclaration,
+    UnopenedReason, java_traced_type_names_of, rust_traced_type_names_of,
+    swift_declared_resolution_of, swift_traced_type_names_of,
 };
 use crate::source_position::SourcePosition;
 use crate::syntax::chunk::{AnnotatedPositions, OverloadDeclaration, TypeAnnotation};
 use crate::syntax::java_callable::{JavaCallable, JavaEnclosingType};
 use crate::syntax::rust_callable::RustCallable;
-use crate::syntax::swift_callable::{SwiftCallable, SwiftEnclosingType};
+use crate::syntax::swift_callable::{SwiftCallable, SwiftEnclosingType, SwiftTypeResolution};
 use crate::syntax::type_reference::TypeReference;
 use crate::syntax::type_spelling::{names_only_types, substituted_spelling_of, type_name_spans_of};
 use crate::syntax::type_structure::{Callable, SignatureKind, TypeStructure};
@@ -400,7 +400,8 @@ pub fn rust_type_signature_outcome_of(
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
 /// `Chunk::name_position`、`type_references` は `Chunk::type_references`、`enclosing_type` は
-/// `Chunk::swift_enclosing_type`。
+/// `Chunk::swift_enclosing_type`。`cache` は `typealias` を開いた答えを候補チャンクのあいだで
+/// 共有する（[`SwiftDeclarationCache`]）。
 ///
 /// **注釈の有無もオーバーロードも見ない。** Swift の引数は型を省けず、省いた戻り値は推論ではなく
 /// `()` に決まる（`syntax::chunk` の `swift_annotated_positions_of`）。同じ名前の関数は
@@ -416,6 +417,7 @@ pub fn rust_type_signature_outcome_of(
 /// **答えが無い / 読めないは `Err` にしない**（[`type_signature_outcome_of`] と同じ）。
 pub fn swift_type_signature_outcome_of(
     session: &mut Session,
+    cache: &mut SwiftDeclarationCache,
     document: &SourceDocument,
     position: SourcePosition,
     type_references: &[TypeReference],
@@ -426,7 +428,7 @@ pub fn swift_type_signature_outcome_of(
         Err(outcome) => return Ok(outcome),
     };
 
-    let traced = swift_traced_type_names_of(session, document, type_references)?;
+    let traced = swift_traced_type_names_of(session, cache, document, type_references)?;
     Ok(swift_normalized_outcome_of(
         &signature_text,
         &traced,
@@ -439,21 +441,27 @@ pub fn swift_type_signature_outcome_of(
 /// **答えの並びは Rust と同じ**（[`rust_normalized_outcome_of`]）。開けなかった型名 →
 /// `Self` → 辿った記録の無い型名の順に見て、どれにも当たらなければ比べられる形にする。
 ///
-/// **省略形の名前が標準ライブラリを指すかは、辿った宣言の場所で決める**
-/// （`semantics::resolved_type` の `is_swift_standard_library_site`）。辿れなかった名前は
-/// 利用者の型として型名に残り、下の順で測れない側へ倒れる。
+/// **辿った型名は宣言の場所で比べる**（`semantics::resolved_type` の
+/// `swift_declared_resolution_of`）。開いた `typealias` は右辺に置き換える。省略形の名前が
+/// 標準ライブラリを指すかも辿った宣言の場所で決める。辿れなかった名前は利用者の型として
+/// 型名に残り、下の順で測れない側へ倒れる。
 pub fn swift_normalized_outcome_of(
     signature_text: &SignatureText,
     traced: &TracedTypeNames,
     enclosing_type: Option<&SwiftEnclosingType>,
 ) -> TypeSignatureOutcome {
-    let is_standard = |name: &str| {
-        traced.declared().iter().any(|declaration| {
-            declaration.name() == name && is_swift_standard_library_site(declaration.site())
-        })
+    let resolve = |name: &str| {
+        if let Some(right) = traced.resolved().swift_type_of(name) {
+            return Some(SwiftTypeResolution::Opened(right.clone()));
+        }
+        traced
+            .declared()
+            .iter()
+            .find(|declaration| declaration.name() == name)
+            .map(|declaration| swift_declared_resolution_of(declaration.site()))
     };
     let Some(callable) =
-        SwiftCallable::from_spelling(signature_text.as_str(), &is_standard, enclosing_type)
+        SwiftCallable::from_spelling(signature_text.as_str(), &resolve, enclosing_type)
     else {
         return TypeSignatureOutcome::UnreadableSignature;
     };
@@ -464,6 +472,11 @@ pub fn swift_normalized_outcome_of(
         .find_map(|name| traced.unopened_reason_of(name))
     {
         return TypeSignatureOutcome::UnopenedTypeName { reason };
+    }
+    if callable.has_unopenable_alias() {
+        return TypeSignatureOutcome::UnopenedTypeName {
+            reason: UnopenedReason::UnopenableAlias,
+        };
     }
 
     // `Self` は囲む型で決まるが、プロトコルの拡張では採用する型ごとに違う
@@ -477,10 +490,11 @@ pub fn swift_normalized_outcome_of(
         };
     }
 
-    let declarations = declarations_named_in(type_names, traced.declared());
+    // 宣言の場所は型名の位置に置いてある（`swift_declared_resolution_of`）。名前で引く一覧を
+    // 重ねると、`typealias` の名前と右辺の型名の宣言が食い違い、同じ型が重ならない
     TypeSignatureOutcome::Normalized(OverloadSet::of_one(TypeSignature {
         chunk_type: ComparedChunkType::Swift(callable),
-        declarations,
+        declarations: Vec::new(),
     }))
 }
 
@@ -1146,6 +1160,7 @@ pub struct TypeSignature {
     /// **書かれ方の違いが型の違いに見える**（`syntax::type_structure`）。
     chunk_type: ComparedChunkType,
     /// 綴りに残った型名が、それぞれどこで宣言されているか。**名前順**。
+    /// **Swift では空。** 宣言の場所は型名の位置に置いてある（`swift_declared_resolution_of`）。
     ///
     /// **綴りは書いた人の位置に依存する。** 別々のモジュールが同じ局所名で構造の違う型を
     /// export していると、hover はどちらも `User` と返す。綴りだけを比べると、
@@ -1802,7 +1817,8 @@ impl<'text> SplitSignature<'text> {
 mod tests {
     use super::*;
 
-    use crate::semantics::resolved_type::UnopenedTypeName;
+    use crate::semantics::resolved_type::{UnopenedTypeName, is_swift_standard_library_site};
+    use crate::syntax::swift_callable::SwiftAliasSource;
     use crate::test_support::{declaration_site, overload_count, signature_text};
 
     /// テストが渡す綴りは読み取れる前提で組み立てる。**書かれた型名はすべて辿れた前提。**
@@ -4223,6 +4239,69 @@ mod tests {
 
         assert_eq!(
             swift_normalized_outcome_of(&signature_text("func f(x: Amount)"), &traced, None),
+            TypeSignatureOutcome::UnopenedTypeName {
+                reason: UnopenedReason::UnopenableAlias
+            }
+        );
+    }
+
+    /// `typealias Money = <right>` を、右辺の型名を標準ライブラリの宣言（`line` 行目）まで
+    /// 辿ったことにして開き、`Money` を `/repo/Sources/Shop/Money.swift` の宣言とした記録を足す。
+    fn swift_with_alias(right: &str, line: usize) -> TracedTypeNames {
+        let source = format!("typealias Money = {right}\n");
+        let position = SourcePosition::from_preceding_text(
+            crate::line_number::LineNumber::new(1).expect("正の行番号"),
+            "typealias ",
+        );
+        let alias = SwiftAliasSource::from_source(&source, position).expect("読める typealias");
+        let right_side = swift_declared_resolution_of(&declaration_site(SWIFT_INTERFACE, line));
+        let opened = alias
+            .opened_with(&|_| Some(right_side.clone()))
+            .expect("開ける右辺");
+
+        TracedTypeNames::new(
+            vec![
+                declared("Int", SWIFT_INTERFACE, 10),
+                declared("Double", SWIFT_INTERFACE, 50),
+                declared("Money", "/repo/Sources/Shop/Money.swift", 1),
+            ],
+            Vec::new(),
+        )
+        .with_resolved(ResolvedTypes::of_swift([("Money".to_owned(), opened)]))
+    }
+
+    #[test]
+    fn test_swift_opened_alias_and_its_right_side_are_unifiable() {
+        let traced = swift_with_alias("Int", 10);
+
+        let through_alias = swift_signature("func f(x: Money) -> Int", &traced);
+
+        assert!(
+            through_alias.is_unifiable_with(&swift_signature("func g(x: Int) -> Int", &traced))
+        );
+        // 対照: 右辺と別の型とは重ならない
+        assert!(
+            !through_alias.is_unifiable_with(&swift_signature("func g(x: Double) -> Int", &traced))
+        );
+    }
+
+    #[test]
+    fn test_swift_aliases_opening_to_different_declarations_are_not_unifiable() {
+        // 綴り（`Money`）と宣言の場所は同じで、右辺が別の宣言へ開く
+        let to_int = swift_signature("func f(x: Money)", &swift_with_alias("Int", 10));
+        let to_double = swift_signature("func f(x: Money)", &swift_with_alias("Double", 50));
+
+        assert!(!to_int.is_unifiable_with(&to_double));
+    }
+
+    #[test]
+    fn test_swift_opened_alias_written_with_type_arguments_is_unopenable() {
+        assert_eq!(
+            swift_normalized_outcome_of(
+                &signature_text("func f(x: Money<Int>)"),
+                &swift_with_alias("Int", 10),
+                None
+            ),
             TypeSignatureOutcome::UnopenedTypeName {
                 reason: UnopenedReason::UnopenableAlias
             }

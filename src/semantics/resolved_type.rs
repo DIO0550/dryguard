@@ -33,7 +33,9 @@ use crate::syntax::rust_callable::{
     RustTypeResolution, associated_owner_position_of, primitive_references_of_alias,
     primitive_spelling_of,
 };
-use crate::syntax::swift_callable::STANDARD_SUGAR_NAMES;
+use crate::syntax::swift_callable::{
+    STANDARD_SUGAR_NAMES, SwiftAliasSource, SwiftOpenedType, SwiftTypeResolution,
+};
 use crate::syntax::type_reference::TypeReference;
 
 mod array_length;
@@ -88,6 +90,8 @@ impl TypeDeclaration {
 pub struct ResolvedTypes {
     by_name: HashMap<String, String>,
     rust_types: HashMap<String, RustTypeResolution>,
+    /// Swift の `typealias` を開いた右辺。型名は宣言の場所へ置き換えてある。
+    swift_types: HashMap<String, SwiftOpenedType>,
 }
 
 impl ResolvedTypes {
@@ -96,7 +100,21 @@ impl ResolvedTypes {
         Self {
             by_name: resolutions.into_iter().collect(),
             rust_types: HashMap::new(),
+            swift_types: HashMap::new(),
         }
+    }
+
+    /// Swift の `typealias` を開いた右辺の組から作る。
+    pub(crate) fn of_swift(opened: impl IntoIterator<Item = (String, SwiftOpenedType)>) -> Self {
+        Self {
+            swift_types: opened.into_iter().collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Swift の `typealias` を開いた右辺。開いていなければ `None`。
+    pub(crate) fn swift_type_of(&self, name: &str) -> Option<&SwiftOpenedType> {
+        self.swift_types.get(name)
     }
 
     /// Rust の解決結果。具体的な宣言元、開いた右辺、型引数を当てはめるテンプレートを返す。
@@ -179,7 +197,8 @@ pub enum UnopenedReason {
     HoverNotProvided,
     /// 宣言は型エイリアスだが、右辺を差し込める形にできなかった。
     ///
-    /// **Swift の `typealias` はすべてここに来る。** 右辺の展開をまだ持たない
+    /// **Swift で開くのは、利用者のソースにある型引数を取らない `typealias` だけ。**
+    /// ジェネリックな宣言・`.swiftinterface` の宣言・型変数を持ちうる宣言の中の宣言はここに来る
     /// （`swift_traced_type_names_of`）。
     ///
     /// **サーバは右辺を返している。** 開けないのは dryguard 側の都合（型引数の当てはめが
@@ -377,8 +396,8 @@ pub(crate) fn rust_traced_type_names_of(
 }
 
 /// Swift の型エイリアスの宣言を導く語。sourcekit-lsp は使用位置への hover にこれを綴る
-/// （`typealias Amount = Int`。6.4.2 で実測）。
-const SWIFT_ALIAS_KEYWORD: &str = "typealias ";
+/// （`typealias Amount = Int`。修飾子が付けば `public typealias Cost = Double`。6.4.2 で実測）。
+const SWIFT_ALIAS_KEYWORD: &str = "typealias";
 
 /// sourcekit-lsp が標準ライブラリの宣言を置くインタフェースの拡張子。
 const SWIFT_INTERFACE_EXTENSION: &str = "swiftinterface";
@@ -386,73 +405,302 @@ const SWIFT_INTERFACE_EXTENSION: &str = "swiftinterface";
 /// 標準ライブラリのモジュールの名前。インタフェースのファイル名・`.swiftmodule` の名前になる。
 const SWIFT_STANDARD_LIBRARY_MODULE: &str = "Swift";
 
+/// 展開した Swift の `typealias` の右辺の、型のノードの数の上限。
+///
+/// **段数だけでは足りない。** `typealias B = (A, A)` の連鎖は段ごとに倍になり、32 段で
+/// 2^32 に届く。Rust の展開の上限（右辺 64 KiB）と同じ役目を、綴りではなく型の大きさで持つ。
+const MAXIMUM_SWIFT_ALIAS_SIZE: usize = 4096;
+
+/// compare / scan の間だけ共有する、Swift の `typealias` を宣言側で開いた答え。
+///
+/// **宣言の場所で決まる答えなので、チャンクごとに尋ね直さない**（`rules/architecture.md`
+/// 「ファイル単位で決まる答えをチャンク単位で問い合わせない」）。同じ `typealias` を通る
+/// 候補チャンクが N 個あると、右辺の型名への definition / hover を N 回往復することになる。
+///
+/// **開けた答えだけを、その展開が使った段数と一緒に持つ。** 循環と上限の失敗は辿っている
+/// 連鎖で決まるので持たない。開けた答えを別の連鎖の途中で使うときは、今の段数と覚えた段数の
+/// 和で上限を確かめ直す（尋ねる順で答えが変わらない）。読み込み前の答え
+/// （`ServerStillWorking` など）は後のチャンクなら開けうるので、失敗は 1 つも持たない。
+///
+/// **1 つのセッションより長く持たない。** 宣言の場所（生成インタフェースのパスを含む）は
+/// サーバに見せたワークスペースで決まる。持ち主は `pipeline`。
+#[derive(Debug, Default)]
+pub struct SwiftDeclarationCache {
+    sources: HashMap<std::path::PathBuf, Result<String, UnopenedReason>>,
+    opened: Vec<(DeclarationSite, SwiftOpenedType, usize)>,
+}
+
+impl SwiftDeclarationCache {
+    /// 宣言側のソース。読めなければその理由（何度尋ねても同じなので覚える）。
+    fn source_of(&mut self, path: &std::path::Path) -> Result<String, UnopenedReason> {
+        self.sources
+            .entry(path.to_owned())
+            .or_insert_with(|| {
+                source_of(path).map_err(|_| UnopenedReason::UnreadableDeclaringDocument)
+            })
+            .clone()
+    }
+}
+
 /// Swift のシグネチャに書かれた型名の宣言が、どこにあるかを尋ねる。
 ///
 /// **definition で辿る。** sourcekit-lsp の typeDefinition は型名の位置にも `null` を返す
 /// （6.4.2 で実測。#406）。
 ///
-/// **辿った先が型エイリアスなら、開けなかったものとして返す**（`UnopenableAlias`）。
-/// 右辺の展開はまだ持たないので、宣言の場所のまま比べると `Amount`（= `Int`）と `Int` が
-/// 「重ならないと確かめた」答えになる（`rules/architecture.md`「どこまでを「取れなかった」に
-/// 数えるか」）。見分けるのは**使用位置への hover**で、宣言のファイルを開かせずに済む。
+/// **辿った先が型エイリアスなら、右辺を開く**（[`SwiftAliasOpener`]）。見分けるのは
+/// **使用位置への hover**で、エイリアスでない型の宣言のファイルを開かせずに済む。開けなければ
+/// その理由で返す。宣言の場所のまま比べると `Amount`（= `Int`）と `Int` が「重ならないと
+/// 確かめた」答えになる（`rules/architecture.md`「どこまでを「取れなかった」に数えるか」）。
+/// 開いた名前は宣言の場所の一覧にも残す（辿った記録があることを答えるため）。
 ///
 /// **標準ライブラリの省略形の名前は、エイリアスかを見る前に通す。** `Void` は標準ライブラリの
-/// `typealias Void = ()` で、先にエイリアスとして倒すと関数型の `-> Void` がすべて測れない側へ落ちる。
-/// 省略形を開くのは `syntax::swift_callable` で、ここは宣言の場所を持つだけ。
+/// `typealias Void = ()` で、`.swiftinterface` の `typealias` は開かないので、先にエイリアスとして
+/// 倒すと関数型の `-> Void` がすべて測れない側へ落ちる。省略形を開くのは `syntax::swift_callable`。
 ///
 /// # Errors
 ///
 /// そのドキュメントを開かせていないとき、往復が失敗したとき。
 pub(crate) fn swift_traced_type_names_of(
     session: &mut Session,
+    cache: &mut SwiftDeclarationCache,
     document: &SourceDocument,
     type_references: &[TypeReference],
 ) -> Result<TracedTypeNames, ClientError> {
     let mut declared = Vec::new();
+    let mut opened = HashMap::new();
     let mut unopened = Vec::new();
+    let mut opener = SwiftAliasOpener {
+        session,
+        cache,
+        active: Vec::new(),
+    };
 
     for reference in type_references {
         let name = reference.name().to_owned();
-        let site =
-            match DeclarationQuery::Definition.site_of(session, document, reference.position())? {
-                Ok(site) => site,
-                Err(reason) => {
-                    unopened.push(UnopenedTypeName::new(name, reason));
-                    continue;
-                }
-            };
-
-        let standard_sugar = is_swift_standard_library_site(&site)
-            && STANDARD_SUGAR_NAMES.contains(&swift_last_segment_of(&name));
-        if standard_sugar {
-            declared.push(TypeDeclaration::new(name, site));
-            continue;
-        }
-
-        match swift_alias_check_of(session.hover(document, reference.position())?) {
-            Ok(false) => declared.push(TypeDeclaration::new(name, site)),
-            Ok(true) => unopened.push(UnopenedTypeName::new(name, UnopenedReason::UnopenableAlias)),
+        match opener.traced_at(document, reference)? {
+            Ok(SwiftTraced::Declared(site)) => declared.push(TypeDeclaration::new(name, site)),
+            Ok(SwiftTraced::Opened(site, right, _)) => {
+                opened.insert(name.clone(), right);
+                declared.push(TypeDeclaration::new(name, site));
+            }
             Err(reason) => unopened.push(UnopenedTypeName::new(name, reason)),
         }
     }
 
-    Ok(TracedTypeNames::new(declared, unopened))
+    Ok(TracedTypeNames::new(declared, unopened).with_resolved(ResolvedTypes::of_swift(opened)))
+}
+
+/// その宣言の場所を、Swift の型シグネチャに置く答えにする。
+///
+/// **宣言の場所の綴りは Rust と同じ形**（`rules/naming.md` の `declared type identity`）。
+/// 型名の綴りとは衝突しない（`@` で始まる型名は書けない）。
+///
+/// **標準ライブラリの宣言は、パスのディレクトリを落としてファイル名と位置で持つ。**
+/// sourcekit-lsp 6.4.2 は生成インタフェースを**尋ねたドキュメントごとに別のディレクトリ**
+/// （`GeneratedInterfaces/<ハッシュ>/Swift.Math.Integers.swiftinterface`）に置き、同じ `Int` でも
+/// 使用側のファイルと `typealias` の宣言側のファイルで別のパスを返す（中の位置は同じ。実測）。
+/// パスのまま比べると、別のファイルの `typealias Money = Int` が `Int` と重ならない。
+///
+/// **Why not（標準ライブラリ以外の生成インタフェースも同じ形にする）**: モジュールごとに
+/// 生成インタフェースの中身が同じかは確かめていない（Issue #522）。違えば、別の型が同じ位置に
+/// 重なる（偽陽性）。
+pub(crate) fn swift_declared_resolution_of(site: &DeclarationSite) -> SwiftTypeResolution {
+    let standard = is_swift_standard_library_site(site);
+    let path = match site.path().file_name() {
+        Some(file_name) if standard => std::path::Path::new(file_name),
+        _ => site.path(),
+    };
+    SwiftTypeResolution::Declared {
+        identity: format!(
+            "@type({:?}, {}, {})",
+            path,
+            site.position().line(),
+            site.position().character()
+        ),
+        standard,
+    }
+}
+
+/// Swift の型名 1 つを辿った答え。
+enum SwiftTraced {
+    /// エイリアスでない型の宣言。
+    Declared(DeclarationSite),
+    /// 開いた `typealias` の宣言と、その右辺と、展開に使った段数（この宣言を含む）。
+    Opened(DeclarationSite, SwiftOpenedType, usize),
+}
+
+/// 右辺の型名ごとの答えと、展開に使った段数。
+type SwiftRightSide = (HashMap<String, SwiftTypeResolution>, usize);
+
+/// 1 チャンクの Swift の型名を宣言まで辿り、`typealias` を開く手順。
+///
+/// **展開中の連鎖（`active`）だけはチャンクの中に閉じる。** 循環と上限はその連鎖の中でだけ
+/// 意味を持つ（Rust の型名解決と同じ）。
+struct SwiftAliasOpener<'session> {
+    session: &'session mut Session,
+    cache: &'session mut SwiftDeclarationCache,
+    active: Vec<DeclarationSite>,
+}
+
+impl SwiftAliasOpener<'_> {
+    /// `document` の中の型名 1 つを辿る。開けなければその理由。
+    ///
+    /// # Errors
+    ///
+    /// definition / hover / didOpen の往復が失敗したとき。
+    fn traced_at(
+        &mut self,
+        document: &SourceDocument,
+        reference: &TypeReference,
+    ) -> Result<Result<SwiftTraced, UnopenedReason>, ClientError> {
+        let site = match DeclarationQuery::Definition.site_of(
+            self.session,
+            document,
+            reference.position(),
+        )? {
+            Ok(site) => site,
+            Err(reason) => return Ok(Err(reason)),
+        };
+
+        let standard_sugar = is_swift_standard_library_site(&site)
+            && STANDARD_SUGAR_NAMES.contains(&swift_last_segment_of(reference.name()));
+        if standard_sugar {
+            return Ok(Ok(SwiftTraced::Declared(site)));
+        }
+
+        match swift_alias_check_of(self.session.hover(document, reference.position())?) {
+            Ok(false) => Ok(Ok(SwiftTraced::Declared(site))),
+            Ok(true) => Ok(self
+                .opened_at(&site)?
+                .map(|(right, depth)| SwiftTraced::Opened(site, right, depth))),
+            Err(reason) => Ok(Err(reason)),
+        }
+    }
+
+    /// その場所に宣言された `typealias` を開いた右辺と、展開に使った段数。
+    ///
+    /// # Errors
+    ///
+    /// definition / hover / didOpen の往復が失敗したとき。
+    fn opened_at(
+        &mut self,
+        site: &DeclarationSite,
+    ) -> Result<Result<(SwiftOpenedType, usize), UnopenedReason>, ClientError> {
+        if self.active.contains(site) {
+            return Ok(Err(UnopenedReason::CyclicAlias));
+        }
+        if let Some((_, right, depth)) =
+            self.cache.opened.iter().find(|(cached, ..)| cached == site)
+        {
+            if exceeds_alias_depth(self.active.len(), *depth) {
+                return Ok(Err(UnopenedReason::AliasExpansionLimit));
+            }
+            return Ok(Ok((right.clone(), *depth)));
+        }
+        if exceeds_alias_depth(self.active.len(), 1) {
+            return Ok(Err(UnopenedReason::AliasExpansionLimit));
+        }
+        // 生成インタフェース（標準ライブラリ・フレームワーク）の右辺を辿れるかは確かめていない
+        let interface = site
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == SWIFT_INTERFACE_EXTENSION);
+        if interface {
+            return Ok(Err(UnopenedReason::UnopenableAlias));
+        }
+        let source = match self.cache.source_of(site.path()) {
+            Ok(source) => source,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let Some(alias) = SwiftAliasSource::from_source(&source, site.position()) else {
+            return Ok(Err(UnopenedReason::UnopenableAlias));
+        };
+        let Ok(declaring) = SourceDocument::new(site.path(), source) else {
+            return Ok(Err(UnopenedReason::UnreadableDeclaringDocument));
+        };
+        self.session.open_document(&declaring)?;
+
+        self.active.push(site.clone());
+        let resolutions = self.right_side_resolutions_of(&declaring, &alias);
+        self.active.pop();
+        let (resolutions, depth) = match resolutions? {
+            Ok(resolved) => resolved,
+            Err(reason) => return Ok(Err(reason)),
+        };
+
+        let Some(right) = alias.opened_with(&|name| resolutions.get(name).cloned()) else {
+            return Ok(Err(UnopenedReason::UnopenableAlias));
+        };
+        if right.size() > MAXIMUM_SWIFT_ALIAS_SIZE {
+            return Ok(Err(UnopenedReason::AliasExpansionLimit));
+        }
+        self.cache.opened.push((site.clone(), right.clone(), depth));
+        Ok(Ok((right, depth)))
+    }
+
+    /// 右辺の型名を**宣言側の位置から**辿った答えと、展開に使った段数（この宣言を含む）。
+    /// 1 つでも辿れなければ、最初の理由。
+    ///
+    /// # Errors
+    ///
+    /// definition / hover / didOpen の往復が失敗したとき。
+    fn right_side_resolutions_of(
+        &mut self,
+        declaring: &SourceDocument,
+        alias: &SwiftAliasSource,
+    ) -> Result<Result<SwiftRightSide, UnopenedReason>, ClientError> {
+        let mut resolutions = HashMap::new();
+        let mut depth = 1;
+        for reference in alias.references() {
+            let resolution = match self.traced_at(declaring, reference)? {
+                Ok(SwiftTraced::Declared(site)) => swift_declared_resolution_of(&site),
+                Ok(SwiftTraced::Opened(_, right, inner)) => {
+                    depth = depth.max(inner + 1);
+                    SwiftTypeResolution::Opened(right)
+                }
+                Err(reason) => return Ok(Err(reason)),
+            };
+            resolutions.insert(reference.name().to_owned(), resolution);
+        }
+        Ok(Ok((resolutions, depth)))
+    }
+}
+
+/// 辿っている連鎖（`chain` 段）の先で `depth` 段の展開を使うと、上限を超えるか。
+///
+/// **開き直すときもキャッシュを使うときも、これ 1 つで決める。** 2 つの判定がずれると、
+/// 同じ連鎖が尋ねた順で開けたり開けなかったりする。
+fn exceeds_alias_depth(chain: usize, depth: usize) -> bool {
+    chain + depth > MAXIMUM_ALIAS_DEPTH
 }
 
 /// 使用位置への hover が型エイリアスを綴ったか。綴りが取れなければその理由。
+///
+/// **修飾子の後ろの語で見る。** sourcekit-lsp は宣言の修飾子ごと綴る
+/// （`public typealias Cost = Double`）。先頭だけを見ると、修飾子の付いたエイリアスを
+/// エイリアスでないと読み、宣言の場所のまま比べる。
 ///
 /// **綴りが取れなければ、エイリアスでないとは言わない。** 確かめていないものを
 /// 「エイリアスでなかった」として宣言の場所で比べると、確かめなかったことを答えにする。
 fn swift_alias_check_of(hover: HoverOutcome) -> Result<bool, UnopenedReason> {
     match hover {
-        HoverOutcome::Answered(text) => {
-            Ok(text.as_str().trim_start().starts_with(SWIFT_ALIAS_KEYWORD))
-        }
+        HoverOutcome::Answered(text) => Ok(is_swift_alias_spelling(text.as_str())),
         HoverOutcome::NoAnswer => Err(UnopenedReason::NoSpellingAtDeclaration),
         HoverOutcome::Unreadable => Err(UnopenedReason::UnreadableDeclarationHover),
         HoverOutcome::ServerStillWorking => Err(UnopenedReason::ServerStillWorking),
         HoverOutcome::NotSupported => Err(UnopenedReason::HoverNotProvided),
     }
+}
+
+/// hover の綴りが `typealias` の宣言か。先頭の行の、宣言の名前より前（`=` より前の語）に
+/// `typealias` があるかで見る（後ろの行に doc の本文が続いても、その中の語を拾わない）。
+fn is_swift_alias_spelling(text: &str) -> bool {
+    text.lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .take_while(|word| !word.contains('='))
+        .any(|word| word == SWIFT_ALIAS_KEYWORD)
 }
 
 /// Java のシグネチャに書かれた型名の宣言が、どこにあるかを尋ねる。
@@ -1809,6 +2057,66 @@ fn declared_type_of(declared: &str) -> DeclaredAlias {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_swift_standard_library_declarations_in_different_generated_directories_are_the_same() {
+        use crate::test_support::declaration_site;
+        // sourcekit-lsp は尋ねたドキュメントごとに生成インタフェースのディレクトリを変える
+        let from_use = declaration_site(
+            "/tmp/sourcekit-lsp/GeneratedInterfaces/111/Swift.Math.Integers.swiftinterface",
+            44536,
+        );
+        let from_alias = declaration_site(
+            "/tmp/sourcekit-lsp/GeneratedInterfaces/222/Swift.Math.Integers.swiftinterface",
+            44536,
+        );
+        assert_eq!(
+            swift_declared_resolution_of(&from_use),
+            swift_declared_resolution_of(&from_alias)
+        );
+
+        // 対照: 標準ライブラリでないモジュールはディレクトリごと比べる（Issue #522）
+        let foundation = |directory: &str| {
+            declaration_site(
+                &format!(
+                    "/tmp/sourcekit-lsp/GeneratedInterfaces/{directory}/Foundation.swiftinterface"
+                ),
+                10,
+            )
+        };
+        assert_ne!(
+            swift_declared_resolution_of(&foundation("111")),
+            swift_declared_resolution_of(&foundation("222"))
+        );
+    }
+
+    #[test]
+    fn test_swift_alias_spelling_is_read_after_modifiers() {
+        assert!(is_swift_alias_spelling("typealias Money = Int"));
+        // sourcekit-lsp 6.4.2 は修飾子ごと綴る。先頭だけを見るとエイリアスでないと読む
+        assert!(is_swift_alias_spelling("public typealias Cost = Double"));
+        assert!(is_swift_alias_spelling("typealias Holder.Inner = Int"));
+        assert!(!is_swift_alias_spelling(
+            "@frozen struct Int : FixedWidthInteger, SignedInteger"
+        ));
+        // 右辺の後ろに同じ語が現れても、宣言の字句としては読まない
+        assert!(!is_swift_alias_spelling(
+            "struct Wrapper<T> where T == typealias"
+        ));
+        // 先頭の行の後ろに続く doc の本文の語は拾わない
+        assert!(!is_swift_alias_spelling(
+            "struct Ledger\nWraps a typealias over Int"
+        ));
+    }
+
+    #[test]
+    fn test_swift_alias_depth_limit_counts_the_chain_and_the_cached_depth_together() {
+        assert!(!exceeds_alias_depth(MAXIMUM_ALIAS_DEPTH - 1, 1));
+        assert!(exceeds_alias_depth(MAXIMUM_ALIAS_DEPTH, 1));
+        // キャッシュした展開を別の連鎖の途中で使うときも、段数の和で決める
+        assert!(!exceeds_alias_depth(MAXIMUM_ALIAS_DEPTH - 3, 3));
+        assert!(exceeds_alias_depth(MAXIMUM_ALIAS_DEPTH - 2, 3));
+    }
 
     #[test]
     fn test_unselected_impls_prefer_the_untraced_candidate_over_unreadable_files() {

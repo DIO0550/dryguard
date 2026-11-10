@@ -58,7 +58,7 @@ if structurally_similar && domains_differ { ... }
 | `codebase` | スキャンの対象になるディレクトリツリー。`scan` が受け取る根の下 |
 | `grammar` | ソースを読むのに使う tree-sitter の文法。拡張子で決まる（`.ts` / `.tsx` / `.mts` / `.cts` / `.rs` / `.java` / `.swift`） |
 | `chunk` | 比較の単位。関数・メソッド・impl ブロック |
-| `declared type identity` | Rust の具体的な型を、宣言のファイルと UTF-16 の位置で識別する比較用の綴り。局所名と独立し、Rust の識別子や正規化した型変数とは衝突しない |
+| `declared type identity` | Rust・Swift の具体的な型を、宣言のファイルと UTF-16 の位置で識別する比較用の綴り。局所名と独立し、Rust・Swift の識別子や正規化した型変数とは衝突しない。Swift の標準ライブラリの生成インタフェースはディレクトリを落としてファイル名と位置で持つ（sourcekit-lsp が尋ねたドキュメントごとに別のディレクトリへ置く）。Swift のパスで書いた型名（`IntBag.Element`）は末尾だけを置き換え、前の区切りは綴りのまま残す（末尾がプロトコルの `associatedtype` を指すと、別の型の 2 つが同じ場所になる） |
 | `array length` | Rust の配列型の要素数。宣言側で評価した整数で比較し、定数名や未評価の式の綴りは比較に使わない |
 | `array length correspondence` | ソースと hover の配列長の出現番号を持つ型構造が一致した組。出現の個数だけでは対応したと扱わない |
 | `generic alias` | Rust の型パラメータ・既定値・右辺を持ち、使用側の型引数を当てはめて展開する型エイリアス |
