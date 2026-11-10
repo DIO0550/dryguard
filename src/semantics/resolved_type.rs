@@ -411,16 +411,23 @@ const SWIFT_STANDARD_LIBRARY_MODULE: &str = "Swift";
 /// 2^32 に届く。Rust の展開の上限（右辺 64 KiB）と同じ役目を、綴りではなく型の大きさで持つ。
 const MAXIMUM_SWIFT_ALIAS_SIZE: usize = 4096;
 
-/// compare / scan の間だけ共有する、Swift の `typealias` を宣言側で開いた答え。
+/// compare / scan の間だけ共有する、Swift の型名の使用位置への definition / hover の答えと、
+/// `typealias` を宣言側で開いた答え。
 ///
-/// **宣言の場所で決まる答えなので、チャンクごとに尋ね直さない**（`rules/architecture.md`
-/// 「ファイル単位で決まる答えをチャンク単位で問い合わせない」）。同じ `typealias` を通る
-/// 候補チャンクが N 個あると、右辺の型名への definition / hover を N 回往復することになる。
+/// **開いた答えは宣言の場所で、使用位置への答えは使用位置で決まるので、どちらもチャンクごとに
+/// 尋ね直さない**（`rules/architecture.md`「ファイル単位で決まる答えをチャンク単位で
+/// 問い合わせない」）。同じ `typealias` を通る候補チャンクが N 個あると、右辺の型名への
+/// definition / hover を N 回往復することになる。
 ///
 /// **開けた答えだけを、その展開が使った段数と一緒に持つ。** 循環と上限の失敗は辿っている
 /// 連鎖で決まるので持たない。開けた答えを別の連鎖の途中で使うときは、今の段数と覚えた段数の
 /// 和で上限を確かめ直す（尋ねる順で答えが変わらない）。読み込み前の答え
 /// （`ServerStillWorking` など）は後のチャンクなら開けうるので、失敗は 1 つも持たない。
+///
+/// **型名の使用位置への definition と hover の答えも持つ。** メンバーを直接囲む型の名前は
+/// 同じ型のメソッドすべての型名に入るので（`syntax::chunk` の `swift_type_references_of`）、
+/// 位置ごとに覚えないと、同じ位置を N 個のチャンクが N 回ずつ尋ねる。持つのは宣言の場所と
+/// エイリアスかどうかまでで、右辺を開くのは上の `opened` の担当（循環と上限が連鎖で決まるため）。
 ///
 /// **1 つのセッションより長く持たない。** 宣言の場所（生成インタフェースのパスを含む）は
 /// サーバに見せたワークスペースで決まる。持ち主は `pipeline`。
@@ -428,6 +435,23 @@ const MAXIMUM_SWIFT_ALIAS_SIZE: usize = 4096;
 pub struct SwiftDeclarationCache {
     sources: HashMap<std::path::PathBuf, Result<String, UnopenedReason>>,
     opened: Vec<(DeclarationSite, SwiftOpenedType, usize)>,
+    named_sites: HashMap<SwiftUseSite, SwiftNamedSite>,
+}
+
+/// 型名の使用位置。ドキュメントのパスと、型名の位置と、その綴り。
+///
+/// **綴りもキーに入れる。** `check --diff --staged` では使用側を index の版、宣言側を作業ツリーの
+/// 版で読むので、同じパスの同じ位置に別の名前が書かれた 2 つの版から尋ねうる。位置だけで引くと、
+/// 片方の型名に、もう片方の型名の答えを黙って返す。
+type SwiftUseSite = (std::path::PathBuf, SourcePosition, String);
+
+/// 型名の使用位置を definition と hover で尋ねた答え。宣言の場所と、それがエイリアスか。
+#[derive(Debug, Clone)]
+enum SwiftNamedSite {
+    /// エイリアスでない型の宣言（標準ライブラリの省略形の名前を含む）。
+    Declared(DeclarationSite),
+    /// `typealias` の宣言。右辺はまだ開いていない。
+    Alias(DeclarationSite),
 }
 
 impl SwiftDeclarationCache {
@@ -553,6 +577,57 @@ impl SwiftAliasOpener<'_> {
         document: &SourceDocument,
         reference: &TypeReference,
     ) -> Result<Result<SwiftTraced, UnopenedReason>, ClientError> {
+        match self.named_site_at(document, reference)? {
+            Ok(SwiftNamedSite::Declared(site)) => Ok(Ok(SwiftTraced::Declared(site))),
+            Ok(SwiftNamedSite::Alias(site)) => Ok(self
+                .opened_at(&site)?
+                .map(|(right, depth)| SwiftTraced::Opened(site, right, depth))),
+            Err(reason) => Ok(Err(reason)),
+        }
+    }
+
+    /// `document` の中の型名 1 つが宣言された場所と、それがエイリアスか。
+    /// 同じ使用位置を尋ねた答えを覚えていれば、尋ねずにそれを返す。
+    ///
+    /// **覚えるのは、尋ねた問い合わせがすべて答えたときだけ**（標準ライブラリの省略形の名前は
+    /// hover を尋ねないので、definition が答えれば覚える）。答えが無かった（`ServerStillWorking`
+    /// など）のは後のチャンクなら答えうるので、覚えると読み込み前の答えをセッションの終わりまで
+    /// 持ち越す（`opened` が失敗を持たないのと同じ理由）。
+    ///
+    /// # Errors
+    ///
+    /// definition / hover の往復が失敗したとき。
+    fn named_site_at(
+        &mut self,
+        document: &SourceDocument,
+        reference: &TypeReference,
+    ) -> Result<Result<SwiftNamedSite, UnopenedReason>, ClientError> {
+        let use_site = (
+            document.path().to_owned(),
+            reference.position(),
+            reference.name().to_owned(),
+        );
+        if let Some(named) = self.cache.named_sites.get(&use_site) {
+            return Ok(Ok(named.clone()));
+        }
+        let named = match self.asked_named_site_at(document, reference)? {
+            Ok(named) => named,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        self.cache.named_sites.insert(use_site, named.clone());
+        Ok(Ok(named))
+    }
+
+    /// `document` の中の型名 1 つを、definition と hover で尋ねる。
+    ///
+    /// # Errors
+    ///
+    /// definition / hover の往復が失敗したとき。
+    fn asked_named_site_at(
+        &mut self,
+        document: &SourceDocument,
+        reference: &TypeReference,
+    ) -> Result<Result<SwiftNamedSite, UnopenedReason>, ClientError> {
         let site = match DeclarationQuery::Definition.site_of(
             self.session,
             document,
@@ -565,16 +640,16 @@ impl SwiftAliasOpener<'_> {
         let standard_sugar = is_swift_standard_library_site(&site)
             && STANDARD_SUGAR_NAMES.contains(&swift_last_segment_of(reference.name()));
         if standard_sugar {
-            return Ok(Ok(SwiftTraced::Declared(site)));
+            return Ok(Ok(SwiftNamedSite::Declared(site)));
         }
 
-        match swift_alias_check_of(self.session.hover(document, reference.position())?) {
-            Ok(false) => Ok(Ok(SwiftTraced::Declared(site))),
-            Ok(true) => Ok(self
-                .opened_at(&site)?
-                .map(|(right, depth)| SwiftTraced::Opened(site, right, depth))),
-            Err(reason) => Ok(Err(reason)),
-        }
+        Ok(
+            match swift_alias_check_of(self.session.hover(document, reference.position())?) {
+                Ok(false) => Ok(SwiftNamedSite::Declared(site)),
+                Ok(true) => Ok(SwiftNamedSite::Alias(site)),
+                Err(reason) => Err(reason),
+            },
+        )
     }
 
     /// その場所に宣言された `typealias` を開いた右辺と、展開に使った段数。
@@ -2167,7 +2242,6 @@ done
             Some(UnopenedReason::NoDefinitionSite)
         );
     }
-
 
     #[test]
     fn test_swift_standard_library_declarations_in_different_generated_directories_are_the_same() {
