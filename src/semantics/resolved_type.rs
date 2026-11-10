@@ -2058,6 +2058,117 @@ fn declared_type_of(declared: &str) -> DeclaredAlias {
 mod tests {
     use super::*;
 
+    /// 宣言の場所を 1 度だけ答え、2 度目からは `null` を返す、sourcekit-lsp のフェイク。
+    ///
+    /// **2 度目に答えないのは、尋ね直したことを結果に出すため。** 尋ね直した型名は
+    /// 「宣言の場所が無い」に倒れるので、往復の回数を数えずに答えの状態で確かめられる
+    /// （`rules/testing.md`「モックは使わない」）。
+    #[cfg(unix)]
+    const SWIFT_SERVER_ANSWERING_ONCE: &str = r#"
+answered_definition=0
+answered_hover=0
+while :; do
+  length=
+  while IFS= read -r line; do
+    line=$(printf '%s' "$line" | tr -d '\r')
+    [ -z "$line" ] && break
+    case "$line" in Content-Length:*) length=${line#Content-Length: } ;; esac
+  done
+  [ -n "$length" ] || exit 0
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$body" in
+    *'"method":"initialize"'*)
+      result='{"capabilities":{"hoverProvider":true,"definitionProvider":true}}' ;;
+    *'"method":"textDocument/definition"'*)
+      if [ "$answered_definition" = 0 ]; then
+        answered_definition=1
+        result='{"uri":"file:///tmp/dryguard-fake/Ledger.swift","range":{"start":{"line":0,"character":7},"end":{"line":0,"character":13}}}'
+      else
+        result=null
+      fi ;;
+    *'"method":"textDocument/hover"'*)
+      if [ "$answered_hover" = 0 ]; then
+        answered_hover=1
+        result='{"contents":{"kind":"markdown","value":"```swift\nstruct Ledger\n```"}}'
+      else
+        result=null
+      fi ;;
+    *'"method":"workspace/synchronize"'*|*'"method":"shutdown"'*)
+      result=null ;;
+    *)
+      continue ;;
+  esac
+  payload=$(printf '{"jsonrpc":"2.0","id":%s,"result":%s}' "$id" "$result")
+  printf 'Content-Length: %s\r\n\r\n%s' "${#payload}" "$payload"
+done
+"#;
+
+    #[test]
+    #[cfg(unix)]
+    fn test_swift_type_name_at_the_same_position_is_asked_once_per_cache() {
+        use crate::lsp::{Client, ServerCommand, WorkspaceRoot};
+        use crate::syntax::chunk::{FileChunks, TestFunctions};
+        use crate::syntax::tree::{Grammar, SyntaxTree};
+        use crate::test_support::repository_path;
+
+        // 同じ型の 2 つのメソッドは、どちらも囲む型の名前（同じ位置）を型名として持つ
+        let source = "struct Ledger {\n    func open() {\n        print(1)\n    }\n    func close() {\n        print(2)\n    }\n}\n";
+        let path = repository_path("tests/fixtures/swift-lsp/Sources/Shop/Ledger.swift");
+        let tree = SyntaxTree::from_source(source, Grammar::Swift).expect("木にできる");
+        let chunks = FileChunks::from_tree(&tree, &path, TestFunctions::Excluded);
+        let [open, close] = chunks.chunks() else {
+            panic!("メソッドが 2 つ切り出せる");
+        };
+        let document = SourceDocument::new(&path, source.to_owned()).expect("ドキュメントにできる");
+        let root = WorkspaceRoot::enclosing(std::slice::from_ref(&path)).expect("根を決められる");
+        let server = ServerCommand::new(
+            "sh",
+            vec!["-c".to_owned(), SWIFT_SERVER_ANSWERING_ONCE.to_owned()],
+            Vec::new(),
+        );
+        let mut session = Client::start(&server)
+            .expect("起動できる")
+            .handshake(&root)
+            .expect("握手できる");
+        session.open_document(&document).expect("開かせられる");
+
+        let mut cache = SwiftDeclarationCache::default();
+        let first =
+            swift_traced_type_names_of(&mut session, &mut cache, &document, open.type_references())
+                .expect("往復できる");
+        let second = swift_traced_type_names_of(
+            &mut session,
+            &mut cache,
+            &document,
+            close.type_references(),
+        )
+        .expect("往復できる");
+        // 対照: 新しいキャッシュで尋ね直すと、フェイクはもう答えない
+        let asked_again = swift_traced_type_names_of(
+            &mut session,
+            &mut SwiftDeclarationCache::default(),
+            &document,
+            close.type_references(),
+        )
+        .expect("往復できる");
+
+        let declared_names = |traced: &TracedTypeNames| {
+            traced
+                .declared()
+                .iter()
+                .map(|declaration| declaration.name().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(declared_names(&first), vec!["Ledger"]);
+        assert_eq!(declared_names(&second), vec!["Ledger"]);
+        assert_eq!(
+            asked_again.unopened_reason_of("Ledger"),
+            Some(UnopenedReason::NoDefinitionSite)
+        );
+    }
+
+
     #[test]
     fn test_swift_standard_library_declarations_in_different_generated_directories_are_the_same() {
         use crate::test_support::declaration_site;
