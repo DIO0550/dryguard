@@ -166,6 +166,12 @@ pub enum UnopenedReason {
     /// （1.94.1 で実測）。利用者が次に試すこと（rust-src を入れる）が増えるので、
     /// TypeScript の利用者にその案内を出さないよう問い合わせで分ける。
     NoDefinitionSite,
+    /// jdtls が definition に宣言の場所を答えなかった。
+    ///
+    /// **[`UnopenedReason::NoDefinitionSite`] と分ける。** jdtls 1.63.0 は JDK の型
+    /// （`List`）の位置に空を返す（#394 で実測）。利用者が入れれば済むもの（rust-src）が無く、
+    /// 塞ぐのは dryguard の側なので、Rust の案内を Java の利用者に出さない。
+    NoJavaDefinitionSite,
     /// typeDefinition の宣言の場所は返ったが、パスとして読めない URI だった。
     UnreadableTypeDefinition,
     /// definition の宣言の場所は返ったが、パスとして読めない URI だった。
@@ -695,6 +701,45 @@ fn is_swift_alias_spelling(text: &str) -> bool {
         .split_whitespace()
         .take_while(|word| !word.contains('='))
         .any(|word| word == SWIFT_ALIAS_KEYWORD)
+}
+
+/// Java のシグネチャに書かれた型名の宣言が、どこにあるかを尋ねる。
+///
+/// **definition で辿る。** jdtls 1.63.0 の typeDefinition は型名の位置にも結果を持たない応答を
+/// 返す（#394 で実測）。**Java にエイリアスは無い**ので、辿った宣言の場所でそのまま比べる。
+///
+/// **JDK の型は辿れない。** jdtls は `List` の位置の definition に空を返すので
+/// （#394 で実測）、その型名は [`UnopenedReason::NoJavaDefinitionSite`] で「測れない」に倒れる。
+/// 綴りのまま比べると、宣言の場所が付かないまま綴りが一致して単一化可能に出る。
+///
+/// # Errors
+///
+/// そのドキュメントを開かせていないとき、往復が失敗したとき。
+pub(crate) fn java_traced_type_names_of(
+    session: &mut Session,
+    document: &SourceDocument,
+    type_references: &[TypeReference],
+) -> Result<TracedTypeNames, ClientError> {
+    let mut declared = Vec::new();
+    let mut unopened = Vec::new();
+
+    for reference in type_references {
+        let name = reference.name().to_owned();
+        match DeclarationQuery::Definition.site_of(session, document, reference.position())? {
+            Ok(site) => declared.push(TypeDeclaration::new(name, site)),
+            Err(reason) => unopened.push(UnopenedTypeName::new(name, java_reason_of(reason))),
+        }
+    }
+
+    Ok(TracedTypeNames::new(declared, unopened))
+}
+
+/// definition の理由を、Java の利用者に出す理由へ直す。空の答えだけを分ける。
+fn java_reason_of(reason: UnopenedReason) -> UnopenedReason {
+    match reason {
+        UnopenedReason::NoDefinitionSite => UnopenedReason::NoJavaDefinitionSite,
+        other => other,
+    }
 }
 
 /// パスで書かれた型名（`Swift.Optional`）の末尾の名前。

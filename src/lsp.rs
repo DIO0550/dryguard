@@ -236,11 +236,10 @@ const SWIFT_SETTLED_ATTEMPTS: usize = connection::SETTLED_ATTEMPTS;
 
 /// jdtls の hover で、綴りを探すコードフェンスの試す順。
 ///
-/// **今は使われない。** jdtls 1.63.0 は `contents` を `MarkedString` の配列
+/// **効かない。** jdtls 1.63.0 は `contents` を `MarkedString` の配列
 /// （`{language: "java", value: 綴り}`・Javadoc・`Source:` の行）で返し、コードフェンスを持たない。
 /// 綴りは配列の言語付きの要素から読むので（`hover::outcome_of_answer`）、フェンスの順は効かない。
-/// 網羅 `match` が値を要るので、TypeScript と同じ先頭のフェンスを置く
-/// （`pipeline` は綴りを型シグネチャとして読む側が無いので、Java の hover をまだ尋ねない）。
+/// 網羅 `match` が値を要るので、TypeScript と同じ先頭のフェンスを置く。
 const JAVA_HOVER_FENCES: &[usize] = hover::LEADING_FENCE;
 
 /// jdtls で、落ち着いた答えを求めて尋ね直す回数の上限。
