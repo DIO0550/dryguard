@@ -9,6 +9,7 @@ cd "$work"
 git init -q . && git config user.email t@t && git config user.name t
 
 mkdir src
+printf '%s\n' '`LIMIT_OF_ROWS` は 3 件。' '無関係な `other_name` の文。' > README.md
 cat > src/a.rs <<'RS'
 /// `limit_of` が返す上限。
 pub const LIMIT_OF_ROWS: usize = 3;
@@ -25,6 +26,8 @@ fail=0
 out="$(bash "$script" HEAD~1)"
 if ! grep -q 'LIMIT_OF_ROWS を読む' <<< "$out"; then echo "FAIL: 名指しのコメントが出ない"; fail=1; fi
 if grep -q '無関係' <<< "$out"; then echo "FAIL: 無関係なコメントが出た"; fail=1; fi
+if ! grep -q 'README.md:1:.*3 件' <<< "$out"; then echo "FAIL: 名指しの文書の行が出ない"; fail=1; fi
+if grep -q 'other_name' <<< "$out"; then echo "FAIL: 無関係な文書の行が出た"; fail=1; fi
 
 git commit -q --allow-empty -m noop
 out="$(bash "$script" HEAD)"

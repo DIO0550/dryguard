@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 #
 # 定義の行を触った識別子を名指しする doc / コメントのうち、差分に載っていないものを出す。
+# 対象は `.rs` のコメントと、利用者向け・規約の文書（README.md / AGENTS.md / docs / rules）の
+# バッククォートで括った名指し。
+#
+# 文書の側を足した理由: `plan` の再発は、計画が README / docs / rules の古くなる文を
+# 挙げ漏れた形が大半で（pr-480〜pr-512）、計画の投稿前に止める層 3 の `plan-impact-check` が
+# あっても続いた。実装を終えた後に、触った識別子を名指しする文書の行を一覧にして取りこぼしを拾う。
 #
 # `comment-mismatch` の再発は、変えた関数・定数・型を名指しする既存の doc が、差分に
 # 載らないまま古くなる形が大半で、実装の検証の観点（層 4）が書いてあっても繰り返している。
@@ -41,6 +47,23 @@ for symbol in $symbols; do
     if [ "$found" -eq 0 ]; then
       echo "stale-doc-check: 定義を触った識別子を名指しする、差分に載っていないコメント（食い違いが無いか 1 文ずつ確かめる）:"
       found=1
+    fi
+    echo "  [$symbol] $hit"
+  done <<< "$hits"
+done
+
+added_docs="$(git diff -U0 "$base" HEAD -- '*.md' | grep -E '^\+[^+]' | sed 's/^+//')"
+
+doc_found=0
+for symbol in $symbols; do
+  hits="$(git grep -nE "\`[^\`]*\\b${symbol}\\b[^\`]*\`" -- README.md AGENTS.md docs rules 2>/dev/null || true)"
+  [ -z "$hits" ] && continue
+  while IFS= read -r hit; do
+    text="${hit#*:*:}"
+    printf '%s\n' "$added_docs" | grep -qxF -- "$text" && continue
+    if [ "$doc_found" -eq 0 ]; then
+      echo "stale-doc-check: 定義を触った識別子を名指しする、差分に載っていない文書の行（README / AGENTS / docs / rules。食い違いが無いか 1 文ずつ確かめる）:"
+      doc_found=1
     fi
     echo "  [$symbol] $hit"
   done <<< "$hits"
