@@ -400,8 +400,8 @@ pub fn rust_type_signature_outcome_of(
 ///
 /// `document` は先に [`Session::open_document`] で開かせておく。`position` は
 /// `Chunk::name_position`、`type_references` は `Chunk::type_references`、`enclosing_type` は
-/// `Chunk::swift_enclosing_type`。`cache` は `typealias` を開いた答えを候補チャンクのあいだで
-/// 共有する（[`SwiftDeclarationCache`]）。
+/// `Chunk::swift_enclosing_type`。`cache` は型名の使用位置への definition / hover の答えと、
+/// `typealias` を開いた答えを候補チャンクのあいだで共有する（[`SwiftDeclarationCache`]）。
 ///
 /// **注釈の有無もオーバーロードも見ない。** Swift の引数は型を省けず、省いた戻り値は推論ではなく
 /// `()` に決まる（`syntax::chunk` の `swift_annotated_positions_of`）。同じ名前の関数は

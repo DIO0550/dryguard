@@ -342,7 +342,10 @@ typeDefinition は型名の位置に `null` を返すので、Rust と同じく 
 `CyclicAlias`、32 段か展開した型が 4096 ノードを超えると `AliasExpansionLimit`（循環した宣言の使用位置には
 sourcekit-lsp 6.4.2 が答えないので、`CyclicAlias` はサーバが答えたときの防御）。開いた答えは
 `SwiftDeclarationCache` が宣言の場所ごとに、展開に使った段数と一緒に持ち、別の連鎖の途中で使うときは
-今の段数との和で上限を確かめ直す（尋ねる順で答えが変わらない）。標準ライブラリの省略形を持つ名前
+今の段数との和で上限を確かめ直す（尋ねる順で答えが変わらない）。型名の使用位置への definition と hover の
+答え（宣言の場所と、エイリアスか）も、同じキャッシュが**ドキュメントのパス・位置・綴りごとに**持つ
+（メンバーを直接囲む型の名前は、同じ型のメソッドすべての型名に入る）。覚えるのは尋ねた問い合わせがすべて答えたときだけで（省略形の名前は hover を尋ねない）、
+開く段は連鎖ごとに上の手順を通す。標準ライブラリの省略形を持つ名前
 （`Void` = `()` など）は、エイリアスかを見る前に標準ライブラリの `.swiftinterface` を指すかで通す
 （`is_swift_standard_library_site`）。hover の綴りに出ないレシーバと `init` の値の型は、
 `syntax::chunk` が運ぶ直接囲む型の綴りで足す（`Chunk::swift_enclosing_type`）。hover は囲む
@@ -541,6 +544,7 @@ pr-155 と同じ形だと自己申告している）。
 | チャンクごとに Rust の型名解決・配列長の評価器が宣言側のソースを読み、同じ trait に implementation を尋ねる | `RustDeclarationCache` をセッションごとに 1 つ作り、ファイル・trait の宣言位置をキーに共有する |
 | チャンクごとに短縮形の投影の supertrait の閉包を definition で辿る | 実装している trait と関連型の宣言の組をキーに、`RustDeclarationCache` で共有する |
 | チャンクごとに Swift の `typealias` の右辺の型名を宣言側から辿り直す | `SwiftDeclarationCache` をセッションごとに 1 つ作り、宣言の場所をキーに開いた答えを共有する |
+| チャンクごとに Swift の型名（メンバーを直接囲む型の名前を含む）の definition / hover を尋ね直す | 同じ `SwiftDeclarationCache` で、使用位置（パス・位置・綴り）をキーに答えを共有する |
 
 **Why**: LSP への問い合わせは同期的な往復を伴うプロセス外呼び出しで、
 `project marker` 探索も印が無い木では毎回ファイルシステムの根まで辿る。
