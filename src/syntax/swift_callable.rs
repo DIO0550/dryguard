@@ -146,6 +146,12 @@ const TYPEALIAS_KIND: &str = "typealias_declaration";
 /// 型の宣言の字句のフィールド（`struct` / `class` / `extension` など）。
 const DECLARATION_KIND_FIELD: &str = "declaration_kind";
 
+/// コメントのノードの種別。
+const COMMENT_KINDS: [&str; 2] = ["comment", "multiline_comment"];
+
+/// `where` 節を導く語。
+const WHERE_KEYWORD: &str = "where";
+
 /// `typealias` を開いてよい、囲む宣言の字句。**`extension` は入れない** — 拡張した型の
 /// 型変数（`extension Array { typealias E = Element }`）を右辺が指しうる。
 const OPENABLE_ENCLOSING_KINDS: [&str; 4] = ["struct", "class", "enum", "actor"];
@@ -160,6 +166,24 @@ const OPENABLE_ANCESTOR_KINDS: [&str; 4] = [
     TYPE_BODY_KINDS[1],
 ];
 
+/// 展開した `typealias` の右辺の、型のノードの数の上限。宣言側で開いた右辺にも、
+/// 使用側で型引数を当てはめた結果にも当てる。
+///
+/// **段数だけでは足りない。** `typealias B = (A, A)` の連鎖は段ごとに倍になり、32 段で
+/// 2^32 に届く。ジェネリックな `typealias Couple<T> = (T, T)` も、入れ子に当てはめるたびに倍になる。
+/// Rust の展開の上限（右辺 64 KiB）と同じ役目を、綴りではなく型の大きさで持つ。
+const MAXIMUM_SWIFT_ALIAS_SIZE: usize = 4096;
+
+/// `typealias` を開けなかった・当てはめられなかったわけ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwiftAliasFailure {
+    /// 開けない右辺・当てはめられない型引数（数の不一致・前の区切りの型引数・境界を持つ宣言に
+    /// 型変数を当てる・具体的な型の関連型）。
+    Unopenable,
+    /// 展開した型が [`MAXIMUM_SWIFT_ALIAS_SIZE`] を超えた。
+    ExpansionLimit,
+}
+
 /// 型名 1 つを宣言まで辿った答え。[`SwiftCallable::from_spelling`] がその名前の位置に置く形を決める。
 ///
 /// **辿った型名は綴りではなく宣言の場所で比べる**（`rules/naming.md` の `declared type identity`）。
@@ -170,39 +194,78 @@ pub(crate) enum SwiftTypeResolution {
     /// 宣言まで辿れた型。`identity` は宣言の場所から作った綴り、`standard` はその宣言が
     /// 標準ライブラリにあるか（省略形と重ねてよいか）。
     Declared { identity: String, standard: bool },
-    /// 型引数を取らない `typealias` を開いた右辺。
+    /// `typealias` を開いた右辺。ジェネリックな宣言なら、使用側の型引数を当てはめる前の形。
     Opened(SwiftOpenedType),
 }
 
 /// `typealias` を開いた右辺の型。右辺の型名は宣言の場所へ置き換えてある。
+///
+/// ジェネリックな宣言の型パラメータは、右辺の中で**宣言の順の番号**の型変数として持ち、
+/// 使用側で型引数を当てはめる（`rules/naming.md` の `generic alias`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SwiftOpenedType(SwiftType);
+pub(crate) struct SwiftOpenedType {
+    value: SwiftType,
+    /// 型パラメータの数。型引数を取らない宣言なら 0。
+    arity: usize,
+    /// 型パラメータに境界（`<T: Hashable>`）を書いたか。
+    ///
+    /// **境界は使用側の関数の要求として推論される**が、hover の綴りに出るかは確かめていない。出なければ
+    /// 型変数を当てて開くと、要求の違う `func f<T>(x: Hashed<T>)` と `func g<T>(x: [T])` が重なる（偽陽性）。
+    bounded: bool,
+}
 
 impl SwiftOpenedType {
-    /// 型を形作るノードの数。展開した右辺の大きさの上限に使う
-    /// （`typealias B = (A, A)` の連鎖は段ごとに倍になる）。
-    pub(crate) fn size(&self) -> usize {
-        self.0.size()
+    /// 使用側の型引数 `arguments` を当てはめた型。当てはめられなければそのわけ。
+    ///
+    /// 新しく現れた型変数の番号付けし直しは呼び出し側（[`SwiftSpelling::substituted`]）が持つ。
+    fn applied_to(&self, arguments: &[SwiftType]) -> Result<SwiftType, SwiftAliasFailure> {
+        if arguments.len() != self.arity {
+            return Err(SwiftAliasFailure::Unopenable);
+        }
+        if self.arity == 0 {
+            return Ok(self.value.clone());
+        }
+        let applied_to_variables = arguments.iter().any(SwiftType::has_type_variable);
+        let inferred_requirements = self.bounded && applied_to_variables;
+        if inferred_requirements {
+            return Err(SwiftAliasFailure::Unopenable);
+        }
+        // 組み立てる前に数える。入れ子の当てはめは段ごとに倍になる
+        let size = self
+            .value
+            .size_with(&|index| arguments.get(index).map_or(1, SwiftType::size));
+        if size > MAXIMUM_SWIFT_ALIAS_SIZE {
+            return Err(SwiftAliasFailure::ExpansionLimit);
+        }
+        self.value
+            .substituted(arguments)
+            .ok_or(SwiftAliasFailure::Unopenable)
     }
 }
 
-/// 宣言側のソースに書かれた、型引数を取らない `typealias` 1 つ。
+/// 宣言側のソースに書かれた `typealias` 1 つ。
 ///
 /// **右辺の型名は宣言側の位置から辿る。** 使用側の同じ綴りの型と同じとは限らない
 /// （`rules/architecture.md`「Rust の引数のないエイリアスの右辺の型名は…」と同じ線）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SwiftAliasSource {
     right: String,
+    /// 型パラメータの名前。宣言の順。
+    type_parameters: Vec<String>,
+    bounded: bool,
     references: Vec<TypeReference>,
 }
 
 impl SwiftAliasSource {
     /// `source` の中で、名前が `position` にある `typealias` を読む。
     ///
-    /// `None`: その位置に `typealias` の名前が無い、型引数を取る、右辺に属性が付く・
+    /// `None`: その位置に `typealias` の名前が無い、`where` 節を持つ、右辺に属性が付く・
     /// 読めない構文、右辺に `Self` がある、**囲む宣言が型変数を持ちうる**（型引数を持つ型・
-    /// `extension` / `protocol` / 関数の中）。最後のものは型引数を取らない宣言でも、右辺が囲む型の
-    /// 型変数を指すと `Box<Int>.Item` と `Box<String>.Item` が同じ型に開く（偽陽性）。
+    /// `extension` / `protocol` / 関数の中）。最後のものは、右辺が囲む型の型変数を指すと
+    /// `Box<Int>.Item` と `Box<String>.Item` が同じ型に開く（偽陽性）。
+    ///
+    /// **`where` 節は宣言の外に出る**（[`is_followed_by_where_clause`]）。宣言だけを見ると、
+    /// 境界を持つ宣言を境界の無い宣言として読む。
     pub(crate) fn from_source(source: &str, position: SourcePosition) -> Option<Self> {
         let tree = SyntaxTree::from_source(source, Grammar::Swift).ok()?;
         let declaration = tree.named_descendants().into_iter().find(|node| {
@@ -212,23 +275,46 @@ impl SwiftAliasSource {
                     .and_then(|name| source_position_of(name, source))
                     == Some(position)
         })?;
-        if declaration.has_error()
-            || !children_of_kind(declaration, TYPE_PARAMETERS_KIND).is_empty()
-            || !is_openable_context(declaration, source)
-        {
+        let unopenable_declaration = declaration.has_error()
+            || is_followed_by_where_clause(declaration, source)
+            || !is_openable_context(declaration, source);
+        if unopenable_declaration {
             return None;
         }
         let value = alias_value_of(declaration)?;
+        let parameters = children_of_kind(declaration, TYPE_PARAMETERS_KIND)
+            .into_iter()
+            .flat_map(|list| children_of_kind(list, TYPE_PARAMETER_KIND))
+            .collect::<Vec<_>>();
+        let type_parameters = parameters
+            .iter()
+            .map(|parameter| {
+                children_of_kind(*parameter, TYPE_IDENTIFIER_KIND)
+                    .first()
+                    .and_then(|name| source.get(name.byte_range()))
+                    .map(str::to_owned)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let bounded = parameters.iter().any(|parameter| {
+            let mut cursor = parameter.walk();
+            parameter
+                .named_children(&mut cursor)
+                .any(|child| is_type_kind(child.kind()))
+        });
 
         let unresolved = |_: &str| None;
         let mut reader = SwiftSpelling::new(source, &unresolved);
         reader.recording = true;
+        // 型パラメータは束縛した型変数として読み、型名として記録しない
+        reader.declared.clone_from(&type_parameters);
         reader.type_of(value)?;
         if reader.refers_to_self {
             return None;
         }
         Some(Self {
             right: source.get(value.byte_range())?.to_owned(),
+            type_parameters,
+            bounded,
             references: reader.references,
         })
     }
@@ -238,30 +324,68 @@ impl SwiftAliasSource {
         &self.references
     }
 
-    /// 右辺の型名を `resolve` で引いて、右辺を型にする。読めなければ `None`。
+    /// 右辺の型名を `resolve` で引いて、右辺を型にする。
     ///
     /// `resolve` は右辺の型名を**宣言側の位置から**辿った答え。省略形を開くかもそれで決まる。
+    ///
+    /// # Errors
+    ///
+    /// 右辺を読めない・右辺の中の `typealias` を開けないとき（[`SwiftAliasFailure::Unopenable`]）、
+    /// 開いた右辺が大きさの上限を超えたとき（[`SwiftAliasFailure::ExpansionLimit`]）。
     pub(crate) fn opened_with(
         &self,
         resolve: &dyn Fn(&str) -> Option<SwiftTypeResolution>,
-    ) -> Option<SwiftOpenedType> {
+    ) -> Result<SwiftOpenedType, SwiftAliasFailure> {
         let wrapped = format!("typealias _ = {}\n", self.right);
-        let tree = SyntaxTree::from_source(&wrapped, Grammar::Swift).ok()?;
+        let tree = SyntaxTree::from_source(&wrapped, Grammar::Swift)
+            .map_err(|_| SwiftAliasFailure::Unopenable)?;
         if tree.has_error() {
-            return None;
+            return Err(SwiftAliasFailure::Unopenable);
         }
-        let declaration = tree
+        let value = tree
             .named_descendants()
             .into_iter()
-            .find(|node| node.kind() == TYPEALIAS_KIND)?;
-        let value = alias_value_of(declaration)?;
+            .find(|node| node.kind() == TYPEALIAS_KIND)
+            .and_then(alias_value_of)
+            .ok_or(SwiftAliasFailure::Unopenable)?;
         let mut reader = SwiftSpelling::new(&wrapped, resolve);
-        let opened = reader.type_of(value)?;
-        if reader.refers_to_self || reader.has_unopenable_alias {
-            return None;
+        // 先に宣言の順で番号を振っておく。右辺の出現順に振ると、`Flip<A, B> = (B, A)` の
+        // `B` が 0 番になり、当てはめる型引数を取り違える
+        reader.declared.clone_from(&self.type_parameters);
+        reader.numbered.clone_from(&self.type_parameters);
+        let opened = reader.type_of(value).ok_or(SwiftAliasFailure::Unopenable)?;
+        if reader.refers_to_self {
+            return Err(SwiftAliasFailure::Unopenable);
         }
-        Some(SwiftOpenedType(opened))
+        if let Some(failure) = reader.alias_failure {
+            return Err(failure);
+        }
+        if opened.size() > MAXIMUM_SWIFT_ALIAS_SIZE {
+            return Err(SwiftAliasFailure::ExpansionLimit);
+        }
+        Ok(SwiftOpenedType {
+            value: opened,
+            arity: self.type_parameters.len(),
+            bounded: self.bounded,
+        })
     }
+}
+
+/// `typealias` の宣言の後ろに `where` 節が続くか。
+///
+/// tree-sitter-swift 0.7.4 は `typealias` の `where` 節を読めず、宣言の外に置く（確かめた）。
+/// 同じ行なら ERROR の兄弟、改行を挟むと `where` を名前と読んだ兄弟の後ろに ERROR が続く。
+/// **コメントを飛ばした最初の兄弟が、ERROR か `where` の語**かで見る。直後の兄弟だけを見ると、
+/// 間のコメント・改行で見落とす。
+fn is_followed_by_where_clause(declaration: Node<'_>, source: &str) -> bool {
+    let mut next = declaration.next_sibling();
+    while let Some(sibling) = next {
+        if !COMMENT_KINDS.contains(&sibling.kind()) {
+            return sibling.is_error() || source.get(sibling.byte_range()) == Some(WHERE_KEYWORD);
+        }
+        next = sibling.next_sibling();
+    }
+    false
 }
 
 /// `typealias` の右辺の型のノード。属性（`@Sendable`）が付く・型が 1 つでなければ `None`。
@@ -273,7 +397,9 @@ fn alias_value_of(declaration: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = declaration.walk();
     let after_name: Vec<Node<'_>> = declaration
         .named_children(&mut cursor)
-        .filter(|child| child.start_byte() >= name.end_byte())
+        .filter(|child| {
+            child.start_byte() >= name.end_byte() && child.kind() != TYPE_PARAMETERS_KIND
+        })
         .collect();
     match after_name.as_slice() {
         [value] if is_type_kind(value.kind()) => Some(*value),
@@ -352,9 +478,8 @@ pub(crate) struct SwiftCallable {
     type_names: BTreeSet<String>,
     /// `Self` が残るか。囲む型で決まるので、綴りだけで比べない。
     refers_to_self: bool,
-    /// 開いた `typealias` を、型引数の付いたパスに当てることになったか。
-    /// 型引数を取らない宣言にだけ右辺を持たせるので、当たれば型引数を落とすことになる。
-    has_unopenable_alias: bool,
+    /// 開いた `typealias` に型引数を当てはめられなかったか、そのわけ。
+    alias_failure: Option<SwiftAliasFailure>,
 }
 
 /// **比べるのは形だけ。** 型名の綴り（`type_names`）と、測れない側へ倒すための印は比べない。
@@ -452,7 +577,7 @@ struct EnclosingReceiver {
     constraints: BTreeSet<ReceiverConstraint>,
     type_names: BTreeSet<String>,
     refers_to_self: bool,
-    has_unopenable_alias: bool,
+    alias_failure: Option<SwiftAliasFailure>,
 }
 
 impl EnclosingReceiver {
@@ -478,7 +603,7 @@ impl EnclosingReceiver {
             constraints,
             type_names: reader.type_names,
             refers_to_self: reader.refers_to_self,
-            has_unopenable_alias: reader.has_unopenable_alias,
+            alias_failure: reader.alias_failure,
         })
     }
 }
@@ -531,32 +656,197 @@ enum SwiftType {
 impl SwiftType {
     /// この型を形作るノードの数（自分を含む）。
     fn size(&self) -> usize {
+        self.size_with(&|_| 1)
+    }
+
+    /// 型変数 `Parameter(index)` を `parameter_size(index)` ノードと数えた、この型の大きさ。
+    /// 型引数を当てはめる前に、当てはめた結果の大きさを出すのに使う。
+    fn size_with(&self, parameter_size: &dyn Fn(usize) -> usize) -> usize {
+        let sized = |inner: &Self| inner.size_with(parameter_size);
         let inner: usize = match self {
+            Self::Parameter(index) => return parameter_size(*index),
+            Self::Member(..) => 0,
             Self::Named(path) => path
                 .iter()
                 .flat_map(|(_, arguments)| arguments)
-                .map(Self::size)
-                .sum(),
-            Self::Parameter(_) | Self::Member(..) => 0,
+                .map(sized)
+                .fold(0, usize::saturating_add),
             Self::Optional(wrapped)
             | Self::ImplicitlyUnwrapped(wrapped)
             | Self::Array(wrapped)
             | Self::Opaque(wrapped)
-            | Self::Existential(wrapped) => wrapped.size(),
-            Self::Dictionary(key, value) => key.size() + value.size(),
-            Self::Tuple(elements) => elements.iter().map(|(_, element)| element.size()).sum(),
+            | Self::Existential(wrapped) => sized(wrapped),
+            Self::Dictionary(key, value) => sized(key).saturating_add(sized(value)),
+            Self::Tuple(elements) => elements
+                .iter()
+                .map(|(_, element)| sized(element))
+                .fold(0, usize::saturating_add),
+            Self::Function {
+                parameters, value, ..
+            } => parameters
+                .iter()
+                .map(|(_, _, parameter)| sized(parameter))
+                .fold(sized(value), usize::saturating_add),
+            Self::Composition(members) => members.iter().map(sized).fold(0, usize::saturating_add),
+        };
+        inner.saturating_add(1)
+    }
+
+    /// 型変数（とその関連型）を含むか。
+    fn has_type_variable(&self) -> bool {
+        match self {
+            Self::Parameter(_) | Self::Member(..) => true,
+            Self::Named(path) => path
+                .iter()
+                .flat_map(|(_, arguments)| arguments)
+                .any(Self::has_type_variable),
+            Self::Optional(wrapped)
+            | Self::ImplicitlyUnwrapped(wrapped)
+            | Self::Array(wrapped)
+            | Self::Opaque(wrapped)
+            | Self::Existential(wrapped) => wrapped.has_type_variable(),
+            Self::Dictionary(key, value) => key.has_type_variable() || value.has_type_variable(),
+            Self::Tuple(elements) => elements
+                .iter()
+                .any(|(_, element)| element.has_type_variable()),
             Self::Function {
                 parameters, value, ..
             } => {
                 parameters
                     .iter()
-                    .map(|(_, _, parameter)| parameter.size())
-                    .sum::<usize>()
-                    + value.size()
+                    .any(|(_, _, parameter)| parameter.has_type_variable())
+                    || value.has_type_variable()
             }
-            Self::Composition(members) => members.iter().map(Self::size).sum(),
-        };
-        inner + 1
+            Self::Composition(members) => members.iter().any(Self::has_type_variable),
+        }
+    }
+
+    /// 型変数 `Parameter(index)` を `arguments[index]` に置き換えた型。
+    ///
+    /// `None`: 型変数の関連型（`C.Element`）に、型変数でない型を当てることになったとき
+    /// （関連型を選ばないと言えない。偽陰性側）、番号に当たる型引数が無いとき。
+    fn substituted(&self, arguments: &[SwiftType]) -> Option<Self> {
+        let each = |inner: &Self| inner.substituted(arguments).map(Box::new);
+        Some(match self {
+            Self::Parameter(index) => arguments.get(*index)?.clone(),
+            Self::Member(index, members) => match arguments.get(*index)? {
+                Self::Parameter(bound) => Self::Member(*bound, members.clone()),
+                Self::Member(bound, outer) => {
+                    Self::Member(*bound, outer.iter().chain(members).cloned().collect())
+                }
+                _ => return None,
+            },
+            Self::Named(path) => Self::Named(
+                path.iter()
+                    .map(|(segment, segment_arguments)| {
+                        let substituted = segment_arguments
+                            .iter()
+                            .map(|argument| argument.substituted(arguments))
+                            .collect::<Option<Vec<_>>>()?;
+                        Some((segment.clone(), substituted))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            Self::Optional(wrapped) => Self::Optional(each(wrapped)?),
+            Self::ImplicitlyUnwrapped(wrapped) => Self::ImplicitlyUnwrapped(each(wrapped)?),
+            Self::Array(element) => Self::Array(each(element)?),
+            Self::Opaque(wrapped) => Self::Opaque(each(wrapped)?),
+            Self::Existential(wrapped) => Self::Existential(each(wrapped)?),
+            Self::Dictionary(key, value) => Self::Dictionary(each(key)?, each(value)?),
+            Self::Tuple(elements) => Self::Tuple(
+                elements
+                    .iter()
+                    .map(|(label, element)| Some((label.clone(), element.substituted(arguments)?)))
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            Self::Function {
+                parameters,
+                effects,
+                value,
+            } => Self::Function {
+                parameters: parameters
+                    .iter()
+                    .map(|(modifiers, variadic, parameter)| {
+                        Some((
+                            modifiers.clone(),
+                            *variadic,
+                            parameter.substituted(arguments)?,
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                effects: effects.clone(),
+                value: each(value)?,
+            },
+            Self::Composition(members) => Self::Composition(
+                members
+                    .iter()
+                    .map(|member| member.substituted(arguments))
+                    .collect::<Option<BTreeSet<_>>>()?,
+            ),
+        })
+    }
+
+    /// 型変数の番号を `renumber` で付け替えた型。**型が書かれた順に**呼ぶ（出現順で振り直すため）。
+    ///
+    /// **`P & Q` だけは書かれた順を持っていない**（並びを落として集合で持つ）ので、付け替える前の
+    /// 番号の順に呼ぶ。直接書いた形と番号の付き方がずれても、付け替えは単射なので別の型が重なる
+    /// ことは無い（偽陰性側）。
+    fn renumbered(self, renumber: &mut dyn FnMut(usize) -> usize) -> Self {
+        match self {
+            Self::Parameter(index) => Self::Parameter(renumber(index)),
+            Self::Member(index, members) => Self::Member(renumber(index), members),
+            Self::Named(path) => Self::Named(
+                path.into_iter()
+                    .map(|(segment, arguments)| {
+                        let arguments = arguments
+                            .into_iter()
+                            .map(|argument| argument.renumbered(renumber))
+                            .collect();
+                        (segment, arguments)
+                    })
+                    .collect(),
+            ),
+            Self::Optional(wrapped) => Self::Optional(Box::new(wrapped.renumbered(renumber))),
+            Self::ImplicitlyUnwrapped(wrapped) => {
+                Self::ImplicitlyUnwrapped(Box::new(wrapped.renumbered(renumber)))
+            }
+            Self::Array(element) => Self::Array(Box::new(element.renumbered(renumber))),
+            Self::Opaque(wrapped) => Self::Opaque(Box::new(wrapped.renumbered(renumber))),
+            Self::Existential(wrapped) => Self::Existential(Box::new(wrapped.renumbered(renumber))),
+            Self::Dictionary(key, value) => {
+                let key = key.renumbered(renumber);
+                Self::Dictionary(Box::new(key), Box::new(value.renumbered(renumber)))
+            }
+            Self::Tuple(elements) => Self::Tuple(
+                elements
+                    .into_iter()
+                    .map(|(label, element)| (label, element.renumbered(renumber)))
+                    .collect(),
+            ),
+            Self::Function {
+                parameters,
+                effects,
+                value,
+            } => {
+                let parameters = parameters
+                    .into_iter()
+                    .map(|(modifiers, variadic, parameter)| {
+                        (modifiers, variadic, parameter.renumbered(renumber))
+                    })
+                    .collect();
+                Self::Function {
+                    parameters,
+                    effects,
+                    value: Box::new(value.renumbered(renumber)),
+                }
+            }
+            Self::Composition(members) => Self::Composition(
+                members
+                    .into_iter()
+                    .map(|member| member.renumbered(renumber))
+                    .collect(),
+            ),
+        }
     }
 }
 
@@ -595,11 +885,11 @@ impl SwiftCallable {
         let mut callable = reader.callable_of(declaration)?;
         let mut type_names = reader.type_names;
         let mut refers_to_self = reader.refers_to_self;
-        let mut has_unopenable_alias = reader.has_unopenable_alias;
+        let mut alias_failure = reader.alias_failure;
         let enclosing = enclosing.map(|receiver| {
             type_names.extend(receiver.type_names);
             refers_to_self |= receiver.refers_to_self;
-            has_unopenable_alias |= receiver.has_unopenable_alias;
+            alias_failure = alias_failure.or(receiver.alias_failure);
             callable.receiver_constraints = receiver.constraints;
             receiver.value
         });
@@ -619,7 +909,7 @@ impl SwiftCallable {
         }
         callable.type_names = type_names;
         callable.refers_to_self = refers_to_self;
-        callable.has_unopenable_alias = has_unopenable_alias;
+        callable.alias_failure = alias_failure;
         Some(callable)
     }
 
@@ -633,9 +923,9 @@ impl SwiftCallable {
         self.refers_to_self
     }
 
-    /// 開いた `typealias` を、型引数の付いたパスに当てることになったか。
-    pub(crate) fn has_unopenable_alias(&self) -> bool {
-        self.has_unopenable_alias
+    /// 開いた `typealias` に型引数を当てはめられなかったか、そのわけ。
+    pub(crate) fn alias_failure(&self) -> Option<SwiftAliasFailure> {
+        self.alias_failure
     }
 }
 
@@ -744,7 +1034,7 @@ struct SwiftSpelling<'source> {
     numbered: Vec<String>,
     type_names: BTreeSet<String>,
     refers_to_self: bool,
-    has_unopenable_alias: bool,
+    alias_failure: Option<SwiftAliasFailure>,
     /// ソースを読むときだけ、型名の位置を残す。
     recording: bool,
     references: Vec<TypeReference>,
@@ -762,7 +1052,7 @@ impl<'source> SwiftSpelling<'source> {
             numbered: Vec::new(),
             type_names: BTreeSet::new(),
             refers_to_self: false,
-            has_unopenable_alias: false,
+            alias_failure: None,
             recording: false,
             references: Vec::new(),
         }
@@ -852,7 +1142,7 @@ impl<'source> SwiftSpelling<'source> {
             constraints,
             type_names: BTreeSet::new(),
             refers_to_self: false,
-            has_unopenable_alias: false,
+            alias_failure: None,
         })
     }
 
@@ -986,11 +1276,13 @@ impl<'source> SwiftSpelling<'source> {
         constraints: &mut BTreeSet<SwiftConstraint>,
     ) -> Option<()> {
         let (path, relation, right) = self.predicate_parts_of(predicate)?;
+        let numbered_before = self.numbered.len();
         let left = self.path_type_of(
             path.into_iter()
                 .map(|segment| (segment, Vec::new()))
                 .collect(),
             None,
+            numbered_before,
         );
         push_split_constraint(constraints, left, relation, right);
         Some(())
@@ -1004,7 +1296,8 @@ impl<'source> SwiftSpelling<'source> {
         let name = declaration.child_by_field_name("name")?;
         if name.kind() == TYPE_IDENTIFIER_KIND {
             let path = vec![(self.text(name)?.to_owned(), Vec::new())];
-            return Some(self.path_type_of(path, Some(name)));
+            let numbered_before = self.numbered.len();
+            return Some(self.path_type_of(path, Some(name), numbered_before));
         }
         self.type_of(name)
     }
@@ -1093,6 +1386,8 @@ impl<'source> SwiftSpelling<'source> {
     }
 
     fn user_type_of(&mut self, node: Node<'_>) -> Option<SwiftType> {
+        // 型引数を読むと番号が振られる。当てはめた後に振り直すので、読む前の数を覚える
+        let numbered_before = self.numbered.len();
         let mut path: Vec<(String, Vec<SwiftType>)> = Vec::new();
         let mut last_identifier = None;
         let mut cursor = node.walk();
@@ -1113,16 +1408,18 @@ impl<'source> SwiftSpelling<'source> {
                 _ => return None,
             }
         }
-        Some(self.path_type_of(path, last_identifier))
+        Some(self.path_type_of(path, last_identifier, numbered_before))
     }
 
     /// 名前のパスを型にする。束縛した型変数・`Self`・標準ライブラリの省略形を見分ける。
     ///
     /// `position_node` は型名を尋ねる位置（パスの末尾の識別子）。ソースを読むときに残す。
+    /// `numbered_before` はパスの型引数を読む前に振ってあった型変数の番号の数。
     fn path_type_of(
         &mut self,
         path: Vec<(String, Vec<SwiftType>)>,
         position_node: Option<Node<'_>>,
+        numbered_before: usize,
     ) -> SwiftType {
         let Some(((head, head_arguments), rest)) = path.split_first() else {
             return SwiftType::Tuple(Vec::new());
@@ -1164,13 +1461,50 @@ impl<'source> SwiftSpelling<'source> {
                 SwiftType::Named(declared_path_of(identity, path))
             }
             Some(SwiftTypeResolution::Opened(opened)) => {
-                if path.iter().any(|(_, arguments)| !arguments.is_empty()) {
-                    self.has_unopenable_alias = true;
-                    return SwiftType::Named(path);
+                match self.substituted(&opened, &path, numbered_before) {
+                    Ok(applied) => applied,
+                    Err(failure) => {
+                        self.alias_failure = self.alias_failure.or(Some(failure));
+                        SwiftType::Named(path)
+                    }
                 }
-                opened.0
             }
         }
+    }
+
+    /// 開いた `typealias` に、パスの末尾の型引数を当てはめた型。
+    ///
+    /// **型引数を書けるのは末尾の区切りだけ。** 前の区切りの型引数（`Outer<Int>.Alias`）は
+    /// 囲む型の型変数を当てることになり、右辺はそれを持たない。
+    ///
+    /// **当てはめた後で、型引数を読んだときに振った番号を展開後の出現順で振り直す。** 振り直さないと
+    /// `Flip<T, U>`（= `(U, T)`）を通る形と、`(U, T)` を直接書いた形が重ならない。右辺に現れなかった
+    /// 型変数は番号ごと捨てる（`Const<U>` = `Int` の `U` が番号を取ったままだと、後の型変数がずれる）。
+    fn substituted(
+        &mut self,
+        opened: &SwiftOpenedType,
+        path: &[(String, Vec<SwiftType>)],
+        numbered_before: usize,
+    ) -> Result<SwiftType, SwiftAliasFailure> {
+        let Some(((_, arguments), front)) = path.split_last() else {
+            return Err(SwiftAliasFailure::Unopenable);
+        };
+        if front.iter().any(|(_, arguments)| !arguments.is_empty()) {
+            return Err(SwiftAliasFailure::Unopenable);
+        }
+        let applied = opened.applied_to(arguments)?;
+        if numbered_before >= self.numbered.len() {
+            return Ok(applied);
+        }
+        let introduced = self.numbered.split_off(numbered_before);
+        Ok(
+            applied.renumbered(&mut |index| match index.checked_sub(numbered_before) {
+                Some(offset) => introduced
+                    .get(offset)
+                    .map_or(index, |name| self.parameter_index_of(name)),
+                None => index,
+            }),
+        )
     }
 
     /// 標準ライブラリの省略形を持つ型を、省略形を開いた形にする。当たらなければ `None`。
@@ -2156,6 +2490,16 @@ mod tests {
         SwiftTypeResolution::Opened(alias.opened_with(&resolving(table)).expect("開ける右辺"))
     }
 
+    /// 1 行目の `typealias` の宣言 `declaration` を、右辺の型名を `table` で引いて開いた答え。
+    fn opened_declaration(
+        declaration: &str,
+        table: &[(&str, SwiftTypeResolution)],
+    ) -> SwiftTypeResolution {
+        let source = format!("{declaration}\n");
+        let alias = alias_at(&source, 1, "typealias ").expect("読める typealias");
+        SwiftTypeResolution::Opened(alias.opened_with(&resolving(table)).expect("開ける右辺"))
+    }
+
     fn resolved_callable_of(
         spelling: &str,
         table: &[(&str, SwiftTypeResolution)],
@@ -2208,8 +2552,6 @@ mod tests {
 
     #[test]
     fn test_alias_source_does_not_read_declarations_that_may_name_type_variables() {
-        // 型引数を取る宣言は #527 で開く
-        assert!(alias_at("typealias Pair<T> = (T, T)\n", 1, "typealias ").is_none());
         // 囲む型の型変数を指しうる: `Box<Int>.Item` と `Box<String>.Item` が同じ型に開くと偽陽性
         assert!(
             alias_at(
@@ -2384,8 +2726,11 @@ mod tests {
         );
         let without = resolved_callable_of("func f(x: Money)", &[("Money", money)]);
 
-        assert!(with_arguments.has_unopenable_alias());
-        assert!(!without.has_unopenable_alias());
+        assert_eq!(
+            with_arguments.alias_failure(),
+            Some(SwiftAliasFailure::Unopenable)
+        );
+        assert_eq!(without.alias_failure(), None);
     }
 
     #[test]
@@ -2401,7 +2746,186 @@ mod tests {
             panic!("開いた右辺");
         };
 
-        assert_eq!(single.size(), 1);
-        assert_eq!(pair.size(), 3);
+        assert_eq!(single.value.size(), 1);
+        assert_eq!(pair.value.size(), 3);
+    }
+
+    #[test]
+    fn test_alias_source_reads_a_generic_declaration_without_recording_its_type_parameters() {
+        let source = "typealias Rated<T> = (T, Rate)\n";
+
+        let alias = alias_at(source, 1, "typealias ").expect("読める typealias");
+
+        // `T` を型名として記録すると、型パラメータの宣言を「宣言された型」として辿ってしまう
+        let names: Vec<&str> = alias.references().iter().map(TypeReference::name).collect();
+        assert_eq!(names, ["Rate"]);
+    }
+
+    #[test]
+    fn test_alias_source_does_not_read_a_generic_declaration_with_a_where_clause() {
+        // tree-sitter-swift は `where` を宣言の外に置く。宣言だけを見ると境界の無い宣言に読める
+        for source in [
+            "typealias W<T> = [T] where T: Hashable\n",
+            "typealias W<T> = [T] where T == Int\n",
+            "typealias W<T> = [T] /* c */ where T: Hashable\n",
+            "typealias W<T> = [T]\n    where T: Hashable\n",
+            "typealias W<T> = [T] // c\nwhere T: Hashable\n",
+        ] {
+            assert!(alias_at(source, 1, "typealias ").is_none(), "{source}");
+        }
+        // 対照: `where` が無ければ読む
+        assert!(alias_at("typealias W<T> = [T]\n", 1, "typealias ").is_some());
+    }
+
+    #[test]
+    fn test_from_spelling_substitutes_type_arguments_into_a_generic_alias() {
+        let int = standard_at("@Int");
+        let double = standard_at("@Double");
+        let couple = opened_declaration("typealias Couple<T> = (T, T)", &[]);
+        let table = [("Couple", couple), ("Int", int.clone()), ("Double", double)];
+
+        let through_alias = resolved_callable_of("func f(x: Couple<Int>)", &table);
+
+        assert_eq!(
+            through_alias,
+            resolved_callable_of("func g(x: (Int, Int))", &table)
+        );
+        // 対照: 当てはめた型引数と違う右辺とは重ならない
+        assert_ne!(
+            through_alias,
+            resolved_callable_of("func g(x: (Int, Double))", &table)
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_marks_a_generic_alias_with_a_different_number_of_arguments_unopenable() {
+        let int = standard_at("@Int");
+        let couple = opened_declaration("typealias Couple<T> = (T, T)", &[]);
+        let table = [
+            ("Couple", couple.clone()),
+            ("Outer.Couple", couple),
+            ("Int", int),
+        ];
+
+        for spelling in [
+            "func f(x: Couple<Int, Int>)",
+            "func f(x: Couple)",
+            // 前の区切りの型引数は囲む型の型変数に当たり、右辺はそれを持たない
+            "func f(x: Outer<Int>.Couple<Int>)",
+        ] {
+            assert_eq!(
+                resolved_callable_of(spelling, &table).alias_failure(),
+                Some(SwiftAliasFailure::Unopenable),
+                "{spelling}"
+            );
+        }
+        // 対照: 数が揃えば開く
+        assert_eq!(
+            resolved_callable_of("func f(x: Couple<Int>)", &table).alias_failure(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_renumbers_type_variables_after_substituting() {
+        let flip = opened_declaration("typealias Flip<A, B> = (B, A)", &[]);
+        let table = [("Flip", flip)];
+
+        let through_alias = resolved_callable_of("func f<T, U>(x: Flip<T, U>) -> T", &table);
+
+        assert_eq!(
+            through_alias,
+            resolved_callable_of("func g<T, U>(x: (U, T)) -> T", &table)
+        );
+        // 対照: 並びを入れ替えない右辺とは重ならない
+        assert_ne!(
+            through_alias,
+            resolved_callable_of("func g<T, U>(x: (T, U)) -> T", &table)
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_drops_type_variables_that_the_generic_alias_does_not_use() {
+        let int = standard_at("@Int");
+        let constant = opened_declaration("typealias Const<X> = Int", &[("Int", int.clone())]);
+        let table = [("Const", constant), ("Int", int)];
+
+        assert_eq!(
+            resolved_callable_of("func f<T, U>(x: Const<U>, y: T) -> T", &table),
+            resolved_callable_of("func g<T, U>(x: Int, y: T) -> T", &table)
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_substitutes_a_type_variable_into_a_member_of_an_alias_parameter() {
+        let int = standard_at("@Int");
+        let element = opened_declaration("typealias Elem<C> = C.Element", &[]);
+        let table = [("Elem", element), ("Int", int)];
+
+        assert_eq!(
+            resolved_callable_of("func f<T>(x: Elem<T>)", &table),
+            resolved_callable_of("func g<T>(x: T.Element)", &table)
+        );
+        // 具体的な型の関連型は、関連型を選ばないと言えない
+        assert_eq!(
+            resolved_callable_of("func f(x: Elem<[Int]>)", &table).alias_failure(),
+            Some(SwiftAliasFailure::Unopenable)
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_does_not_open_a_bounded_generic_alias_applied_to_type_variables() {
+        let int = standard_at("@Int");
+        let hashed = opened_declaration("typealias Hashed<T: Hashable> = [T]", &[]);
+        let table = [("Hashed", hashed), ("Int", int)];
+
+        // 境界は使用側の要求として推論される。hover の綴りに出なければ、開くと `[T]` と重なる
+        assert_eq!(
+            resolved_callable_of("func f<T>(x: Hashed<T>)", &table).alias_failure(),
+            Some(SwiftAliasFailure::Unopenable)
+        );
+        // 対照: 具体的な型を当てるなら要求は足されない
+        assert_eq!(
+            resolved_callable_of("func f(x: Hashed<Int>)", &table),
+            resolved_callable_of("func g(x: [Int])", &table)
+        );
+    }
+
+    #[test]
+    fn test_alias_source_opens_a_generic_alias_nested_in_the_right_side() {
+        let int = standard_at("@Int");
+        let couple = opened_declaration("typealias Couple<T> = (T, T)", &[]);
+        let couples =
+            opened_declaration("typealias Couples<T> = [Couple<T>]", &[("Couple", couple)]);
+        let table = [("Couples", couples), ("Int", int)];
+
+        assert_eq!(
+            resolved_callable_of("func f(x: Couples<Int>)", &table),
+            resolved_callable_of("func g(x: [(Int, Int)])", &table)
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_stops_substituting_beyond_the_size_limit() {
+        let int = standard_at("@Int");
+        let couple = opened_declaration("typealias Couple<T> = (T, T)", &[]);
+        let table = [("Couple", couple), ("Int", int)];
+        let nested = |depth: usize| {
+            format!(
+                "func f(x: {}Int{})",
+                "Couple<".repeat(depth),
+                ">".repeat(depth)
+            )
+        };
+
+        // 入れ子 1 段ごとに倍になる: 11 段で 4095 ノード、12 段で 8191 ノード
+        assert_eq!(
+            resolved_callable_of(&nested(12), &table).alias_failure(),
+            Some(SwiftAliasFailure::ExpansionLimit)
+        );
+        assert_eq!(
+            resolved_callable_of(&nested(11), &table).alias_failure(),
+            None
+        );
     }
 }
