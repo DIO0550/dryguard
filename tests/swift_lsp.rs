@@ -306,14 +306,24 @@ fn test_sourcekit_lsp_chained_typealias_is_opened_to_the_end() {
 
 #[test]
 #[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
-fn test_sourcekit_lsp_typealias_that_may_name_type_variables_is_not_opened() {
-    // 型引数を取る `typealias` は開かない（Issue #527）
+fn test_sourcekit_lsp_generic_typealias_applied_to_type_arguments_and_its_right_side_are_unifiable()
+{
+    // `coupled(value: Couple<Int>)` と `paired(value: (Int, Int))`。`Couple<T>` は別ファイルの
+    // `typealias Couple<T> = (T, T)` で、使用側の `Int` を右辺の `T` へ当てはめる
     assert_eq!(
-        type_signature_match_of("coupled", "doubled"),
-        TypeSignatureMatch::UnopenedTypeName {
-            reason: UnopenedReason::UnopenableAlias
-        }
+        type_signature_match_of("coupled", "paired"),
+        TypeSignatureMatch::Unifiable
     );
+    // 対照: 当てはめた型引数と違う右辺とは重ならない
+    assert_eq!(
+        type_signature_match_of("coupled", "mixed"),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
+fn test_sourcekit_lsp_typealias_that_may_name_type_variables_is_not_opened() {
     // 型引数を持つ型の中の `typealias Item = T`。開くと `Box<Int>.Item` と `Box<String>.Item` が重なる
     assert_eq!(
         type_signature_match_of("boxed", "doubled"),

@@ -34,7 +34,7 @@ use crate::syntax::rust_callable::{
     primitive_spelling_of,
 };
 use crate::syntax::swift_callable::{
-    STANDARD_SUGAR_NAMES, SwiftAliasSource, SwiftOpenedType, SwiftTypeResolution,
+    STANDARD_SUGAR_NAMES, SwiftAliasFailure, SwiftAliasSource, SwiftOpenedType, SwiftTypeResolution,
 };
 use crate::syntax::type_reference::TypeReference;
 
@@ -197,9 +197,10 @@ pub enum UnopenedReason {
     HoverNotProvided,
     /// 宣言は型エイリアスだが、右辺を差し込める形にできなかった。
     ///
-    /// **Swift で開くのは、利用者のソースにある型引数を取らない `typealias` だけ。**
-    /// ジェネリックな宣言・`.swiftinterface` の宣言・型変数を持ちうる宣言の中の宣言はここに来る
-    /// （`swift_traced_type_names_of`）。
+    /// **Swift で開くのは、利用者のソースにある `typealias` だけ。** `.swiftinterface` の宣言・
+    /// 型変数を持ちうる宣言の中の宣言・`where` 節を持つ宣言と、ジェネリックな宣言に型引数を
+    /// 当てはめられない使い方（数の不一致・境界を持つ宣言に型変数を当てる・具体的な型の関連型）は
+    /// ここに来る（`swift_traced_type_names_of` / `syntax::swift_callable` の `SwiftAliasFailure`）。
     ///
     /// **サーバは右辺を返している。** 開けないのは dryguard 側の都合（型引数の当てはめが
     /// 要るライフタイム・const 引数や未対応の型構文など）なので、開く先が無い `interface` / `class` とは
@@ -404,12 +405,6 @@ const SWIFT_INTERFACE_EXTENSION: &str = "swiftinterface";
 
 /// 標準ライブラリのモジュールの名前。インタフェースのファイル名・`.swiftmodule` の名前になる。
 const SWIFT_STANDARD_LIBRARY_MODULE: &str = "Swift";
-
-/// 展開した Swift の `typealias` の右辺の、型のノードの数の上限。
-///
-/// **段数だけでは足りない。** `typealias B = (A, A)` の連鎖は段ごとに倍になり、32 段で
-/// 2^32 に届く。Rust の展開の上限（右辺 64 KiB）と同じ役目を、綴りではなく型の大きさで持つ。
-const MAXIMUM_SWIFT_ALIAS_SIZE: usize = 4096;
 
 /// compare / scan の間だけ共有する、Swift の型名の使用位置への definition / hover の答えと、
 /// `typealias` を宣言側で開いた答え。
@@ -703,12 +698,10 @@ impl SwiftAliasOpener<'_> {
             Err(reason) => return Ok(Err(reason)),
         };
 
-        let Some(right) = alias.opened_with(&|name| resolutions.get(name).cloned()) else {
-            return Ok(Err(UnopenedReason::UnopenableAlias));
+        let right = match alias.opened_with(&|name| resolutions.get(name).cloned()) {
+            Ok(right) => right,
+            Err(failure) => return Ok(Err(swift_alias_reason_of(failure))),
         };
-        if right.size() > MAXIMUM_SWIFT_ALIAS_SIZE {
-            return Ok(Err(UnopenedReason::AliasExpansionLimit));
-        }
         self.cache.opened.push((site.clone(), right.clone(), depth));
         Ok(Ok((right, depth)))
     }
@@ -738,6 +731,14 @@ impl SwiftAliasOpener<'_> {
             resolutions.insert(reference.name().to_owned(), resolution);
         }
         Ok(Ok((resolutions, depth)))
+    }
+}
+
+/// Swift の `typealias` を開けなかった・当てはめられなかったわけを、利用者に出す理由へ直す。
+pub(crate) fn swift_alias_reason_of(failure: SwiftAliasFailure) -> UnopenedReason {
+    match failure {
+        SwiftAliasFailure::Unopenable => UnopenedReason::UnopenableAlias,
+        SwiftAliasFailure::ExpansionLimit => UnopenedReason::AliasExpansionLimit,
     }
 }
 
