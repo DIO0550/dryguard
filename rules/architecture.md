@@ -327,19 +327,28 @@ implementation の候補のうち対象型の綴りが等しい impl（`RustImpl
   等しい impl が無ければ上の 0 件と同じ順（`UnselectedImpls::reason_with`）
 - **短縮形の入れ子（`Self::Item::Out`）は扱わない。** rustc が E0223 で拒否する形
 
-**Swift の型名は definition で辿り、型引数を取らない `typealias` は右辺へ開く。** sourcekit-lsp の
+**Swift の型名は definition で辿り、`typealias` は右辺へ開く（ジェネリックな宣言は使用側の型引数を当てはめる）。** sourcekit-lsp の
 typeDefinition は型名の位置に `null` を返すので、Rust と同じく definition を尋ねる（`semantics::resolved_type` の
 `swift_traced_type_names_of`）。辿った型名は綴りではなく `declared type identity` で比べる
 （`swift_declared_resolution_of`。標準ライブラリの生成インタフェースは、sourcekit-lsp 6.4.2 が尋ねたドキュメントごとに
 別のディレクトリへ置くので、ファイル名と位置で持つ）。辿った先がエイリアスかは**使用位置への hover**
 （`typealias Amount = Int` / `public typealias Cost = Double`。修飾子の後ろの語で見る）で見分け、
 `syntax::swift_callable::SwiftAliasSource` が宣言側のソースの右辺を読み、右辺の型名を**宣言側の位置から**
-辿って再帰的に開く。開くのは**利用者のソースにあり、型引数を取らず、祖先が型引数を持たない
+辿って再帰的に開く。開くのは**利用者のソースにあり、祖先が型引数を持たない
 `struct` / `class` / `enum` / `actor` かファイルの直下だけ**の宣言（許可リスト。`extension` / `protocol` /
 関数の中の宣言は、右辺が型変数を指すと `Box<Int>.Item` と `Box<String>.Item` が同じ型に開く）。
+**ジェネリックな `typealias Couple<T> = (T, T)` は右辺を型パラメータの宣言の順の番号で持ち、使用側（`Couple<Int>`）で
+型引数を当てはめる**（`rules/naming.md` の `generic alias`。`SwiftOpenedType`）。型パラメータは右辺の型名として辿らない。
+当てはめた後、型引数を読んだときに振った型変数の番号を展開後の出現順で振り直し、右辺に現れなかった型変数は捨てる
+（`Flip<T, U>` = `(U, T)` を通る形と `(U, T)` を直接書いた形を重ねる）。当てはめないもの（`UnopenableAlias`。偽陰性側）:
+型引数の数の不一致・前の区切りの型引数（`Outer<Int>.Alias`）・**境界を持つ宣言（`<T: Hashable>`）に使用側の型変数を
+当てる形**（Swift は境界を使用側の関数の要求として推論する。hover の綴りにその要求が出るかは未実測で、出なければ`[T]` を直接書いた
+境界の無い関数と重なる）・型パラメータの関連型（`C.Element`）に具体的な型を当てる形。`where` 節を持つ宣言は
+tree-sitter-swift が宣言の外の ERROR にするので読まない（宣言の直後の兄弟で見る）。
 それ以外・`.swiftinterface` の宣言・右辺に `Self` や属性がある宣言は `UnopenableAlias` で「測れない」にする
 （宣言の場所のまま比べると、`Amount` と `Int` が重ならないと確かめた答えになる）。循環は宣言の場所で
-`CyclicAlias`、32 段か展開した型が 4096 ノードを超えると `AliasExpansionLimit`（循環した宣言の使用位置には
+`CyclicAlias`、32 段か展開した型が 4096 ノードを超えると `AliasExpansionLimit`（ノード数の上限は使用側で型引数を
+当てはめた結果にも当てる。`Couple<Couple<…>>` は段ごとに倍になる。循環した宣言の使用位置には
 sourcekit-lsp 6.4.2 が答えないので、`CyclicAlias` はサーバが答えたときの防御）。開いた答えは
 `SwiftDeclarationCache` が宣言の場所ごとに、展開に使った段数と一緒に持ち、別の連鎖の途中で使うときは
 今の段数との和で上限を確かめ直す（尋ねる順で答えが変わらない）。型名の使用位置への definition と hover の
