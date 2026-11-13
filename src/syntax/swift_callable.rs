@@ -146,6 +146,12 @@ const TYPEALIAS_KIND: &str = "typealias_declaration";
 /// 型の宣言の字句のフィールド（`struct` / `class` / `extension` など）。
 const DECLARATION_KIND_FIELD: &str = "declaration_kind";
 
+/// コメントのノードの種別。
+const COMMENT_KINDS: [&str; 2] = ["comment", "multiline_comment"];
+
+/// `where` 節を導く語。
+const WHERE_KEYWORD: &str = "where";
+
 /// `typealias` を開いてよい、囲む宣言の字句。**`extension` は入れない** — 拡張した型の
 /// 型変数（`extension Array { typealias E = Element }`）を右辺が指しうる。
 const OPENABLE_ENCLOSING_KINDS: [&str; 4] = ["struct", "class", "enum", "actor"];
@@ -220,7 +226,8 @@ impl SwiftOpenedType {
             return Ok(self.value.clone());
         }
         let applied_to_variables = arguments.iter().any(SwiftType::has_type_variable);
-        if self.bounded && applied_to_variables {
+        let inferred_requirements = self.bounded && applied_to_variables;
+        if inferred_requirements {
             return Err(SwiftAliasFailure::Unopenable);
         }
         // 組み立てる前に数える。入れ子の当てはめは段ごとに倍になる
@@ -257,8 +264,8 @@ impl SwiftAliasSource {
     /// `extension` / `protocol` / 関数の中）。最後のものは、右辺が囲む型の型変数を指すと
     /// `Box<Int>.Item` と `Box<String>.Item` が同じ型に開く（偽陽性）。
     ///
-    /// **`where` 節は宣言の外の ERROR になる**（tree-sitter-swift 0.7.4 で確かめた）ので、
-    /// 宣言の直後の兄弟で見る。宣言だけを見ると、境界を持つ宣言を境界の無い宣言として読む。
+    /// **`where` 節は宣言の外に出る**（[`is_followed_by_where_clause`]）。宣言だけを見ると、
+    /// 境界を持つ宣言を境界の無い宣言として読む。
     pub(crate) fn from_source(source: &str, position: SourcePosition) -> Option<Self> {
         let tree = SyntaxTree::from_source(source, Grammar::Swift).ok()?;
         let declaration = tree.named_descendants().into_iter().find(|node| {
@@ -268,11 +275,10 @@ impl SwiftAliasSource {
                     .and_then(|name| source_position_of(name, source))
                     == Some(position)
         })?;
-        let followed_by_error = declaration
-            .next_sibling()
-            .is_some_and(|next| next.is_error());
-        if declaration.has_error() || followed_by_error || !is_openable_context(declaration, source)
-        {
+        let unopenable_declaration = declaration.has_error()
+            || is_followed_by_where_clause(declaration, source)
+            || !is_openable_context(declaration, source);
+        if unopenable_declaration {
             return None;
         }
         let value = alias_value_of(declaration)?;
@@ -363,6 +369,23 @@ impl SwiftAliasSource {
             bounded: self.bounded,
         })
     }
+}
+
+/// `typealias` の宣言の後ろに `where` 節が続くか。
+///
+/// tree-sitter-swift 0.7.4 は `typealias` の `where` 節を読めず、宣言の外に置く（確かめた）。
+/// 同じ行なら ERROR の兄弟、改行を挟むと `where` を名前と読んだ兄弟の後ろに ERROR が続く。
+/// **コメントを飛ばした最初の兄弟が、ERROR か `where` の語**かで見る。直後の兄弟だけを見ると、
+/// 間のコメント・改行で見落とす。
+fn is_followed_by_where_clause(declaration: Node<'_>, source: &str) -> bool {
+    let mut next = declaration.next_sibling();
+    while let Some(sibling) = next {
+        if !COMMENT_KINDS.contains(&sibling.kind()) {
+            return sibling.is_error() || source.get(sibling.byte_range()) == Some(WHERE_KEYWORD);
+        }
+        next = sibling.next_sibling();
+    }
+    false
 }
 
 /// `typealias` の右辺の型のノード。属性（`@Sendable`）が付く・型が 1 つでなければ `None`。
@@ -764,6 +787,10 @@ impl SwiftType {
     }
 
     /// 型変数の番号を `renumber` で付け替えた型。**型が書かれた順に**呼ぶ（出現順で振り直すため）。
+    ///
+    /// **`P & Q` だけは書かれた順を持っていない**（並びを落として集合で持つ）ので、付け替える前の
+    /// 番号の順に呼ぶ。直接書いた形と番号の付き方がずれても、付け替えは単射なので別の型が重なる
+    /// ことは無い（偽陰性側）。
     fn renumbered(self, renumber: &mut dyn FnMut(usize) -> usize) -> Self {
         match self {
             Self::Parameter(index) => Self::Parameter(renumber(index)),
@@ -2736,8 +2763,16 @@ mod tests {
 
     #[test]
     fn test_alias_source_does_not_read_a_generic_declaration_with_a_where_clause() {
-        // tree-sitter-swift は `where` を宣言の外の ERROR にする。宣言だけを見ると境界の無い宣言に読める
-        assert!(alias_at("typealias W<T> = [T] where T: Hashable\n", 1, "typealias ").is_none());
+        // tree-sitter-swift は `where` を宣言の外に置く。宣言だけを見ると境界の無い宣言に読める
+        for source in [
+            "typealias W<T> = [T] where T: Hashable\n",
+            "typealias W<T> = [T] where T == Int\n",
+            "typealias W<T> = [T] /* c */ where T: Hashable\n",
+            "typealias W<T> = [T]\n    where T: Hashable\n",
+            "typealias W<T> = [T] // c\nwhere T: Hashable\n",
+        ] {
+            assert!(alias_at(source, 1, "typealias ").is_none(), "{source}");
+        }
         // 対照: `where` が無ければ読む
         assert!(alias_at("typealias W<T> = [T]\n", 1, "typealias ").is_some());
     }
@@ -2766,9 +2801,18 @@ mod tests {
     fn test_from_spelling_marks_a_generic_alias_with_a_different_number_of_arguments_unopenable() {
         let int = standard_at("@Int");
         let couple = opened_declaration("typealias Couple<T> = (T, T)", &[]);
-        let table = [("Couple", couple), ("Int", int)];
+        let table = [
+            ("Couple", couple.clone()),
+            ("Outer.Couple", couple),
+            ("Int", int),
+        ];
 
-        for spelling in ["func f(x: Couple<Int, Int>)", "func f(x: Couple)"] {
+        for spelling in [
+            "func f(x: Couple<Int, Int>)",
+            "func f(x: Couple)",
+            // 前の区切りの型引数は囲む型の型変数に当たり、右辺はそれを持たない
+            "func f(x: Outer<Int>.Couple<Int>)",
+        ] {
             assert_eq!(
                 resolved_callable_of(spelling, &table).alias_failure(),
                 Some(SwiftAliasFailure::Unopenable),

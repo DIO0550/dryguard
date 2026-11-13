@@ -344,7 +344,8 @@ typeDefinition は型名の位置に `null` を返すので、Rust と同じく 
 型引数の数の不一致・前の区切りの型引数（`Outer<Int>.Alias`）・**境界を持つ宣言（`<T: Hashable>`）に使用側の型変数を
 当てる形**（Swift は境界を使用側の関数の要求として推論する。hover の綴りにその要求が出るかは未実測で、出なければ`[T]` を直接書いた
 境界の無い関数と重なる）・型パラメータの関連型（`C.Element`）に具体的な型を当てる形。`where` 節を持つ宣言は
-tree-sitter-swift が宣言の外の ERROR にするので読まない（宣言の直後の兄弟で見る）。
+tree-sitter-swift が宣言の外に置くので読まない（コメントを飛ばした最初の兄弟が ERROR か `where` の語かで見る。
+改行を挟むと `where` が名前として読まれ、直後の兄弟だけでは見落とす）。
 それ以外・`.swiftinterface` の宣言・右辺に `Self` や属性がある宣言は `UnopenableAlias` で「測れない」にする
 （宣言の場所のまま比べると、`Amount` と `Int` が重ならないと確かめた答えになる）。循環は宣言の場所で
 `CyclicAlias`、32 段か展開した型が 4096 ノードを超えると `AliasExpansionLimit`（ノード数の上限は使用側で型引数を
