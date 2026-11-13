@@ -13,7 +13,7 @@ use crate::line_number::LineNumber;
 /// 文字列が要る。行の文字列を持っているのはソースを読んだ層だけなので、そこで数え終えて
 /// この型にしてから持ち回る。バイト位置のまま渡すと、**どちらの数え方の列なのかが
 /// 型から消える**（どちらも `usize`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SourcePosition {
     line: LineNumber,
     character: usize,

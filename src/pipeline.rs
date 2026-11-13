@@ -771,7 +771,7 @@ fn asked_semantics_of(
 /// 宣言側の答え。**チャンクごとに作らない** — 答えはチャンクではなく宣言のファイルと
 /// trait で決まる（`rules/architecture.md`「ファイル単位で決まる答えをチャンク単位で
 /// 問い合わせない」）。`swift_declarations_cache` は同じ理由で共有する、Swift の
-/// `typealias` を開いた答え。
+/// 型名の使用位置への definition / hover の答えと、`typealias` を開いた答え。
 ///
 /// # Errors
 ///
