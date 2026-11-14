@@ -3,6 +3,7 @@
 //! サーバを要するので通常の `cargo test` では飛ばし、CI で `--ignored` を実行する。
 
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use dryguard::classification::ConfiguredThresholds;
@@ -19,9 +20,26 @@ use dryguard::pipeline::{chunk_pair_of, measured_pair_of};
 use dryguard::source_position::SourcePosition;
 use dryguard::threshold::Threshold;
 
+/// jdtls を同時に 1 つだけ起動する。Maven の取り込みは `-data` ではなくフィクスチャの下に
+/// `.project` などを書くので、並列に起動すると取り込みが壊れうる（JVM どうしの CPU の取り合いもある）。
+///
+/// `static` が効くのはこのテストのバイナリの中だけ。cargo はテストのバイナリを順に走らせるので、
+/// jdtls を起動するテストはこのファイルに置く。
+static JDTLS: Mutex<()> = Mutex::new(());
+
+/// jdtls を起動する番が回ってくるまで待ち、番を表すガードを返す。テストの先頭で取り、
+/// 名前の付いた束縛（`_turn`）で最後まで持つ（`let _ =` はその場で落とすので直列にならない）。
+///
+/// 毒は剥がす。剥がさないと、1 本が番を持ったまま落ちたときに残りが全部 `PoisonError` で落ち、
+/// どれが本当に落ちたのかが読めなくなる。
+fn jdtls_turn() -> MutexGuard<'static, ()> {
+    JDTLS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[test]
 #[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
 fn test_jdtls_answers_hover_and_references_but_leaves_callees_unsettled() {
+    let _turn = jdtls_turn();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/java-lsp");
     let path = fixture.join("src/main/java/shop/Total.java");
     let caller = fixture.join("src/main/java/shop/Checkout.java");
@@ -166,6 +184,7 @@ fn type_signature_match_of(member_a: &str, member_b: &str) -> TypeSignatureMatch
 #[test]
 #[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
 fn test_jdtls_methods_of_the_same_type_are_unifiable() {
+    let _turn = jdtls_turn();
     // メソッド名・引数名・本体だけが違う。型はプリミティブだけ
     assert_eq!(
         type_signature_match_of("added", "summed"),
@@ -176,6 +195,7 @@ fn test_jdtls_methods_of_the_same_type_are_unifiable() {
 #[test]
 #[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
 fn test_jdtls_methods_taking_different_types_are_not_unifiable() {
+    let _turn = jdtls_turn();
     assert_eq!(
         type_signature_match_of("added", "scaled"),
         TypeSignatureMatch::NotUnifiable
@@ -185,6 +205,7 @@ fn test_jdtls_methods_taking_different_types_are_not_unifiable() {
 #[test]
 #[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
 fn test_jdtls_generic_methods_differing_only_in_type_parameter_names_are_unifiable() {
+    let _turn = jdtls_turn();
     // `<T extends Priced>` と `<U extends Priced>`。`Priced` は両側ともフィクスチャの同じ宣言へ辿る
     assert_eq!(
         type_signature_match_of("cheaper", "lower"),
@@ -195,6 +216,7 @@ fn test_jdtls_generic_methods_differing_only_in_type_parameter_names_are_unifiab
 #[test]
 #[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
 fn test_jdtls_type_parameters_with_different_bounds_are_not_unifiable() {
+    let _turn = jdtls_turn();
     // `<T extends Priced>` と `<T extends Named>`。形は同じで境界だけが違う
     assert_eq!(
         type_signature_match_of("cheaper", "earlier"),
@@ -205,6 +227,7 @@ fn test_jdtls_type_parameters_with_different_bounds_are_not_unifiable() {
 #[test]
 #[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
 fn test_jdtls_constructor_and_instance_method_are_read() {
+    let _turn = jdtls_turn();
     // 綴りを読めない側があれば単一化不能ではなく「測れない」になる。コンストラクタと
     // インスタンスメソッドの hover の綴りを読めることを、比べられた答えで確かめる
     assert_eq!(
@@ -216,6 +239,7 @@ fn test_jdtls_constructor_and_instance_method_are_read() {
 #[test]
 #[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
 fn test_jdtls_varargs_and_array_parameters_are_not_unifiable() {
+    let _turn = jdtls_turn();
     // `offset(int... values)` と `shifted(int[] values)`。可変長かだけが違う。jdtls が `int...` を
     // `int[]` と綴ると単一化可能に出る
     assert_eq!(
@@ -227,6 +251,7 @@ fn test_jdtls_varargs_and_array_parameters_are_not_unifiable() {
 #[test]
 #[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
 fn test_jdtls_methods_differing_only_in_throws_are_not_unifiable() {
+    let _turn = jdtls_turn();
     // `offset(int...) throws OutOfStock` と `rounded(int...)`。jdtls が `throws` を綴らないと
     // 単一化可能に出る
     assert_eq!(
@@ -238,6 +263,7 @@ fn test_jdtls_methods_differing_only_in_throws_are_not_unifiable() {
 #[test]
 #[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
 fn test_jdtls_hover_spells_constructor_generic_method_and_throwing_method() {
+    let _turn = jdtls_turn();
     // `syntax::java_callable` が読む前提（綴りが返ること）を確かめる。綴りそのものは
     // `eprintln!` で出すが、通ったテストの stderr は捕まるので、見るには `--nocapture` を付ける
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/java-lsp");
