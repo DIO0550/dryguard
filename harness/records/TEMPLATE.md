@@ -101,6 +101,7 @@
 | `lint-suppress` | rules/coding.md「禁止事項」（lint 抑制を足さない） |
 | `comment-mismatch` | rules/coding.md「コメントは doc と Why / Why not に絞る」（内容が実装・事実と食い違う） |
 | `comment-missing` | rules/coding.md「Why と Why not は別物として書く」（書くべき Why / Why not が無い） |
+| `comment-redundant` | rules/coding.md「コメントは doc と Why / Why not に絞る」の「消すもの」・「Why と Why not は別物として書く」の 1〜2 行（**内容は事実と合っているのに、置く理由が無い**コメント・doc の文。What の言い換え・経緯・別の doc や `# Errors` と同じことの言い直し・コード内の値や他モジュールの振る舞いの再掲・それで 3 行以上に延びた Why。見分ける問いは「**その文は事実と食い違っているか**」で、食い違っていれば `comment-mismatch`、要る Why / Why not が無ければ `comment-missing`。`分類: なし` から昇格。pr-336 指摘 10・pr-444 指摘 8・pr-480 指摘 2・pr-489 指摘 9・pr-511 指摘 11 の 5 件で、いずれも `なし` のまま） |
 | `naming-mismatch` | rules/naming.md「名前と実体を一致させる」 |
 | `naming-vocabulary` | rules/naming.md「このツールの語彙を固定する」（同じものを別名で呼んだ） |
 | `test-assert-weak` | rules/testing.md「assert は『落ちうるか』で見る」 |
