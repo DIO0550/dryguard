@@ -15,12 +15,18 @@ use crate::line_number::LineNumber;
 use crate::similarity::Similarity;
 use crate::syntax::tree::{Grammar, SyntaxTree};
 
-/// 解決済みの依存先。相対指定は importer の位置から畳んである。
+/// 解決済みの依存先。ファイル位置と名前で指定された依存先を区別する。
 ///
 /// 区切りは常に `/`。プラットフォームの区切りをそのまま持つと、
 /// 同じ依存先が OS によって別の値になる。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ModulePath(String);
+pub struct ModulePath(ModuleIdentity);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ModuleIdentity {
+    File(String),
+    Named(String),
+}
 
 impl ModulePath {
     /// import 指定子を、それを書いているファイルの位置から解決する。
@@ -37,11 +43,11 @@ impl ModulePath {
         let written = with_forward_separators(specifier);
         if !is_relative(&written) {
             // パッケージ名は importer の位置に依らないので、区切りも直さず綴りのまま残す
-            return Self(specifier.to_string());
+            return Self(ModuleIdentity::Named(specifier.to_string()));
         }
 
         let directory = importer.parent().unwrap_or_else(|| Path::new(""));
-        Self(folded_path(directory, &written))
+        Self(ModuleIdentity::File(folded_path(directory, &written)))
     }
 
     /// `crate::` は importer のソース根から解決する。別クレートの同じ綴りを
@@ -57,7 +63,11 @@ impl ModulePath {
             let source_root_text = source_root.to_string_lossy();
             let normalized_root = with_forward_separators(&source_root_text);
             let suffix = specifier.strip_prefix("crate::").unwrap_or("");
-            return Self(format!("{}/{}", normalized_root, suffix.replace("::", "/")));
+            return Self(ModuleIdentity::File(format!(
+                "{}/{}",
+                normalized_root,
+                suffix.replace("::", "/")
+            )));
         }
         if specifier == "self"
             || specifier == "super"
@@ -66,9 +76,11 @@ impl ModulePath {
         {
             let importer_text = importer.to_string_lossy();
             let normalized_importer = with_forward_separators(&importer_text);
-            return Self(format!("{normalized_importer}::{specifier}"));
+            return Self(ModuleIdentity::File(format!(
+                "{normalized_importer}::{specifier}"
+            )));
         }
-        Self(specifier.to_owned())
+        Self(ModuleIdentity::Named(specifier.to_owned()))
     }
 
     /// Swift の `import` が書いたモジュールの綴り（`Dispatch.DispatchTime`）を、区切りを `/` にして持つ。
@@ -81,7 +93,7 @@ impl ModulePath {
             .split('.')
             .map(|segment| segment.trim_matches('`'))
             .collect();
-        Self(path.join("/"))
+        Self(ModuleIdentity::Named(path.join("/")))
     }
 
     /// Java の `import` が書いた綴り（`java.util.List` / `java.util.*`）を、区切りを `/` にして持つ。
@@ -91,12 +103,14 @@ impl ModulePath {
     /// 同じく綴りのまま持つ。
     /// ワイルドカードは `java/util/*` の形で残す（Rust の `use a::*` と同じ）。
     fn from_java_import(specifier: &str) -> Self {
-        Self(specifier.replace('.', "/"))
+        Self(ModuleIdentity::Named(specifier.replace('.', "/")))
     }
 
-    /// 解決済みの依存先そのもの。
+    /// 解決済みの依存先の綴り。等値の判定には種別も含む [`ModulePath`] を使う。
     pub fn as_str(&self) -> &str {
-        &self.0
+        match &self.0 {
+            ModuleIdentity::File(path) | ModuleIdentity::Named(path) => path,
+        }
     }
 }
 
@@ -1671,6 +1685,25 @@ mod tests {
     }
 
     #[test]
+    fn test_module_path_of_a_local_file_differs_from_a_package_with_the_same_spelling() {
+        let local = ModulePath::from_specifier("./shared", Path::new("a.ts"));
+        let package = ModulePath::from_specifier("shared", Path::new("a.ts"));
+
+        assert_eq!(local.as_str(), package.as_str());
+        assert_ne!(local, package);
+    }
+
+    #[test]
+    fn test_import_sets_of_local_and_named_dependencies_do_not_overlap() {
+        let local = tree_of("import { helper } from './shared';");
+        let package = tree_of("import { helper } from 'shared';");
+        let local = ImportSet::from_tree(&local, Path::new("a.ts")).expect("import を読める");
+        let package = ImportSet::from_tree(&package, Path::new("b.ts")).expect("import を読める");
+
+        assert_eq!(local.jaccard(&package).value(), 0.0);
+    }
+
+    #[test]
     fn test_module_path_of_a_sibling_specifier_is_relative_to_the_importer() {
         assert_eq!(
             resolved("./pad", "src/utils/formatDate.ts"),
@@ -1691,8 +1724,8 @@ mod tests {
         // このツールの最悪の外し方（共有ユーティリティに「共通化するな」と言う）は、
         // 指定子を文字列のまま比べたときに起きる
         assert_eq!(
-            resolved("./pad", "src/utils/formatDate.ts"),
-            resolved("../utils/pad", "src/report/dateHelper.ts")
+            ModulePath::from_specifier("./pad", Path::new("src/utils/formatDate.ts")),
+            ModulePath::from_specifier("../utils/pad", Path::new("src/report/dateHelper.ts"))
         );
     }
 
