@@ -678,6 +678,48 @@ fn location_at(path: &Path, line: usize) -> Location {
 }
 
 #[test]
+fn test_compare_of_a_local_file_and_a_same_named_package_is_review_for_both_path_forms() {
+    let directory = scratch_directory("import-identity");
+    let source = "import { helper } from './shared';\n\
+                  export function transform(value: number): number {\n\
+                  const doubled = helper(value) * 2;\n\
+                  const shifted = doubled + 3;\n\
+                  return shifted * value;\n\
+                  }\n";
+    typescript_file(&directory, "a.ts", source);
+    typescript_file(&directory, "b.ts", &source.replace("./shared", "shared"));
+    typescript_file(&directory, "c.ts", source);
+
+    for absolute in [false, true] {
+        for (right, expected_overlap, expected_verdict) in
+            [("b.ts", 0.0, "REVIEW"), ("c.ts", 1.0, "EXTRACT-CANDIDATE")]
+        {
+            let root = if absolute { &directory } else { Path::new("") };
+            let left = format!("{}:2", root.join("a.ts").display());
+            let right = format!("{}:2", root.join(right).display());
+            let output = process::Command::new(env!("CARGO_BIN_EXE_dryguard"))
+                .args(["compare", &left, &right, "--format", "json", "--explain"])
+                .current_dir(&directory)
+                .env("PATH", "")
+                .output()
+                .expect("CLI を起動できる");
+            assert!(output.status.success(), "{:?}", output);
+            let report: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("JSON を出す");
+            assert_eq!(report["verdict"], expected_verdict, "{report}");
+            let import = report["reasons"]
+                .as_array()
+                .expect("根拠がある")
+                .iter()
+                .find(|reason| reason["signal"] == "import-overlap")
+                .expect("依存先の重なりを測れる");
+            assert_eq!(import["value"]["overlap"], expected_overlap, "{report}");
+        }
+    }
+    fs::remove_dir_all(directory).expect("作業ディレクトリを消せる");
+}
+
+#[test]
 fn test_compare_without_an_lsp_server_still_reaches_the_stage1_verdict() {
     // Phase 0 の仮説と同じペア。**サーバを使えなくても判定まで届く**
     // （届かないと、LSP の入っていない環境でツールが使えなくなる）
