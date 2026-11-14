@@ -616,11 +616,12 @@ impl<'source> JavaSpelling<'source> {
 
     /// 名前で書かれた型。メソッドが束縛した型変数なら番号へ付け替え、そうでなければ型名に残す。
     fn named_type_of(&mut self, path: JavaPath, position_node: Node<'_>) -> JavaType {
-        if let [(head, arguments)] = path.as_slice()
-            && arguments.is_empty()
-            && let Some(index) = self.declared.iter().position(|declared| declared == head)
-        {
-            return JavaType::Parameter(index);
+        if let [(head, arguments)] = path.as_slice() {
+            if arguments.is_empty() {
+                if let Some(index) = self.declared.iter().position(|declared| declared == head) {
+                    return JavaType::Parameter(index);
+                }
+            }
         }
 
         let name = path
@@ -628,12 +629,11 @@ impl<'source> JavaSpelling<'source> {
             .map(|(segment, _)| segment.as_str())
             .collect::<Vec<_>>()
             .join(".");
-        if self.recording
-            && !self.type_names.contains(&name)
-            && let Some(position) = source_position_of(position_node, self.source)
-        {
-            self.references
-                .push(TypeReference::new(name.clone(), position));
+        if self.recording && !self.type_names.contains(&name) {
+            if let Some(position) = source_position_of(position_node, self.source) {
+                self.references
+                    .push(TypeReference::new(name.clone(), position));
+            }
         }
         self.type_names.insert(name);
         JavaType::Named(path)
