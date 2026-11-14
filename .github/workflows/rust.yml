@@ -25,6 +25,11 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
+      # tomllib を使うため、ランナーの既定 Python に依存させない。
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.12"
+
       - name: 最低対応 Rust ツールチェーン
         # 宣言と検査する版のずれを防ぐ。minor 指定でも最初の patch を検査する。
         run: |
