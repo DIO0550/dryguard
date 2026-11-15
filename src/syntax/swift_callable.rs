@@ -807,10 +807,10 @@ impl<'source> SwiftSpelling<'source> {
         for child in &children {
             if child.kind() == PARAMETER_KIND {
                 parameters.push(self.parameter_of(*child)?);
-            } else if is_default_value(declaration, *child)
-                && let Some(last) = parameters.last_mut()
-            {
-                last.defaulted = true;
+            } else if is_default_value(declaration, *child) {
+                if let Some(last) = parameters.last_mut() {
+                    last.defaulted = true;
+                }
             }
         }
 
@@ -1149,13 +1149,13 @@ impl<'source> SwiftSpelling<'source> {
             return opened;
         }
 
-        if self.recording
-            && !self.type_names.contains(&name)
-            && let Some(position) =
+        if self.recording && !self.type_names.contains(&name) {
+            if let Some(position) =
                 position_node.and_then(|node| source_position_of(node, self.source))
-        {
-            self.references
-                .push(TypeReference::new(name.clone(), position));
+            {
+                self.references
+                    .push(TypeReference::new(name.clone(), position));
+            }
         }
         self.type_names.insert(name);
         match resolution {

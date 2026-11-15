@@ -894,8 +894,10 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             let work_is_pending =
                 !self.running_progress.is_empty() || !self.prepared_progress.is_empty();
             let untouched_by_work = !noticed_while_answering && !work_is_pending;
-            if untouched_by_work && let Some(answered) = answered {
-                return Ok(answered);
+            if untouched_by_work {
+                if let Some(answered) = answered {
+                    return Ok(answered);
+                }
             }
 
             attempts_left -= 1;
