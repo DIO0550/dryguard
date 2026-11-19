@@ -19,7 +19,7 @@ use std::num::NonZeroUsize;
 use crate::lsp::{ClientError, HoverOutcome, Session, SignatureText, SourceDocument};
 use crate::semantics::resolved_type::{
     ResolvedTypes, RustDeclarationCache, SwiftDeclarationCache, TracedTypeNames, TypeDeclaration,
-    UnopenedReason, java_traced_type_names_of, rust_traced_type_names_of,
+    UnopenedReason, java_traced_type_names_of, rust_traced_type_names_of, swift_alias_reason_of,
     swift_declared_resolution_of, swift_traced_type_names_of,
 };
 use crate::source_position::SourcePosition;
@@ -473,9 +473,9 @@ pub fn swift_normalized_outcome_of(
     {
         return TypeSignatureOutcome::UnopenedTypeName { reason };
     }
-    if callable.has_unopenable_alias() {
+    if let Some(failure) = callable.alias_failure() {
         return TypeSignatureOutcome::UnopenedTypeName {
-            reason: UnopenedReason::UnopenableAlias,
+            reason: swift_alias_reason_of(failure),
         };
     }
 

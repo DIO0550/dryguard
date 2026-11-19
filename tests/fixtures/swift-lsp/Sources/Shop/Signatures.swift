@@ -83,6 +83,14 @@ func coupled(value: Couple<Int>) -> Int {
     value.0
 }
 
+func paired(value: (Int, Int)) -> Int {
+    value.0
+}
+
+func mixed(value: (Int, Double)) -> Int {
+    value.0
+}
+
 func boxed(value: Box<Int>.Item) -> Int {
     value * 2
 }
