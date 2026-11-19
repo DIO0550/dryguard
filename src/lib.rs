@@ -15,7 +15,7 @@
 //! `config` が読む `dryguard.toml` > 既定値の順に決まる。`dryguard.toml` の `[domains]` が
 //! 宣言したドメイン（`domain_declaration`）は、ディレクトリからの推定に勝つ。
 //! 出力は `--format` が人の読む text とエージェントの読む JSON を切り替える
-//! （**どちらにも同じ根拠が出る**。JSON のスキーマ安定化は Phase 5）。
+//! （**どちらにも同じ根拠が出る**。JSON の形と版は `docs/json-output.md`）。
 //!
 //! `lsp` はサーバの起動・JSON-RPC の往復・握手・ワークスペースの根の受け渡し・
 //! 候補ペアのファイルの開閉・hover / references の問い合わせを持つ。

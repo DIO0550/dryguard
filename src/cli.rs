@@ -121,9 +121,8 @@ pub enum LanguageOption {
 
 /// `--format` が取る値。
 ///
-/// **JSON スキーマはまだ安定していない。** 形を固めるのは Phase 5 で、
-/// それまではシグナルの構造が変わると読む側も追従することになる
-/// （`docs/dryguard-plan.md`「Phase 5: エージェント連携」）。
+/// JSON の形は `docs/json-output.schema.json` が持ち、出力の `schema_version` が版を示す。
+/// 読み方と破壊的変更の扱いは `docs/json-output.md`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     /// 人が読む形式

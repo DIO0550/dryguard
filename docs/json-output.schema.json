@@ -1,0 +1,309 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/DIO0550/dryguard/docs/json-output.schema.json",
+  "title": "dryguard --format json",
+  "description": "dryguard の `--format json` の出力。`compare` はペア 1 つ（compare_output）、`scan` / `check` は走査の結果一式（scan_output）を出す。読み方と破壊的変更の扱いは docs/json-output.md。キーの追加は版を上げずに行うので、知らないキーは無視して読む。",
+  "oneOf": [
+    { "$ref": "#/$defs/compare_output" },
+    { "$ref": "#/$defs/scan_output" }
+  ],
+  "$defs": {
+    "schema_version": {
+      "description": "出力の形の版。読む側が壊れる変更（キーの削除・改名、値の型・意味の変更、閉じた語彙への値の増減）のときだけ上がる。知らない版なら読まずに止まる。",
+      "const": 1
+    },
+    "compare_output": {
+      "description": "`compare` の出力。ペア 1 つの判定に、最上位の版が付く。",
+      "type": "object",
+      "allOf": [{ "$ref": "#/$defs/pair" }],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schema_version" }
+      },
+      "required": ["schema_version"]
+    },
+    "scan_output": {
+      "description": "`scan` / `check` の出力。候補ペアの判定と、走査で見なかったもの・走査した量。",
+      "type": "object",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "candidate_pairs": {
+          "description": "構造類似度が閾値に届いた候補ペアの判定。並びに意味は無い。中のペアに schema_version は付かない。",
+          "type": "array",
+          "items": { "$ref": "#/$defs/pair" }
+        },
+        "skipped_files": {
+          "description": "読めずに飛ばしたファイル。無くても空配列で出る。",
+          "type": "array",
+          "items": { "$ref": "#/$defs/skipped_file" }
+        },
+        "unchunkable": {
+          "description": "構文エラーで切り出せなかった関数の位置。無くても空配列で出る。",
+          "type": "array",
+          "items": { "$ref": "#/$defs/location" }
+        },
+        "walked": { "$ref": "#/$defs/walked" }
+      },
+      "required": ["schema_version", "candidate_pairs", "skipped_files", "unchunkable", "walked"]
+    },
+    "pair": {
+      "description": "2 つの関数の判定と、その根拠。",
+      "type": "object",
+      "properties": {
+        "verdict": { "$ref": "#/$defs/verdict" },
+        "location_a": { "$ref": "#/$defs/location" },
+        "location_b": { "$ref": "#/$defs/location" },
+        "reasons": {
+          "description": "判定を傾けた根拠。尋ねなかったシグナル（status が not-asked）のうち、stage-1-only と unaligned-tokens は `--explain` のときだけ並ぶ。not-a-candidate は既定でも並ぶ。",
+          "type": "array",
+          "items": { "$ref": "#/$defs/reason" }
+        },
+        "suggestion": {
+          "description": "人が読む提案の文（日本語）。verdict から決まるので、エージェントは verdict で分岐し、この文を解釈しない。",
+          "type": "string"
+        }
+      },
+      "required": ["verdict", "location_a", "location_b", "reasons", "suggestion"]
+    },
+    "verdict": {
+      "description": "判定。閉じた語彙で、値が増減したら版が上がる。各値の description がエージェントの取るべき行動。",
+      "oneOf": [
+        {
+          "const": "EXTRACT-CANDIDATE",
+          "description": "共通化してよい。1 つにまとめる先を検討する。まとめるかどうかは作業の範囲に照らして決め、この判定だけを理由に無関係な変更へ広げない。"
+        },
+        {
+          "const": "DO-NOT-EXTRACT",
+          "description": "共通化しない。似ているのは偶然で、意味が違う。「直せ」ではないので何も変更しない。この 2 つをまとめる変更を始めていたなら、それを取り下げる。"
+        },
+        {
+          "const": "REVIEW",
+          "description": "判断材料が足りない。共通化もその取り下げも自分で決めず、人に判断を仰ぐ。reasons の value.status が unmeasurable のシグナルは、環境やコードを直すと測れるようになることがある。compare で structural-similarity の lean が toward-extract でないペアは、似ていないので何もしない。"
+        }
+      ]
+    },
+    "location": {
+      "description": "ファイルと 1 始まりの行。",
+      "type": "object",
+      "properties": {
+        "file": { "type": "string" },
+        "line": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["file", "line"]
+    },
+    "reason": {
+      "description": "シグナル 1 つの値と、それが判定を傾けた向き。",
+      "type": "object",
+      "properties": {
+        "signal": {
+          "description": "シグナルの名前。開いた語彙で、増えても版は上がらない。知らない名前の根拠は飛ばしてよい。",
+          "type": "string",
+          "examples": [
+            "structural-similarity",
+            "leaf-divergence",
+            "import-overlap",
+            "module-distance",
+            "type-signature-match",
+            "caller-domain-overlap",
+            "callee-domain-overlap"
+          ]
+        },
+        "value": { "$ref": "#/$defs/value" },
+        "lean": { "$ref": "#/$defs/lean" },
+        "threshold": {
+          "description": "判定が当てた 0.0-1.0 の閾値。測れたときだけ付く。structural-similarity は常に、それ以外は `--explain` のときだけ。",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "separate_directory_steps": {
+          "description": "module-distance がディレクトリで比べたときに、別ドメインと見なした段数。`--explain` のときだけ付く。",
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": ["signal", "value", "lean"],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "signal": { "const": "structural-similarity" },
+              "value": { "properties": { "status": { "const": "measured" } } }
+            }
+          },
+          "then": { "properties": { "value": { "required": ["similarity"] } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "signal": { "const": "leaf-divergence" },
+              "value": { "properties": { "status": { "const": "measured" } } }
+            }
+          },
+          "then": { "properties": { "value": { "required": ["divergent_leaves"] } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "signal": { "const": "import-overlap" },
+              "value": { "properties": { "status": { "const": "measured" } } }
+            }
+          },
+          "then": { "properties": { "value": { "required": ["overlap"] } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "signal": { "const": "module-distance" },
+              "value": { "properties": { "status": { "const": "measured" } } }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "oneOf": [
+                  { "required": ["steps"] },
+                  { "required": ["declared_domain_a", "declared_domain_b"] }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "signal": { "const": "type-signature-match" },
+              "value": { "properties": { "status": { "const": "measured" } } }
+            }
+          },
+          "then": { "properties": { "value": { "required": ["unifiable"] } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "signal": { "const": "caller-domain-overlap" },
+              "value": { "properties": { "status": { "const": "measured" } } }
+            }
+          },
+          "then": { "properties": { "value": { "required": ["overlap", "callers_a", "callers_b"] } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "signal": { "const": "callee-domain-overlap" },
+              "value": { "properties": { "status": { "const": "measured" } } }
+            }
+          },
+          "then": { "properties": { "value": { "required": ["overlap", "callees_a", "callees_b"] } } }
+        }
+      ]
+    },
+    "lean": {
+      "description": "シグナルが判定を傾けた向き。閉じた語彙。",
+      "oneOf": [
+        { "const": "toward-extract", "description": "共通化する側へ傾けた。" },
+        { "const": "toward-do-not-extract", "description": "共通化しない側へ傾けた。" },
+        { "const": "neither", "description": "どちらへも傾けなかった（測れなかったシグナルを含む）。" }
+      ]
+    },
+    "status": {
+      "description": "`signal status`。シグナルの値が測れたか。閉じた語彙。",
+      "oneOf": [
+        { "const": "measured", "description": "測れた。value にシグナルごとの値が並ぶ。" },
+        { "const": "unmeasurable", "description": "尋ねたが測れなかった。value.reason が理由で、理由ごとの値が並ぶことがある。" },
+        { "const": "not-asked", "description": "そもそも尋ねていない（Stage 1 で降りた・候補ペアでない）。value.reason が理由。" }
+      ]
+    },
+    "value": {
+      "description": "シグナルの値。先頭の status で分岐する。measured のときに並ぶキーはシグナルごとに違い（reason の allOf）、unmeasurable / not-asked のときは reason と、理由ごとの値が並ぶ。",
+      "type": "object",
+      "properties": {
+        "status": { "$ref": "#/$defs/status" },
+        "reason": {
+          "description": "測れなかった / 尋ねていない理由。開いた語彙で、増えても版は上がらない。知らない理由は status だけで扱う。",
+          "type": "string",
+          "examples": ["no-tokens", "stage-1-only", "not-a-candidate", "lsp-unusable", "untraced-type-name", "no-references"]
+        },
+        "similarity": { "description": "structural-similarity。丸めない 0.0-1.0。", "type": "number", "minimum": 0, "maximum": 1 },
+        "overlap": { "description": "import-overlap / caller-domain-overlap / callee-domain-overlap の重なり（Jaccard）。", "type": "number", "minimum": 0, "maximum": 1 },
+        "steps": { "description": "module-distance。2 つのファイルを隔てるディレクトリの段数。", "type": "integer", "minimum": 0 },
+        "declared_domain_a": { "description": "module-distance を宣言で比べたときの a 側の宣言の名前。当たらなければ null。", "type": ["string", "null"] },
+        "declared_domain_b": { "description": "同じく b 側。", "type": ["string", "null"] },
+        "unifiable": { "description": "type-signature-match。型シグネチャが単一化できたか。", "type": "boolean" },
+        "divergent_leaves": {
+          "description": "leaf-divergence。同じ位置で綴りが違った葉の組。違いが無ければ空配列。",
+          "type": "array",
+          "items": { "$ref": "#/$defs/divergent_leaf" }
+        },
+        "callers_a": { "description": "caller-domain-overlap。a 側の参照元のドメインごとの件数。", "type": "array", "items": { "$ref": "#/$defs/domain_count" } },
+        "callers_b": { "description": "同じく b 側。", "type": "array", "items": { "$ref": "#/$defs/domain_count" } },
+        "callees_a": { "description": "callee-domain-overlap。a 側の呼び出し先のドメインごとの件数。", "type": "array", "items": { "$ref": "#/$defs/domain_count" } },
+        "callees_b": { "description": "同じく b 側。", "type": "array", "items": { "$ref": "#/$defs/domain_count" } },
+        "line": { "description": "理由が指す 1 始まりの行（読めなかった import 宣言・参照元の位置）。", "type": "integer", "minimum": 1 },
+        "character": { "description": "理由が指す列（UTF-16 のコード単位、0 始まり）。", "type": "integer", "minimum": 0 },
+        "path": { "description": "理由が指すファイル（読めなかった参照元・2 つの宣言に当たったファイル）。", "type": "string" },
+        "domains": { "description": "ambiguous-domain。ファイルが当たった宣言の名前。", "type": "array", "items": { "type": "string" } },
+        "counted": { "description": "overload-set-miscounted。サーバが数えたオーバーロードの本数。", "type": "integer" },
+        "found": { "description": "overload-set-miscounted。構文木から見つけた宣言の数。", "type": "integer" },
+        "project_markers": { "description": "project-unrooted / outside-project。サーバがプロジェクトの根と見なすファイルの名前。", "type": "array", "items": { "type": "string" } },
+        "unopened": { "description": "unopened-type-name。型名を開けなかった理由。開いた語彙。", "type": "string" },
+        "untraced": { "description": "untraced-type-name。型名を尋ねていない理由。開いた語彙。omitted-type-annotation なら、注釈を書くと測れるようになる。", "type": "string" },
+        "count": { "description": "several-call-hierarchy-items。返ってきた起点の数。", "type": "integer" }
+      },
+      "required": ["status"],
+      "if": { "properties": { "status": { "enum": ["unmeasurable", "not-asked"] } } },
+      "then": { "required": ["reason"] }
+    },
+    "divergent_leaf": {
+      "description": "同じ位置にあった両側の綴り。",
+      "type": "object",
+      "properties": {
+        "a": { "type": "string" },
+        "b": { "type": "string" }
+      },
+      "required": ["a", "b"]
+    },
+    "domain_count": {
+      "description": "ドメイン 1 つと、そこに属する参照元（references）または呼び出し先（callees）の件数。",
+      "type": "object",
+      "properties": {
+        "domain": { "description": "宣言の名前か、ディレクトリのパス（縮めない）。", "type": "string" },
+        "declared": { "description": "domain が宣言の名前なら true、ディレクトリなら false。", "type": "boolean" },
+        "references": { "type": "integer", "minimum": 1 },
+        "callees": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["domain", "declared"]
+    },
+    "skipped_file": {
+      "description": "読めずに飛ばしたファイル。",
+      "type": "object",
+      "properties": {
+        "file": { "type": "string" },
+        "reason": {
+          "description": "飛ばした理由。開いた語彙。",
+          "type": "string",
+          "examples": ["unreadable-extension", "source-unreadable", "source-unparsable"]
+        },
+        "cause": { "description": "OS やパーサが返した文。source-unreadable / source-unparsable のときだけ付く。", "type": "string" }
+      },
+      "required": ["file", "reason"]
+    },
+    "walked": {
+      "description": "走査した量。候補ペアの数は candidate_pairs の要素数で読む。",
+      "type": "object",
+      "properties": {
+        "files": { "type": "integer", "minimum": 0 },
+        "chunks": { "type": "integer", "minimum": 0 },
+        "excluded_test_functions": { "type": "integer", "minimum": 0 },
+        "undersized_chunks": { "type": "integer", "minimum": 0 },
+        "compared_pairs": { "type": "integer", "minimum": 0 },
+        "pruned_pairs": { "type": "integer", "minimum": 0 },
+        "changed_chunks": {
+          "description": "`check --diff` のときだけ付く、変わった行を含む関数の数。0 なら変更が無かった。",
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": ["files", "chunks", "excluded_test_functions", "undersized_chunks", "compared_pairs", "pruned_pairs"]
+    }
+  }
+}

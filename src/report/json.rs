@@ -34,6 +34,20 @@ use crate::semantics::type_signature::UntracedReason;
 use crate::syntax::import::ImportsUnavailable;
 use crate::threshold::Threshold;
 
+/// 出力の形の版。`compare` と `scan` / `check` の JSON の最上位に `schema_version` として載る。
+///
+/// **上げるのは読む側が壊れる変更だけ**（キーの削除・改名、値の型・意味の変更、
+/// 閉じた語彙への値の増減）。キーの追加と開いた語彙への値の追加では上げない。
+/// 線引きと読む側への約束は `docs/json-output.md`、形は `docs/json-output.schema.json` が持ち、
+/// スキーマの `schema_version` の `const` とこの値はテストが突き合わせる。
+///
+/// **Why not（semver の文字列）**: 非破壊の変更で上げないので、読む側が比べるのは
+/// 壊れたかどうかの 1 段だけ。整数で足りる。
+const JSON_SCHEMA_VERSION: u32 = 1;
+
+/// 最上位に版を載せるキー。
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+
 /// シグナルの値が測れたときの `signal status`。
 const MEASURED_STATUS: &str = "measured";
 
@@ -59,6 +73,8 @@ const REASON_KEY: &str = "reason";
 /// `--explain` のときだけ出る。形式によって出る中身が変わると、
 /// **同じ判定を 2 通りの範囲で読むことになる**。
 ///
+/// 最上位に `schema_version`（`JSON_SCHEMA_VERSION`）を載せる。
+///
 /// 末尾に改行は付けない（呼ぶ側が `println!` で出す）。
 pub fn json_of(
     location_a: &Location,
@@ -66,7 +82,8 @@ pub fn json_of(
     classification: &Classification,
     explanation: Explanation,
 ) -> String {
-    let value = pair_value_of(location_a, location_b, classification, explanation);
+    let mut value = pair_value_of(location_a, location_b, classification, explanation);
+    value[SCHEMA_VERSION_KEY] = json!(JSON_SCHEMA_VERSION);
 
     format!("{value:#}")
 }
@@ -75,12 +92,16 @@ pub fn json_of(
 ///
 /// `explanation` は根拠をどこまで出すか（`--explain` が [`Explanation::AllSignals`]）。
 ///
-/// 候補ペアは [`json_of`] と同じ形で並べる。**`compare` と `scan` で同じペアの
-/// 見え方が変わると、片方で見た結果をもう片方で確かめられない。**
+/// 候補ペアは [`json_of`] と同じ形で並べる（最上位の `schema_version` だけは出力全体に 1 つ）。
+/// **`compare` と `scan` で同じペアの見え方が変わると、片方で見た結果をもう片方で
+/// 確かめられない。**
 ///
 /// 飛ばしたファイルと切り出せなかった関数は、**1 件も無くても配列を出す**。
 /// text が節ごと消すのは見出しだけの節を読ませないためだが、JSON の読む側は
 /// キーの有無で分岐するより空配列を受け取るほうが短い。
+///
+/// 最上位に `schema_version`（`JSON_SCHEMA_VERSION`）を 1 つだけ載せ、中に並ぶペアには付けない。
+/// **同じ値を候補ペアの数だけ並べない** — 版は出力全体で 1 つに決まる。
 ///
 /// 末尾に改行は付けない（呼ぶ側が `println!` で出す）。
 pub fn scan_json_of(scan: &Scan, explanation: Explanation) -> String {
@@ -138,6 +159,7 @@ fn scan_value_of(scan: &Scan, explanation: Explanation) -> Value {
     let unchunkable: Vec<Value> = scan.unchunkable().iter().map(location_value_of).collect();
 
     json!({
+        SCHEMA_VERSION_KEY: JSON_SCHEMA_VERSION,
         "candidate_pairs": candidate_pairs,
         "skipped_files": skipped_files,
         "unchunkable": unchunkable,
@@ -785,9 +807,11 @@ fn untraced_name_of(reason: UntracedReason) -> &'static str {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
     use crate::classification::signal::{DeclaredDomains, Signals};
+    use crate::classification::verdict::Verdict;
     use crate::classification::{
         ConfiguredThresholds, DEFAULT_STRUCTURAL_SIMILARITY_THRESHOLD, classification_of,
     };
@@ -1656,5 +1680,323 @@ mod tests {
             reason_of(&json, "leaf-divergence")["value"],
             json!({ "status": "unmeasurable", "reason": "no-tokens" })
         );
+    }
+
+    /// `docs/json-output.schema.json` を読んだもの。
+    fn schema() -> Value {
+        serde_json::from_str(include_str!("../../docs/json-output.schema.json"))
+            .expect("スキーマは JSON として読める")
+    }
+
+    /// スキーマの `$defs` の 1 つが `properties` に並べたキー。
+    fn schema_property_names_of(definition: &str) -> BTreeSet<String> {
+        let schema = schema();
+        let Some(properties) = schema["$defs"][definition]["properties"].as_object() else {
+            panic!("スキーマの $defs.{definition} に properties がある");
+        };
+        properties.keys().cloned().collect()
+    }
+
+    /// スキーマの `$defs` の 1 つが閉じた語彙として並べた綴り（`oneOf` の `const`）。
+    fn schema_constants_of(definition: &str) -> BTreeSet<String> {
+        let schema = schema();
+        let Some(alternatives) = schema["$defs"][definition]["oneOf"].as_array() else {
+            panic!("スキーマの $defs.{definition} は oneOf で値を並べる");
+        };
+        alternatives
+            .iter()
+            .map(|alternative| {
+                alternative["const"]
+                    .as_str()
+                    .expect("並べた値はどれも文字列の const")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// オブジェクトが持つキー。
+    fn keys_of(value: &Value) -> BTreeSet<String> {
+        value
+            .as_object()
+            .expect("オブジェクトで出る")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// 出力のキーのうち、スキーマが定義していないもの。空ならスキーマが追いついている。
+    fn undefined_keys_of(value: &Value, defined: &BTreeSet<String>) -> BTreeSet<String> {
+        keys_of(value).difference(defined).cloned().collect()
+    }
+
+    /// 根拠の `value` に出るキーを、スキーマが定義したキーすべてにわたって出す見本。
+    ///
+    /// 各キーを出す形を 1 つずつ選んである。新しいキーを足したら、それを出す形もここに足す
+    /// （足さなければ [`test_schema_defines_exactly_the_keys_of_a_signal_value`] が落ちる）。
+    fn sample_values() -> Vec<Value> {
+        let divergent =
+            DivergentLeaves::new(vec![DivergentLeaf::new("a", "b")]).expect("1 組あるので作れる");
+        let declarations = DomainDeclarations::default();
+        let callers = |path: &str| {
+            CallerDomains::from_reference_paths(&[PathBuf::from(path)], &declarations)
+                .expect("宣言は食い違わない")
+                .expect("参照元は 1 件")
+        };
+        let ambiguous = declarations_of(&[
+            ("billing", &["src/billing/**"]),
+            ("reporting", &["src/**/report*.ts"]),
+        ])
+        .declared_domain_of(Path::new("/repo/src/billing/report.ts"))
+        .expect_err("2 つの宣言に当たる");
+        let invalid_position =
+            crate::semantics::caller_domain::ReferenceSourceError::InvalidPosition {
+                path: PathBuf::from("/repo/src/caller.rs"),
+                position: crate::source_position::SourcePosition::from_lsp_position(
+                    lsp_types::Position::new(3, 7),
+                ),
+            };
+        let unreadable_import = Signals::new(
+            StructuralSimilarity::Measured(measured(0.91)),
+            LeafDivergence::UnalignedTokens,
+            ImportOverlap::Unavailable(ImportsUnavailable::UnreadableDeclaration { line: line(2) }),
+            separate_directories(),
+        );
+        let signals = [
+            accidental_duplication(),
+            unreadable_import,
+            accidental_duplication_with_one_declared_side(),
+            accidental_duplication().with_semantics(
+                TypeSignatureMatch::Unifiable,
+                CallerDomainOverlap::Measured(MeasuredCallerDomains::new(
+                    callers("/repo/src/billing/invoice.ts"),
+                    callers("/repo/src/inventory/stock.ts"),
+                )),
+            ),
+            accidental_duplication().with_semantics(
+                TypeSignatureMatch::OverloadSetMiscounted {
+                    counted: overload_count(3),
+                    found: 1,
+                },
+                CallerDomainOverlap::ProjectUnrooted {
+                    markers: vec!["tsconfig.json".to_owned()],
+                },
+            ),
+            accidental_duplication()
+                .with_semantics(
+                    TypeSignatureMatch::UnopenedTypeName {
+                        reason: UnopenedReason::CyclicAlias,
+                    },
+                    CallerDomainOverlap::UnclassifiedReference(invalid_position),
+                )
+                .with_callee_domain_overlap(CalleeDomainOverlap::AmbiguousDomain(ambiguous)),
+            accidental_duplication()
+                .with_semantics(
+                    TypeSignatureMatch::UntracedTypeName {
+                        reason: UntracedReason::OmittedTypeAnnotation,
+                    },
+                    CallerDomainOverlap::NoReferences,
+                )
+                .with_callee_domain_overlap(CalleeDomainOverlap::SeveralCallHierarchyItems {
+                    count: 2,
+                }),
+        ];
+        let mut outputs: Vec<Value> = signals
+            .iter()
+            .map(|signals| json_of_signals(signals, Explanation::AllSignals))
+            .collect();
+        outputs.push(json_of_callees_in_separate_domains(Explanation::AllSignals));
+        outputs.push(json_of_leaf_divergence(
+            LeafDivergence::Diverged(divergent),
+            Explanation::AllSignals,
+        ));
+
+        outputs
+            .iter()
+            .flat_map(|output| {
+                output["reasons"]
+                    .as_array()
+                    .expect("根拠は配列で出る")
+                    .iter()
+                    .map(|reason| reason["value"].clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_json_of_carries_the_schema_version_at_the_top() {
+        let json = json_of_signals(&accidental_duplication(), Explanation::AskedSignals);
+
+        assert_eq!(json["schema_version"], JSON_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_scan_json_of_carries_the_schema_version_once_for_the_whole_walk() {
+        // 走査の中では最上位の 1 つが版を決め、中のペアには付けない
+        let json = scan_json_of_fixture("scan");
+
+        assert_eq!(json["schema_version"], JSON_SCHEMA_VERSION);
+        assert!(
+            json["candidate_pairs"][0].get("schema_version").is_none(),
+            "走査の中のペアに同じ版を並べない: {:#}",
+            json["candidate_pairs"][0]
+        );
+    }
+
+    #[test]
+    fn test_schema_declares_the_version_the_output_carries() {
+        assert_eq!(
+            schema()["$defs"]["schema_version"]["const"],
+            JSON_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn test_schema_lists_exactly_the_verdicts_the_classification_returns() {
+        // `_` を置かない match。バリアントを足すとここがコンパイルで落ち、下の並びの直し忘れを止める
+        match Verdict::Review {
+            Verdict::ExtractCandidate | Verdict::DoNotExtract | Verdict::Review => {}
+        }
+        let verdicts: BTreeSet<String> = [
+            Verdict::ExtractCandidate,
+            Verdict::DoNotExtract,
+            Verdict::Review,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+
+        assert_eq!(schema_constants_of("verdict"), verdicts);
+    }
+
+    #[test]
+    fn test_schema_lists_exactly_the_leans_the_output_names() {
+        // verdict と同じく、バリアントを足すとコンパイルで落ちる
+        match Lean::Neither {
+            Lean::TowardExtract | Lean::TowardDoNotExtract | Lean::Neither => {}
+        }
+        let leans: BTreeSet<String> =
+            [Lean::TowardExtract, Lean::TowardDoNotExtract, Lean::Neither]
+                .into_iter()
+                .map(|lean| lean_name_of(lean).to_owned())
+                .collect();
+
+        assert_eq!(schema_constants_of("lean"), leans);
+    }
+
+    #[test]
+    fn test_schema_lists_exactly_the_signal_statuses_the_output_names() {
+        let statuses: BTreeSet<String> = [MEASURED_STATUS, UNMEASURABLE_STATUS, NOT_ASKED_STATUS]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+        assert_eq!(schema_constants_of("status"), statuses);
+    }
+
+    #[test]
+    fn test_schema_defines_exactly_the_keys_of_a_compare_output() {
+        // 両方向で比べる。実装だけが持つキーはスキーマが古く、スキーマだけが持つキーは
+        // 実装が消した（読む側が壊れる）か改名した
+        let json = json_of_signals(&accidental_duplication(), Explanation::AllSignals);
+        let defined: BTreeSet<String> = schema_property_names_of("pair")
+            .union(&schema_property_names_of("compare_output"))
+            .cloned()
+            .collect();
+
+        assert_eq!(keys_of(&json), defined);
+        assert_eq!(
+            keys_of(&json["location_a"]),
+            schema_property_names_of("location")
+        );
+    }
+
+    #[test]
+    fn test_schema_defines_exactly_the_keys_of_a_reason_with_every_applied_threshold() {
+        // 構造類似度は threshold を、ディレクトリで比べたモジュール距離は
+        // separate_directory_steps を `--explain` で持つ。2 つを合わせると reason の全キーになる
+        let json = json_of_signals(&accidental_duplication(), Explanation::AllSignals);
+        let keys: BTreeSet<String> = ["structural-similarity", "module-distance"]
+            .into_iter()
+            .flat_map(|signal| keys_of(&reason_of(&json, signal)))
+            .collect();
+
+        assert_eq!(keys, schema_property_names_of("reason"));
+    }
+
+    #[test]
+    fn test_schema_defines_every_key_of_a_domain_count_and_a_divergent_leaf() {
+        let callees = json_of_callees_in_separate_domains(Explanation::AskedSignals);
+        let divergent =
+            DivergentLeaves::new(vec![DivergentLeaf::new("a", "b")]).expect("1 組あるので作れる");
+        let leaves = json_of_leaf_divergence(
+            LeafDivergence::Diverged(divergent),
+            Explanation::AskedSignals,
+        );
+
+        assert_eq!(
+            undefined_keys_of(
+                &reason_of(&callees, "callee-domain-overlap")["value"]["callees_a"][0],
+                &schema_property_names_of("domain_count")
+            ),
+            BTreeSet::new()
+        );
+        assert_eq!(
+            keys_of(&reason_of(&leaves, "leaf-divergence")["value"]["divergent_leaves"][0]),
+            schema_property_names_of("divergent_leaf")
+        );
+    }
+
+    #[test]
+    fn test_schema_refers_only_to_definitions_it_has() {
+        let schema = schema();
+        let text = schema.to_string();
+        let referred: BTreeSet<&str> = text
+            .split("\"$ref\":\"#/$defs/")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        let defined: BTreeSet<&str> = schema["$defs"]
+            .as_object()
+            .expect("$defs はオブジェクト")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        assert!(!referred.is_empty(), "$ref を 1 つ以上たどれている");
+        assert_eq!(
+            referred.difference(&defined).collect::<Vec<_>>(),
+            Vec::<&&str>::new()
+        );
+    }
+
+    #[test]
+    fn test_schema_defines_exactly_the_keys_of_a_scan_output() {
+        let json = scan_json_of_fixture("scan-skipped");
+
+        assert_eq!(keys_of(&json), schema_property_names_of("scan_output"));
+        assert_eq!(
+            keys_of(&json["unchunkable"][0]),
+            schema_property_names_of("location")
+        );
+        assert_eq!(
+            undefined_keys_of(&json["walked"], &schema_property_names_of("walked")),
+            BTreeSet::new()
+        );
+        assert_eq!(
+            undefined_keys_of(
+                &json["skipped_files"][0],
+                &schema_property_names_of("skipped_file")
+            ),
+            BTreeSet::new()
+        );
+    }
+
+    #[test]
+    fn test_schema_defines_exactly_the_keys_of_a_signal_value() {
+        // 見本すべての value のキーを合わせたものと、スキーマの value のキーを両方向で比べる
+        let keys: BTreeSet<String> = sample_values().iter().flat_map(keys_of).collect();
+
+        assert_eq!(keys, schema_property_names_of("value"));
     }
 }
