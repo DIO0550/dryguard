@@ -2303,6 +2303,36 @@ done
     }
 
     #[test]
+    fn test_swift_alias_is_read_from_generated_interfaces_but_not_from_toolchain_interfaces() {
+        // ツールチェーンのインタフェースは右辺をモジュールで修飾する（`Swift::Decodable`）ので、
+        // 直接書いた `Decodable` と綴りが食い違う
+        let source = "import Glibc\n\npublic func === (lhs: Int, rhs: Int) -> Bool\n\n/// doc\npublic typealias TimeInterval = Double\n\npublic func f() -> Int\n";
+        let site_in = |path: &str| {
+            let position = SourcePosition::from_preceding_text(
+                crate::line_number::LineNumber::new(6).expect("正の行番号"),
+                "public typealias ",
+            );
+            DeclarationSite::new(std::path::Path::new(path), position).expect("絶対パス")
+        };
+
+        let generated =
+            site_in("/tmp/sourcekit-lsp/GeneratedInterfaces/111/Foundation.swiftinterface");
+        let toolchain = site_in(
+            "/toolchain/usr/lib/swift/linux/Foundation.swiftmodule/x86_64-unknown-linux-gnu.swiftinterface",
+        );
+
+        assert!(swift_alias_source_of(&generated, source).is_some());
+        assert!(swift_alias_source_of(&toolchain, source).is_none());
+        // 対照: 利用者のソースはファイル全体を読む。根が ERROR の木では許可リストが開かせない
+        let user = site_in("/repo/Sources/Shop/Money.swift");
+        assert!(swift_alias_source_of(&user, source).is_none());
+        assert!(
+            swift_alias_source_of(&user, "\n\n\n\n\npublic typealias TimeInterval = Double\n")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn test_swift_alias_spelling_is_read_after_modifiers() {
         assert!(is_swift_alias_spelling("typealias Money = Int"));
         // sourcekit-lsp 6.4.2 は修飾子ごと綴る。先頭だけを見るとエイリアスでないと読む

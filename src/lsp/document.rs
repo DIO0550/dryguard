@@ -257,6 +257,22 @@ mod tests {
     }
 
     #[test]
+    fn test_with_grammar_opens_a_generated_swift_interface_as_swift() {
+        // sourcekit-lsp が宣言を置く生成インタフェース。`new` は拡張子で断る（対照）
+        let path = repository_path("GeneratedInterfaces/1/Foundation.swiftinterface");
+        let text = "public typealias TimeInterval = Double\n".to_owned();
+
+        let document = SourceDocument::with_grammar(&path, text.clone(), Grammar::Swift)
+            .expect("ドキュメントにできる");
+
+        assert_eq!(document.to_text_document_item().language_id, "swift");
+        assert!(matches!(
+            SourceDocument::new(&path, text),
+            Err(DocumentError::UnreadableExtension { .. })
+        ));
+    }
+
+    #[test]
     fn test_new_keeps_the_text_it_was_given() {
         // 開いた中身がディスク上のものとずれると、位置を指す問い合わせが別の場所を指す
         let path = repository_path("tests/fixtures/billing/discount.ts");
