@@ -1,3 +1,5 @@
+import Foundation
+
 /// `tests/swift_lsp.rs` が型シグネチャを比べる関数。本体の違いは型シグネチャに効かない。
 func doubled(value: Int) -> Int {
     value * 2
@@ -93,4 +95,21 @@ func mixed(value: (Int, Double)) -> Int {
 
 func boxed(value: Box<Int>.Item) -> Int {
     value * 2
+}
+
+/// 標準ライブラリ・Foundation の生成インタフェースにある `typealias` を通る関数。
+func waited(value: TimeInterval) -> Int {
+    Int(value / 2)
+}
+
+func coded(value: Codable) -> Int {
+    0
+}
+
+func composed(value: Decodable & Encodable) -> Int {
+    0
+}
+
+func objected(value: AnyObject) -> Int {
+    0
 }
