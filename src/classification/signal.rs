@@ -410,11 +410,11 @@ pub enum CallerDomainOverlap {
     /// **`OutsideProject` と分ける。** あちらは**範囲外だと確かめた**答えで、こちらは
     /// **確かめる術が無い**。利用者が直す先も違う（印の範囲 / 使うサーバ）。
     ProjectMembershipNotProvided,
-    /// どちらかのチャンクに数える参照元がない（Rust テスト内の参照は除く）。
+    /// どちらかのチャンクに数える参照元がない（Rust・Swift のテスト内の参照は除く）。
     NoReferences,
     /// 参照元は返ったが、パスとして読めない URI が混じっていた。
     UnreadableReferences,
-    /// Rust の参照元をテスト範囲と照合できない。
+    /// Rust・Swift の参照元がテストの中にあるかを確かめられない。
     UnclassifiedReference(ReferenceSourceError),
     /// サーバが作業中で、落ち着いた答えを受け取れなかった。
     ServerStillWorking,

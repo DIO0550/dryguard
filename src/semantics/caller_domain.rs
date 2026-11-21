@@ -10,7 +10,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::codebase::source_of;
+use crate::line_number::LineNumber;
 use crate::syntax::rust_test_scope::RustTestScopes;
+use crate::syntax::swift_test_source::{SwiftImportsUnreadable, imports_swift_test_framework};
 use crate::syntax::tree::Grammar;
 
 use crate::domain_declaration::{AmbiguousDomain, DomainDeclarations};
@@ -19,13 +21,18 @@ use crate::semantics::domain::{Domain, DomainCounts};
 use crate::similarity::Similarity;
 use crate::source_position::SourcePosition;
 
-/// Rust の参照位置をテスト範囲と照合できなかった理由。
+/// 参照元がテストの中にあるかを確かめられなかった理由。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReferenceSourceError {
     /// ファイルを UTF-8 ソースとして読めなかった。
     Unreadable { path: PathBuf },
-    /// Rust 構文木を作れない、または構文エラーが残った。
+    /// 構文木を作れない、または（Rust で）構文エラーが残った。
     Unparsable { path: PathBuf },
+    /// Swift の import の宣言を読み切れず、テストフレームワークを import しているかを言えない。
+    ///
+    /// **[`Self::Unparsable`] と混ぜない。** Swift は import だけで答えが決まるので、
+    /// 直す先（tree-sitter-swift が読めない import の行）まで言える。
+    UnreadableImport { path: PathBuf, line: LineNumber },
     /// 応答の行・UTF-16 列がソースの文字を指していない。
     InvalidPosition {
         path: PathBuf,
@@ -39,6 +46,7 @@ impl ReferenceSourceError {
         match self {
             Self::Unreadable { path }
             | Self::Unparsable { path }
+            | Self::UnreadableImport { path, .. }
             | Self::InvalidPosition { path, .. } => path,
         }
     }
@@ -51,8 +59,14 @@ impl fmt::Display for ReferenceSourceError {
                 write!(f, "参照元のファイルを読めない: {}", path.display())
             }
             Self::Unparsable { path } => {
-                write!(f, "参照元の Rust 構文を読めない: {}", path.display())
+                write!(f, "参照元の構文を読めない: {}", path.display())
             }
+            Self::UnreadableImport { path, line } => write!(
+                f,
+                "参照元の import を読めない: {}:{}",
+                path.display(),
+                line.get()
+            ),
             Self::InvalidPosition { path, position } => write!(
                 f,
                 "参照元の位置がソースの文字を指していない: {}:{}:{}",
@@ -66,19 +80,21 @@ impl fmt::Display for ReferenceSourceError {
 
 impl std::error::Error for ReferenceSourceError {}
 
-/// compare / scan の間だけ共有する、Rust 参照元ファイルごとのテスト範囲。
+/// compare / scan の間だけ共有する、参照元ファイルごとのテスト範囲。
 ///
 /// 同じファイルから別のチャンクへの参照が返っても、読み込みと構文解析は繰り返さない。
 #[derive(Debug, Default)]
 pub struct ReferenceSources {
     rust: HashMap<PathBuf, Result<RustTestScopes, ReferenceSourceError>>,
+    /// Swift はファイルごとに答えが 1 つ（`syntax::swift_test_source`）。
+    swift: HashMap<PathBuf, Result<bool, ReferenceSourceError>>,
 }
 
 impl ReferenceSources {
-    /// テスト内の Rust 参照を除いたパス。重複は参照の件数として残す。
+    /// テスト内の Rust・Swift の参照を除いたパス。重複は参照の件数として残す。
     ///
     /// # Errors
-    /// Rust の参照元を読めない・解析できない・位置を照合できないとき。
+    /// Rust・Swift の参照元を読めない・解析できない・（Rust で）位置を照合できないとき。
     fn production_paths_of(
         &mut self,
         references: &[Reference],
@@ -92,15 +108,55 @@ impl ReferenceSources {
         Ok(paths)
     }
 
-    /// Rust 以外は従来どおり数える。Rust は確認できたテスト参照だけを除く。
+    /// Rust と Swift は確認できたテスト参照だけを除く。それ以外の言語はすべて数える。
     ///
     /// # Errors
     /// 参照元ソースまたは参照位置を読み取れないとき。
     fn is_test(&mut self, reference: &Reference) -> Result<bool, ReferenceSourceError> {
-        let path = reference.path();
-        if Grammar::of_path(path) != Some(Grammar::Rust) {
-            return Ok(false);
+        match Grammar::of_path(reference.path()) {
+            Some(Grammar::Rust) => self.is_in_rust_test_scope(reference),
+            Some(Grammar::Swift) => self.is_swift_test_source(reference.path()),
+            Some(Grammar::TypeScript | Grammar::Tsx | Grammar::Java) | None => Ok(false),
         }
+    }
+
+    /// Swift の参照元ファイルがテストフレームワークを import しているか。
+    ///
+    /// **位置は照合しない。** 答えがファイルで決まるので、位置が文字を指していなくても答えは変わらない。
+    ///
+    /// # Errors
+    /// 参照元ソースまたはその import を読み取れないとき。
+    fn is_swift_test_source(&mut self, path: &Path) -> Result<bool, ReferenceSourceError> {
+        self.swift
+            .entry(path.to_path_buf())
+            .or_insert_with(|| {
+                let source = source_of(path).map_err(|_| ReferenceSourceError::Unreadable {
+                    path: path.to_path_buf(),
+                })?;
+                imports_swift_test_framework(&source).map_err(|unreadable| match unreadable {
+                    SwiftImportsUnreadable::NoTree => ReferenceSourceError::Unparsable {
+                        path: path.to_path_buf(),
+                    },
+                    SwiftImportsUnreadable::Declaration { line } => {
+                        ReferenceSourceError::UnreadableImport {
+                            path: path.to_path_buf(),
+                            line,
+                        }
+                    }
+                })
+            })
+            .clone()
+    }
+
+    /// Rust の参照位置が、テスト属性か `cfg(test)` が覆う範囲にあるか。
+    ///
+    /// # Errors
+    /// 参照元ソースまたは参照位置を読み取れないとき。
+    fn is_in_rust_test_scope(
+        &mut self,
+        reference: &Reference,
+    ) -> Result<bool, ReferenceSourceError> {
+        let path = reference.path();
         let scopes = self.rust.entry(path.to_path_buf()).or_insert_with(|| {
             let source = source_of(path).map_err(|_| ReferenceSourceError::Unreadable {
                 path: path.to_path_buf(),
@@ -128,11 +184,11 @@ impl ReferenceSources {
 pub enum CallerDomainsOutcome {
     /// 参照元をドメインごとに数えられた。
     Counted(CallerDomains),
-    /// 参照元が返らない、または Rust のテスト内の参照しかなかった。
+    /// 参照元が返らない、または Rust・Swift のテスト内の参照しかなかった。
     NoReferences,
     /// 参照元は返ったが、パスとして読めない URI が混じっていた。
     UnreadableReferences,
-    /// Rust の参照元がテスト内か確認できなかった。部分集計は返さない。
+    /// Rust・Swift の参照元がテスト内か確認できなかった。部分集計は返さない。
     UnclassifiedReference(ReferenceSourceError),
     /// サーバが作業中で、落ち着いた答えを受け取れなかった。
     ServerStillWorking,
@@ -378,6 +434,78 @@ mod tests {
         .expect("宣言がない")
         .expect("本番参照がある");
         assert_eq!(outcome, CallerDomainsOutcome::Counted(expected));
+    }
+
+    /// Swift のフィクスチャの参照。位置は照合しないので、行の先頭を指す。
+    fn swift_reference(file: &str) -> Reference {
+        Reference::new(
+            crate::test_support::repository_path(&format!(
+                "tests/fixtures/swift-test-references/{file}"
+            )),
+            SourcePosition::from_preceding_text(crate::test_support::line(1), ""),
+        )
+    }
+
+    #[test]
+    fn test_caller_domains_outcome_excludes_swift_files_importing_a_test_framework() {
+        // 対照: XCTest を import しないテストのディレクトリのファイル（Commands.swift）は数える
+        let production = swift_reference("Sources/Shop/Checkout.swift");
+        let untagged = swift_reference("Tests/ShopTests/Commands.swift");
+        let outcome = undeclared_outcome_of(ReferencesOutcome::Answered(vec![
+            production.clone(),
+            swift_reference("Tests/ShopTests/CheckoutTests.swift"),
+            untagged.clone(),
+        ]));
+        let expected = CallerDomains::from_reference_paths(
+            &[
+                production.path().to_path_buf(),
+                untagged.path().to_path_buf(),
+            ],
+            &DomainDeclarations::default(),
+        )
+        .expect("宣言がない")
+        .expect("本番参照がある");
+        assert_eq!(outcome, CallerDomainsOutcome::Counted(expected));
+    }
+
+    #[test]
+    fn test_caller_domains_outcome_with_only_swift_test_files_has_no_references() {
+        let outcome = undeclared_outcome_of(ReferencesOutcome::Answered(vec![
+            swift_reference("Tests/ShopTests/CheckoutTests.swift"),
+            swift_reference("Tests/ShopTests/CheckoutTests.swift"),
+        ]));
+        assert_eq!(outcome, CallerDomainsOutcome::NoReferences);
+    }
+
+    #[test]
+    fn test_caller_domains_outcome_does_not_return_partial_counts_for_unreadable_swift_imports() {
+        let operators = swift_reference("Tests/ShopTests/Operators.swift");
+        let outcome = undeclared_outcome_of(ReferencesOutcome::Answered(vec![
+            swift_reference("Sources/Shop/Checkout.swift"),
+            operators.clone(),
+        ]));
+        assert_eq!(
+            outcome,
+            CallerDomainsOutcome::UnclassifiedReference(ReferenceSourceError::UnreadableImport {
+                path: operators.path().to_path_buf(),
+                line: crate::test_support::line(2),
+            })
+        );
+    }
+
+    #[test]
+    fn test_caller_domains_outcome_does_not_count_unreadable_swift_sources() {
+        let missing = swift_reference("Tests/ShopTests/Missing.swift");
+        let outcome = undeclared_outcome_of(ReferencesOutcome::Answered(vec![
+            swift_reference("Sources/Shop/Checkout.swift"),
+            missing.clone(),
+        ]));
+        assert_eq!(
+            outcome,
+            CallerDomainsOutcome::UnclassifiedReference(ReferenceSourceError::Unreadable {
+                path: missing.path().to_path_buf()
+            })
+        );
     }
 
     fn undeclared_outcome_of(references: ReferencesOutcome) -> CallerDomainsOutcome {

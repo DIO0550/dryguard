@@ -89,10 +89,7 @@ impl ModulePath {
     /// 書いた位置から解決するものが無い。要素のバッククォートは外す（`` `Foundation` `` と
     /// `Foundation` は同じモジュール）。
     fn from_swift_import(specifier: &str) -> Self {
-        let path: Vec<&str> = specifier
-            .split('.')
-            .map(|segment| segment.trim_matches('`'))
-            .collect();
+        let path: Vec<&str> = swift_module_segments_of(specifier).collect();
         Self(ModuleIdentity::Named(path.join("/")))
     }
 
@@ -186,7 +183,8 @@ impl ImportSet {
                 .iter()
                 .map(|specifier| ModulePath::from_java_import(specifier))
                 .collect(),
-            Grammar::Swift => swift_import_specifiers_of(tree)?
+            Grammar::Swift => swift_import_specifiers_of(tree)
+                .map_err(|line| ImportsUnavailable::UnreadableDeclaration { line })?
                 .iter()
                 .map(|specifier| ModulePath::from_swift_import(specifier))
                 .collect(),
@@ -393,24 +391,52 @@ fn java_name_segments_of<'source>(
 ///
 /// 同じモジュールのファイルどうしは `import` を書かないので、ここで集まるのは
 /// **フレームワーク単位の依存だけ**。`@testable import` も区別しない。
-fn swift_import_specifiers_of(tree: &SyntaxTree<'_>) -> Result<Vec<String>, ImportsUnavailable> {
-    let mut specifiers = Vec::new();
+///
+/// # Errors
+/// 読み取れなかった宣言があれば、最初のその行。
+fn swift_import_specifiers_of(tree: &SyntaxTree<'_>) -> Result<Vec<String>, LineNumber> {
+    swift_import_outcomes_of(tree).into_iter().collect()
+}
+
+/// Swift の `import_declaration` ごとの、モジュールの綴りか読み取れなかった行。ソースの順に並ぶ。
+///
+/// **最初の読めない宣言で止めない。** 依存先の集合は 1 件でも欠ければ測れない
+/// （[`swift_import_specifiers_of`] が最初の `Err` で止める）が、テストフレームワークを
+/// import しているかは読めた宣言だけで決まることがある（`syntax::swift_test_source`）。
+/// ERROR の中に入れ子になった宣言は、包む ERROR の `Err` 1 つに数えて読まない。
+pub(crate) fn swift_import_outcomes_of(tree: &SyntaxTree<'_>) -> Vec<Result<String, LineNumber>> {
+    let mut outcomes = Vec::new();
     for node in tree.named_descendants() {
         let line = LineNumber::from_index(node.start_position().row);
+        if has_error_ancestor(node) {
+            continue;
+        }
         if node.is_error() && contains_an_import_keyword(node) {
-            return Err(ImportsUnavailable::UnreadableDeclaration { line });
+            outcomes.push(Err(line));
+            continue;
         }
         if node.kind() != "import_declaration" {
             continue;
         }
         if is_unreadable_swift_import(node) {
-            return Err(ImportsUnavailable::UnreadableDeclaration { line });
+            outcomes.push(Err(line));
+            continue;
         }
-        let specifier = swift_import_specifier_of(tree, node)
-            .ok_or(ImportsUnavailable::UnreadableDeclaration { line })?;
-        specifiers.push(specifier);
+        outcomes.push(swift_import_specifier_of(tree, node).ok_or(line));
     }
-    Ok(specifiers)
+    outcomes
+}
+
+/// Swift の `import` の綴り（`` `XCTest`.XCTestCase ``）を、バッククォートを外した要素に割る。
+pub(crate) fn swift_module_segments_of(specifier: &str) -> impl Iterator<Item = &str> {
+    specifier
+        .split('.')
+        .map(|segment| segment.trim_matches('`'))
+}
+
+/// 祖先に ERROR があるか。
+fn has_error_ancestor(node: Node<'_>) -> bool {
+    std::iter::successors(node.parent(), Node::parent).any(|ancestor| ancestor.is_error())
 }
 
 /// ERROR の中に `import` の字句が残っているか。
