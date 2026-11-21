@@ -334,9 +334,16 @@ typeDefinition は型名の位置に `null` を返すので、Rust と同じく 
 別のディレクトリへ置くので、ファイル名と位置で持つ）。辿った先がエイリアスかは**使用位置への hover**
 （`typealias Amount = Int` / `public typealias Cost = Double`。修飾子の後ろの語で見る）で見分け、
 `syntax::swift_callable::SwiftAliasSource` が宣言側のソースの右辺を読み、右辺の型名を**宣言側の位置から**
-辿って再帰的に開く。開くのは**利用者のソースにあり、祖先が型引数を持たない
+辿って再帰的に開く。開くのは**祖先が型引数を持たない
 `struct` / `class` / `enum` / `actor` かファイルの直下だけ**の宣言（許可リスト。`extension` / `protocol` /
 関数の中の宣言は、右辺が型変数を指すと `Box<Int>.Item` と `Box<String>.Item` が同じ型に開く）。
+**sourcekit-lsp の生成インタフェース（`GeneratedInterfaces/<ハッシュ>/Foundation.swiftinterface` など）の宣言は、
+字下げの無い行の宣言だけを開く**（`SwiftAliasSource::from_generated_interface`）。生成インタフェースは本体の無い関数を
+並べるので、tree-sitter-swift ではファイルの根が ERROR になり、祖先の許可リストが使えない（6.4.2 で実測）。宣言の行と、
+次の字下げの無い行までの続きだけを残して読み、メンバー（字下げされる）は開かない。右辺の型名は生成インタフェースを
+開かせてその位置から辿る（`SourceDocument::with_grammar`。拡張子では作らない）。**ツールチェーンの `.swiftinterface`
+（`Swift.swiftmodule` の下など）は開かない** — 右辺をモジュールで修飾して書き（`Swift::Decodable`。Swift 6.4.2 で確認）、
+直接書いた `Decodable` と綴りが食い違う（`resolved_type` の `swift_alias_source_of`）。
 **ジェネリックな `typealias Couple<T> = (T, T)` は右辺を型パラメータの宣言の順の番号で持ち、使用側（`Couple<Int>`）で
 型引数を当てはめる**（`rules/naming.md` の `generic alias`。`SwiftOpenedType`）。型パラメータは右辺の型名として辿らない。
 当てはめた後、型引数を読んだときに振った型変数の番号を展開後の出現順で振り直し、右辺に現れなかった型変数は捨てる
@@ -346,7 +353,8 @@ typeDefinition は型名の位置に `null` を返すので、Rust と同じく 
 境界の無い関数と重なる）・型パラメータの関連型（`C.Element`）に具体的な型を当てる形。`where` 節を持つ宣言は
 tree-sitter-swift が宣言の外に置くので読まない（コメントを飛ばした最初の兄弟が ERROR か `where` の語かで見る。
 改行を挟むと `where` が名前として読まれ、直後の兄弟だけでは見落とす）。
-それ以外・`.swiftinterface` の宣言・右辺に `Self` や属性がある宣言は `UnopenableAlias` で「測れない」にする
+それ以外・ツールチェーンの `.swiftinterface` の宣言・右辺を綴らない宣言（生成インタフェースの
+`public typealias AnyObject`）・右辺に `Self` や属性がある宣言は `UnopenableAlias` で「測れない」にする
 （宣言の場所のまま比べると、`Amount` と `Int` が重ならないと確かめた答えになる）。循環は宣言の場所で
 `CyclicAlias`、32 段か展開した型が 4096 ノードを超えると `AliasExpansionLimit`（ノード数の上限は使用側で型引数を
 当てはめた結果にも当てる。`Couple<Couple<…>>` は段ごとに倍になる。循環した宣言の使用位置には
