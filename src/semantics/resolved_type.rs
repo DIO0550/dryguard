@@ -36,6 +36,7 @@ use crate::syntax::rust_callable::{
 use crate::syntax::swift_callable::{
     STANDARD_SUGAR_NAMES, SwiftAliasFailure, SwiftAliasSource, SwiftOpenedType, SwiftTypeResolution,
 };
+use crate::syntax::tree::Grammar;
 use crate::syntax::type_reference::TypeReference;
 
 mod array_length;
@@ -197,7 +198,9 @@ pub enum UnopenedReason {
     HoverNotProvided,
     /// 宣言は型エイリアスだが、右辺を差し込める形にできなかった。
     ///
-    /// **Swift で開くのは、利用者のソースにある `typealias` だけ。** `.swiftinterface` の宣言・
+    /// **Swift で開くのは、利用者のソースと sourcekit-lsp の生成インタフェースの最上位にある
+    /// `typealias` だけ。** ツールチェーンの `.swiftinterface` の宣言・生成インタフェースの字下げされた
+    /// 宣言・右辺を綴らない宣言（`public typealias AnyObject`）・
     /// 型変数を持ちうる宣言の中の宣言・`where` 節を持つ宣言と、ジェネリックな宣言に型引数を
     /// 当てはめられない使い方（数の不一致・境界を持つ宣言に型変数を当てる・具体的な型の関連型）は
     /// ここに来る（`swift_traced_type_names_of` / `syntax::swift_callable` の `SwiftAliasFailure`）。
@@ -403,6 +406,10 @@ const SWIFT_ALIAS_KEYWORD: &str = "typealias";
 /// sourcekit-lsp が標準ライブラリの宣言を置くインタフェースの拡張子。
 const SWIFT_INTERFACE_EXTENSION: &str = "swiftinterface";
 
+/// sourcekit-lsp が生成インタフェースを置くディレクトリの名前
+/// （`/tmp/sourcekit-lsp/GeneratedInterfaces/<ハッシュ>/Foundation.swiftinterface`。6.4.2 で実測）。
+const SWIFT_GENERATED_INTERFACES_DIRECTORY: &str = "GeneratedInterfaces";
+
 /// 標準ライブラリのモジュールの名前。インタフェースのファイル名・`.swiftmodule` の名前になる。
 const SWIFT_STANDARD_LIBRARY_MODULE: &str = "Swift";
 
@@ -473,8 +480,9 @@ impl SwiftDeclarationCache {
 /// 開いた名前は宣言の場所の一覧にも残す（辿った記録があることを答えるため）。
 ///
 /// **標準ライブラリの省略形の名前は、エイリアスかを見る前に通す。** `Void` は標準ライブラリの
-/// `typealias Void = ()` で、`.swiftinterface` の `typealias` は開かないので、先にエイリアスとして
-/// 倒すと関数型の `-> Void` がすべて測れない側へ落ちる。省略形を開くのは `syntax::swift_callable`。
+/// `typealias Void = ()` で、省略形として開いた形と右辺を開いた形は同じ `()` になる。先に通せば
+/// `-> Void` のたびに hover と生成インタフェースの読み込みを往復せずに済む。省略形を開くのは
+/// `syntax::swift_callable`。
 ///
 /// # Errors
 ///
@@ -670,22 +678,16 @@ impl SwiftAliasOpener<'_> {
         if exceeds_alias_depth(self.active.len(), 1) {
             return Ok(Err(UnopenedReason::AliasExpansionLimit));
         }
-        // 生成インタフェース（標準ライブラリ・フレームワーク）の右辺を辿れるかは確かめていない
-        let interface = site
-            .path()
-            .extension()
-            .is_some_and(|extension| extension == SWIFT_INTERFACE_EXTENSION);
-        if interface {
-            return Ok(Err(UnopenedReason::UnopenableAlias));
-        }
         let source = match self.cache.source_of(site.path()) {
             Ok(source) => source,
             Err(reason) => return Ok(Err(reason)),
         };
-        let Some(alias) = SwiftAliasSource::from_source(&source, site.position()) else {
+        let Some(alias) = swift_alias_source_of(site, &source) else {
             return Ok(Err(UnopenedReason::UnopenableAlias));
         };
-        let Ok(declaring) = SourceDocument::new(site.path(), source) else {
+        // 拡張子では作らない。生成インタフェース（`.swiftinterface`）も Swift として開かせる
+        let Ok(declaring) = SourceDocument::with_grammar(site.path(), source, Grammar::Swift)
+        else {
             return Ok(Err(UnopenedReason::UnreadableDeclaringDocument));
         };
         self.session.open_document(&declaring)?;
@@ -732,6 +734,30 @@ impl SwiftAliasOpener<'_> {
         }
         Ok(Ok((resolutions, depth)))
     }
+}
+
+/// 宣言の場所 `site` にある `typealias` を、宣言側のソース `source` から読む。
+///
+/// `None`: その位置に開ける `typealias` が無いとき、**sourcekit-lsp の生成インタフェース以外の
+/// `.swiftinterface`**（ツールチェーンが持つインタフェース）にあるとき。
+///
+/// **Why not（ツールチェーンのインタフェースも読む）**: 右辺をモジュールで修飾して書く
+/// （`Swift::Decodable`）ので、直接書いた `Decodable` と綴りが食い違い、重ならない答えになる。
+fn swift_alias_source_of(site: &DeclarationSite, source: &str) -> Option<SwiftAliasSource> {
+    let path = site.path();
+    let interface = path
+        .extension()
+        .is_some_and(|extension| extension == SWIFT_INTERFACE_EXTENSION);
+    if !interface {
+        return SwiftAliasSource::from_source(source, site.position());
+    }
+    let generated = path
+        .components()
+        .any(|component| component.as_os_str() == SWIFT_GENERATED_INTERFACES_DIRECTORY);
+    if !generated {
+        return None;
+    }
+    SwiftAliasSource::from_generated_interface(source, site.position())
 }
 
 /// Swift の `typealias` を開けなかった・当てはめられなかったわけを、利用者に出す理由へ直す。
@@ -2185,7 +2211,7 @@ done
     fn test_swift_type_name_at_the_same_position_is_asked_once_per_cache() {
         use crate::lsp::{Client, ServerCommand, WorkspaceRoot};
         use crate::syntax::chunk::{FileChunks, TestFunctions};
-        use crate::syntax::tree::{Grammar, SyntaxTree};
+        use crate::syntax::tree::SyntaxTree;
         use crate::test_support::repository_path;
 
         // 同じ型の 2 つのメソッドは、どちらも囲む型の名前（同じ位置）を型名として持つ

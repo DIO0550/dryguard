@@ -319,6 +319,54 @@ impl SwiftAliasSource {
         })
     }
 
+    /// sourcekit-lsp の生成インタフェース `source` の中で、名前が `position` にある、
+    /// **字下げの無い**（最上位の）`typealias` を読む。
+    ///
+    /// `None`: 宣言の行が字下げされている、宣言の後ろの行が `where` で始まる、または
+    /// その宣言だけを [`SwiftAliasSource::from_source`] で読んで `None` になるとき。
+    ///
+    /// 宣言の行と、次の字下げの無い行までの続きだけを残し、ほかの行を空にして読む（位置は変わらない）。
+    ///
+    /// **Why**: 本体の無い関数を並べるので、ファイル全体を読むと根が ERROR になり祖先の許可リストが
+    /// 使えない。メンバーは字下げして書かれるので（sourcekit-lsp 6.4.2 で実測）、字下げで最上位を見分ける。
+    pub(crate) fn from_generated_interface(source: &str, position: SourcePosition) -> Option<Self> {
+        let first = position.line().to_index();
+        let lines: Vec<&str> = source.lines().collect();
+        let declaration_line = lines.get(first)?;
+        if declaration_line.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let is_top_level_line =
+            |line: &&str| !line.is_empty() && !line.starts_with(char::is_whitespace);
+        let continued = lines
+            .iter()
+            .skip(first + 1)
+            .take_while(|line| !is_top_level_line(line))
+            .count();
+        let last = first + continued;
+        // tree-sitter-swift は `where` を宣言の外に置き、字下げの無い次の行の `where` は
+        // 続きとして残らない
+        let where_follows = lines
+            .get(last + 1)
+            .is_some_and(|line| line.split_whitespace().next() == Some(WHERE_KEYWORD));
+        if where_follows {
+            return None;
+        }
+        let isolated = lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                if (first..=last).contains(&index) {
+                    *line
+                } else {
+                    ""
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self::from_source(&isolated, position)
+    }
+
     /// 右辺に書かれた型名と、宣言側のソースでの位置。**名前ごとに最初の 1 つ。**
     pub(crate) fn references(&self) -> &[TypeReference] {
         &self.references
