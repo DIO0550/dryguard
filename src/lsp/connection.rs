@@ -2292,6 +2292,13 @@ mod tests {
         )
     }
 
+    /// 題を指定して、その作業が始まったという通知。
+    fn progress_begin_notification_titled(token: &str, title: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"$/progress","params":{{"token":"{token}","value":{{"kind":"begin","title":"{title}"}}}}}}"#
+        )
+    }
+
     /// その作業が終わったという通知。
     fn progress_end_notification(token: &str) -> String {
         format!(
@@ -2485,6 +2492,140 @@ mod tests {
         assert!(
             matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
             "作業に触れていない答えを返す: {outcome:?}"
+        );
+    }
+
+    /// テストで問い合わせ自身が始める作業として渡す題。
+    const QUERY_PROGRESS_TITLE: &str = "問い合わせの作業";
+
+    /// 問い合わせ自身が始めて終える作業（create → begin → end）が応答の前に届き、
+    /// その後に空の答えと 1 件の答えが続く並び。
+    fn query_progress_then_empty_then_one_reference() -> Vec<u8> {
+        frames_of(&[
+            &progress_create_request(9, "query"),
+            &progress_begin_notification_titled("query", QUERY_PROGRESS_TITLE),
+            &progress_end_notification("query"),
+            &no_references_response(1),
+            &references_response(2, "file:///repo/src/billing/invoice.ts"),
+        ])
+    }
+
+    #[test]
+    fn test_references_touched_only_by_query_progress_takes_that_answer() {
+        // jdtls は callHierarchy のたびに、応答の前に作業を始めて終える。それを読み込みと
+        // 同じく捨てると、何回尋ねても落ち着かない
+        let server_output = query_progress_then_empty_then_one_reference();
+        let mut connection =
+            connection_over(&server_output).with_query_progress_titles(&[QUERY_PROGRESS_TITLE]);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::NoAnswer),
+            "問い合わせの作業に触れただけの 1 通目を採る: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_touched_by_progress_with_another_title_asks_again() {
+        // 対照は上のテスト。同じ並びでも、題が一覧に無ければ読み込みとして捨てる
+        // （tsserver の空の答えの守り）
+        let server_output = query_progress_then_empty_then_one_reference();
+        let mut connection = connection_over(&server_output);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "題が一覧に無い作業に触れた答えは捨てて尋ね直す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_touched_by_query_progress_and_other_work_asks_again() {
+        // 問い合わせの作業と読み込みが同じ回に始まって終わる。問い合わせの作業を
+        // 除いても読み込みに触れているので、1 通目を採ると見ていないファイルの分が抜ける
+        let server_output = frames_of(&[
+            &progress_create_request(10, "loading"),
+            &progress_begin_notification("loading"),
+            &progress_create_request(9, "query"),
+            &progress_begin_notification_titled("query", QUERY_PROGRESS_TITLE),
+            &progress_end_notification("query"),
+            &progress_end_notification("loading"),
+            &no_references_response(1),
+            &references_response(2, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection =
+            connection_over(&server_output).with_query_progress_titles(&[QUERY_PROGRESS_TITLE]);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "読み込みにも触れた答えは捨てて尋ね直す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_with_query_progress_prepared_earlier_does_not_hide_other_work() {
+        // 1 回目に用意された問い合わせの作業が 2 回目に始まり、同じ 2 回目に別の作業が
+        // 用意されて捨てられる。問い合わせの作業の分を差し引く形で数えると、2 回目の
+        // 別の作業と相殺して「触れていない」に見える
+        let server_output = frames_of(&[
+            &progress_create_request(9, "query"),
+            &no_references_response(1),
+            &progress_create_request(10, "loading"),
+            &progress_end_notification("loading"),
+            &progress_begin_notification_titled("query", QUERY_PROGRESS_TITLE),
+            &progress_end_notification("query"),
+            &no_references_response(2),
+            &references_response(3, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection =
+            connection_over(&server_output).with_query_progress_titles(&[QUERY_PROGRESS_TITLE]);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "2 回目は別の作業に触れているので捨てる: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_answered_while_query_progress_is_running_asks_again() {
+        // 問い合わせの作業でも、終わる前に答えが返れば捨てる。動いている間の答えは
+        // その作業が見終える前のもの
+        let server_output = frames_of(&[
+            &progress_create_request(9, "query"),
+            &progress_begin_notification_titled("query", QUERY_PROGRESS_TITLE),
+            &no_references_response(1),
+            &progress_end_notification("query"),
+            &references_response(2, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection =
+            connection_over(&server_output).with_query_progress_titles(&[QUERY_PROGRESS_TITLE]);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "動いている作業の終わりを待って尋ね直す: {outcome:?}"
         );
     }
 
