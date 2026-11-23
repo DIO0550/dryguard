@@ -16,6 +16,9 @@ use dryguard::lsp::{
     SourceDocument, WorkspaceRoot,
 };
 use dryguard::pipeline::{chunk_pair_of, measured_pair_of};
+use dryguard::semantics::caller_domain::{
+    CallerDomains, CallerDomainsOutcome, ReferenceSources, caller_domains_outcome_of,
+};
 use dryguard::semantics::resolved_type::UnopenedReason;
 use dryguard::source_position::SourcePosition;
 use dryguard::threshold::Threshold;
@@ -88,6 +91,55 @@ fn test_sourcekit_lsp_answers_both_candidates_in_one_session() {
         started.elapsed() - queried,
         started.elapsed()
     );
+}
+
+#[test]
+#[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
+fn test_sourcekit_lsp_references_from_swift_test_target_helpers_are_not_counted() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/swift-package-test-references");
+    let path = fixture.join("Sources/Shop/Checkout.swift");
+    let commands = fixture.join("Tests/ShopTests/Commands.swift");
+    let root = WorkspaceRoot::enclosing(&[path.clone(), fixture.join("Package.swift")])
+        .expect("Package.swift を含む根");
+    let document = SourceDocument::new(&path, source_of(&path).expect("フィクスチャを読める"))
+        .expect("ドキュメントを作れる");
+    let position = SourcePosition::from_preceding_text(
+        LineNumber::new(1).expect("正の行番号"),
+        "public func ",
+    );
+
+    let client = Client::start(&ServerCommand::swift()).expect("sourcekit-lsp を起動できる");
+    let mut session = client.handshake(&root).expect("握手できる");
+    session.open_document(&document).expect("ファイルを開ける");
+
+    let references = session
+        .references(&document, position)
+        .expect("参照元を尋ねられる");
+    let ReferencesOutcome::Answered(references) = references else {
+        panic!("checkout の参照元が返る: {references:?}");
+    };
+    assert!(
+        references
+            .iter()
+            .any(|reference| reference.path() == commands),
+        "補助ファイルもサーバの応答に含まれる: {references:?}"
+    );
+
+    let declarations = DomainDeclarations::default();
+    let expected = CallerDomains::from_reference_paths(&[path], &declarations)
+        .expect("宣言がない")
+        .expect("本番参照がある");
+    let outcome = caller_domains_outcome_of(
+        &mut session,
+        &document,
+        position,
+        &declarations,
+        &mut ReferenceSources::default(),
+    )
+    .expect("参照元ドメインを数えられる");
+    assert_eq!(outcome, CallerDomainsOutcome::Counted(expected));
+    session.shutdown().expect("正常終了できる");
 }
 
 /// `tests/fixtures/swift-lsp` の中で、`function` を宣言している行の位置。

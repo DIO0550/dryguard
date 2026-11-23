@@ -130,7 +130,7 @@ const RUST_PROJECT_MARKERS: [&str; 1] = ["Cargo.toml"];
 ///
 /// 印の外のファイルはビルド設定を持てず、別ファイルの参照元が揃わない。sourcekit-lsp 6.4.2 で
 /// 実測すると、印の無いディレクトリでは index を待つ要求がすぐに答え、references は空のまま返った。
-const SWIFT_PROJECT_MARKERS: [&str; 1] = ["Package.swift"];
+const SWIFT_PROJECT_MARKERS: [&str; 1] = [crate::syntax::swift_package::MANIFEST_FILE_NAME];
 
 /// jdtls が Maven / Gradle のプロジェクトとして取り込むためのビルドファイル。
 ///

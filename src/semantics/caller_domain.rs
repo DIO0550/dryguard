@@ -8,10 +8,12 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::codebase::source_of;
+use crate::codebase::{source_of, swift_package_manifests_at};
 use crate::line_number::LineNumber;
 use crate::syntax::rust_test_scope::RustTestScopes;
+use crate::syntax::swift_package::SwiftTestTarget;
 use crate::syntax::swift_test_source::{SwiftImportsUnreadable, imports_swift_test_framework};
 use crate::syntax::tree::Grammar;
 
@@ -28,10 +30,7 @@ pub enum ReferenceSourceError {
     Unreadable { path: PathBuf },
     /// 構文木を作れない、または（Rust で）構文エラーが残った。
     Unparsable { path: PathBuf },
-    /// Swift の import の宣言を読み切れず、テストフレームワークを import しているかを言えない。
-    ///
-    /// **[`Self::Unparsable`] と混ぜない。** Swift は import だけで答えが決まるので、
-    /// 直す先（tree-sitter-swift が読めない import の行）まで言える。
+    /// Swift の参照元がテストターゲット内と確認できず、import の宣言も読み切れない。
     UnreadableImport { path: PathBuf, line: LineNumber },
     /// 応答の行・UTF-16 列がソースの文字を指していない。
     InvalidPosition {
@@ -86,8 +85,8 @@ impl std::error::Error for ReferenceSourceError {}
 #[derive(Debug, Default)]
 pub struct ReferenceSources {
     rust: HashMap<PathBuf, Result<RustTestScopes, ReferenceSourceError>>,
-    /// Swift はファイルごとに答えが 1 つ（`syntax::swift_test_source`）。
     swift: HashMap<PathBuf, Result<bool, ReferenceSourceError>>,
+    swift_test_targets: SwiftTestTargetsByDirectory,
 }
 
 impl ReferenceSources {
@@ -120,12 +119,12 @@ impl ReferenceSources {
         }
     }
 
-    /// Swift の参照元ファイルがテストフレームワークを import しているか。
+    /// Swift の参照元ファイルがテストフレームワークを import するか、テストターゲットに属するか。
     ///
     /// **位置は照合しない。** 答えがファイルで決まるので、位置が文字を指していなくても答えは変わらない。
     ///
     /// # Errors
-    /// 参照元ソースまたはその import を読み取れないとき。
+    /// 参照元ソースを読めないとき。またはテストターゲット所属を確認できず、import を読み取れないとき。
     fn is_swift_test_source(&mut self, path: &Path) -> Result<bool, ReferenceSourceError> {
         self.swift
             .entry(path.to_path_buf())
@@ -133,7 +132,11 @@ impl ReferenceSources {
                 let source = source_of(path).map_err(|_| ReferenceSourceError::Unreadable {
                     path: path.to_path_buf(),
                 })?;
-                imports_swift_test_framework(&source).map_err(|unreadable| match unreadable {
+                let imports_test_framework = imports_swift_test_framework(&source);
+                if imports_test_framework == Ok(true) || self.swift_test_targets.contains(path) {
+                    return Ok(true);
+                }
+                imports_test_framework.map_err(|unreadable| match unreadable {
                     SwiftImportsUnreadable::NoTree => ReferenceSourceError::Unparsable {
                         path: path.to_path_buf(),
                     },
@@ -172,6 +175,50 @@ impl ReferenceSources {
                 path: path.to_path_buf(),
                 position: reference.position(),
             })
+    }
+}
+
+/// 最寄りの SwiftPM マニフェストごとの配置を、探索したディレクトリ間で共有する。
+#[derive(Debug, Default)]
+struct SwiftTestTargetsByDirectory {
+    by_directory: HashMap<PathBuf, Arc<[Vec<SwiftTestTarget>]>>,
+}
+
+impl SwiftTestTargetsByDirectory {
+    fn contains(&mut self, path: &Path) -> bool {
+        let Some(directory) = path.parent() else {
+            return false;
+        };
+        let mut visited = Vec::new();
+        let layouts = directory
+            .ancestors()
+            .find_map(|ancestor| {
+                if let Some(layouts) = self.by_directory.get(ancestor) {
+                    return Some(Arc::clone(layouts));
+                }
+                visited.push(ancestor);
+                match swift_package_manifests_at(ancestor) {
+                    Ok(Some(manifests)) => Some(
+                        manifests
+                            .iter()
+                            .map(|source| SwiftTestTarget::from_manifest(source, ancestor))
+                            .collect(),
+                    ),
+                    Ok(None) => None,
+                    // 内側のマニフェストを読めないときも外側のパッケージには帰属させない。
+                    Err(_) => Some(Arc::default()),
+                }
+            })
+            .unwrap_or_default();
+        for visited_directory in visited {
+            self.by_directory
+                .insert(visited_directory.to_path_buf(), Arc::clone(&layouts));
+        }
+        // LSP がどの Swift 版でマニフェストを選んだかにかかわらず、所属が一致する参照だけを除く。
+        !layouts.is_empty()
+            && layouts
+                .iter()
+                .all(|targets| targets.iter().any(|target| target.contains(path)))
     }
 }
 
@@ -475,6 +522,96 @@ mod tests {
             swift_reference("Tests/ShopTests/CheckoutTests.swift"),
         ]));
         assert_eq!(outcome, CallerDomainsOutcome::NoReferences);
+    }
+
+    #[test]
+    fn test_caller_domains_outcome_excludes_swift_test_target_helpers() {
+        let root =
+            crate::test_support::repository_path("tests/fixtures/swift-package-test-references");
+        let production = root.join("Sources/Shop/Checkout.swift");
+        let commands = root.join("Tests/ShopTests/Commands.swift");
+        let reference = |path, line| {
+            Reference::new(
+                path,
+                SourcePosition::from_preceding_text(crate::test_support::line(line), "    "),
+            )
+        };
+        let outcome = undeclared_outcome_of(ReferencesOutcome::Answered(vec![
+            reference(production.clone(), 6),
+            reference(commands, 4),
+        ]));
+        let expected =
+            CallerDomains::from_reference_paths(&[production], &DomainDeclarations::default())
+                .expect("宣言がない")
+                .expect("本番参照がある");
+        assert_eq!(outcome, CallerDomainsOutcome::Counted(expected));
+    }
+
+    #[test]
+    fn test_swift_test_targets_use_the_nearest_manifest_and_share_ancestor_lookups() {
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "dryguard-swift-test-targets-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("このテスト用のディレクトリを作れる");
+        let test_target = root.join("Tests/ShopTests");
+        let nested = test_target.join("Nested");
+        let versioned = test_target.join("Versioned");
+        fs::create_dir_all(&nested).expect("内側のパッケージを作れる");
+        fs::create_dir(&versioned).expect("バージョン別のマニフェストのパッケージを作れる");
+        let outer_manifest = root.join("Package.swift");
+        fs::write(
+            &outer_manifest,
+            include_str!("../../tests/fixtures/swift-package-test-references/Package.swift"),
+        )
+        .expect("外側のマニフェストを書ける");
+        fs::write(nested.join("Package.swift"), [0xff]).expect("UTF-8 でないマニフェストを書ける");
+        fs::copy(&outer_manifest, versioned.join("Package.swift"))
+            .expect("基本マニフェストを置ける");
+        fs::write(
+            versioned.join("Package@swift-6.swift"),
+            r#"import PackageDescription
+let package = Package(name: "Shop", targets: [
+    .testTarget(name: "ShopTests", exclude: ["Production"]),
+])"#,
+        )
+        .expect("バージョン別のマニフェストを書ける");
+
+        let operators = test_target.join("Operators.swift");
+        fs::write(&operators, "import func Swift.+\n").expect("テストの参照元を書ける");
+        let import_outcome =
+            undeclared_outcome_of(ReferencesOutcome::Answered(vec![Reference::new(
+                operators,
+                SourcePosition::from_preceding_text(crate::test_support::line(1), ""),
+            )]));
+
+        let mut targets = SwiftTestTargetsByDirectory::default();
+        let outer_test = targets.contains(&test_target.join("Helpers/One.swift"));
+        let nested_source = targets.contains(&nested.join("Source.swift"));
+        let shared_source = targets.contains(&versioned.join("Tests/ShopTests/One.swift"));
+        let versioned_source =
+            targets.contains(&versioned.join("Tests/ShopTests/Production/Two.swift"));
+        fs::remove_file(outer_manifest).expect("外側のマニフェストを消せる");
+        let cached_outer_test = targets.contains(&test_target.join("Other/Two.swift"));
+        fs::remove_dir_all(root).expect("テスト用のディレクトリを片付けられる");
+
+        assert!(outer_test, "外側のマニフェストで所属を確認できる");
+        assert!(
+            !nested_source,
+            "読めないマニフェストより外側のテストターゲットには含めない"
+        );
+        assert!(
+            !versioned_source,
+            "バージョン別のマニフェストで外れるソースは除かない"
+        );
+        assert!(shared_source, "全マニフェストでテストに属するソースは除く");
+        assert_eq!(import_outcome, CallerDomainsOutcome::NoReferences);
+        assert!(
+            cached_outer_test,
+            "別の参照元ディレクトリでも祖先の結果を使う"
+        );
     }
 
     #[test]

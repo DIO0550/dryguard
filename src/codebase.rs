@@ -15,6 +15,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::syntax::swift_package::MANIFEST_FILE_NAME;
 use crate::syntax::tree::Grammar;
 
 pub mod diff;
@@ -161,6 +162,33 @@ pub fn source_paths_of(
 /// ファイルが開けない / 読めない / UTF-8 として解釈できないとき。
 pub fn source_of(path: &Path) -> io::Result<String> {
     fs::read_to_string(path)
+}
+
+/// ディレクトリ直下に `Package.swift` があれば、Swift のバージョン別マニフェストと一緒に読む。
+///
+/// # Errors
+/// マニフェストを確認できないとき、または通常の UTF-8 ファイルとして読めないとき。
+pub(crate) fn swift_package_manifests_at(directory: &Path) -> io::Result<Option<Vec<String>>> {
+    let manifest = directory.join(MANIFEST_FILE_NAME);
+    match fs::metadata(&manifest) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(io::ErrorKind::InvalidData.into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let mut sources = vec![source_of(&manifest)?];
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("Package@swift-") && name.ends_with(".swift"))
+            && entry.path().metadata()?.is_file()
+        {
+            sources.push(source_of(&entry.path())?);
+        }
+    }
+    Ok(Some(sources))
 }
 
 /// そのディレクトリの中身。読めなければ、どのディレクトリで失敗したかを持つエラー。

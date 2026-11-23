@@ -132,7 +132,9 @@ sourcekit-lsp は index を作り終える前の参照元に空を返すので�
 `swift build` が要らないのは sourcekit-lsp の background indexing が有効なとき（既定）だけで、無効にすると参照元と呼び出し先は測れなくなる（Swift 6.4.2 の既定のビルドシステムで `swift build` した後も同じ）。
 実コード（apple/swift-argument-parser 1.6.1、160 ファイル）で `scan` が通り、握手から最後の答えまで約 62 秒（初回起動は 105 秒）だった（#408）。
 `extension` に書いた XCTest のメソッドは外れないので、テストをそう書くコードベースでは候補ペアの大半がテスト同士になる（#521）。
-呼び出し元ドメインは、XCTest か Testing を import するファイル（テストと、SwiftPM が `.build` に生成するテスト一覧）からの参照を数えない。どちらも import しないテストのファイル（テストが使うコマンドの定義だけのファイルなど）からの参照は数える。
+呼び出し元ドメインは、XCTest か Testing を import するファイル（SwiftPM が `.build` に生成するテスト一覧を含む）と、最寄りの `Package.swift` からテストターゲットと確認できたファイルの参照を除く。
+マニフェストでは `Package(..., targets: [...])` の初期配列に直接書いた `testTarget` を読み、`Tests/<name>` または文字列リテラルの `path:` と、`sources:` / `exclude:` / `resources:` のリテラル配置を使う。
+バージョン別マニフェストがあれば、全マニフェストでテストに属するファイルを除く。式で組み立てた配置や SwiftPM マニフェストを持たない Xcode プロジェクトでは import の判定に従う。初期化後のターゲットの変更は読み取る配置に反映されない。
 `compare` は `--lang` と拡張子が一致しなければ比べない（`--lang ts` と `.swift` / `.java`、`--lang java` と `.ts` など。`auto` は拡張子に従う）。
 CLI は拡張子から TypeScript・Rust・Swift・Java の LSP サーバを選ぶ。`scan --lang auto` では
 言語ごとに候補を揃え、TypeScript は typescript-language-server、Rust は rust-analyzer の
@@ -184,7 +186,7 @@ CLI は拡張子から TypeScript・Rust・Swift・Java の LSP サーバを選�
 （揃えるのは Issue #365）。次のものは**作業ツリーの版**を読む。
 
 - 型名の宣言側・参照元として読むファイル（Rust のエイリアス・関連型・配列長の評価、
-  参照元のテスト範囲の判別）と、LSP サーバが自分で読むファイル。**候補ペアのファイル自身も、
+  テスト参照の判別に使う SwiftPM の `Package.swift` など）と、LSP サーバが自分で読むファイル。**候補ペアのファイル自身も、
   宣言側・参照元として読むときは作業ツリーの版を読む**（同じファイルの `#[cfg(test)] mod tests` など）。
   **ステージしていない変更が残ったファイル**をここで読むと、index の版で数えた位置を
   別の版に当てることになり、測れない側に倒れるだけでなく**別の宣言・範囲を読んだ答えが出ることがある**

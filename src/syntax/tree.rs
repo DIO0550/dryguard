@@ -142,6 +142,10 @@ impl<'source> SyntaxTree<'source> {
         self.grammar
     }
 
+    pub(super) fn root_node(&self) -> Node<'_> {
+        self.tree.root_node()
+    }
+
     /// 木の中の名前付きノードを、根から前順（ソースに書かれた順）で返す。
     ///
     /// 名前付きだけを返すのは、`{` や `,` のような字句そのもののノードが
@@ -152,7 +156,7 @@ impl<'source> SyntaxTree<'source> {
     /// どちらも木を歩くので、両方に書くと同じ処理が 2 箇所に現れる。
     pub fn named_descendants(&self) -> Vec<Node<'_>> {
         let mut nodes = Vec::new();
-        let mut pending = vec![self.tree.root_node()];
+        let mut pending = vec![self.root_node()];
 
         while let Some(node) = pending.pop() {
             nodes.push(node);
@@ -172,7 +176,7 @@ impl<'source> SyntaxTree<'source> {
     /// （`Map<string` の閉じ `>`）、[`SyntaxTree::named_descendants`] は
     /// **名前付きだけを返す**ので、そこを歩いても見つからない。
     pub(crate) fn has_error(&self) -> bool {
-        self.tree.root_node().has_error()
+        self.root_node().has_error()
     }
 
     /// そのノードが覆っているソースのテキスト。

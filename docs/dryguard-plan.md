@@ -68,7 +68,7 @@ n² 比較になるため、規模が問題になった時点で MinHash/LSH ま
 
 - **型シグネチャの正規化比較**: hover から取得し、引数名を捨てて型構造で比較。ジェネリクスは単一化を試みる
 - **コールグラフ比較**: callHierarchy/outgoingCalls で呼び出し先集合を取り、依存モジュール・型の重なりを測る
-- **参照元比較**: references で呼び出し元を取り、それが属するモジュール/ディレクトリ (= ドメイン) を比較。Rust はテスト属性の関数や単純な `cfg(test)` の範囲内の参照を除く（`rules/naming.md` の `reference`）。候補を含める `--include-tests` とは独立。参照元を読み取れないときは部分集計せず、理由付きで測れないとする
+- **参照元比較**: references で呼び出し元を取り、それが属するモジュール/ディレクトリ (= ドメイン) を比較。Rust はテスト属性の関数や単純な `cfg(test)` の範囲内の参照を除く。Swift はテストフレームワークの import か、静的に読める SwiftPM マニフェストから除外する（`rules/naming.md` の `reference`）。候補を含める `--include-tests` とは独立。参照元を読み取れないときは部分集計せず、理由付きで測れないとする
 - Rust は直接囲む impl の対象型・型変数・境界をメソッドの比較に使う。Self とレシーバは対象型へ置換し、型変数は impl / メソッドの束縛元を区別して改名する。直接囲む trait impl に定義された Self::Item と完全修飾形は trait の宣言元を確認して RHS を展開し、impl 型変数と GAT の型引数を代入する。inherent impl・別 trait の impl の中の完全修飾形は implementation で trait の impl を集め、境界を持たず、型変数に使用側の型変数か具体的な型を当てはめるだけで対象型と trait 引数が一致する 1 つ（境界の無い blanket impl を含む）を選んで展開する。関連型 RHS の Self は使用側の impl の対象型を代入する。関連型 RHS の中の投影は RHS を書いた impl を使用側として再帰して開き、入れ子の投影（`<<Self as T>::Item as O>::Out`）は 1 段目が具体的な型に閉じたときだけ型パラメータを持たない 2 段目の impl を選ぶ。trait impl の中の短縮形（Self::Item）が supertrait の関連型を指すなら、supertrait の閉包で definition の所有 trait 以外にその名前を宣言する trait が無いときに、所有 trait の impl を同じ規則で選ぶ。型引数を書いた supertrait・境界を持つ impl の選択と const generics は未対応（inherent impl・無関係な trait の impl の中の短縮形と短縮形の入れ子は rustc が拒否する）
 - Swift は引数のラベルを型の一部として残し、内部名を落とす。`T?` / `[T]` / `[K: V]` / `()` は、標準ライブラリを指すと辿れた `Optional` / `Array` / `Dictionary` / `Void` と同じ形にする。レシーバと `init` の値の型は直接囲む型にし、制約付きの extension（`extension Array<Int>` / `extension [Int]` / `extension Array where Element == Int`）は型引数と `where` もレシーバの側に足す。型名は definition で辿って宣言の場所で比べ、利用者のソースと sourcekit-lsp の生成インタフェース（標準ライブラリ・Foundation など）の最上位にある `typealias` は右辺へ開き、ジェネリックな `typealias` は使用側の型引数を当てはめる（境界を持つ宣言に型変数を当てる形・型変数を持ちうる宣言の中の `typealias`・生成インタフェースの中で字下げされた `typealias`・右辺を綴らない `typealias`（`AnyObject`）・ツールチェーンの `.swiftinterface` の `typealias` は、理由付きで測れないとする）
 - Rust はトレイト境界も考慮。TS / Rust とも型エイリアスを展開する。Rust は引数のないエイリアスの右辺の型名を宣言側ソースから辿り、再輸出・エイリアス連鎖を宣言元の同一性で比較する。型引数と既定の型引数も当てはめるが、ジェネリック宣言の右辺と既定値はプリミティブや束縛された型パラメータに閉じるものに限る。ライフタイム・const 引数、未知の型構文、循環・展開上限は理由付きで測れないとする。直接の配列長と型引数のないエイリアス RHS の配列長は、宣言側の整数・usize 定数の連鎖・`+ - * / %` を評価する。hover の `{const}` はソースとの型構造の対応を確認してから復元する。中間値も65535以下に限り、式・連鎖・評価量に上限を設ける。未対応・循環・上限・対応不能は理由付きで測れないとする（詳細は `rules/architecture.md`）
@@ -153,7 +153,7 @@ inventory = ["src/inventory/**", "src/**/product*.ts"]
 
 - Python / Java / Swift を、TypeScript・Rust と同じ 3 ステージ（候補抽出 → 意味情報収集 → 分類）で扱う (Issue #360)
 - 「LSPサーバを差し替えれば他言語も足せる設計にしておく」（「何を作るか」）を、実際に 3 言語足して確かめる回でもある
-- 参照元のテスト範囲の除外（Rust の `syntax::rust_test_scope` に当たるもの）は、各言語の実コーパスで、テスト内の参照が呼び出し元ドメインを歪めるかを測ってから起こす。Swift は測って歪めていたので足した（`syntax::swift_test_source`。Issue #520）。Java は未測定で、すべて数える
+- 参照元のテスト範囲の除外（Rust の `syntax::rust_test_scope` に当たるもの）は、各言語の実コーパスで、テスト内の参照が呼び出し元ドメインを歪めるかを測ってから起こす。Swift はテストフレームワークの import（`syntax::swift_test_source`、#520）と SwiftPM のテストターゲット（`syntax::swift_package`、#554）を印にする。Java は未測定で、すべて数える
 
 進め方は 2 段。
 
@@ -199,6 +199,8 @@ sourcekit-lsp の時間（中継スクリプトがフレームの受け渡し時
 | `Tools/generate-docc-reference/Extensions/ArgumentParser+Markdown.swift:114` / `:154`（`usage()` / `identity()`） | EXTRACT-CANDIDATE | 妥当（名前の組み立てが重複している） | — |
 
 上の表は Issue #520 の前の測定。#520（XCTest / Testing を import するファイルの参照を除く）の後に同じルートで測り直すと、`caller-domain-overlap` が測れたペアのうち参照元に `Tests/` のドメインが入るのは 445 → 27（残りはすべて XCTest を import しない `Tests/ArgumentParserPackageManagerTests/PackageManager`。Issue #554）、測れたペアは 519 → 147 だった。`swift build --build-tests --build-system native` の後に background indexing を切った回では、参照元に `.build` のドメインが入るペアが 9,567 → 0（SwiftPM の生成物は `import XCTest` を書く）。
+
+Issue #554 では、同じ Swift Argument Parser 1.6.1 を sourcekit-lsp 6.4.2 で `scan . --lang swift --explain --format json` し直した。参照元に `Tests/ArgumentParserPackageManagerTests/PackageManager` のドメインが入るペアは main（`5ae71ba`）の 28 から 0、`caller-domain-overlap` が測れたペアは 149 から 135 になった。
 
 同じモジュールのファイルどうしは `import` を書かないので、`Sources` 同士の 564 ペアのうち 544 ペアで依存先の重なりは `no-declarations`（測れない）だった。判定は呼び出し先ドメインとモジュール距離が持つ。
 

@@ -571,26 +571,32 @@ pr-155 と同じ形だと自己申告している）。
 
 ## Rust・Swift の参照元のテスト範囲
 
-参照元のテスト範囲は、Rust は `syntax::rust_test_scope`、Swift は `syntax::swift_test_source` が
-ソースだけから取り出す。`semantics::caller_domain` が `codebase::source_of` でファイルを読み、
-その結果を渡して照合し、残った参照をドメインへまとめる。`pipeline` は compare / scan ごとに
-`ReferenceSources` を共有する。読み込みと解析は参照元ファイルごとに一度で、
-`syntax` に I/O、`pipeline` に構文判別を持ち込まない。TypeScript・Java の参照はすべて数える。
+参照元のテスト範囲は、Rust は `syntax::rust_test_scope`、Swift は `syntax::swift_test_source` と
+`syntax::swift_package` が取り出す。`semantics::caller_domain` は `codebase` の読み取り結果を
+`syntax` に渡し、照合して残った参照をドメインへまとめる。`pipeline` は compare / scan ごとに
+`ReferenceSources` を共有する。読み込みと解析は参照元ファイルごとに一度で、SwiftPM の探索結果は
+ディレクトリごとに共有する。TypeScript・Java の参照はすべて数える。
 
 **Swift は範囲ではなくファイルで決める。** XCTest か Testing を import するファイル（綴りの先頭の
 要素で見る。テストのターゲット・テスト支援のライブラリ・SwiftPM が `.build` に生成するテスト一覧）の
 参照をすべて除き、位置は照合しない。テストは `XCTestCase` を継承したクラスの `extension`
 （別のファイルにも書けるので継承を構文から確かめられない）とファイルの直下の型（テストが使う
 コマンドの定義）からも本番のコードを参照するので、構文の範囲で囲むと本番の参照として数える。
-テストフレームワークを import しないテストのファイルは本番として数える（除外しない側へ倒れる）。
-逆に本番のモジュールが `#if canImport(XCTest)` の中で import すると、そのファイルの参照も除く
-（除く側へ倒れる。`#if` の条件は評価しない）。
+`#if canImport(XCTest)` の中で import する本番のファイルも、この印で除く。
+
+SwiftPM は、参照元の最寄りの `Package.swift` で `package` の初期化に直接書いた `targets:` 配列を読む。
+`testTarget` の既定配置 `Tests/<name>` か、通常の文字列リテラルで書いたパッケージ内の `path:` を
+使い、リテラル配列の `sources:` で絞り、`exclude:` と `resources:` のパスをソースの範囲から外す。
+パッケージの根を指定した場合は、具体的な `sources:` の指定が必要になる。
+バージョン別のマニフェストがあれば、全マニフェストで所属が確認できるファイルを除く。
+式で組み立てた配置は import の結果に従う。後続のターゲット変更、SwiftPM の既定配置の代替ディレクトリ、
+Xcode のターゲットは読み取りの範囲外。
 
 **除外はドメイン宣言の照合より先。** テスト内にしかない参照元が曖昧な宣言に当たっても、
 本番の分布には影響しない。Rust ソースの読み取り・構文解析・位置の照合、Swift ソースの
-読み取り・import の読み取りに失敗したときはその理由を運び、読めた分だけで数えない
-（Swift は import 以外の構文エラーでは落とさず、読めた import にテストフレームワークがあれば
-読めない import があっても答える。欠けた宣言が何であっても答えは変わらない）。
+読み取りに失敗したときはその理由を運び、読めた分だけで数えない。Swift の import を読み切れなくても、
+テストフレームワークの import またはテストターゲットへの所属を確認できれば除く。
+Swift ソースの import 以外の構文エラーは import の判定に影響しない。
 除外後に参照がなければ `NoReferences` とする。
 
 ## モジュールの公開 API
