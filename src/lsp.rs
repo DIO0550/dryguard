@@ -2262,6 +2262,65 @@ mod tests {
         );
     }
 
+    /// 問い合わせのたびに `Background task` の作業を始めて終えてから答え、尋ね直されたら
+    /// 別の綴りで答える台本。jdtls の callHierarchy の並び。
+    fn background_task_then_two_hover_answers() -> String {
+        [
+            r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"query","value":{"kind":"begin","title":"Background task"}}}"#.to_owned(),
+            r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"query","value":{"kind":"end","message":"Reconciling..."}}}"#.to_owned(),
+            fenced_hover_response(2, "first()"),
+            fenced_hover_response(3, "second()"),
+        ]
+        .iter()
+        .map(|frame| format!("{}; ", printed_frame(frame)))
+        .collect()
+    }
+
+    /// 先頭のフェンスに綴りを置く hover の応答。
+    fn fenced_hover_response(id: u64, signature: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"contents":{{"kind":"markdown","value":"```java\n{signature}\n```"}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn test_session_with_jdtls_takes_the_answer_touched_only_by_its_background_task() {
+        // jdtls は問い合わせのたびに Background task を始めて終える。読み込みとして捨てると、
+        // 尋ね直しても同じ並びが続き、上限まで尋ねて `ServerStillWorking` になる
+        let mut session = handshake_as(
+            ServerLanguage::Java,
+            &background_task_then_two_hover_answers(),
+        );
+        let document = fixture_document();
+        session.open_document(&document).expect("開かせられる");
+        let position = SourcePosition::from_preceding_text(line(5), "export function ");
+
+        let outcome = session
+            .hover(&document, position)
+            .expect("応答を受け取れる");
+
+        assert_eq!(outcome, HoverOutcome::Answered(signature_text("first()")));
+    }
+
+    #[test]
+    fn test_session_with_tsserver_asks_again_after_a_background_task() {
+        // 対照は上のテスト。tsserver は読み込みの途中にも答えるので、どの題の作業に触れた
+        // 答えも捨てる守りを外さない
+        let mut session = handshake_as(
+            ServerLanguage::TypeScript,
+            &background_task_then_two_hover_answers(),
+        );
+        let document = fixture_document();
+        session.open_document(&document).expect("開かせられる");
+        let position = SourcePosition::from_preceding_text(line(5), "export function ");
+
+        let outcome = session
+            .hover(&document, position)
+            .expect("応答を受け取れる");
+
+        assert_eq!(outcome, HoverOutcome::Answered(signature_text("second()")));
+    }
+
     /// rust-analyzer の形の hover の応答。綴りの前のフェンスにモジュールのパスを置く。
     fn rust_hover_response(id: u64, signature: &str) -> String {
         format!(
@@ -2732,27 +2791,6 @@ mod tests {
                 "build.gradle.kts".to_owned()
             ]
         );
-    }
-
-    #[test]
-    fn test_server_command_for_java_does_not_discard_answers_touched_by_its_background_task() {
-        // 対照は他のサーバ。tsserver は読み込みの途中にも空の答えを返すので、どの題の作業に
-        // 触れた答えも捨てる守りを外さない
-        assert_eq!(
-            ServerCommand::java().language.query_progress_titles(),
-            ["Background task"]
-        );
-        for command in [
-            ServerCommand::typescript(),
-            ServerCommand::rust(),
-            ServerCommand::swift(),
-        ] {
-            assert!(
-                command.language.query_progress_titles().is_empty(),
-                "{:?} はどの題の作業に触れた答えも捨てる",
-                command.language
-            );
-        }
     }
 
     #[test]
