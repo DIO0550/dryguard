@@ -30,7 +30,7 @@ use std::fmt;
 
 use tree_sitter::Node;
 
-use crate::syntax::token::{Token, token_nodes_of};
+use crate::syntax::token::{Token, interpolations_of, token_nodes_of};
 use crate::syntax::tree::Grammar;
 
 /// 束縛として扱ってよい葉の種別。**これ以外の葉は、束縛と同じ綴りでも綴りで比べる。**
@@ -139,6 +139,7 @@ enum Spelling {
     /// チャンクが束縛した名前。**一貫した付け替えは違いに数えない。**
     Bound(String),
     /// それ以外の葉（外を指す名前・リテラル・子を持たない構文ノード）。綴りで比べる。
+    /// 補間を持つ文字列は、補間の区間を `\(…)` に綴り直したもの（[`literal_spelling_of`]）。
     Fixed(String),
 }
 
@@ -379,7 +380,10 @@ impl<'tree> SpellingContext<'tree, '_> {
             return Spelling::Unspelled;
         }
 
-        let text = text_of(node, self.source).to_owned();
+        let text = match token {
+            Token::Literal(_) => literal_spelling_of(node, self.source),
+            Token::Identifier | Token::Syntax(_) => text_of(node, self.source).to_owned(),
+        };
         if self.own_name == Some(node) {
             return Spelling::Bound(text);
         }
@@ -403,6 +407,80 @@ impl<'tree> SpellingContext<'tree, '_> {
             covering.start <= range.start && range.end <= covering.end
         })
     }
+}
+
+/// 補間の区間を開く字句と閉じる字句（Swift の `\(` と `)`）。
+const INTERPOLATION_OPENER: &str = "\\(";
+const INTERPOLATION_CLOSER: &str = ")";
+
+/// 補間の区間の中で、複数の式を区切る字句（`\(a, b)`）。
+const INTERPOLATION_SEPARATOR: &str = ",";
+
+/// 補間の式の代わりに綴る印。
+const INTERPOLATION_PLACEHOLDER: &str = "…";
+
+/// リテラル 1 つの綴り。補間を持つ文字列（`syntax::token` の `interpolations_of`）は、
+/// `\(` から対応する `)` までの区間を、式の数だけ `…` を `, ` で繋いだ形に綴り直す
+/// （`"a\( x /*c*/ )b"` は `"a\(…)b"`）。
+///
+/// **補間の中の名前は文字列の綴りに入れない。** 補間の式は列に自分のトークンとして続くので、
+/// そこで束縛の付け替えを見る。文字列の綴りに残すと、付け替えただけでも違いに見える。
+/// 空白とコメントは補間の式の外（文字列のノードの直接の子と、子のあいだ）に置かれるので、
+/// 式の範囲だけを置き換えると書式の違いが違いに見える。
+///
+/// 区間に区切り・式・コメント以外の子があれば、その区間は書かれたとおりに残す。
+/// **構文エラーを含む文字列は、丸ごと書かれたとおりに残す** — tree-sitter-swift は
+/// 補間の中で読めなかった部分（`\(rate b)` の `b`）を extras の `ERROR` にするので、
+/// extras として通すと違いが消える。どちらも違いに出る側（REVIEW 側）へ倒れる。
+fn literal_spelling_of(node: Node<'_>, source: &str) -> String {
+    let interpolations = interpolations_of(node);
+    if interpolations.is_empty() || node.has_error() {
+        return text_of(node, source).to_owned();
+    }
+
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+    let mut spelling = String::new();
+    let mut copied_up_to = node.start_byte();
+    let mut index = 0;
+    while index < children.len() {
+        let opener = children[index];
+        index += 1;
+        if opener.is_named() || opener.kind() != INTERPOLATION_OPENER {
+            continue;
+        }
+        let Some(closer_offset) = children[index..]
+            .iter()
+            .position(|child| !child.is_named() && child.kind() == INTERPOLATION_CLOSER)
+        else {
+            break;
+        };
+        let inside = &children[index..index + closer_offset];
+        let closer = children[index + closer_offset];
+        index += closer_offset + 1;
+
+        let only_expressions = inside.iter().all(|child| {
+            let comment = child.is_extra() && !child.is_error();
+            comment
+                || interpolations.contains(child)
+                || (!child.is_named() && child.kind() == INTERPOLATION_SEPARATOR)
+        });
+        if !only_expressions {
+            continue;
+        }
+
+        let expression_count = inside
+            .iter()
+            .filter(|child| interpolations.contains(child))
+            .count();
+        spelling.push_str(&source[copied_up_to..opener.start_byte()]);
+        spelling.push_str(INTERPOLATION_OPENER);
+        spelling.push_str(&vec![INTERPOLATION_PLACEHOLDER; expression_count].join(", "));
+        spelling.push_str(INTERPOLATION_CLOSER);
+        copied_up_to = closer.end_byte();
+    }
+    spelling.push_str(&source[copied_up_to..node.end_byte()]);
+    spelling
 }
 
 /// チャンク自身のシグネチャに書かれた型のノード。引数の型・戻り値の型・型引数・`where` 節
@@ -1662,5 +1740,95 @@ mod tests {
         );
 
         assert_eq!(divergence, vec!["x ↔ y"]);
+    }
+
+    #[test]
+    fn test_leaves_of_swift_functions_returning_different_strings_diverge_at_the_string() {
+        let divergence = swift_divergence(
+            r#"func unrooted() -> String { return "no marker" }"#,
+            r#"func outside() -> String { return "out of range" }"#,
+        );
+
+        assert_eq!(divergence, vec![r#""no marker" ↔ "out of range""#]);
+    }
+
+    #[test]
+    fn test_leaves_of_swift_functions_returning_strings_of_different_lengths_diverge_at_the_string()
+    {
+        // 文字の部分の個数（0 個と 3 個）が違っても列は揃い、違いは文字列の綴りに出る
+        let divergence = swift_divergence(
+            r#"func unrooted() -> String { return "" }"#,
+            r#"func outside() -> String { return "a\nb" }"#,
+        );
+
+        assert_eq!(divergence, vec![r#""" ↔ "a\nb""#]);
+    }
+
+    #[test]
+    fn test_leaves_of_swift_functions_renaming_a_binder_inside_an_interpolation_do_not_diverge() {
+        // 補間の中の名前は自分のトークンで付け替えを見る。文字列を 1 つの綴りにすると違いに見える
+        let divergence = swift_divergence(
+            r#"func describe(_ rate: Int) -> String { return "rate: \(rate)" }"#,
+            r#"func label(_ fee: Int) -> String { return "rate: \(fee)" }"#,
+        );
+
+        assert_eq!(divergence, vec!["identical"]);
+    }
+
+    #[test]
+    fn test_leaves_of_swift_functions_differing_in_the_text_around_an_interpolation_diverge_at_the_string()
+     {
+        let divergence = swift_divergence(
+            r#"func describe(_ rate: Int) -> String { return "rate: \(rate)" }"#,
+            r#"func label(_ fee: Int) -> String { return "fee: \(fee)" }"#,
+        );
+
+        assert_eq!(divergence, vec![r#""rate: \(…)" ↔ "fee: \(…)""#]);
+    }
+
+    #[test]
+    fn test_leaves_of_swift_functions_interpolating_different_outer_names_diverge_at_the_name() {
+        // 対照は上の付け替えのテスト。束縛していない名前は綴りで比べ、文字列は揃ったまま
+        let divergence = swift_divergence(
+            r#"func describe() -> String { return "rate: \(rate)" }"#,
+            r#"func label() -> String { return "rate: \(fee)" }"#,
+        );
+
+        assert_eq!(divergence, vec!["rate ↔ fee"]);
+    }
+
+    #[test]
+    fn test_leaves_of_swift_functions_differing_only_in_spacing_and_comments_inside_an_interpolation_do_not_diverge()
+     {
+        // `\(` と `)` のあいだの空白・コメントは補間の式の外に置かれる
+        let divergence = swift_divergence(
+            r#"func describe(_ rate: Int) -> String { return "rate: \( rate /* raw */ )" }"#,
+            r#"func label(_ fee: Int) -> String { return "rate: \(fee)" }"#,
+        );
+
+        assert_eq!(divergence, vec!["identical"]);
+    }
+
+    #[test]
+    fn test_leaves_of_swift_functions_passing_two_values_to_one_interpolation_diverge_at_the_string()
+     {
+        // `\(a, b)` は 2 引数の `appendInterpolation` を呼ぶ。`\(a)\(b)` とは列が揃っても別物
+        let divergence = swift_divergence(
+            r#"func describe(_ a: Int, _ b: Int) -> String { return "\(a, b)" }"#,
+            r#"func label(_ a: Int, _ b: Int) -> String { return "\(a)\(b)" }"#,
+        );
+
+        assert_eq!(divergence, vec![r#""\(…, …)" ↔ "\(…)\(…)""#]);
+    }
+
+    #[test]
+    fn test_leaves_of_swift_functions_with_different_broken_interpolations_diverge() {
+        // `\(rate b)` の `b` は補間の式の外の ERROR になる。綴り直すと `b` と `c` の違いが消える
+        let divergence = swift_divergence(
+            r#"func describe() -> String { return "\(rate b)" }"#,
+            r#"func label() -> String { return "\(rate c)" }"#,
+        );
+
+        assert_ne!(divergence, vec!["identical"]);
     }
 }
