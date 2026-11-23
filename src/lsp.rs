@@ -263,8 +263,8 @@ const JAVA_SETTLED_ATTEMPTS: usize = RUST_SETTLED_ATTEMPTS;
 ///
 /// **題で見分けるので jdtls の文言に依存する。** 題が変われば一覧に当たらず、今までどおり
 /// 捨てる側（`ServerStillWorking`）へ倒れる。読み込みの作業は別の題（`Building` など）で届く。
-/// hover / references にも同じ一覧が効くので、読み込みの作業がこの題で届く版では、読み込み途中の
-/// 答えを採りうる（jdtls 1.63.0 の hover / references の実サーバテストは綴りと参照元を確かめている）。
+/// 落ち着きを待つ問い合わせすべて（hover / references / definition / implementation）に同じ一覧が
+/// 効くので、読み込みの作業がこの題で届く版では、読み込み途中の答えを採りうる。
 const JAVA_QUERY_PROGRESS_TITLES: &[&str] = &["Background task"];
 
 /// サーバの問い合わせ形式。**サーバごとの値を選ぶのは、ここの網羅 `match` だけ。**
