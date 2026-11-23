@@ -251,9 +251,21 @@ const JAVA_HOVER_FENCES: &[usize] = hover::LEADING_FENCE;
 /// rust-analyzer と同じ形なので同じ上限にする。読み込みが終わった後の hover / references は
 /// 作業に触れないので、回数を増やしても待つのは読み込みの間だけ。
 ///
-/// callHierarchy は尋ねるたびに応答の前に作業（`Background task`）を始めて終えるので、
-/// 尋ね直すという仕組みでは何回でも落ち着かない（上限まで尋ねて `ServerStillWorking` になる）。
+/// callHierarchy は尋ねるたびに応答の前に作業（`Background task`）を始めて終えるが、
+/// [`JAVA_QUERY_PROGRESS_TITLES`] が答えを捨てる理由から外すので、尋ね直しは読み込みの間に限られる。
 const JAVA_SETTLED_ATTEMPTS: usize = RUST_SETTLED_ATTEMPTS;
+
+/// jdtls で、問い合わせ自身が始める作業の題（`query progress`）。
+///
+/// jdtls 1.63.0 は prepareCallHierarchy / outgoingCalls のたびに、応答の前にこの題の作業を
+/// 始めて終える（読み込みが終わった後も毎回）。捨てる理由にすると、尋ね直しが
+/// 上限まで続いて `ServerStillWorking` になる。
+///
+/// **題で見分けるので jdtls の文言に依存する。** 題が変われば一覧に当たらず、今までどおり
+/// 捨てる側（`ServerStillWorking`）へ倒れる。読み込みの作業は別の題（`Building` など）で届く。
+/// hover / references にも同じ一覧が効くので、読み込みの作業がこの題で届く版では、読み込み途中の
+/// 答えを採りうる（jdtls 1.63.0 の hover / references の実サーバテストは綴りと参照元を確かめている）。
+const JAVA_QUERY_PROGRESS_TITLES: &[&str] = &["Background task"];
 
 /// サーバの問い合わせ形式。**サーバごとの値を選ぶのは、ここの網羅 `match` だけ。**
 ///
@@ -286,6 +298,18 @@ impl ServerLanguage {
             Self::Rust => RUST_SETTLED_ATTEMPTS,
             Self::Swift => SWIFT_SETTLED_ATTEMPTS,
             Self::Java => JAVA_SETTLED_ATTEMPTS,
+        }
+    }
+
+    /// 問い合わせ自身が始める作業の題（`query progress`）。この題の作業は、尋ねている間に
+    /// 始まって終わっても答えを捨てる理由にしない。
+    ///
+    /// **Java 以外は空。** tsserver は読み込みの途中にも空の答えを返すので、どの題の作業に
+    /// 触れた答えも捨てる今の守りを保つ。
+    fn query_progress_titles(self) -> &'static [&'static str] {
+        match self {
+            Self::TypeScript | Self::Rust | Self::Swift => &[],
+            Self::Java => JAVA_QUERY_PROGRESS_TITLES,
         }
     }
 
@@ -559,6 +583,7 @@ impl Client {
             connection: Connection::new(BufReader::new(output), input)
                 .with_hover_fences(command.language.hover_fences())
                 .with_settled_attempts(command.language.settled_attempts())
+                .with_query_progress_titles(command.language.query_progress_titles())
                 .with_streaming_limit(command.wait_limits.streaming),
             stderr,
             program: command.program.clone(),
