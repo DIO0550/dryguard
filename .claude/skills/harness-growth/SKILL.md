@@ -49,6 +49,22 @@ git fetch --unshallow origin 2>/dev/null || git fetch origin main
 grep -n '^- 対策済: .* at pr-<介入の PR の番号>$' harness/records/pr-*.md
 ```
 
+- **宣言が記録に無い介入があれば、その分類だけ `count.sh` の `再発` を使わず、宣言した PR より後の
+  記録で数え直す**（下のスクリプト）。分類ごとに番号の最も大きい宣言を起点にし、数え直した値と
+  起点の PR・層を手順 3 の表に当てる。介入の PR 自身の記録は `harness-record` が埋めるまで無いので、
+  **埋まるのを待つと、同じ分類へ介入を重ね続ける**（2026-11 時点で、マージ済みの介入 27 本の
+  宣言がどれも記録に無く、`count.sh` は `plan` を pr-77 から数えていた。pr-323 で割り、
+  pr-475 / pr-481 / pr-513 / pr-515 / pr-532 で介入した後も）。記録が無い介入の PR の一覧は、
+  Issue / PR 本文に `harness-record` で埋める対象として書く
+
+```bash
+n=<宣言した PR の番号>; tag=<分類>
+for f in harness/records/pr-*.md; do
+  k=${f##*/pr-}; k=${k%.md}
+  [ "$k" -gt "$n" ] && grep -c "^- 分類: \`$tag\`" "$f"
+done | awk '{s+=$1} END {print s+0}'
+```
+
 ### 2. 数える
 
 ```bash
@@ -81,7 +97,7 @@ bash harness/records/count.sh
    満たし、その中に族が見つかれば 4-C。見つからなければ次へ
 2. `なし` を除いて `再発` の多い順に上から見て、**介入の PR がまだ開いている分類を飛ばした
    最初の 1 つ**（開いているかは `search_pull_requests` に `"記録へ写す行" is:open` で引き、
-   本文の宣言の分類で見る）
+   本文の宣言の分類で見る）。宣言が記録に無い介入のある分類は、手順 1 で数え直した値で並べる
 
 選んだものと、飛ばした候補とその理由を Issue に書く。
 
