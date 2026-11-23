@@ -55,6 +55,7 @@ const CLIENT_NAME: &str = "dryguard";
 /// **3 回目でも作業に触れているなら、尋ねるたびに始まっている**ので、待っても
 /// 答えは落ち着かない（`ReferencesOutcome::ServerStillWorking` /
 /// `HoverOutcome::ServerStillWorking` / `CalleesOutcome::ServerStillWorking`）。
+/// 問い合わせ自身が始める作業（`query progress`）は、触れた作業に数えない。
 pub(super) const SETTLED_ATTEMPTS: usize = 3;
 
 /// LSP の `ContentModified`。rust-analyzer は読み込みが進んでいる間の要求に返す。
@@ -104,11 +105,20 @@ pub struct Connection<R: BufRead, W: Write> {
     prepared_progress: Vec<ProgressToken>,
     /// 始まりの通知が届き、終わりの通知がまだ来ていない作業。
     running_progress: Vec<ProgressToken>,
-    /// サーバの作業について知らされた回数（token を用意する要求と、始まりの通知）。
+    /// 1 回尋ねている間に知らされた作業（token を用意する要求と、始まりの通知）の token。
     ///
-    /// **減らさない。** 始まって終わった作業は [`Self::running_progress`] から消えるので、
-    /// 尋ねている間に何か起きたかは数でしか追えない。
-    noticed_progress_count: usize,
+    /// 始まって終わった作業は [`Self::running_progress`] から消えるので、尋ねている間に
+    /// 何か起きたかはここで追う。**尋ねる直前に空にする。**
+    ///
+    /// **数ではなく token で持つ。** 用意された時点では題が分からず、問い合わせ自身の作業かは
+    /// 始まりの通知で決まる。数から差し引くと、前の回に用意された作業の分が今の回の別の作業と
+    /// 相殺し、「触れていない」に見える。
+    noticed_progress: Vec<ProgressToken>,
+    /// 問い合わせ自身が始める作業の題（`query progress`）。この題で始まった作業は、
+    /// 尋ねている間に始まって終わっても答えを捨てる理由にしない。
+    ///
+    /// **動いている間は今までどおり待つ**（[`Self::running_progress`] には入れる）。
+    query_progress_titles: &'static [&'static str],
     /// hover の応答で、綴りを探すコードフェンスの試す順。
     hover_fences: &'static [usize],
     /// 落ち着いた答えを求めて尋ね直す回数の上限。
@@ -130,7 +140,8 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             open_documents: BTreeSet::new(),
             prepared_progress: Vec::new(),
             running_progress: Vec::new(),
-            noticed_progress_count: 0,
+            noticed_progress: Vec::new(),
+            query_progress_titles: &[],
             hover_fences: hover::LEADING_FENCE,
             settled_attempts: SETTLED_ATTEMPTS,
             streaming_limit: None,
@@ -149,6 +160,15 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     /// 子プロセスを起動する側（[`super::Client`]）がサーバの指定から渡す。
     pub(super) fn with_hover_fences(mut self, fences: &'static [usize]) -> Self {
         self.hover_fences = fences;
+        self
+    }
+
+    /// 問い合わせ自身が始める作業の題を付ける。
+    ///
+    /// **既定は空**（どの題の作業に触れても答えを捨てる）。題はサーバごとに決まるので、
+    /// 子プロセスを起動する側（[`super::Client`]）がサーバの指定から渡す。
+    pub(super) fn with_query_progress_titles(mut self, titles: &'static [&'static str]) -> Self {
+        self.query_progress_titles = titles;
         self
     }
 
@@ -845,6 +865,9 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         // 始まらないまま捨てられた token 1 つで、以降の問い合わせがすべて
         // 落ち着かなかったことになる。
         self.prepared_progress.clear();
+        // 知らされた作業も同じ。次に尋ねる直前にも空にするが、問い合わせのあいだの
+        // 要求（open・typeDefinition など）の通知で伸び続けないよう、ここで手放す。
+        self.noticed_progress.clear();
 
         settled
     }
@@ -871,10 +894,10 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         while attempts_left > 0 {
             // **尋ねる前に、動いている作業を待ち切る。** 動いている最中に送ると、
             // その作業が終わってから応答が届いたときに、こちらからは何も起きなかったように
-            // 見える（前の問い合わせで覚えた作業なので、数も増えない）。
+            // 見える（前の問い合わせで覚えた作業なので、今の回には覚えない）。
             self.wait_for_running_progress()?;
 
-            let noticed_before = self.noticed_progress_count;
+            self.noticed_progress.clear();
             let answered = match ask_once(self, params.clone()) {
                 Ok(answered) => Some(answered),
                 Err(ConnectionError::ServerFailure { failure, .. })
@@ -888,7 +911,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             // 「今動いているか」だけでは足りない。**尋ねている間に始まって終わった作業**が
             // あると、読み込み前に計算された答えを受け取りながら、手元では何も動いて
             // いないように見える（実測: 進捗の終わりが応答より先に届き、答えは 0 件）。
-            let noticed_while_answering = self.noticed_progress_count != noticed_before;
+            let noticed_while_answering = !self.noticed_progress.is_empty();
             // 用意されただけの作業も落ち着いていない扱いにする。始まりの通知が応答より
             // 後ろに並ぶと、こちらからは何も起きていないように見える。
             let work_is_pending =
@@ -1194,10 +1217,10 @@ impl<R: BufRead, W: Write> Connection<R, W> {
 
         self.send(&message::null_result_payload_of(id))?;
 
-        // 数はここでも進める。**作業が起きうると分かるのはこの時点**で、尋ねている間に
+        // ここでも覚える。**作業が起きうると分かるのはこの時点**で、尋ねている間に
         // ここを通ったかどうかが、答えを信用してよいかの判断材料になる
         // （`running_progress` は始まって終わると空に戻り、痕跡が残らない）。
-        self.noticed_progress_count = self.noticed_progress_count.saturating_add(1);
+        self.noticed_progress.push(created.token.clone());
         self.prepared_progress.push(created.token);
 
         Ok(())
@@ -1225,11 +1248,18 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         let ProgressParamsValue::WorkDone(work) = progress.value;
 
         match work {
-            // **始まりでも数を進める。** token を用意するのが前の問い合わせの最中で、
+            // **始まりでも覚える。** token を用意するのが前の問い合わせの最中で、
             // 始まりと終わりだけが次の問い合わせの最中に届く並びがある。用意した時点しか
             // 数えないと、その並びで「何も起きなかった」ように見える。
-            WorkDoneProgress::Begin(_) => {
-                self.noticed_progress_count = self.noticed_progress_count.saturating_add(1);
+            WorkDoneProgress::Begin(begun) => {
+                // 問い合わせ自身の作業なら、用意された時点で覚えた分も取り消す。
+                // 取り消すのはその token だけなので、同じ回の別の作業は残る。
+                if self.query_progress_titles.contains(&begun.title.as_str()) {
+                    self.noticed_progress
+                        .retain(|token| *token != progress.token);
+                } else {
+                    self.noticed_progress.push(progress.token.clone());
+                }
                 self.prepared_progress
                     .retain(|token| *token != progress.token);
                 self.running_progress.push(progress.token);
