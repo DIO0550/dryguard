@@ -2537,10 +2537,17 @@ mod tests {
 
     #[test]
     fn test_references_touched_by_progress_with_another_title_asks_again() {
-        // 対照は上のテスト。同じ並びでも、題が一覧に無ければ読み込みとして捨てる
-        // （tsserver の空の答えの守り）
-        let server_output = query_progress_then_empty_then_one_reference();
-        let mut connection = connection_over(&server_output);
+        // 対照は上のテスト。題が一覧の題で始まるだけの作業は、読み込みとして捨てる。
+        // 前方一致で見ると、サーバが同じ語で始まる題を読み込みに使ったときに途中の答えを採る
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            &progress_begin_notification_titled("loading", "問い合わせの作業 2"),
+            &progress_end_notification("loading"),
+            &no_references_response(1),
+            &references_response(2, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection =
+            connection_over(&server_output).with_query_progress_titles(&[QUERY_PROGRESS_TITLE]);
         let document = opened_document(&mut connection);
 
         let outcome = connection
@@ -2607,6 +2614,34 @@ mod tests {
         assert!(
             matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
             "2 回目は別の作業に触れているので捨てる: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_with_a_token_reused_by_query_progress_still_sees_the_earlier_work() {
+        // 読み込みが終わった後、サーバが同じ token を問い合わせの作業に使い回す。
+        // その token の記録をすべて外すと、読み込みに触れたことまで消える
+        let server_output = frames_of(&[
+            &progress_create_request(9, "reused"),
+            &progress_begin_notification("reused"),
+            &progress_end_notification("reused"),
+            &progress_create_request(10, "reused"),
+            &progress_begin_notification_titled("reused", QUERY_PROGRESS_TITLE),
+            &progress_end_notification("reused"),
+            &no_references_response(1),
+            &references_response(2, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection =
+            connection_over(&server_output).with_query_progress_titles(&[QUERY_PROGRESS_TITLE]);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "読み込みに触れた 1 通目は捨てる: {outcome:?}"
         );
     }
 
