@@ -1857,6 +1857,8 @@ mod tests {
                 UnopenedReason::DefinitionNotProvided,
                 UnopenedReason::NoDeclarationSite,
                 UnopenedReason::NoDefinitionSite,
+                UnopenedReason::NoSwiftDefinitionSite,
+                UnopenedReason::NoJavaDefinitionSite,
                 UnopenedReason::UnreadableTypeDefinition,
                 UnopenedReason::UnreadableDefinition,
                 UnopenedReason::UnreadableDeclaringDocument,

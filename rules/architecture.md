@@ -371,6 +371,14 @@ sourcekit-lsp 6.4.2 が答えないので、`CyclicAlias` はサーバが答え�
 `where` の右辺と型引数の型名は使用位置から辿る。**`where` の左辺は辿らない** — レシーバの型変数で、
 sourcekit-lsp 6.4.2 の definition は宣言ではない位置（そのモジュールの生成インタフェースの先頭）を返す。
 
+**Swift のメタタイプは基底型を持つ型構造で比べる。** `SwiftSpelling` は `X.Type` の `X` を型名として集め、その位置に
+definition を向ける。ツリー上の `user_type`・`metatype`・`bracket_qualified_type` がこの形を持つ。
+`any P.Type` は `P.Type` と重ね、`(any P).Type` は `P.Protocol` と重ねる（Swift 6.4.2 の `inout` 引数で確認）。
+バッククォート付きの ``Outer.`Type` `` は型名として辿る。
+エイリアスの右辺も同じ規則で読む。固定長配列の長さや値の型引数など、比較に残せない情報を含む型は測れないとする。
+Swift の definition が空の場合は `NoSwiftDefinitionSite` とし、テキストでは sourcekit-lsp の応答を説明する。
+Swift の JSON では空の definition を `no-definition-site` で表す。
+
 **Java の型名は definition で辿り、宣言の場所でそのまま比べる。** jdtls 1.63.0 の typeDefinition は
 結果を持たない応答を返すので definition を尋ねる（`semantics::resolved_type` の
 `java_traced_type_names_of`）。Java にエイリアスは無いので開く段は無い。**JDK の型は辿れない** —

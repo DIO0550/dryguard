@@ -113,3 +113,17 @@ func composed(value: Decodable & Encodable) -> Int {
 func objected(value: AnyObject) -> Int {
     0
 }
+
+typealias IntMetatype = Int.Type
+
+func aliasedMetatype(value: IntMetatype) -> Int {
+    0
+}
+
+func writtenMetatype(value: Int.Type) -> Int {
+    0
+}
+
+func classMetatype(value: AnyClass) -> Int {
+    0
+}

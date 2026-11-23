@@ -668,6 +668,30 @@ enum ConstraintRelation {
 /// 境界 1 つ。左辺・関係・右辺。
 type SwiftConstraint = (SwiftType, ConstraintRelation, SwiftType);
 
+/// メタタイプを作る接尾辞。`P.Protocol` は `(any P).Type` と同じ型になる。
+enum MetatypeSuffix {
+    Type,
+    Protocol,
+}
+
+impl MetatypeSuffix {
+    fn from_spelling(spelling: &str) -> Option<Self> {
+        match spelling {
+            "Type" => Some(Self::Type),
+            "Protocol" => Some(Self::Protocol),
+            _ => None,
+        }
+    }
+
+    fn wrapping(self, base: SwiftType) -> SwiftType {
+        let base = match self {
+            Self::Type => base,
+            Self::Protocol => base.into_existential(),
+        };
+        SwiftType::Metatype(Box::new(base))
+    }
+}
+
 /// 型 1 つ分の形。**書かれ方の違い（省略形・冗長な括弧）を落としてある。**
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum SwiftType {
@@ -677,6 +701,8 @@ enum SwiftType {
     Parameter(usize),
     /// 型変数の関連型（`T.Element`）。
     Member(usize, Vec<String>),
+    /// `T.Type`。`P.Protocol` は existential 型を基底型に持つ。
+    Metatype(Box<SwiftType>),
     /// `T?` / `Optional<T>`。
     Optional(Box<SwiftType>),
     /// `T!`。**`T?` と重ねない** — 受け取る側で暗黙に unwrap されるので、呼び出し側の書き方が変わる。
@@ -702,6 +728,13 @@ enum SwiftType {
 }
 
 impl SwiftType {
+    fn into_existential(self) -> Self {
+        match self {
+            Self::Existential(_) => self,
+            _ => Self::Existential(Box::new(self)),
+        }
+    }
+
     /// この型を形作るノードの数（自分を含む）。
     fn size(&self) -> usize {
         self.size_with(&|_| 1)
@@ -719,7 +752,8 @@ impl SwiftType {
                 .flat_map(|(_, arguments)| arguments)
                 .map(sized)
                 .fold(0, usize::saturating_add),
-            Self::Optional(wrapped)
+            Self::Metatype(wrapped)
+            | Self::Optional(wrapped)
             | Self::ImplicitlyUnwrapped(wrapped)
             | Self::Array(wrapped)
             | Self::Opaque(wrapped)
@@ -748,7 +782,8 @@ impl SwiftType {
                 .iter()
                 .flat_map(|(_, arguments)| arguments)
                 .any(Self::has_type_variable),
-            Self::Optional(wrapped)
+            Self::Metatype(wrapped)
+            | Self::Optional(wrapped)
             | Self::ImplicitlyUnwrapped(wrapped)
             | Self::Array(wrapped)
             | Self::Opaque(wrapped)
@@ -795,6 +830,7 @@ impl SwiftType {
                     })
                     .collect::<Option<Vec<_>>>()?,
             ),
+            Self::Metatype(wrapped) => Self::Metatype(each(wrapped)?),
             Self::Optional(wrapped) => Self::Optional(each(wrapped)?),
             Self::ImplicitlyUnwrapped(wrapped) => Self::ImplicitlyUnwrapped(each(wrapped)?),
             Self::Array(element) => Self::Array(each(element)?),
@@ -854,6 +890,7 @@ impl SwiftType {
                     })
                     .collect(),
             ),
+            Self::Metatype(wrapped) => Self::Metatype(Box::new(wrapped.renumbered(renumber))),
             Self::Optional(wrapped) => Self::Optional(Box::new(wrapped.renumbered(renumber))),
             Self::ImplicitlyUnwrapped(wrapped) => {
                 Self::ImplicitlyUnwrapped(Box::new(wrapped.renumbered(renumber)))
@@ -1009,6 +1046,7 @@ fn is_callable_kind(kind: &str) -> bool {
 /// `function` はチャンクのノード（関数・`init`・`deinit`）、`source` はそれを含むファイル全体。
 /// **hover の綴りを読むのと同じ読み手で読む**ので、型名の綴りが揃う。
 /// 関数自身が束縛した型変数・`Self` は集めない（辿る相手が居ない / 囲む型で決まる）。
+/// メタタイプは基底型の名前を集める。`.Type` と `.Protocol` はメタタイプの構造にする。
 /// **標準ライブラリの省略形の名前（`Optional` など）も集める** — 標準ライブラリを
 /// 指すかは辿ってみるまで分からない。
 pub(crate) fn type_references_of(function: Node<'_>, source: &str) -> Vec<TypeReference> {
@@ -1396,16 +1434,28 @@ impl<'source> SwiftSpelling<'source> {
     fn type_of(&mut self, node: Node<'_>) -> Option<SwiftType> {
         match node.kind() {
             "user_type" => self.user_type_of(node),
+            "metatype" | "bracket_qualified_type" => self.metatype_of(node),
             "optional_type" => {
-                let wrapped = first_type_child_of(node)?;
-                Some(SwiftType::Optional(Box::new(self.type_of(wrapped)?)))
+                let wrapped = only_type_child_of(node)?;
+                let wrapped = self.type_of(wrapped)?;
+                let mut cursor = node.walk();
+                // tree-sitter-swift は `T??` の `??` を 1 トークンとして返す。
+                let depth: usize = node
+                    .children(&mut cursor)
+                    .map(|child| match child.kind() {
+                        "?" => 1,
+                        "??" => 2,
+                        _ => 0,
+                    })
+                    .sum();
+                Some((0..depth).fold(wrapped, |wrapped, _| SwiftType::Optional(Box::new(wrapped))))
             }
             "array_type" => {
-                let element = first_type_child_of(node)?;
+                let element = only_type_child_of(node)?;
                 Some(SwiftType::Array(Box::new(self.type_of(element)?)))
             }
             "dictionary_type" => {
-                let types = type_children_of(node);
+                let types = type_children_of(node)?;
                 let [key, value] = types.as_slice() else {
                     return None;
                 };
@@ -1417,14 +1467,19 @@ impl<'source> SwiftSpelling<'source> {
             "tuple_type" => self.tuple_type_of(node),
             "function_type" => self.function_type_of(node),
             "opaque_type" => Some(SwiftType::Opaque(Box::new(
-                self.type_of(first_type_child_of(node)?)?,
+                self.type_of(only_type_child_of(node)?)?,
             ))),
-            "existential_type" => Some(SwiftType::Existential(Box::new(
-                self.type_of(first_type_child_of(node)?)?,
-            ))),
+            "existential_type" => {
+                let wrapped = self.type_of(only_type_child_of(node)?)?;
+                // `any P.Type` と `P.Type` は同じメタタイプ。`(any P).Type` の `any` は基底型に入る。
+                if matches!(wrapped, SwiftType::Metatype(_)) {
+                    return Some(wrapped);
+                }
+                Some(wrapped.into_existential())
+            }
             "protocol_composition_type" => {
                 let mut members = BTreeSet::new();
-                for member in type_children_of(node) {
+                for member in type_children_of(node)? {
                     members.insert(self.type_of(member)?);
                 }
                 Some(SwiftType::Composition(members))
@@ -1438,17 +1493,30 @@ impl<'source> SwiftSpelling<'source> {
         let numbered_before = self.numbered.len();
         let mut path: Vec<(String, Vec<SwiftType>)> = Vec::new();
         let mut last_identifier = None;
+        let mut suffixes = Vec::new();
         let mut cursor = node.walk();
-        let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
-        for child in children {
+        for child in node
+            .named_children(&mut cursor)
+            .filter(|child| !child.is_extra())
+        {
             match child.kind() {
                 TYPE_IDENTIFIER_KIND => {
-                    path.push((self.text(child)?.to_owned(), Vec::new()));
-                    last_identifier = Some(child);
+                    let name = self.text(child)?;
+                    // tree-sitter-swift 0.7.4 は `X.Type` を user_type として読む。
+                    // 単独の `Type` やバッククォート付きの名前はそのまま型名になる。
+                    let suffix = MetatypeSuffix::from_spelling(name).filter(|_| !path.is_empty());
+                    match suffix {
+                        Some(suffix) => suffixes.push(suffix),
+                        None if suffixes.is_empty() => {
+                            path.push((name.to_owned(), Vec::new()));
+                            last_identifier = Some(child);
+                        }
+                        None => return None,
+                    }
                 }
-                TYPE_ARGUMENTS_KIND => {
+                TYPE_ARGUMENTS_KIND if suffixes.is_empty() => {
                     let mut arguments = Vec::new();
-                    for argument in type_children_of(child) {
+                    for argument in type_children_of(child)? {
                         arguments.push(self.type_of(argument)?);
                     }
                     path.last_mut()?.1 = arguments;
@@ -1456,7 +1524,26 @@ impl<'source> SwiftSpelling<'source> {
                 _ => return None,
             }
         }
-        Some(self.path_type_of(path, last_identifier, numbered_before))
+        let base = self.path_type_of(path, last_identifier, numbered_before);
+        Some(
+            suffixes
+                .into_iter()
+                .fold(base, |base, suffix| suffix.wrapping(base)),
+        )
+    }
+
+    /// `(any P).Type` などの metatype と、`[T].Type` などの bracket_qualified_type を読む。
+    /// ブラケット型に続く通常のメンバー名は未対応なので `None`。
+    fn metatype_of(&mut self, node: Node<'_>) -> Option<SwiftType> {
+        let mut cursor = node.walk();
+        let mut parts = node
+            .children(&mut cursor)
+            .filter(|part| !part.is_extra() && part.kind() != ".");
+        let base = self.type_of(parts.next()?)?;
+        parts.try_fold(base, |wrapped, part| {
+            let suffix = MetatypeSuffix::from_spelling(self.text(part)?)?;
+            Some(suffix.wrapping(wrapped))
+        })
     }
 
     /// 名前のパスを型にする。束縛した型変数・`Self`・標準ライブラリの省略形を見分ける。
@@ -1610,6 +1697,12 @@ impl<'source> SwiftSpelling<'source> {
             .collect();
         for item in items {
             let children = all_children_of(item);
+            if children
+                .iter()
+                .any(|child| child.kind() == TYPE_MODIFIERS_KIND)
+            {
+                return None;
+            }
             let label = children
                 .iter()
                 .find(|child| child.kind() == SIMPLE_IDENTIFIER_KIND)
@@ -1630,10 +1723,10 @@ impl<'source> SwiftSpelling<'source> {
 
     fn function_type_of(&mut self, node: Node<'_>) -> Option<SwiftType> {
         let children = all_children_of(node);
-        // 戻り値の型に付いた属性（`() -> @Sendable () -> Void`）は読まない
+        // 型に付いた属性や typed throws を落とすと、呼び出しの要件が異なる型が重なる。
         if children
             .iter()
-            .any(|child| child.kind() == TYPE_MODIFIERS_KIND)
+            .any(|child| matches!(child.kind(), TYPE_MODIFIERS_KIND | THROWS_CLAUSE_KIND))
         {
             return None;
         }
@@ -1744,6 +1837,8 @@ fn is_default_value(declaration: Node<'_>, child: Node<'_>) -> bool {
 fn is_type_kind(kind: &str) -> bool {
     [
         "user_type",
+        "metatype",
+        "bracket_qualified_type",
         "optional_type",
         "array_type",
         "dictionary_type",
@@ -1756,14 +1851,21 @@ fn is_type_kind(kind: &str) -> bool {
     .contains(&kind)
 }
 
-fn first_type_child_of(node: Node<'_>) -> Option<Node<'_>> {
-    type_children_of(node).into_iter().next()
+fn only_type_child_of(node: Node<'_>) -> Option<Node<'_>> {
+    let children = type_children_of(node)?;
+    let [child] = children.as_slice() else {
+        return None;
+    };
+    Some(*child)
 }
 
-fn type_children_of(node: Node<'_>) -> Vec<Node<'_>> {
+/// 型だけで構成される位置の子を読む。固定長配列の長さ、値の型引数、型属性などがあれば `None`。
+/// 情報を落とすと、エイリアス展開や型引数の代入を通ったメタタイプでも別の型が重なる。
+fn type_children_of(node: Node<'_>) -> Option<Vec<Node<'_>>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
-        .filter(|child| is_type_kind(child.kind()))
+        .filter(|child| !child.is_extra())
+        .map(|child| is_type_kind(child.kind()).then_some(child))
         .collect()
 }
 
@@ -1883,6 +1985,56 @@ mod tests {
             callable_of("func f(x: (Int)) -> ((Int))"),
             callable_of("func f(x: Int) -> Int")
         );
+    }
+
+    #[test]
+    fn test_from_spelling_keeps_metatype_layers() {
+        let nested = callable_of("func f(x: Int.Type.Type)");
+
+        assert_eq!(nested, callable_of("func f(x: (Int).Type.Type)"));
+        assert_ne!(nested, callable_of("func f(x: Int.Type)"));
+    }
+
+    #[test]
+    fn test_from_spelling_normalizes_equivalent_protocol_metatype_spellings() {
+        let conforming_metatype = callable_of("func f(x: any P.Type)");
+        let container_metatype = callable_of("func f(x: (any P).Type)");
+
+        assert_eq!(conforming_metatype, callable_of("func f(x: P.Type)"));
+        assert_eq!(container_metatype, callable_of("func f(x: P.Protocol)"));
+        assert_ne!(conforming_metatype, container_metatype);
+    }
+
+    #[test]
+    fn test_from_spelling_normalizes_array_and_dictionary_metatypes() {
+        assert_eq!(
+            callable_of("func f(x: [Int].Type, y: [String: Int].Type)"),
+            callable_of("func f(x: Array<Int>.Type, y: Dictionary<String, Int>.Type)")
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_keeps_nested_optional_metatype_bases() {
+        let double = callable_of("func f(x: Int??.Type)");
+
+        assert_eq!(double, callable_of("func f(x: (Int??).Type)"));
+        assert_ne!(double, callable_of("func f(x: Int?.Type)"));
+    }
+
+    #[test]
+    fn test_from_spelling_rejects_metatypes_whose_base_would_lose_type_information() {
+        for spelling in [
+            "func f(x: [4 of Int].Type)",
+            "func f(x: ([4 of Int]).Type)",
+            "func f(x: InlineArray<4, Int>.Type)",
+            "func f(x: (@Sendable () -> Void).Type)",
+            "func f(x: ((Int) throws(Failure) -> Int).Type)",
+        ] {
+            assert!(
+                SwiftCallable::from_spelling(spelling, &standard, None).is_none(),
+                "{spelling}"
+            );
+        }
     }
 
     #[test]
@@ -2356,6 +2508,25 @@ mod tests {
     }
 
     #[test]
+    fn test_type_references_of_metatypes_point_at_the_base_type() {
+        let source = "func f<T>(x: Swift.Int.Type, y: T.Type, z: Outer.`Type`) {}\n";
+        let line = crate::line_number::LineNumber::from_index(0);
+        let expected = [
+            ("Swift.Int", "func f<T>(x: Swift."),
+            (
+                "Outer.`Type`",
+                "func f<T>(x: Swift.Int.Type, y: T.Type, z: Outer.",
+            ),
+        ]
+        .map(|(name, preceding)| {
+            let position = SourcePosition::from_preceding_text(line, preceding);
+            (name.to_owned(), format!("{position:?}"))
+        });
+
+        assert_eq!(references_of(source), expected);
+    }
+
+    #[test]
     fn test_type_references_of_a_source_function_keep_standard_sugar_names() {
         // 標準ライブラリを指すかは辿ってみるまで分からないので、`Optional` も尋ねる
         let names: BTreeSet<String> = references_of("func f(x: Optional<Int>) {}\n")
@@ -2553,6 +2724,25 @@ mod tests {
         table: &[(&str, SwiftTypeResolution)],
     ) -> SwiftCallable {
         SwiftCallable::from_spelling(spelling, &resolving(table), None).expect("読める綴り")
+    }
+
+    #[test]
+    fn test_from_spelling_substitutes_type_arguments_inside_metatypes() {
+        let alias = opened_declaration("typealias Swapped<T, U> = (U.Type, T)", &[]);
+        let table = [
+            ("Swapped", alias),
+            ("Int", standard_at("Int")),
+            ("String", standard_at("String")),
+        ];
+
+        assert_eq!(
+            resolved_callable_of("func f(x: Swapped<Int, String>)", &table),
+            resolved_callable_of("func f(x: (String.Type, Int))", &table)
+        );
+        assert_eq!(
+            resolved_callable_of("func f<T, U>(x: Swapped<T, U>) -> T", &table),
+            resolved_callable_of("func f<T, U>(x: (U.Type, T)) -> T", &[])
+        );
     }
 
     #[test]

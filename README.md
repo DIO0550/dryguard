@@ -128,6 +128,7 @@ jdtls 1.63.0 は JDK 25 が要る。呼び出し先は問い合わせのたび�
 呼び出し元は印（`pom.xml` / `build.gradle` / `build.gradle.kts`）の外のファイルでは尋ねない（`pom.xml` の無いディレクトリでは別ファイルの参照元が返らないことを実測した。Gradle は未確認）。
 `.swift` は関数・メソッド・`init` / `deinit` をチャンクにする。
 Swift の候補は sourcekit-lsp に型シグネチャ・呼び出し元・呼び出し先を尋ねる。型シグネチャは引数のラベルを型の一部として残し（内部名は落とす）、型名は definition で宣言まで辿り、宣言の場所で比べる。`typealias` は右辺へ開く（連鎖も辿り、ジェネリックな `typealias` は使用側の型引数を当てはめる）。標準ライブラリやフレームワークの `typealias`（`Codable` / `TimeInterval` など）も、sourcekit-lsp が生成したインタフェースの最上位にあれば開く。境界を持つジェネリックな `typealias` に型変数を当てる形・`where` 節を持つ `typealias`・型変数を持ちうる宣言（`extension` / `protocol` / ジェネリックな型）の中の `typealias`・生成インタフェースで型の中に書かれた `typealias`（`Array.Index` など）・右辺を綴らない `typealias`（`AnyObject`）はまだ開かないので、それらを通る型シグネチャは「測れない」になる。
+`X.Type` などのメタタイプは基底型 `X` の宣言を辿り、メタタイプとして比較する。sourcekit-lsp が宣言の場所を返さない場合は、`--explain` にその旨を表示する。
 sourcekit-lsp は index を作り終える前の参照元に空を返すので、セッションを始めるたびに index を作り終えるまで待つ（`compare` は実行ごと、`scan` / `check` は走査ごとに 1 回。`swift build` は要らない）。
 `swift build` が要らないのは sourcekit-lsp の background indexing が有効なとき（既定）だけで、無効にすると参照元と呼び出し先は測れなくなる（Swift 6.4.2 の既定のビルドシステムで `swift build` した後も同じ）。
 実コード（apple/swift-argument-parser 1.6.1、160 ファイル）で `scan` が通り、握手から最後の答えまで約 62 秒（初回起動は 105 秒）だった（#408）。

@@ -424,3 +424,28 @@ fn test_sourcekit_lsp_generated_interface_typealias_without_a_right_side_is_not_
         }
     );
 }
+
+#[test]
+#[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
+fn test_sourcekit_lsp_metatype_alias_matches_its_right_side() {
+    assert_eq!(
+        type_signature_match_of("aliasedMetatype", "writtenMetatype"),
+        TypeSignatureMatch::Unifiable
+    );
+    assert_eq!(
+        type_signature_match_of("writtenMetatype", "doubled"),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
+fn test_sourcekit_lsp_any_class_is_unmeasurable_when_any_object_cannot_be_opened() {
+    // AnyClass の右辺 `any AnyObject.Type` は、基底型の AnyObject まで辿る。
+    assert_eq!(
+        type_signature_match_of("classMetatype", "writtenMetatype"),
+        TypeSignatureMatch::UnopenedTypeName {
+            reason: UnopenedReason::UnopenableAlias
+        }
+    );
+}

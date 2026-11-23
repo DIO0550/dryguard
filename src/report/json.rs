@@ -778,7 +778,9 @@ fn unopened_name_of(reason: UnopenedReason) -> &'static str {
         UnopenedReason::TypeDefinitionNotProvided => "type-definition-not-provided",
         UnopenedReason::DefinitionNotProvided => "definition-not-provided",
         UnopenedReason::NoDeclarationSite => "no-declaration-site",
-        UnopenedReason::NoDefinitionSite => "no-definition-site",
+        UnopenedReason::NoDefinitionSite | UnopenedReason::NoSwiftDefinitionSite => {
+            "no-definition-site"
+        }
         UnopenedReason::NoJavaDefinitionSite => "no-java-definition-site",
         UnopenedReason::UnreadableTypeDefinition => "unreadable-type-definition",
         UnopenedReason::UnreadableDefinition => "unreadable-definition",
@@ -1263,6 +1265,10 @@ mod tests {
         );
         assert_eq!(
             json_for(UnopenedReason::NoDefinitionSite),
+            "no-definition-site"
+        );
+        assert_eq!(
+            json_for(UnopenedReason::NoSwiftDefinitionSite),
             "no-definition-site"
         );
         assert_eq!(
