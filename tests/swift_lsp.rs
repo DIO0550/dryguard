@@ -332,3 +332,43 @@ fn test_sourcekit_lsp_typealias_that_may_name_type_variables_is_not_opened() {
         }
     );
 }
+
+#[test]
+#[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
+fn test_sourcekit_lsp_typealias_in_a_generated_interface_and_its_right_side_are_unifiable() {
+    // `waited(value: TimeInterval)` と `halved(value: Double)`。`TimeInterval` は Foundation の
+    // 生成インタフェースの `public typealias TimeInterval = Double`。右辺の `Double` は
+    // 生成インタフェースの位置から辿る
+    assert_eq!(
+        type_signature_match_of("waited", "halved"),
+        TypeSignatureMatch::Unifiable
+    );
+    // 対照: 右辺と別の型とは重ならない
+    assert_eq!(
+        type_signature_match_of("waited", "doubled"),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
+fn test_sourcekit_lsp_standard_library_composition_typealias_and_its_right_side_are_unifiable() {
+    // `Codable` は標準ライブラリの `public typealias Codable = Decodable & Encodable`
+    assert_eq!(
+        type_signature_match_of("coded", "composed"),
+        TypeSignatureMatch::Unifiable
+    );
+}
+
+#[test]
+#[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
+fn test_sourcekit_lsp_generated_interface_typealias_without_a_right_side_is_not_opened() {
+    // `AnyObject` は標準ライブラリの生成インタフェースに `public typealias AnyObject` と
+    // 右辺を綴らずに置かれる。開く先が無いので、宣言の場所のまま比べない
+    assert_eq!(
+        type_signature_match_of("objected", "doubled"),
+        TypeSignatureMatch::UnopenedTypeName {
+            reason: UnopenedReason::UnopenableAlias
+        }
+    );
+}

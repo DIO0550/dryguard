@@ -45,7 +45,22 @@ impl SourceDocument {
                 path: path.to_path_buf(),
             });
         };
+        Self::with_grammar(path, text, grammar)
+    }
 
+    /// 宣言を返したサーバの言語 `grammar` で、宣言側のファイルを組み立てる。拡張子は見ない。
+    ///
+    /// **Why**: sourcekit-lsp が宣言を置く生成インタフェース（`.swiftinterface`）は、チャンクに
+    /// しないので [`Grammar`] の読める拡張子に無い。そこに足すと `scan` の走査の対象にまで入る。
+    ///
+    /// # Errors
+    ///
+    /// パスを絶対パスにできないとき、URI にできないとき。
+    pub(crate) fn with_grammar(
+        path: &Path,
+        text: String,
+        grammar: Grammar,
+    ) -> Result<Self, DocumentError> {
         let resolved =
             uri::absolute_path_of(path).map_err(|cause| DocumentError::PathNotAbsolute {
                 path: path.to_path_buf(),
@@ -239,6 +254,22 @@ mod tests {
             SourceDocument::new(&path, "let a = 1".to_owned()).expect("ドキュメントにできる");
 
         assert_eq!(document.to_text_document_item().language_id, "swift");
+    }
+
+    #[test]
+    fn test_with_grammar_opens_a_generated_swift_interface_as_swift() {
+        // sourcekit-lsp が宣言を置く生成インタフェース。`new` は拡張子で断る（対照）
+        let path = repository_path("GeneratedInterfaces/1/Foundation.swiftinterface");
+        let text = "public typealias TimeInterval = Double\n".to_owned();
+
+        let document = SourceDocument::with_grammar(&path, text.clone(), Grammar::Swift)
+            .expect("ドキュメントにできる");
+
+        assert_eq!(document.to_text_document_item().language_id, "swift");
+        assert!(matches!(
+            SourceDocument::new(&path, text),
+            Err(DocumentError::UnreadableExtension { .. })
+        ));
     }
 
     #[test]

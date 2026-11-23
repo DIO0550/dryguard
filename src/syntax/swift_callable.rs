@@ -319,6 +319,54 @@ impl SwiftAliasSource {
         })
     }
 
+    /// sourcekit-lsp の生成インタフェース `source` の中で、名前が `position` にある、
+    /// **字下げの無い**（最上位の）`typealias` を読む。
+    ///
+    /// `None`: 宣言の行が字下げされている、宣言の後ろの行が `where` で始まる、または
+    /// その宣言だけを [`SwiftAliasSource::from_source`] で読んで `None` になるとき。
+    ///
+    /// 宣言の行と、次の字下げの無い行までの続きだけを残し、ほかの行を空にして読む（位置は変わらない）。
+    ///
+    /// **Why**: 本体の無い関数を並べるので、ファイル全体を読むと根が ERROR になり祖先の許可リストが
+    /// 使えない。メンバーは字下げして書かれるので（sourcekit-lsp 6.4.2 で実測）、字下げで最上位を見分ける。
+    pub(crate) fn from_generated_interface(source: &str, position: SourcePosition) -> Option<Self> {
+        let first = position.line().to_index();
+        let lines: Vec<&str> = source.lines().collect();
+        let declaration_line = lines.get(first)?;
+        if declaration_line.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let is_top_level_line =
+            |line: &&str| !line.is_empty() && !line.starts_with(char::is_whitespace);
+        let continued = lines
+            .iter()
+            .skip(first + 1)
+            .take_while(|line| !is_top_level_line(line))
+            .count();
+        let last = first + continued;
+        // tree-sitter-swift は `where` を宣言の外に置き、字下げの無い次の行の `where` は
+        // 続きとして残らない
+        let where_follows = lines
+            .get(last + 1)
+            .is_some_and(|line| line.split_whitespace().next() == Some(WHERE_KEYWORD));
+        if where_follows {
+            return None;
+        }
+        let isolated = lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                if (first..=last).contains(&index) {
+                    *line
+                } else {
+                    ""
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self::from_source(&isolated, position)
+    }
+
     /// 右辺に書かれた型名と、宣言側のソースでの位置。**名前ごとに最初の 1 つ。**
     pub(crate) fn references(&self) -> &[TypeReference] {
         &self.references
@@ -2531,6 +2579,76 @@ mod tests {
                 ("Shop.Money", at("typealias Ledger = [Shop.")),
                 ("Rate", at("typealias Ledger = [Shop.Money: ")),
             ]
+        );
+    }
+
+    /// 生成インタフェースの `source` の `line` 行目で、`preceding` の直後に名前がある `typealias`。
+    fn interface_alias_at(source: &str, line: usize, preceding: &str) -> Option<SwiftAliasSource> {
+        let position = SourcePosition::from_preceding_text(
+            crate::line_number::LineNumber::new(line).expect("正の行番号"),
+            preceding,
+        );
+        SwiftAliasSource::from_generated_interface(source, position)
+    }
+
+    #[test]
+    fn test_alias_source_reads_a_top_level_declaration_of_a_generated_interface() {
+        // 生成インタフェースは本体の無い関数を並べるので、tree-sitter-swift ではファイルの根が
+        // ERROR になる（sourcekit-lsp 6.4.2 の Foundation で実測）
+        let source = "import Glibc\n\npublic func === (lhs: Int, rhs: Int) -> Bool\n\n/// doc\npublic typealias TimeInterval = Double\n\npublic func f() -> Int\n";
+
+        let alias = interface_alias_at(source, 6, "public typealias ").expect("読める typealias");
+
+        let names: Vec<(&str, SourcePosition)> = alias
+            .references()
+            .iter()
+            .map(|reference| (reference.name(), reference.position()))
+            .collect();
+        // 位置は生成インタフェースの中の位置のまま。そこへ definition を尋ねる
+        let double = SourcePosition::from_preceding_text(
+            crate::line_number::LineNumber::new(6).expect("正の行番号"),
+            "public typealias TimeInterval = ",
+        );
+        assert_eq!(names, [("Double", double)]);
+        // 対照: ファイル全体を読むと、根の ERROR が祖先になって読まない
+        assert!(alias_at(source, 6, "public typealias ").is_none());
+    }
+
+    #[test]
+    fn test_alias_source_does_not_read_an_indented_declaration_of_a_generated_interface() {
+        // 字下げは型の中のメンバー。囲む型が型変数を持つか、根が ERROR の木からは言えない
+        for (source, preceding) in [
+            (
+                "public struct Box<T> {\n\n    public typealias Item = T\n    public func f() -> Int\n}\n",
+                "    public typealias ",
+            ),
+            (
+                "extension Array {\n\n    public typealias Index = Int\n}\n",
+                "    public typealias ",
+            ),
+        ] {
+            assert!(
+                interface_alias_at(source, 3, preceding).is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_alias_source_does_not_read_a_generated_interface_declaration_with_a_where_clause() {
+        for source in [
+            "public typealias W<T> = [T] where T : Hashable\n",
+            "public typealias W<T> = [T]\nwhere T : Hashable\n",
+            "public typealias W<T> = [T]\n    where T : Hashable\n",
+        ] {
+            assert!(
+                interface_alias_at(source, 1, "public typealias ").is_none(),
+                "{source}"
+            );
+        }
+        // 対照: `where` が無ければ読む
+        assert!(
+            interface_alias_at("public typealias W<T> = [T]\n", 1, "public typealias ").is_some()
         );
     }
 
