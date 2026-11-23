@@ -147,7 +147,7 @@ inventory = ["src/inventory/**", "src/**/product*.ts"]
 ### Phase 5: エージェント連携
 
 - `check --diff` (git diff範囲のみ)
-- JSONスキーマ整備、pre-commit フック化
+- JSONスキーマ整備（`docs/json-output.schema.json`・読み方と版の扱いは `docs/json-output.md`。Issue #44）、pre-commit フック化
 
 ### Phase 6: 他言語対応
 

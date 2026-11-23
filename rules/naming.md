@@ -79,6 +79,7 @@ if structurally_similar && domains_differ { ... }
 | `verdict` | 判定の結果（`EXTRACT-CANDIDATE` / `DO-NOT-EXTRACT` / `REVIEW`） |
 | `reason` | 判定を傾けた根拠 1 件。シグナルの値と、**それに当てた閾値**と、それが傾けた向きの組 |
 | `lean` | シグナルが判定を傾けた向き（共通化する側 / しない側 / どちらでもない） |
+| `schema version` | `--format json` の出力の形の版（最上位の `schema_version`）。**読む側が壊れる変更のときだけ上がる**整数で、キーの追加・開いた語彙への値の追加では上げない（`report::json::JSON_SCHEMA_VERSION`。線引きは `docs/json-output.md`） |
 | `signal status` | シグナルの値が**測れた / 測れない / 尋ねていない**のどれか。`--format json` がこの語で出し、text は文に組み立てる |
 | `explanation` | 根拠をどこまで出すか。`--explain` が切り替える。**尋ねなかったシグナル**と**当てた閾値**を出すかどうかで分かれる |
 | `configured threshold` | 外から動かせる閾値。`--threshold` と `dryguard.toml` が決める 3 つ（構造類似度・依存先の重なり・呼び出し元ドメインの重なり）。**既定値は持たず**、指定が無いキーに何を当てるかは `classification` が決める |
