@@ -55,7 +55,8 @@ const CLIENT_NAME: &str = "dryguard";
 /// **3 回目でも作業に触れているなら、尋ねるたびに始まっている**ので、待っても
 /// 答えは落ち着かない（`ReferencesOutcome::ServerStillWorking` /
 /// `HoverOutcome::ServerStillWorking` / `CalleesOutcome::ServerStillWorking`）。
-/// 問い合わせ自身が始める作業（`query progress`）は、触れた作業に数えない。
+/// 尋ねている間に始まって終わった `query progress`（問い合わせ自身が始める作業）は、
+/// 触れた作業に数えない。
 pub(super) const SETTLED_ATTEMPTS: usize = 3;
 
 /// LSP の `ContentModified`。rust-analyzer は読み込みが進んでいる間の要求に返す。
@@ -865,17 +866,15 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         // 始まらないまま捨てられた token 1 つで、以降の問い合わせがすべて
         // 落ち着かなかったことになる。
         self.prepared_progress.clear();
-        // 知らされた作業も同じ。次に尋ねる直前にも空にするが、問い合わせのあいだの
-        // 要求（open・typeDefinition など）の通知で伸び続けないよう、ここで手放す。
-        self.noticed_progress.clear();
 
         settled
     }
 
     /// 作業に触れていない答えを、上限まで尋ね直して探す。
     ///
-    /// 上限まで落ち着かなければ `still_working` を返す。覚えている作業を忘れるのは
-    /// 呼び出し元（[`Self::settled_outcome_of`]）の担当。
+    /// 上限まで落ち着かなければ `still_working` を返す。知らされた作業（`noticed_progress`）は
+    /// 尋ねる前に毎回ここで空にし、用意された作業を忘れるのは呼び出し元
+    /// （[`Self::settled_outcome_of`]）の担当。
     ///
     /// # Errors
     ///
@@ -1255,8 +1254,15 @@ impl<R: BufRead, W: Write> Connection<R, W> {
                 // 問い合わせ自身の作業なら、用意された時点で覚えた分も取り消す。
                 // 取り消すのはその token だけなので、同じ回の別の作業は残る。
                 if self.query_progress_titles.contains(&begun.title.as_str()) {
-                    self.noticed_progress
-                        .retain(|token| *token != progress.token);
+                    // 1 件だけ外す。同じ token を使い回されたとき、先に終わった別の作業の分まで
+                    // 消すと、その作業に触れた答えを採ってしまう。
+                    if let Some(index) = self
+                        .noticed_progress
+                        .iter()
+                        .position(|token| *token == progress.token)
+                    {
+                        self.noticed_progress.remove(index);
+                    }
                 } else {
                     self.noticed_progress.push(progress.token.clone());
                 }
