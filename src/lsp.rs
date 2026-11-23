@@ -2735,6 +2735,27 @@ mod tests {
     }
 
     #[test]
+    fn test_server_command_for_java_does_not_discard_answers_touched_by_its_background_task() {
+        // 対照は他のサーバ。tsserver は読み込みの途中にも空の答えを返すので、どの題の作業に
+        // 触れた答えも捨てる守りを外さない
+        assert_eq!(
+            ServerCommand::java().language.query_progress_titles(),
+            ["Background task"]
+        );
+        for command in [
+            ServerCommand::typescript(),
+            ServerCommand::rust(),
+            ServerCommand::swift(),
+        ] {
+            assert!(
+                command.language.query_progress_titles().is_empty(),
+                "{:?} はどの題の作業に触れた答えも捨てる",
+                command.language
+            );
+        }
+    }
+
+    #[test]
     fn test_server_command_for_java_asks_for_a_state_directory_with_data() {
         // 対照は他のサーバ。要らないサーバに渡すと、知らない引数で起動に失敗する
         assert_eq!(ServerCommand::java().state_directory_flag, Some("-data"));
