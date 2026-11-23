@@ -38,7 +38,7 @@ fn jdtls_turn() -> MutexGuard<'static, ()> {
 
 #[test]
 #[ignore = "jdtls が要る。CI では入れて --ignored で走らせる"]
-fn test_jdtls_answers_hover_and_references_but_leaves_callees_unsettled() {
+fn test_jdtls_answers_hover_references_and_callees() {
     let _turn = jdtls_turn();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/java-lsp");
     let path = fixture.join("src/main/java/shop/Total.java");
@@ -112,10 +112,13 @@ fn test_jdtls_answers_hover_and_references_but_leaves_callees_unsettled() {
         .callees(&caller_document, checkout)
         .expect("callHierarchy を尋ねられる");
     // jdtls は prepareCallHierarchy / outgoingCalls のたびに応答の前に作業（"Background task"）を
-    // 始めて終えるので、作業に触れない答えが得られない
+    // 始めて終える。それを読み込みとして捨てると、何回尋ねても `ServerStillWorking` になる
+    let CalleesOutcome::Answered(callees) = callees else {
+        panic!("checkout の呼び出し先が返る: {callees:?}");
+    };
     assert!(
-        matches!(callees, CalleesOutcome::ServerStillWorking),
-        "checkout の呼び出し先: {callees:?}"
+        callees.contains(&path),
+        "checkout は Total.java を呼ぶ: {callees:?}"
     );
 
     let called = started.elapsed();
