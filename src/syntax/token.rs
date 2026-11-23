@@ -66,7 +66,7 @@ enum Normalization {
     Collapsed(Token),
     /// トークンを 1 つ出し、子も続けて見る。
     Expanded(Token),
-    /// トークンを 1 つ出し、子のうち補間の式（[`interpolations_of`]）だけを見る。
+    /// トークンを 1 つ出し、子は [`walked_string_children_of`] に従って見る。
     Interpolated(Token),
     /// トークンにしない。子も見ない。
     Dropped,
@@ -101,13 +101,12 @@ const NAME_KINDS: [&str; 15] = [
 
 /// リテラルのノード種別と、その型タグ。
 ///
-/// `string_fragment` が要るのは、テンプレートリテラルへ降りるため。`string` は
-/// そこで潰れるので `string_fragment` が現れないが、`` `a ${b} c` `` では
-/// 文字の部分が `string_fragment` として出てくる。
+/// TypeScript のテンプレートリテラル型（`template_literal_type`）は
+/// [`INTERPOLATED_STRING_KINDS`] の対象外で、文字の部分は `string_fragment` で出る。
 ///
 /// Java のテキストブロックは `string_literal` で潰れるので、中の `multiline_string_fragment` は要らない。
 ///
-/// Swift の補間を持てる文字列はここに入れない（[`INTERPOLATED_STRING_KINDS`]）。生文字列は
+/// 補間を持てる値の文字列はここに入れない（[`INTERPOLATED_STRING_KINDS`]）。Swift の生文字列は
 /// Rust と同じ種別名の `raw_string_literal` で、補間ごと潰れる。`nil` は `nil_literal` という
 /// 名前付きノードで返る。
 const LITERAL_KINDS: [(&str, LiteralType); 29] = [
@@ -142,16 +141,23 @@ const LITERAL_KINDS: [(&str, LiteralType); 29] = [
     ("regex_literal", LiteralType::Regex),
 ];
 
-/// 補間を持てる文字列のノード種別（Swift）。[`LiteralType::Text`] を 1 つ出し、子のうち
-/// 補間の式（[`INTERPOLATION_FIELD`]）だけを見る。
+/// 補間を持てる値の文字列のノード種別（Swift、TypeScript / TSX）。
+/// [`LiteralType::Text`] を 1 つ出し、補間だけを見る。
 ///
 /// **文字の部分はトークンにしない。** 文字の部分の個数は値の違い（`""` は 0 個、`"a\nb"` は
 /// 文字・エスケープ・文字の 3 個）で、トークンにすると文字列を書き換えただけで構造が違って見える。
 /// 綴りは `syntax::leaf_divergence` が文字列のノードの側で比べる。
 ///
-/// **Why not（文字の部分の種別を落とす）**: 複数行の文字列の中の `"` は無名の `"` として
+/// **Why not（Swift で文字の部分の種別を落とす）**: 複数行の文字列の中の `"` は無名の `"` として
 /// 文字の部分（フィールド `text`）に入り、行の文字列の区切りと種別では分けられない。
-const INTERPOLATED_STRING_KINDS: [&str; 2] = ["line_string_literal", "multi_line_string_literal"];
+const INTERPOLATED_STRING_KINDS: [&str; 3] = [
+    "line_string_literal",
+    "multi_line_string_literal",
+    TEMPLATE_STRING_KIND,
+];
+
+/// TypeScript / TSX の値のテンプレートリテラル（タグ付きの引数も同じ種別）。
+pub(super) const TEMPLATE_STRING_KIND: &str = "template_string";
 
 /// 補間を持てる文字列で、補間の式を載せるフィールド（tree-sitter-swift）。
 const INTERPOLATION_FIELD: &str = "interpolation";
@@ -216,8 +222,8 @@ fn normalization_of(kind: &'static str) -> Normalization {
 /// **Type-2 クローンが許す違い（名前・値・型）を超えたものまで同じに見える**。
 ///
 /// リテラルの中へは降りない。`/ab-[0-9]+/` の中身は値であって構造ではないので、
-/// 降りると正規表現を書き換えただけで構造が違って見える。補間を持てる文字列（Swift）だけは
-/// 補間の式へ降りる（式は値ではなく構造）が、文字の部分はトークンにしない。
+/// 降りると正規表現を書き換えただけで構造が違って見える。補間を持てる文字列では、文字の部分を
+/// 落とし、補間の式の構造を残す。
 pub fn tokens_of(node: Node<'_>) -> Vec<Token> {
     token_nodes_of(node)
         .into_iter()
@@ -256,33 +262,48 @@ pub(crate) fn token_nodes_of(node: Node<'_>) -> Vec<(Token, Node<'_>)> {
     tokens
 }
 
-/// 補間を持てる文字列で、[`token_nodes_of`] が歩く子。ふだんは補間の式だけ。
+/// 補間を持てる文字列で、[`token_nodes_of`] が歩く子。
 ///
-/// **構文エラーを含む文字列は、子をすべて歩く。** 補間の中で読めなかった部分（`\(rate b)` の `b`）は
-/// 補間の式の外の `ERROR` になるので、補間の式だけを歩くと違う 2 つが同じ列に見える
-/// （偽の `EXTRACT-CANDIDATE` の側）。すべて歩けば文字の部分まで列に出て、揃わない側へ倒れる。
+/// 補間を確定できなければ、子をすべて歩く。Swift の `\(rate b)` の `b` のように補間の式の外へ
+/// 出た `ERROR` も残り、読めなかった部分が違うペアを同じ列に揃えにくくなる。
 fn walked_string_children_of(node: Node<'_>) -> Vec<Node<'_>> {
-    if node.has_error() {
-        let mut cursor = node.walk();
-        return node.children(&mut cursor).collect();
-    }
-    interpolations_of(node)
-}
-
-/// 補間を持てる文字列（[`INTERPOLATED_STRING_KINDS`]）の、補間の式のノード。書かれた順に並ぶ。
-/// それ以外のノードでは空。
-///
-/// [`token_nodes_of`] がこの文字列の中で歩くのはここが返すノードだけで、
-/// `syntax::leaf_divergence` は文字列の綴りからこの範囲を外す。**同じ関数を引く** —
-/// 2 箇所で決めると、片方だけ文法の変化に追随したときに、補間の中の名前が列と綴りの
-/// 両方で比べられるか、どちらでも比べられなくなる。
-pub(crate) fn interpolations_of(node: Node<'_>) -> Vec<Node<'_>> {
-    if !INTERPOLATED_STRING_KINDS.contains(&node.kind()) {
-        return Vec::new();
+    if let Some(interpolations) = interpolations_of(node) {
+        return interpolations;
     }
     let mut cursor = node.walk();
-    node.children_by_field_name(INTERPOLATION_FIELD, &mut cursor)
-        .collect()
+    node.children(&mut cursor).collect()
+}
+
+/// 補間を持てる文字列の、書かれた順の補間ノード。Swift では補間の式、TypeScript では
+/// 式と区切りを包む `template_substitution`。対象外の種別、構文エラー、未知のテンプレートの子は
+/// `None`。
+///
+/// [`token_nodes_of`] はこのノードを歩き、`syntax::leaf_divergence` は文字列の綴りから
+/// 対応する区間を外す。両方で同じ関数を使い、補間の中の名前を比べる位置を揃える。
+pub(crate) fn interpolations_of(node: Node<'_>) -> Option<Vec<Node<'_>>> {
+    let can_inspect_interpolations =
+        INTERPOLATED_STRING_KINDS.contains(&node.kind()) && !node.has_error();
+    if !can_inspect_interpolations {
+        return None;
+    }
+
+    let mut cursor = node.walk();
+    if node.kind() != TEMPLATE_STRING_KIND {
+        return Some(
+            node.children_by_field_name(INTERPOLATION_FIELD, &mut cursor)
+                .collect(),
+        );
+    }
+
+    let mut substitutions = Vec::new();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "template_substitution" => substitutions.push(child),
+            "`" | "string_fragment" | "escape_sequence" => {}
+            _ => return None,
+        }
+    }
+    Some(substitutions)
 }
 
 /// チャンク 1 つ分の、正規化トークンの列。
@@ -545,7 +566,47 @@ mod tests {
     #[test]
     fn test_tokens_of_a_template_literal_drop_the_text_around_its_substitutions() {
         // 対照は上のテスト。式の構造は残すが、文字の部分は値なので潰す
-        assert_eq!(tokens("`a ${b} c`"), tokens("`x ${b} y`"));
+        assert_eq!(tokens(r"`a\n${b} c`"), tokens("`${b}`"));
+    }
+
+    #[test]
+    fn test_tokens_of_a_template_literal_without_substitutions_are_one_text_literal() {
+        let string = tokens("\"ab\"");
+
+        assert_eq!(tokens("``"), string);
+        assert_eq!(tokens(r"`a\nb`"), string);
+    }
+
+    #[test]
+    fn test_tokens_of_a_template_literal_keep_the_number_of_substitutions() {
+        assert_ne!(tokens("`${a}${b}`"), tokens("`${a}`"));
+    }
+
+    #[test]
+    fn test_tokens_of_a_tsx_tagged_template_drop_text_and_keep_the_call_structure() {
+        let tsx_tokens = |source| {
+            let tree = SyntaxTree::from_source(source, Grammar::Tsx).expect("TSX の構文木");
+            let root = *tree.named_descendants().first().expect("木には根がある");
+            assert!(!root.has_error());
+            tokens_of(root)
+        };
+        let tagged = tsx_tokens("<p title={label`${x}`}/>;");
+
+        assert_eq!(tagged, tsx_tokens(r"<p title={label`a\nb${x}`}/>;"));
+        assert_ne!(tagged, tsx_tokens("<p title={label(`${x}`)}/>;"));
+    }
+
+    #[test]
+    fn test_tokens_of_a_broken_template_literal_keep_its_text_fragments() {
+        assert_ne!(tokens(r"`a\nb${a b}`"), tokens("`${a b}`"));
+    }
+
+    #[test]
+    fn test_tokens_of_a_template_literal_type_keep_its_text_fragment() {
+        let with_text = tokens("type T = `v${string}`;");
+
+        assert!(with_text.contains(&Token::Literal(LiteralType::Text)));
+        assert_ne!(with_text, tokens("type T = `${string}`;"));
     }
 
     #[test]

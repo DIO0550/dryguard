@@ -27,7 +27,7 @@ TypeScript で、5 ドメイン（`billing` / `inventory` / `shipping` / `notifi
 | テスト | 固定している数 | 何を守っているか |
 |---|---|---|
 | `test_scan_of_the_corpus_compares_every_pair_of_chunks_it_found` | 関数 47（比べたチャンク 46 + 小さいチャンク 1）・総ペア 1035 | 既定の閾値を決めたときの母数がまだ成り立っていること |
-| `test_scan_of_the_corpus_keeps_every_candidate_pair_it_can_reach` | 候補ペア 64 | 枝刈りが候補を 1 組も落としていないこと |
+| `test_scan_of_the_corpus_keeps_every_candidate_pair_it_can_reach` | 候補ペア 67 | 枝刈りが候補を 1 組も落としていないこと |
 
 `scan` は正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない関数（`notification/queue.ts` の `shouldRetry`）を比べないので、
 総当たりは 46 関数の 1035 ペアになる（Issue #271）。閾値を決めたときに測った 1081 ペアは、
