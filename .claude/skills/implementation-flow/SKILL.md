@@ -93,8 +93,11 @@ Issue に Claude Code セッションの URL をコメントする
 
 ### 4. 計画の検証
 
-サブエージェントに [`references/plan-review.md`](references/plan-review.md) の観点で
-検証させる。**Issue の本文と計画をそのまま渡す**（サブエージェントは Issue を読めないことがある）。
+[`plan-reviewer`](../../agents/plan-reviewer.md) にゴール、Issue 本文と関連する判断、計画と却下案を渡す。
+Issue がない作業ではユーザーの依頼を渡す。
+
+段 4・6 でプロジェクトの名前付きエージェントを起動できない実行環境では、選んだ定義と同じ入力を
+汎用サブエージェントに渡す。指摘の書式と検証時の分担は [レビューの共通指示](references/reviewer-instructions.md) に従う。
 
 返ってきた指摘は**一次情報で確かめてから**採否を決める。サブエージェントの数値・主張を
 そのまま Issue に転記しない。採った指摘・採らなかった指摘とその理由を Issue に書き、
@@ -123,18 +126,27 @@ Issue に Claude Code セッションの URL をコメントする
 | `harness/ci/` | `harness/ci/pr-body-diff-test.sh` |
 | テストの無いスクリプト（`harness/githooks/pre-push`・`harness/deps/*.sh`・`harness/records/count.sh`・`.claude/hooks/wire-githooks.sh`） | 手で走らせ、**何を走らせて何を見たか**を PR 本文に書く |
 
-pre-push が走らせるのは 3 つだけで、残りは CI（`.github/workflows/`）にしか無い。
-**CI にしか無いものを push の前に走らせないと、push の後に 1 巡を失う。**
+CI にしか無い検査は `.github/workflows/` を参照して push 前に個別に走らせる。
 
-**疑わしい assert は、その 1 件だけ実装を壊して走らせる**
-（`rules/testing.md`「迷ったら、その 1 件だけ実装を壊して走らせる」）。
+ゴール、Issue 本文（Issue がなければユーザーの依頼）、計画と却下案、検査の結果を各担当に渡す。
+差分はベースブランチとの共通祖先から作業ツリーまでを取り、
+ステージ済み・未ステージの変更と、無視対象外の新規ファイルのパスと内容を含める。
 
-そのうえで、サブエージェントに [`references/implementation-review.md`](references/implementation-review.md)
-の観点で差分を検証させる。扱いは計画の検証と同じ（一次情報で確かめて採否を決め、Issue に書く）。
+| 担当 | 見る差分 |
+| --- | --- |
+| [`implementation-reviewer`](../../agents/implementation-reviewer.md) | 全差分の構造・判定・規約との整合 |
+| [`test-reviewer`](../../agents/test-reviewer.md) | 実行される実装、テスト、検査のスクリプトや設定が変わる差分 |
+
+**疑わしい assert は、呼び出し元がその 1 件だけ実装を壊して走らせる**
+（`rules/testing.md`「迷ったら、その 1 件だけ実装を壊して走らせる」）。`test-reviewer` には実測結果を渡し、
+追加の検証候補が返れば呼び出し元が確かめる。作業ツリーの一時変更はレビュー担当の読み取りが終わってから行い、
+元に戻したうえで実測結果を渡す。指摘の採否と記録は段 4 と同じ。
 
 ### 7. PR
 
 - 0 で走らせた `echo hook-canary` の結果を PR 本文にも書く
+- 報告の判断に迷ったら、[裏取り漏れ](../../../harness/case-law/process.md#unverified-claim) と
+  [後続の変更で古くなった報告](../../../harness/case-law/process.md#claim-staleness) の判例を参照する
 - **本文・コミットメッセージ・レビュー返信に書いた「N 件」「N 回」は、書く直前に走らせた
   コマンドの出力と 1 つずつ突き合わせる**（`unverified-claim` が `count.sh` の再発数で
   最多。書いた内訳の合計が総数に届かない・前の巡の数の転記・別のツリーで数えた数が
