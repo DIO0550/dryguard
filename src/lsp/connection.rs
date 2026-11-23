@@ -55,6 +55,8 @@ const CLIENT_NAME: &str = "dryguard";
 /// **3 回目でも作業に触れているなら、尋ねるたびに始まっている**ので、待っても
 /// 答えは落ち着かない（`ReferencesOutcome::ServerStillWorking` /
 /// `HoverOutcome::ServerStillWorking` / `CalleesOutcome::ServerStillWorking`）。
+/// 尋ねている間に始まって終わった `query progress`（問い合わせ自身が始める作業）は、
+/// 触れた作業に数えない。
 pub(super) const SETTLED_ATTEMPTS: usize = 3;
 
 /// LSP の `ContentModified`。rust-analyzer は読み込みが進んでいる間の要求に返す。
@@ -104,11 +106,20 @@ pub struct Connection<R: BufRead, W: Write> {
     prepared_progress: Vec<ProgressToken>,
     /// 始まりの通知が届き、終わりの通知がまだ来ていない作業。
     running_progress: Vec<ProgressToken>,
-    /// サーバの作業について知らされた回数（token を用意する要求と、始まりの通知）。
+    /// 1 回尋ねている間に知らされた作業（token を用意する要求と、始まりの通知）の token。
     ///
-    /// **減らさない。** 始まって終わった作業は [`Self::running_progress`] から消えるので、
-    /// 尋ねている間に何か起きたかは数でしか追えない。
-    noticed_progress_count: usize,
+    /// 始まって終わった作業は [`Self::running_progress`] から消えるので、尋ねている間に
+    /// 何か起きたかはここで追う。**尋ねる直前に空にする。**
+    ///
+    /// **数ではなく token で持つ。** 用意された時点では題が分からず、問い合わせ自身の作業かは
+    /// 始まりの通知で決まる。数から差し引くと、前の回に用意された作業の分が今の回の別の作業と
+    /// 相殺し、「触れていない」に見える。
+    noticed_progress: Vec<ProgressToken>,
+    /// 問い合わせ自身が始める作業の題（`query progress`）。この題で始まった作業は、
+    /// 尋ねている間に始まって終わっても答えを捨てる理由にしない。
+    ///
+    /// **動いている間は今までどおり待つ**（[`Self::running_progress`] には入れる）。
+    query_progress_titles: &'static [&'static str],
     /// hover の応答で、綴りを探すコードフェンスの試す順。
     hover_fences: &'static [usize],
     /// 落ち着いた答えを求めて尋ね直す回数の上限。
@@ -130,7 +141,8 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             open_documents: BTreeSet::new(),
             prepared_progress: Vec::new(),
             running_progress: Vec::new(),
-            noticed_progress_count: 0,
+            noticed_progress: Vec::new(),
+            query_progress_titles: &[],
             hover_fences: hover::LEADING_FENCE,
             settled_attempts: SETTLED_ATTEMPTS,
             streaming_limit: None,
@@ -149,6 +161,15 @@ impl<R: BufRead, W: Write> Connection<R, W> {
     /// 子プロセスを起動する側（[`super::Client`]）がサーバの指定から渡す。
     pub(super) fn with_hover_fences(mut self, fences: &'static [usize]) -> Self {
         self.hover_fences = fences;
+        self
+    }
+
+    /// 問い合わせ自身が始める作業の題を付ける。
+    ///
+    /// **既定は空**（どの題の作業に触れても答えを捨てる）。題はサーバごとに決まるので、
+    /// 子プロセスを起動する側（[`super::Client`]）がサーバの指定から渡す。
+    pub(super) fn with_query_progress_titles(mut self, titles: &'static [&'static str]) -> Self {
+        self.query_progress_titles = titles;
         self
     }
 
@@ -851,8 +872,9 @@ impl<R: BufRead, W: Write> Connection<R, W> {
 
     /// 作業に触れていない答えを、上限まで尋ね直して探す。
     ///
-    /// 上限まで落ち着かなければ `still_working` を返す。覚えている作業を忘れるのは
-    /// 呼び出し元（[`Self::settled_outcome_of`]）の担当。
+    /// 上限まで落ち着かなければ `still_working` を返す。知らされた作業（`noticed_progress`）は
+    /// 尋ねる前に毎回ここで空にし、用意された作業を忘れるのは呼び出し元
+    /// （[`Self::settled_outcome_of`]）の担当。
     ///
     /// # Errors
     ///
@@ -871,10 +893,10 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         while attempts_left > 0 {
             // **尋ねる前に、動いている作業を待ち切る。** 動いている最中に送ると、
             // その作業が終わってから応答が届いたときに、こちらからは何も起きなかったように
-            // 見える（前の問い合わせで覚えた作業なので、数も増えない）。
+            // 見える（前の問い合わせで覚えた作業なので、今の回には覚えない）。
             self.wait_for_running_progress()?;
 
-            let noticed_before = self.noticed_progress_count;
+            self.noticed_progress.clear();
             let answered = match ask_once(self, params.clone()) {
                 Ok(answered) => Some(answered),
                 Err(ConnectionError::ServerFailure { failure, .. })
@@ -888,7 +910,7 @@ impl<R: BufRead, W: Write> Connection<R, W> {
             // 「今動いているか」だけでは足りない。**尋ねている間に始まって終わった作業**が
             // あると、読み込み前に計算された答えを受け取りながら、手元では何も動いて
             // いないように見える（実測: 進捗の終わりが応答より先に届き、答えは 0 件）。
-            let noticed_while_answering = self.noticed_progress_count != noticed_before;
+            let noticed_while_answering = !self.noticed_progress.is_empty();
             // 用意されただけの作業も落ち着いていない扱いにする。始まりの通知が応答より
             // 後ろに並ぶと、こちらからは何も起きていないように見える。
             let work_is_pending =
@@ -1194,10 +1216,10 @@ impl<R: BufRead, W: Write> Connection<R, W> {
 
         self.send(&message::null_result_payload_of(id))?;
 
-        // 数はここでも進める。**作業が起きうると分かるのはこの時点**で、尋ねている間に
+        // ここでも覚える。**作業が起きうると分かるのはこの時点**で、尋ねている間に
         // ここを通ったかどうかが、答えを信用してよいかの判断材料になる
         // （`running_progress` は始まって終わると空に戻り、痕跡が残らない）。
-        self.noticed_progress_count = self.noticed_progress_count.saturating_add(1);
+        self.noticed_progress.push(created.token.clone());
         self.prepared_progress.push(created.token);
 
         Ok(())
@@ -1225,11 +1247,25 @@ impl<R: BufRead, W: Write> Connection<R, W> {
         let ProgressParamsValue::WorkDone(work) = progress.value;
 
         match work {
-            // **始まりでも数を進める。** token を用意するのが前の問い合わせの最中で、
+            // **始まりでも覚える。** token を用意するのが前の問い合わせの最中で、
             // 始まりと終わりだけが次の問い合わせの最中に届く並びがある。用意した時点しか
             // 数えないと、その並びで「何も起きなかった」ように見える。
-            WorkDoneProgress::Begin(_) => {
-                self.noticed_progress_count = self.noticed_progress_count.saturating_add(1);
+            WorkDoneProgress::Begin(begun) => {
+                // 問い合わせ自身の作業なら、用意された時点で覚えた分も取り消す。
+                // 取り消すのはその token だけなので、同じ回の別の作業は残る。
+                if self.query_progress_titles.contains(&begun.title.as_str()) {
+                    // 1 件だけ外す。同じ token を使い回されたとき、先に終わった別の作業の分まで
+                    // 消すと、その作業に触れた答えを採ってしまう。
+                    if let Some(index) = self
+                        .noticed_progress
+                        .iter()
+                        .position(|token| *token == progress.token)
+                    {
+                        self.noticed_progress.remove(index);
+                    }
+                } else {
+                    self.noticed_progress.push(progress.token.clone());
+                }
                 self.prepared_progress
                     .retain(|token| *token != progress.token);
                 self.running_progress.push(progress.token);
@@ -2262,6 +2298,13 @@ mod tests {
         )
     }
 
+    /// 題を指定して、その作業が始まったという通知。
+    fn progress_begin_notification_titled(token: &str, title: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"$/progress","params":{{"token":"{token}","value":{{"kind":"begin","title":"{title}"}}}}}}"#
+        )
+    }
+
     /// その作業が終わったという通知。
     fn progress_end_notification(token: &str) -> String {
         format!(
@@ -2455,6 +2498,175 @@ mod tests {
         assert!(
             matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
             "作業に触れていない答えを返す: {outcome:?}"
+        );
+    }
+
+    /// テストで問い合わせ自身が始める作業として渡す題。
+    const QUERY_PROGRESS_TITLE: &str = "問い合わせの作業";
+
+    /// 問い合わせ自身が始めて終える作業（create → begin → end）が応答の前に届き、
+    /// その後に空の答えと 1 件の答えが続く並び。
+    fn query_progress_then_empty_then_one_reference() -> Vec<u8> {
+        frames_of(&[
+            &progress_create_request(9, "query"),
+            &progress_begin_notification_titled("query", QUERY_PROGRESS_TITLE),
+            &progress_end_notification("query"),
+            &no_references_response(1),
+            &references_response(2, "file:///repo/src/billing/invoice.ts"),
+        ])
+    }
+
+    #[test]
+    fn test_references_touched_only_by_query_progress_takes_that_answer() {
+        // jdtls は callHierarchy のたびに、応答の前に作業を始めて終える。それを読み込みと
+        // 同じく捨てると、何回尋ねても落ち着かない
+        let server_output = query_progress_then_empty_then_one_reference();
+        let mut connection =
+            connection_over(&server_output).with_query_progress_titles(&[QUERY_PROGRESS_TITLE]);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::NoAnswer),
+            "問い合わせの作業に触れただけの 1 通目を採る: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_touched_by_progress_with_another_title_asks_again() {
+        // 対照は上のテスト。題が一覧の題で始まるだけの作業は、読み込みとして捨てる。
+        // 前方一致で見ると、サーバが同じ語で始まる題を読み込みに使ったときに途中の答えを採る
+        let server_output = frames_of(&[
+            &progress_create_request(9, "loading"),
+            &progress_begin_notification_titled("loading", "問い合わせの作業 2"),
+            &progress_end_notification("loading"),
+            &no_references_response(1),
+            &references_response(2, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection =
+            connection_over(&server_output).with_query_progress_titles(&[QUERY_PROGRESS_TITLE]);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "題が一覧に無い作業に触れた答えは捨てて尋ね直す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_touched_by_query_progress_and_other_work_asks_again() {
+        // 問い合わせの作業と読み込みが同じ回に始まって終わる。問い合わせの作業を
+        // 除いても読み込みに触れているので、1 通目を採ると見ていないファイルの分が抜ける
+        let server_output = frames_of(&[
+            &progress_create_request(10, "loading"),
+            &progress_begin_notification("loading"),
+            &progress_create_request(9, "query"),
+            &progress_begin_notification_titled("query", QUERY_PROGRESS_TITLE),
+            &progress_end_notification("query"),
+            &progress_end_notification("loading"),
+            &no_references_response(1),
+            &references_response(2, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection =
+            connection_over(&server_output).with_query_progress_titles(&[QUERY_PROGRESS_TITLE]);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "読み込みにも触れた答えは捨てて尋ね直す: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_with_query_progress_prepared_earlier_does_not_hide_other_work() {
+        // 1 回目に用意された問い合わせの作業が 2 回目に始まり、同じ 2 回目に別の作業が
+        // 用意されて捨てられる。問い合わせの作業の分を差し引く形で数えると、2 回目の
+        // 別の作業と相殺して「触れていない」に見える
+        let server_output = frames_of(&[
+            &progress_create_request(9, "query"),
+            &no_references_response(1),
+            &progress_create_request(10, "loading"),
+            &progress_end_notification("loading"),
+            &progress_begin_notification_titled("query", QUERY_PROGRESS_TITLE),
+            &progress_end_notification("query"),
+            &no_references_response(2),
+            &references_response(3, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection =
+            connection_over(&server_output).with_query_progress_titles(&[QUERY_PROGRESS_TITLE]);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "2 回目は別の作業に触れているので捨てる: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_with_a_token_reused_by_query_progress_still_sees_the_earlier_work() {
+        // 読み込みが終わった後、サーバが同じ token を問い合わせの作業に使い回す。
+        // その token の記録をすべて外すと、読み込みに触れたことまで消える
+        let server_output = frames_of(&[
+            &progress_create_request(9, "reused"),
+            &progress_begin_notification("reused"),
+            &progress_end_notification("reused"),
+            &progress_create_request(10, "reused"),
+            &progress_begin_notification_titled("reused", QUERY_PROGRESS_TITLE),
+            &progress_end_notification("reused"),
+            &no_references_response(1),
+            &references_response(2, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection =
+            connection_over(&server_output).with_query_progress_titles(&[QUERY_PROGRESS_TITLE]);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "読み込みに触れた 1 通目は捨てる: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_references_answered_while_query_progress_is_running_asks_again() {
+        // 問い合わせの作業でも、終わる前に答えが返れば捨てる。動いている間の答えは
+        // その作業が見終える前のもの
+        let server_output = frames_of(&[
+            &progress_create_request(9, "query"),
+            &progress_begin_notification_titled("query", QUERY_PROGRESS_TITLE),
+            &no_references_response(1),
+            &progress_end_notification("query"),
+            &references_response(2, "file:///repo/src/billing/invoice.ts"),
+        ]);
+        let mut connection =
+            connection_over(&server_output).with_query_progress_titles(&[QUERY_PROGRESS_TITLE]);
+        let document = opened_document(&mut connection);
+
+        let outcome = connection
+            .references(&document, position_after(5, "export function "))
+            .expect("応答を受け取れる");
+
+        assert!(
+            matches!(outcome, ReferencesOutcome::Answered(ref paths) if paths.len() == 1),
+            "動いている作業の終わりを待って尋ね直す: {outcome:?}"
         );
     }
 

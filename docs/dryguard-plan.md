@@ -229,6 +229,7 @@ sourcekit-lsp の時間（中継スクリプトがフレームの受け渡し時
 | `lsp` | `ServerCommand::supports` | そのサーバが尋ねられる grammar | `ServerLanguage` × `Grammar` の網羅 `match`（Issue #363） |
 | `lsp` | `ServerLanguage::hover_fences` | hover のどのコードフェンスに綴りがあるか（試す順） | 網羅 `match`。`lsp::hover` は値を受け取るだけ（Issue #367） |
 | `lsp` | `ServerLanguage::settled_attempts` | 読み込み中の答えを捨てて尋ね直す回数 | 網羅 `match`。`lsp::connection` は値を受け取るだけ（Issue #367） |
+| `lsp` | `ServerLanguage::query_progress_titles` | 問い合わせ自身が始める作業の題（`query progress`。触れても答えを捨てない） | 網羅 `match`。`lsp::connection` は値を受け取るだけ（Issue #504） |
 | `lsp` | `ServerLanguage::asks_project_membership` | `project membership` を尋ねるか | 網羅 `match`。`Session::needs_project_membership_query` はこれを返すだけ（Issue #367） |
 | `lsp::document` | `LanguageId`・`LanguageId::from_grammar` | `language id` の綴り | 網羅 `match` |
 | `semantics::type_signature` | `type_signature_outcome_of` / `rust_type_signature_outcome_of` の系統 | hover の綴りから型シグネチャを組む系統 | TypeScript と Rust の 2 系統 |
@@ -288,7 +289,7 @@ dryguard check --diff --staged   # ステージ済みの変更だけ (pre-commit
 - 単一バイナリで配布が楽、Rust解析対象なので dogfooding できる
 - その他: `rayon` (Stage 1 並列化), `serde`, `clap`
 
-LSPサーバ: TS は typescript-language-server、Rust は rust-analyzer。Phase 6 で Python は pyright、Java は Eclipse JDT Language Server（jdtls）、Swift は sourcekit-lsp を足す（配布形は言語ごとの親 Issue #368 / #369 / #370。hover の綴りの形・references / callHierarchy の対応・読み込みの待ち時間は、各言語の「実サーバで確かめる」Issue が最初に測る。Swift は #406 で測り、sourcekit-lsp は index を作り終える前の references / callHierarchy に進捗を始める前から空を返すので、握手の後に `workspace/synchronize` で index を待つ。jdtls は #394 で測り、1.63.0 は JDK 25 を要し、references は `pom.xml` の下では別ファイルから返るが印の無いディレクトリでは返らず（Gradle は未確認）、hover は `MarkedString` の配列で返り（綴りは言語付きの要素にあり、#503 でそこから読む）、callHierarchy は尋ねるたびに作業の進捗を始める。pyright は未実測）。
+LSPサーバ: TS は typescript-language-server、Rust は rust-analyzer。Phase 6 で Python は pyright、Java は Eclipse JDT Language Server（jdtls）、Swift は sourcekit-lsp を足す（配布形は言語ごとの親 Issue #368 / #369 / #370。hover の綴りの形・references / callHierarchy の対応・読み込みの待ち時間は、各言語の「実サーバで確かめる」Issue が最初に測る。Swift は #406 で測り、sourcekit-lsp は index を作り終える前の references / callHierarchy に進捗を始める前から空を返すので、握手の後に `workspace/synchronize` で index を待つ。jdtls は #394 で測り、1.63.0 は JDK 25 を要し、references は `pom.xml` の下では別ファイルから返るが印の無いディレクトリでは返らず（Gradle は未確認）、hover は `MarkedString` の配列で返り（綴りは言語付きの要素にあり、#503 でそこから読む）、callHierarchy は尋ねるたびに作業の進捗を始める（題 `Background task`。#504 でその題の作業を `query progress` として、答えを捨てる理由から外す）。pyright は未実測）。
 
 ---
 
