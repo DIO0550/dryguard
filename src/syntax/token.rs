@@ -66,6 +66,8 @@ enum Normalization {
     Collapsed(Token),
     /// トークンを 1 つ出し、子も続けて見る。
     Expanded(Token),
+    /// トークンを 1 つ出し、子のうち補間の式（[`interpolations_of`]）だけを見る。
+    Interpolated(Token),
     /// トークンにしない。子も見ない。
     Dropped,
 }
@@ -105,11 +107,10 @@ const NAME_KINDS: [&str; 15] = [
 ///
 /// Java のテキストブロックは `string_literal` で潰れるので、中の `multiline_string_fragment` は要らない。
 ///
-/// Swift の文字列（`line_string_literal` / `multi_line_string_literal`）は補間の式へ降りるため
-/// 潰さず、文字の部分（`line_str_text` / `multi_line_str_text` / `str_escaped_char`）を
-/// `string_fragment` と同じ扱いにする。生文字列は Rust と同じ種別名の `raw_string_literal` で、
-/// 補間ごと潰れる。`nil` は `nil_literal` という名前付きノードで返る。
-const LITERAL_KINDS: [(&str, LiteralType); 32] = [
+/// Swift の補間を持てる文字列はここに入れない（[`INTERPOLATED_STRING_KINDS`]）。生文字列は
+/// Rust と同じ種別名の `raw_string_literal` で、補間ごと潰れる。`nil` は `nil_literal` という
+/// 名前付きノードで返る。
+const LITERAL_KINDS: [(&str, LiteralType); 29] = [
     ("number", LiteralType::Number),
     ("string", LiteralType::Text),
     ("string_fragment", LiteralType::Text),
@@ -137,12 +138,23 @@ const LITERAL_KINDS: [(&str, LiteralType); 32] = [
     ("oct_literal", LiteralType::Number),
     ("bin_literal", LiteralType::Number),
     ("real_literal", LiteralType::Number),
-    ("line_str_text", LiteralType::Text),
-    ("multi_line_str_text", LiteralType::Text),
-    ("str_escaped_char", LiteralType::Text),
     ("nil_literal", LiteralType::Null),
     ("regex_literal", LiteralType::Regex),
 ];
+
+/// 補間を持てる文字列のノード種別（Swift）。[`LiteralType::Text`] を 1 つ出し、子のうち
+/// 補間の式（[`INTERPOLATION_FIELD`]）だけを見る。
+///
+/// **文字の部分はトークンにしない。** 文字の部分の個数は値の違い（`""` は 0 個、`"a\nb"` は
+/// 文字・エスケープ・文字の 3 個）で、トークンにすると文字列を書き換えただけで構造が違って見える。
+/// 綴りは `syntax::leaf_divergence` が文字列のノードの側で比べる。
+///
+/// **Why not（文字の部分の種別を落とす）**: 複数行の文字列の中の `"` は無名の `"` として
+/// 文字の部分（フィールド `text`）に入り、行の文字列の区切りと種別では分けられない。
+const INTERPOLATED_STRING_KINDS: [&str; 2] = ["line_string_literal", "multi_line_string_literal"];
+
+/// 補間を持てる文字列で、補間の式を載せるフィールド（tree-sitter-swift）。
+const INTERPOLATION_FIELD: &str = "interpolation";
 
 /// コメントのノード種別。
 ///
@@ -188,6 +200,9 @@ fn normalization_of(kind: &'static str) -> Normalization {
     if let Some(literal_type) = LiteralType::from_kind(kind) {
         return Normalization::Collapsed(Token::Literal(literal_type));
     }
+    if INTERPOLATED_STRING_KINDS.contains(&kind) {
+        return Normalization::Interpolated(Token::Literal(LiteralType::Text));
+    }
     if COMMENT_KINDS.contains(&kind) {
         return Normalization::Dropped;
     }
@@ -201,7 +216,8 @@ fn normalization_of(kind: &'static str) -> Normalization {
 /// **Type-2 クローンが許す違い（名前・値・型）を超えたものまで同じに見える**。
 ///
 /// リテラルの中へは降りない。`/ab-[0-9]+/` の中身は値であって構造ではないので、
-/// 降りると正規表現を書き換えただけで構造が違って見える。
+/// 降りると正規表現を書き換えただけで構造が違って見える。補間を持てる文字列（Swift）だけは
+/// 補間の式へ降りる（式は値ではなく構造）が、文字の部分はトークンにしない。
 pub fn tokens_of(node: Node<'_>) -> Vec<Token> {
     token_nodes_of(node)
         .into_iter()
@@ -230,10 +246,43 @@ pub(crate) fn token_nodes_of(node: Node<'_>) -> Vec<(Token, Node<'_>)> {
                 // 逆順に積む。取り出すのが末尾からなので、そのまま積むと兄弟が逆に出る
                 pending.extend(children.into_iter().rev());
             }
+            Normalization::Interpolated(token) => {
+                tokens.push((token, current));
+                pending.extend(walked_string_children_of(current).into_iter().rev());
+            }
         }
     }
 
     tokens
+}
+
+/// 補間を持てる文字列で、[`token_nodes_of`] が歩く子。ふだんは補間の式だけ。
+///
+/// **構文エラーを含む文字列は、子をすべて歩く。** 補間の中で読めなかった部分（`\(rate b)` の `b`）は
+/// 補間の式の外の `ERROR` になるので、補間の式だけを歩くと違う 2 つが同じ列に見える
+/// （偽の `EXTRACT-CANDIDATE` の側）。すべて歩けば文字の部分まで列に出て、揃わない側へ倒れる。
+fn walked_string_children_of(node: Node<'_>) -> Vec<Node<'_>> {
+    if node.has_error() {
+        let mut cursor = node.walk();
+        return node.children(&mut cursor).collect();
+    }
+    interpolations_of(node)
+}
+
+/// 補間を持てる文字列（[`INTERPOLATED_STRING_KINDS`]）の、補間の式のノード。書かれた順に並ぶ。
+/// それ以外のノードでは空。
+///
+/// [`token_nodes_of`] がこの文字列の中で歩くのはここが返すノードだけで、
+/// `syntax::leaf_divergence` は文字列の綴りからこの範囲を外す。**同じ関数を引く** —
+/// 2 箇所で決めると、片方だけ文法の変化に追随したときに、補間の中の名前が列と綴りの
+/// 両方で比べられるか、どちらでも比べられなくなる。
+pub(crate) fn interpolations_of(node: Node<'_>) -> Vec<Node<'_>> {
+    if !INTERPOLATED_STRING_KINDS.contains(&node.kind()) {
+        return Vec::new();
+    }
+    let mut cursor = node.walk();
+    node.children_by_field_name(INTERPOLATION_FIELD, &mut cursor)
+        .collect()
 }
 
 /// チャンク 1 つ分の、正規化トークンの列。
@@ -604,6 +653,57 @@ mod tests {
         assert_ne!(
             swift_tokens("let a = \"\\(y)\""),
             swift_tokens("let a = \"x\"")
+        );
+    }
+
+    #[test]
+    fn test_tokens_of_an_empty_swift_string_are_the_same_as_a_string_with_text() {
+        // 文字の部分の有無は値の違い。数えると空の文字列を返す関数だけが別の構造に見える
+        assert_eq!(swift_tokens("let a = \"\""), swift_tokens("let a = \"x\""));
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_string_with_an_escape_in_the_middle_are_the_same_as_plain_text() {
+        // `"a\nb"` は文字の部分が 3 つ（文字・エスケープ・文字）に割れる
+        assert_eq!(
+            swift_tokens("let a = \"a\\nb\""),
+            swift_tokens("let a = \"ab\"")
+        );
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_string_differing_only_in_the_text_around_interpolations_are_the_same()
+    {
+        assert_eq!(
+            swift_tokens("let a = \"a\\(y)b\""),
+            swift_tokens("let a = \"\\(y)\"")
+        );
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_multi_line_string_quoting_inside_are_the_same_as_plain_text() {
+        // 複数行の文字列の中の `"` は、文字の部分（フィールド `text`）に無名の `"` として入る
+        assert_eq!(
+            swift_tokens("let a = \"\"\"\nsay \"hi\" \\(y)\n\"\"\""),
+            swift_tokens("let a = \"\"\"\nx\\(y)\n\"\"\"")
+        );
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_string_with_more_interpolations_differ() {
+        // 対照は上のテスト。文字の部分は落とすが、補間の数は構造に残る
+        assert_ne!(
+            swift_tokens("let a = \"\\(y)\\(z)\""),
+            swift_tokens("let a = \"\\(y)\"")
+        );
+    }
+
+    #[test]
+    fn test_tokens_of_a_swift_string_with_a_broken_interpolation_keep_what_could_not_be_read() {
+        // `b` は補間の式の外の ERROR になる。補間の式だけを歩くと `"\(rate)"` と同じ列になる
+        assert_ne!(
+            swift_tokens("let a = \"\\(rate b)\""),
+            swift_tokens("let a = \"\\(rate)\"")
         );
     }
 

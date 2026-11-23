@@ -73,7 +73,7 @@ if structurally_similar && domains_differ { ... }
 | `undersized chunk` | 正規化トークンが下限（`syntax::token` の `MINIMUM_TOKEN_COUNT`）に届かない chunk。**chunk ではある**が、`scan` / `check` は候補列挙に入れない（`compare` は名指しされれば比べる）。`test function` は**chunk にしない**ので別物 |
 | `candidate pair` | 構造類似度が閾値に届いた pair。**両側とも `undersized chunk` でない**。`scan` / `check` が判定して出すのはこれだけ |
 | `gram` | 構造類似度を測るときに突き合わせる、正規化トークンの並び 1 つ分 |
-| `leaf divergence` | 正規化トークン列が**完全に一致する** 2 つのチャンクで、同じ位置の葉（名前・リテラル・子を持たない構文ノード）の綴りが違うこと。**チャンクが束縛した名前の一貫した付け替えと、チャンク自身のシグネチャに書かれた型は数えない**。列が揃わなければ比べない（`syntax::leaf_divergence`） |
+| `leaf divergence` | 正規化トークン列が**完全に一致する** 2 つのチャンクで、同じ位置の葉（名前・リテラル・子を持たない構文ノード）の綴りが違うこと。補間を持つ Swift の文字列は 1 つのリテラルの葉として、補間の区間を `\(…)` に綴り直して比べる（補間の中の名前は自分の位置で比べる）。**チャンクが束縛した名前の一貫した付け替えと、チャンク自身のシグネチャに書かれた型は数えない**。列が揃わなければ比べない（`syntax::leaf_divergence`） |
 | `divergent leaf` | `leaf divergence` の 1 組。同じ位置にあった両側の綴り |
 | `signal` | 判定の材料。構造類似度・葉の綴りの違い・型シグネチャ・呼び出し先 / 呼び出し元・モジュール距離 |
 | `verdict` | 判定の結果（`EXTRACT-CANDIDATE` / `DO-NOT-EXTRACT` / `REVIEW`） |
