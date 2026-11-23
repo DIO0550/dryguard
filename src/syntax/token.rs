@@ -281,7 +281,9 @@ fn walked_string_children_of(node: Node<'_>) -> Vec<Node<'_>> {
 /// [`token_nodes_of`] はこのノードを歩き、`syntax::leaf_divergence` は文字列の綴りから
 /// 対応する区間を外す。両方で同じ関数を使い、補間の中の名前を比べる位置を揃える。
 pub(crate) fn interpolations_of(node: Node<'_>) -> Option<Vec<Node<'_>>> {
-    if !INTERPOLATED_STRING_KINDS.contains(&node.kind()) || node.has_error() {
+    let can_inspect_interpolations =
+        INTERPOLATED_STRING_KINDS.contains(&node.kind()) && !node.has_error();
+    if !can_inspect_interpolations {
         return None;
     }
 
