@@ -643,7 +643,7 @@ fn test_scan_of_the_corpus_keeps_every_candidate_pair_it_can_reach() {
     // 落としてはならない。落ちればこの数が減る
     let scan = scan_of_corpus();
 
-    assert_eq!(scan.candidate_pairs().len(), 64, "閾値に届いたペアの数");
+    assert_eq!(scan.candidate_pairs().len(), 67, "閾値に届いたペアの数");
 }
 
 #[test]

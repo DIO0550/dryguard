@@ -27,10 +27,11 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::Range;
 
 use tree_sitter::Node;
 
-use crate::syntax::token::{Token, interpolations_of, token_nodes_of};
+use crate::syntax::token::{TEMPLATE_STRING_KIND, Token, interpolations_of, token_nodes_of};
 use crate::syntax::tree::Grammar;
 
 /// 束縛として扱ってよい葉の種別。**これ以外の葉は、束縛と同じ綴りでも綴りで比べる。**
@@ -139,7 +140,7 @@ enum Spelling {
     /// チャンクが束縛した名前。**一貫した付け替えは違いに数えない。**
     Bound(String),
     /// それ以外の葉（外を指す名前・リテラル・子を持たない構文ノード）。綴りで比べる。
-    /// 補間を持つ文字列は、補間の区間を `\(…)` に綴り直したもの（[`literal_spelling_of`]）。
+    /// 補間を持つ文字列は、補間の区間を綴り直したもの（[`literal_spelling_of`]）。
     Fixed(String),
 }
 
@@ -419,29 +420,50 @@ const INTERPOLATION_SEPARATOR: &str = ",";
 /// 補間の式の代わりに綴る印。
 const INTERPOLATION_PLACEHOLDER: &str = "…";
 
-/// リテラル 1 つの綴り。補間を持つ文字列（`syntax::token` の `interpolations_of`）は、
-/// `\(` から対応する `)` までの区間を、式の数だけ `…` を `, ` で繋いだ形に綴り直す
-/// （`"a\( x /*c*/ )b"` は `"a\(…)b"`）。
+/// リテラル 1 つの綴り。補間の区間を TypeScript では `${…}`、Swift では
+/// 式の数に応じて `\(…)` や `\(…, …)` に綴り直す。補間を確定できない文字列は元の綴りを返す。
 ///
 /// **補間の中の名前は文字列の綴りに入れない。** 補間の式は列に自分のトークンとして続くので、
 /// そこで束縛の付け替えを見る。文字列の綴りに残すと、付け替えただけでも違いに見える。
-/// 空白とコメントは補間の式の外（文字列のノードの直接の子と、子のあいだ）に置かれるので、
-/// 式の範囲だけを置き換えると書式の違いが違いに見える。
-///
-/// 区間に区切り・式・コメント以外の子があれば、その区間は書かれたとおりに残す。
-/// **構文エラーを含む文字列は、丸ごと書かれたとおりに残す** — tree-sitter-swift は
-/// 補間の中で読めなかった部分（`\(rate b)` の `b`）を extras の `ERROR` にするので、
-/// extras として通すと違いが消える。どちらも違いに出る側（REVIEW 側）へ倒れる。
+/// 式の外側の空白とコメントも除くため、区切りを含む区間を置き換える。
 fn literal_spelling_of(node: Node<'_>, source: &str) -> String {
-    let interpolations = interpolations_of(node);
-    if interpolations.is_empty() || node.has_error() {
+    let Some(interpolations) = interpolations_of(node).filter(|nodes| !nodes.is_empty()) else {
         return text_of(node, source).to_owned();
-    }
+    };
 
-    let mut cursor = node.walk();
-    let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+    let (opener, closer, ranges) = if node.kind() == TEMPLATE_STRING_KIND {
+        let ranges = interpolations
+            .iter()
+            .map(|substitution| (substitution.byte_range(), 1))
+            .collect();
+        ("${", "}", ranges)
+    } else {
+        let ranges = swift_interpolation_ranges_of(node, &interpolations);
+        (INTERPOLATION_OPENER, INTERPOLATION_CLOSER, ranges)
+    };
+
     let mut spelling = String::new();
     let mut copied_up_to = node.start_byte();
+    for (range, expression_count) in ranges {
+        spelling.push_str(&source[copied_up_to..range.start]);
+        spelling.push_str(opener);
+        spelling.push_str(&vec![INTERPOLATION_PLACEHOLDER; expression_count].join(", "));
+        spelling.push_str(closer);
+        copied_up_to = range.end;
+    }
+    spelling.push_str(&source[copied_up_to..node.end_byte()]);
+    spelling
+}
+
+/// Swift の区切りを含む補間区間と、それぞれに渡す式の数。
+/// 区間に区切り・式・コメント以外の子があれば、置き換える範囲には含めない。
+fn swift_interpolation_ranges_of(
+    node: Node<'_>,
+    interpolations: &[Node<'_>],
+) -> Vec<(Range<usize>, usize)> {
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+    let mut ranges = Vec::new();
     let mut index = 0;
     while index < children.len() {
         let opener = children[index];
@@ -473,14 +495,9 @@ fn literal_spelling_of(node: Node<'_>, source: &str) -> String {
             .iter()
             .filter(|child| interpolations.contains(child))
             .count();
-        spelling.push_str(&source[copied_up_to..opener.start_byte()]);
-        spelling.push_str(INTERPOLATION_OPENER);
-        spelling.push_str(&vec![INTERPOLATION_PLACEHOLDER; expression_count].join(", "));
-        spelling.push_str(INTERPOLATION_CLOSER);
-        copied_up_to = closer.end_byte();
+        ranges.push((opener.start_byte()..closer.end_byte(), expression_count));
     }
-    spelling.push_str(&source[copied_up_to..node.end_byte()]);
-    spelling
+    ranges
 }
 
 /// チャンク自身のシグネチャに書かれた型のノード。引数の型・戻り値の型・型引数・`where` 節
@@ -1253,6 +1270,47 @@ mod tests {
             divergence,
             vec![r#""印が見つからない" ↔ "範囲から外れている""#]
         );
+    }
+
+    #[test]
+    fn test_leaves_of_typescript_functions_renaming_binders_in_template_substitutions_do_not_diverge()
+     {
+        let divergence = typescript_divergence(
+            "function describe(rate: number) { return `${ `inner ${ /* note */ rate }` }${rate}`; }",
+            "function label(fee: number) { return `${`inner ${fee}`}${fee}`; }",
+        );
+
+        assert_eq!(divergence, vec!["identical"]);
+    }
+
+    #[test]
+    fn test_leaves_of_typescript_functions_with_different_template_text_diverge_at_the_literal() {
+        let divergence = typescript_divergence(
+            r"function describe(value: number) { return `金額\n\${表示}${value}円`; }",
+            "function label(amount: number) { return `${amount}`; }",
+        );
+
+        assert_eq!(divergence, vec![r"`金額\n\${表示}${…}円` ↔ `${…}`"]);
+    }
+
+    #[test]
+    fn test_leaves_of_typescript_functions_with_different_template_tags_and_outer_names_diverge() {
+        let divergence = typescript_divergence(
+            "function describe() { return format`${rate}`; }",
+            "function label() { return display`${fee}`; }",
+        );
+
+        assert_eq!(divergence, vec!["format ↔ display", "rate ↔ fee"]);
+    }
+
+    #[test]
+    fn test_leaves_of_typescript_functions_with_broken_templates_keep_the_original_spelling() {
+        let divergence = typescript_divergence(
+            "function describe() { return `${a b}`; }",
+            "function label() { return `${a c}`; }",
+        );
+
+        assert_eq!(divergence, vec!["`${a b}` ↔ `${a c}`", "b ↔ c"]);
     }
 
     #[test]
