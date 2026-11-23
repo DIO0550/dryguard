@@ -44,7 +44,7 @@ const EXCLUDED_DIRECTORY_NAMES: [&str; 10] = [
     ".gradle",
 ];
 
-/// 走査するソースの言語。
+/// 走査・比較するソースの言語。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceLanguage {
     TypeScript,
@@ -55,7 +55,8 @@ pub enum SourceLanguage {
 }
 
 impl SourceLanguage {
-    fn accepts(self, grammar: Grammar) -> bool {
+    /// この言語指定がソースの [`Grammar`] を受け付けるか。
+    pub fn accepts(self, grammar: Grammar) -> bool {
         // grammar 側も網羅 `match` にする。「Rust 以外」の否定で書くと、
         // grammar を足したときに TypeScript の走査が黙って拾う。
         match (self, grammar) {
