@@ -512,12 +512,20 @@ fn caller_domain_value_of(signal: &CallerDomainOverlap, explanation: Explanation
             let reason = match cause {
                 ReferenceSourceError::Unreadable { .. } => "unreadable-reference-source",
                 ReferenceSourceError::Unparsable { .. } => "unparsable-reference-source",
+                ReferenceSourceError::UnreadableImport { .. } => "unreadable-reference-import",
                 ReferenceSourceError::InvalidPosition { .. } => "invalid-reference-position",
             };
             let mut details = vec![("path", json!(cause.path().display().to_string()))];
-            if let ReferenceSourceError::InvalidPosition { position, .. } = cause {
-                details.push(("line", json!(position.line().get())));
-                details.push(("character", json!(position.character())));
+            match cause {
+                ReferenceSourceError::InvalidPosition { position, .. } => {
+                    details.push(("line", json!(position.line().get())));
+                    details.push(("character", json!(position.character())));
+                }
+                ReferenceSourceError::UnreadableImport { line, .. } => {
+                    details.push(("line", json!(line.get())));
+                }
+                ReferenceSourceError::Unreadable { .. }
+                | ReferenceSourceError::Unparsable { .. } => {}
             }
             detailed_unmeasurable_value_of(reason, details)
         }
@@ -932,6 +940,13 @@ mod tests {
                 },
                 "invalid-reference-position",
             ),
+            (
+                ReferenceSourceError::UnreadableImport {
+                    path: path.clone(),
+                    line: crate::line_number::LineNumber::from_index(3),
+                },
+                "unreadable-reference-import",
+            ),
         ] {
             let signals = accidental_duplication().with_semantics(
                 TypeSignatureMatch::NoName,
@@ -945,6 +960,10 @@ mod tests {
             if expected == "invalid-reference-position" {
                 assert_eq!(value["line"], 4);
                 assert_eq!(value["character"], 7);
+            }
+            if expected == "unreadable-reference-import" {
+                assert_eq!(value["line"], 4);
+                assert_eq!(value["character"], Value::Null);
             }
         }
     }

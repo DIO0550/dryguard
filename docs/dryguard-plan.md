@@ -153,7 +153,7 @@ inventory = ["src/inventory/**", "src/**/product*.ts"]
 
 - Python / Java / Swift を、TypeScript・Rust と同じ 3 ステージ（候補抽出 → 意味情報収集 → 分類）で扱う (Issue #360)
 - 「LSPサーバを差し替えれば他言語も足せる設計にしておく」（「何を作るか」）を、実際に 3 言語足して確かめる回でもある
-- 参照元のテスト範囲の除外（Rust の `syntax::rust_test_scope` に当たるもの）は入れない。各言語の実コーパスで、テスト内の参照が呼び出し元ドメインを歪めるかを測ってから起こす
+- 参照元のテスト範囲の除外（Rust の `syntax::rust_test_scope` に当たるもの）は、各言語の実コーパスで、テスト内の参照が呼び出し元ドメインを歪めるかを測ってから起こす。Swift は測って歪めていたので足した（`syntax::swift_test_source`。Issue #520）。Java は未測定で、すべて数える
 
 進め方は 2 段。
 
@@ -198,6 +198,8 @@ sourcekit-lsp の時間（中継スクリプトがフレームの受け渡し時
 | `Parsing/InputOrigin.swift:117` / `Parsing/SplitArguments.swift:143`（別々の型の `Comparable` の `<`） | DO-NOT-EXTRACT | 妥当 | protocol 準拠の定型 |
 | `Tools/generate-docc-reference/Extensions/ArgumentParser+Markdown.swift:114` / `:154`（`usage()` / `identity()`） | EXTRACT-CANDIDATE | 妥当（名前の組み立てが重複している） | — |
 
+上の表は Issue #520 の前の測定。#520（XCTest / Testing を import するファイルの参照を除く）の後に同じルートで測り直すと、`caller-domain-overlap` が測れたペアのうち参照元に `Tests/` のドメインが入るのは 445 → 27（残りはすべて XCTest を import しない `Tests/ArgumentParserPackageManagerTests/PackageManager`。Issue #554）、測れたペアは 519 → 147 だった。`swift build --build-tests --build-system native` の後に background indexing を切った回では、参照元に `.build` のドメインが入るペアが 9,567 → 0（SwiftPM の生成物は `import XCTest` を書く）。
+
 同じモジュールのファイルどうしは `import` を書かないので、`Sources` 同士の 564 ペアのうち 544 ペアで依存先の重なりは `no-declarations`（測れない）だった。判定は呼び出し先ドメインとモジュール距離が持つ。
 
 #### 言語を足すときに触る場所
@@ -236,7 +238,7 @@ sourcekit-lsp の時間（中継スクリプトがフレームの受け渡し時
 | CI | `.github/workflows/rust.yml` の「LSP サーバ」「rust-analyzer」の段 | サーバの導入。npm 配布なら「LSP サーバ」の段に倣う（`harness/deps/resolve-node.sh` と `pnpm-lock.yaml`）。それ以外は「rust-analyzer」の段に倣い、版を固定して取り sha256 で確かめる | 「LSP サーバ」が `pnpm install --frozen-lockfile` で typescript-language-server、「rust-analyzer」が curl と `sha256sum --check` で rust-analyzer |
 | テスト | 実サーバのテスト（TypeScript は `tests/semantics.rs`、Rust は `tests/rust_lsp.rs`、Swift は `tests/swift_lsp.rs`）・`tests/language_cli.rs`・`tests/fixtures/` | 実サーバのテスト（`#[ignore]`、CI の `cargo test -- --ignored` が走らせる）・CLI の言語の振り分け・フィクスチャ | 言語ごと |
 
-**触らなくてよいもの**: `semantics::caller_domain` の `ReferenceSources::is_test` は Rust 以外の参照を除かないので、新しい言語は TypeScript と同じく全部数える（上のスコープ外どおり）。テスト参照の除外を足すときの置き場所はここ。`codebase::typescript_paths_of` と `pipeline::scan_of` は名前どおり TypeScript 専用の入口で、**`SourceLanguage::accepts` を網羅 `match` に直した後なら**言語を足しても黙って倒れない（直す前は `grammar != Grammar::Rust` なので、新しい言語のファイルまで拾う）。
+**触らなくてよいもの**: `semantics::caller_domain` の `ReferenceSources::is_test` は grammar の網羅 `match` で、Rust と Swift 以外の参照を除かない。新しい言語は variant を足した時点でコンパイラがここを指すので、TypeScript と同じく全部数えるか、テスト参照の除外を足すかを決める（上のスコープ外どおり、測ってから足す）。`codebase::typescript_paths_of` と `pipeline::scan_of` は名前どおり TypeScript 専用の入口で、**`SourceLanguage::accepts` を網羅 `match` に直した後なら**言語を足しても黙って倒れない（直す前は `grammar != Grammar::Rust` なので、新しい言語のファイルまで拾う）。
 
 **コード以外で言語を並べている場所**も同じ回に直す: `README.md`（`--lang`・`--include-tests`・拡張子・サーバ）、`AGENTS.md`「プロジェクト構成」（外部依存・LSP サーバ）、この計画書の「CLI 仕様 (案)」と「技術スタック」、`rules/naming.md` の語彙表（`grammar`・`test function`・`project marker`・`language id`）。
 

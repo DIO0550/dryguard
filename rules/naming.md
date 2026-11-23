@@ -116,7 +116,7 @@ if structurally_similar && domains_differ { ... }
 | `declaration site` | `type definition` / `definition` が返す宣言の場所。ファイルと、その中の 1 点 |
 | `references` | ソースの 1 点を指して、そこにある名前を使っているところを尋ねる問い合わせ |
 | `reference` | `references` が返す 1 件。**その名前を使っている側**のファイルの位置 |
-| `caller domain` | 参照元が属する `domain`。Rust のテスト範囲内の参照を除き、ドメインごとの件数を持つ |
+| `caller domain` | 参照元が属する `domain`。Rust のテスト範囲内の参照と、XCTest / Testing を import する Swift のファイルからの参照を除き、ドメインごとの件数を持つ |
 | `call hierarchy` | ソースの 1 点を指して、そこにある名前の呼び出し関係を尋ねる問い合わせ。**起点を取る要求と、向きを指定する要求の 2 往復で 1 つ** |
 | `call hierarchy item` | `call hierarchy` の起点。`prepareCallHierarchy` が返し、**1 点につき 2 つ以上返ることがある** |
 | `callee` | `outgoingCalls` が返す 1 件。**そのチャンクが呼んでいる側**のファイルの位置 |
@@ -471,9 +471,11 @@ Rust の直接囲む impl は例外で、ヘッダーごと運び、メソッド
 **`reference` はファイルパスだけでなく開始位置まで持つ。** 同じファイルの本番参照と
 テスト参照を分けるため。Rust は `#[test]`（末尾が `test` の scoped 属性も含む）関数、
 単純な `#[cfg(test)]` を付けた項目、および `#![cfg(test)]` のあるファイル・本体の範囲を除く。
-ネストしたヘルパーも範囲に入る。候補列挙の `test function` 除外とは別で、
-`--include-tests` でも参照の数え方は変わらない。複合 cfg・cfg_attr・他ファイルの mod 宣言からの
-cfg 伝播・マクロ展開・TypeScript のテスト参照の判別は行わない。
+ネストしたヘルパーも範囲に入る。Swift は位置を見ず、XCTest / Testing を import するファイルの
+参照をすべて除く（`syntax::swift_test_source`。`test function` の印と違い、ファイルで決める —
+テストは別のファイルの `extension` やファイルの直下の型からも参照する）。候補列挙の
+`test function` 除外とは別で、`--include-tests` でも参照の数え方は変わらない。複合 cfg・cfg_attr・
+他ファイルの mod 宣言からの cfg 伝播・マクロ展開・TypeScript / Java のテスト参照の判別は行わない。
 
 **`caller domain` と `callee domain` を 1 つの型で持たない。** どちらも
 `domain counts`（ドメインごとの件数）を中身に持つが、**向きが逆**なので、1 つの型にすると

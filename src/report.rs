@@ -638,7 +638,9 @@ fn caller_domain_overlap_text_of(
         CallerDomainOverlap::ProjectMembershipNotProvided => {
             "サーバがプロジェクトの所属を答えられない"
         }
-        CallerDomainOverlap::NoReferences => "数える参照元がない (Rust のテスト内の参照は除外)",
+        CallerDomainOverlap::NoReferences => {
+            "数える参照元がない (Rust・Swift のテスト内の参照は除外)"
+        }
         CallerDomainOverlap::UnclassifiedReference(cause) => {
             return Some(format!("呼び出し元ドメインの重なりを測れない ({cause})"));
         }
@@ -1013,7 +1015,7 @@ mod tests {
             ),
             (
                 ReferenceSourceError::Unparsable { path: path.clone() },
-                "Rust 構文を読めない",
+                "参照元の構文を読めない",
             ),
             (
                 ReferenceSourceError::InvalidPosition {
@@ -1034,6 +1036,24 @@ mod tests {
             assert!(text.contains(expected), "{text}");
             assert!(text.contains("/repo/src/caller.rs"), "{text}");
         }
+    }
+
+    #[test]
+    fn test_reference_source_failure_text_reports_the_unreadable_swift_import_line() {
+        use crate::semantics::caller_domain::ReferenceSourceError;
+        let text = caller_domain_overlap_text_of(
+            &CallerDomainOverlap::UnclassifiedReference(ReferenceSourceError::UnreadableImport {
+                path: std::path::PathBuf::from("/repo/Tests/CartTests.swift"),
+                line: crate::line_number::LineNumber::from_index(2),
+            }),
+            Threshold::from_literal(0.5),
+            Explanation::AskedSignals,
+        )
+        .expect("理由を出す");
+        assert!(
+            text.contains("参照元の import を読めない: /repo/Tests/CartTests.swift:3"),
+            "{text}"
+        );
     }
 
     #[test]
