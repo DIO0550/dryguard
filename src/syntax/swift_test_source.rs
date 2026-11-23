@@ -17,7 +17,7 @@ use crate::syntax::tree::{Grammar, SyntaxTree};
 ///
 /// **名前の前方一致で見ない。** `XCTestDynamicOverlay` のように本番のコードが import する
 /// モジュールが、テストフレームワークの名前で始まることがある。一覧に無いフレームワーク
-/// （Quick など）だけを import するファイルは本番の参照として数える（除外しない側へ倒れる）。
+/// （Quick など）だけを import するファイルには、この import による印が付かない。
 const SWIFT_TEST_FRAMEWORK_MODULES: [&str; 2] = ["XCTest", "Testing"];
 
 /// テストフレームワークを import しているかを言えなかった理由。
