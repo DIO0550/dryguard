@@ -127,3 +127,13 @@ func writtenMetatype(value: Int.Type) -> Int {
 func classMetatype(value: AnyClass) -> Int {
     0
 }
+
+protocol MetatypeProtocol {}
+
+func legacyNestedMetatype(value: MetatypeProtocol.Type.Type) -> Int {
+    0
+}
+
+func explicitNestedMetatype(value: (any MetatypeProtocol.Type).Type) -> Int {
+    0
+}

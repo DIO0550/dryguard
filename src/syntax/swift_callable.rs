@@ -174,13 +174,16 @@ const OPENABLE_ANCESTOR_KINDS: [&str; 4] = [
 /// Rust の展開の上限（右辺 64 KiB）と同じ役目を、綴りではなく型の大きさで持つ。
 const MAXIMUM_SWIFT_ALIAS_SIZE: usize = 4096;
 
+/// 型を読み取り、組み立てるときの深さの上限。比較・展開・破棄が消費するスタックを抑える。
+const MAXIMUM_SWIFT_TYPE_DEPTH: usize = 64;
+
 /// `typealias` を開けなかった・当てはめられなかったわけ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SwiftAliasFailure {
     /// 開けない右辺・当てはめられない型引数（数の不一致・前の区切りの型引数・境界を持つ宣言に
     /// 型変数を当てる・具体的な型の関連型）。
     Unopenable,
-    /// 展開した型が [`MAXIMUM_SWIFT_ALIAS_SIZE`] を超えた。
+    /// 展開した型がノード数か深さの上限を超えた。
     ExpansionLimit,
 }
 
@@ -218,24 +221,32 @@ impl SwiftOpenedType {
     /// 使用側の型引数 `arguments` を当てはめた型。当てはめられなければそのわけ。
     ///
     /// 新しく現れた型変数の番号付けし直しは呼び出し側（[`SwiftSpelling::substituted`]）が持つ。
-    fn applied_to(&self, arguments: &[SwiftType]) -> Result<SwiftType, SwiftAliasFailure> {
+    fn applied_to(
+        &self,
+        arguments: &[SwiftType],
+        maximum_depth: usize,
+    ) -> Result<SwiftType, SwiftAliasFailure> {
         if arguments.len() != self.arity {
             return Err(SwiftAliasFailure::Unopenable);
-        }
-        if self.arity == 0 {
-            return Ok(self.value.clone());
         }
         let applied_to_variables = arguments.iter().any(SwiftType::has_type_variable);
         let inferred_requirements = self.bounded && applied_to_variables;
         if inferred_requirements {
             return Err(SwiftAliasFailure::Unopenable);
         }
-        // 組み立てる前に数える。入れ子の当てはめは段ごとに倍になる
-        let size = self
-            .value
-            .size_with(&|index| arguments.get(index).map_or(1, SwiftType::size));
-        if size > MAXIMUM_SWIFT_ALIAS_SIZE {
+        // 型パラメータへの代入を計測値で先に行う。展開する型を複製するのは上限の確認後。
+        let argument_shapes: Vec<_> = arguments.iter().map(SwiftType::shape).collect();
+        let shape = self.value.shape_with(&|index| {
+            argument_shapes
+                .get(index)
+                .copied()
+                .unwrap_or(SwiftTypeShape::LEAF)
+        });
+        if shape.node_count > MAXIMUM_SWIFT_ALIAS_SIZE || shape.depth > maximum_depth {
             return Err(SwiftAliasFailure::ExpansionLimit);
+        }
+        if self.arity == 0 {
+            return Ok(self.value.clone());
         }
         self.value
             .substituted(arguments)
@@ -379,7 +390,7 @@ impl SwiftAliasSource {
     /// # Errors
     ///
     /// 右辺を読めない・右辺の中の `typealias` を開けないとき（[`SwiftAliasFailure::Unopenable`]）、
-    /// 開いた右辺が大きさの上限を超えたとき（[`SwiftAliasFailure::ExpansionLimit`]）。
+    /// 開いた右辺が展開の上限を超えたとき（[`SwiftAliasFailure::ExpansionLimit`]）。
     pub(crate) fn opened_with(
         &self,
         resolve: &dyn Fn(&str) -> Option<SwiftTypeResolution>,
@@ -408,7 +419,7 @@ impl SwiftAliasSource {
         if let Some(failure) = reader.alias_failure {
             return Err(failure);
         }
-        if opened.size() > MAXIMUM_SWIFT_ALIAS_SIZE {
+        if opened.shape().node_count > MAXIMUM_SWIFT_ALIAS_SIZE {
             return Err(SwiftAliasFailure::ExpansionLimit);
         }
         Ok(SwiftOpenedType {
@@ -690,6 +701,14 @@ impl MetatypeSuffix {
         };
         SwiftType::Metatype(Box::new(base))
     }
+
+    /// `.Protocol` は基底が existential でないときにもう一層を包む。
+    fn maximum_layers(&self) -> usize {
+        match self {
+            Self::Type => 1,
+            Self::Protocol => 2,
+        }
+    }
 }
 
 /// 型 1 つ分の形。**書かれ方の違い（省略形・冗長な括弧）を落としてある。**
@@ -727,6 +746,24 @@ enum SwiftType {
     Composition(BTreeSet<SwiftType>),
 }
 
+#[derive(Clone, Copy)]
+struct SwiftTypeShape {
+    node_count: usize,
+    depth: usize,
+}
+
+impl SwiftTypeShape {
+    const LEAF: Self = Self {
+        node_count: 1,
+        depth: 1,
+    };
+
+    fn include_child(&mut self, child: Self) {
+        self.node_count = self.node_count.saturating_add(child.node_count);
+        self.depth = self.depth.max(child.depth + 1);
+    }
+}
+
 impl SwiftType {
     fn into_existential(self) -> Self {
         match self {
@@ -735,43 +772,44 @@ impl SwiftType {
         }
     }
 
-    /// この型を形作るノードの数（自分を含む）。
-    fn size(&self) -> usize {
-        self.size_with(&|_| 1)
+    /// この型を形作るノードの数と、最も深いノードまでの深さ（自分を含む）。
+    fn shape(&self) -> SwiftTypeShape {
+        self.shape_with(&|_| SwiftTypeShape::LEAF)
     }
 
-    /// 型変数 `Parameter(index)` を `parameter_size(index)` ノードと数えた、この型の大きさ。
-    /// 型引数を当てはめる前に、当てはめた結果の大きさを出すのに使う。
-    fn size_with(&self, parameter_size: &dyn Fn(usize) -> usize) -> usize {
-        let sized = |inner: &Self| inner.size_with(parameter_size);
-        let inner: usize = match self {
-            Self::Parameter(index) => return parameter_size(*index),
-            Self::Member(..) => 0,
+    /// 型変数に `parameter_shape` のノード数と深さを当て、展開後の形を組み立てずに測る。
+    fn shape_with(&self, parameter_shape: &dyn Fn(usize) -> SwiftTypeShape) -> SwiftTypeShape {
+        let mut shape = SwiftTypeShape::LEAF;
+        let mut include = |child: &Self| shape.include_child(child.shape_with(parameter_shape));
+        match self {
+            Self::Parameter(index) => return parameter_shape(*index),
+            Self::Member(..) => {}
             Self::Named(path) => path
                 .iter()
                 .flat_map(|(_, arguments)| arguments)
-                .map(sized)
-                .fold(0, usize::saturating_add),
+                .for_each(&mut include),
             Self::Metatype(wrapped)
             | Self::Optional(wrapped)
             | Self::ImplicitlyUnwrapped(wrapped)
             | Self::Array(wrapped)
             | Self::Opaque(wrapped)
-            | Self::Existential(wrapped) => sized(wrapped),
-            Self::Dictionary(key, value) => sized(key).saturating_add(sized(value)),
-            Self::Tuple(elements) => elements
-                .iter()
-                .map(|(_, element)| sized(element))
-                .fold(0, usize::saturating_add),
+            | Self::Existential(wrapped) => include(wrapped),
+            Self::Dictionary(key, value) => {
+                include(key);
+                include(value);
+            }
+            Self::Tuple(elements) => elements.iter().for_each(|(_, element)| include(element)),
             Self::Function {
                 parameters, value, ..
-            } => parameters
-                .iter()
-                .map(|(_, _, parameter)| sized(parameter))
-                .fold(sized(value), usize::saturating_add),
-            Self::Composition(members) => members.iter().map(sized).fold(0, usize::saturating_add),
-        };
-        inner.saturating_add(1)
+            } => {
+                parameters
+                    .iter()
+                    .for_each(|(_, _, parameter)| include(parameter));
+                include(value);
+            }
+            Self::Composition(members) => members.iter().for_each(&mut include),
+        }
+        shape
     }
 
     /// 型変数（とその関連型）を含むか。
@@ -807,7 +845,8 @@ impl SwiftType {
     /// 型変数 `Parameter(index)` を `arguments[index]` に置き換えた型。
     ///
     /// `None`: 型変数の関連型（`C.Element`）に、型変数でない型を当てることになったとき
-    /// （関連型を選ばないと言えない。偽陰性側）、番号に当たる型引数が無いとき。
+    /// （関連型を選ばないと言えない。偽陰性側）、番号に当たる型引数が無いとき、
+    /// `T.Type` の基底を代入したときに、どの種類のメタタイプになるか判定できないとき。
     fn substituted(&self, arguments: &[SwiftType]) -> Option<Self> {
         let each = |inner: &Self| inner.substituted(arguments).map(Box::new);
         Some(match self {
@@ -830,7 +869,19 @@ impl SwiftType {
                     })
                     .collect::<Option<Vec<_>>>()?,
             ),
-            Self::Metatype(wrapped) => Self::Metatype(each(wrapped)?),
+            Self::Metatype(wrapped) => {
+                let base = wrapped.substituted(arguments)?;
+                // `T.Type` にプロトコルの `P` や `P.Type` を代入すると `.Protocol` の形になる。
+                // 宣言位置だけではプロトコルを識別できず、合成型もこの判定では扱わない。
+                let uncertain_base = matches!(
+                    base,
+                    Self::Named(_) | Self::Metatype(_) | Self::Composition(_)
+                );
+                if matches!(wrapped.as_ref(), Self::Parameter(_)) && uncertain_base {
+                    return None;
+                }
+                Self::Metatype(Box::new(base))
+            }
             Self::Optional(wrapped) => Self::Optional(each(wrapped)?),
             Self::ImplicitlyUnwrapped(wrapped) => Self::ImplicitlyUnwrapped(each(wrapped)?),
             Self::Array(element) => Self::Array(each(element)?),
@@ -946,7 +997,7 @@ impl SwiftCallable {
     /// 型の外の関数では `None`。
     ///
     /// **読めない形は `None`**（偽陰性側）: typed throws（`throws(E)`）、未知の型の構文、
-    /// 囲む型の分からない `init` / `deinit`、囲む型の綴りを読めないメンバー。
+    /// 深さの上限を超える型、囲む型の分からない `init` / `deinit`、囲む型の綴りを読めないメンバー。
     pub(crate) fn from_spelling(
         spelling: &str,
         resolve: &dyn Fn(&str) -> Option<SwiftTypeResolution>,
@@ -983,7 +1034,13 @@ impl SwiftCallable {
             SwiftCallableKind::Deinitializer => callable.receiver = Some(enclosing?),
             SwiftCallableKind::Initializer => {
                 let initialized = enclosing?;
-                callable.value_type = match failability_of(declaration) {
+                let failability = failability_of(declaration);
+                if !matches!(failability, Failability::Never)
+                    && initialized.shape().depth >= MAXIMUM_SWIFT_TYPE_DEPTH
+                {
+                    return None;
+                }
+                callable.value_type = match failability {
                     Failability::Never => initialized,
                     Failability::Optional => SwiftType::Optional(Box::new(initialized)),
                     Failability::ImplicitlyUnwrapped => {
@@ -1110,6 +1167,13 @@ pub(crate) fn enclosing_type_references_of(function: Node<'_>, source: &str) -> 
     reader.references
 }
 
+#[derive(Clone, Copy)]
+enum TypePosition {
+    Ordinary,
+    /// 直後の `.Type` / `.Protocol` に渡す基底。透過的な括弧を挟んでも保持する。
+    MetatypeBase,
+}
+
 /// 1 つの宣言の綴りを読み進める途中の状態。
 struct SwiftSpelling<'source> {
     source: &'source str,
@@ -1124,6 +1188,7 @@ struct SwiftSpelling<'source> {
     /// ソースを読むときだけ、型名の位置を残す。
     recording: bool,
     references: Vec<TypeReference>,
+    remaining_type_depth: usize,
 }
 
 impl<'source> SwiftSpelling<'source> {
@@ -1141,6 +1206,7 @@ impl<'source> SwiftSpelling<'source> {
             alias_failure: None,
             recording: false,
             references: Vec::new(),
+            remaining_type_depth: MAXIMUM_SWIFT_TYPE_DEPTH,
         }
     }
 
@@ -1244,10 +1310,11 @@ impl<'source> SwiftSpelling<'source> {
         if written.kind() == TYPE_MODIFIERS_KIND {
             return None;
         }
-        let value = self.type_of(written)?;
         let unwrapped = written.next_sibling().is_some_and(|next| {
             !next.is_named() && self.text(next) == Some(IMPLICITLY_UNWRAPPED_TOKEN)
         });
+        let value =
+            self.with_type_layers(usize::from(unwrapped), |reader| reader.type_of(written))?;
         if unwrapped {
             return Some(SwiftType::ImplicitlyUnwrapped(Box::new(value)));
         }
@@ -1295,14 +1362,15 @@ impl<'source> SwiftSpelling<'source> {
             .iter()
             .rev()
             .find(|child| child.is_named() && is_type_kind(child.kind()))?;
-        let mut value = self.type_of(*written)?;
-
         let tokens: Vec<&str> = children
             .iter()
             .filter(|child| !child.is_named())
             .filter_map(|child| self.text(*child))
             .collect();
-        if tokens.contains(&IMPLICITLY_UNWRAPPED_TOKEN) {
+        let unwrapped = tokens.contains(&IMPLICITLY_UNWRAPPED_TOKEN);
+        let mut value =
+            self.with_type_layers(usize::from(unwrapped), |reader| reader.type_of(*written))?;
+        if unwrapped {
             value = SwiftType::ImplicitlyUnwrapped(Box::new(value));
         }
 
@@ -1432,12 +1500,28 @@ impl<'source> SwiftSpelling<'source> {
 
     /// 型 1 つ分のノードを読む。読めない構文なら `None`。
     fn type_of(&mut self, node: Node<'_>) -> Option<SwiftType> {
-        match node.kind() {
-            "user_type" => self.user_type_of(node),
-            "metatype" | "bracket_qualified_type" => self.metatype_of(node),
+        self.type_in(node, TypePosition::Ordinary)
+    }
+
+    /// 先に層を確保し、読み終えたら戻す。兄弟の型は同じ深さから読む。
+    fn with_type_layers(
+        &mut self,
+        layers: usize,
+        read: impl FnOnce(&mut Self) -> Option<SwiftType>,
+    ) -> Option<SwiftType> {
+        let remaining = self.remaining_type_depth;
+        self.remaining_type_depth = remaining.checked_sub(layers)?;
+        let value = read(self);
+        self.remaining_type_depth = remaining;
+        value
+    }
+
+    fn type_in(&mut self, node: Node<'_>, position: TypePosition) -> Option<SwiftType> {
+        self.with_type_layers(1, |reader| match node.kind() {
+            "user_type" => reader.user_type_of(node),
+            "metatype" | "bracket_qualified_type" => reader.metatype_of(node),
             "optional_type" => {
                 let wrapped = only_type_child_of(node)?;
-                let wrapped = self.type_of(wrapped)?;
                 let mut cursor = node.walk();
                 // tree-sitter-swift は `T??` の `??` を 1 トークンとして返す。
                 let depth: usize = node
@@ -1448,11 +1532,17 @@ impl<'source> SwiftSpelling<'source> {
                         _ => 0,
                     })
                     .sum();
-                Some((0..depth).fold(wrapped, |wrapped, _| SwiftType::Optional(Box::new(wrapped))))
+                reader.with_type_layers(depth.checked_sub(1)?, |reader| {
+                    let wrapped = reader.type_of(wrapped)?;
+                    Some(
+                        (0..depth)
+                            .fold(wrapped, |wrapped, _| SwiftType::Optional(Box::new(wrapped))),
+                    )
+                })
             }
             "array_type" => {
                 let element = only_type_child_of(node)?;
-                Some(SwiftType::Array(Box::new(self.type_of(element)?)))
+                Some(SwiftType::Array(Box::new(reader.type_of(element)?)))
             }
             "dictionary_type" => {
                 let types = type_children_of(node)?;
@@ -1460,19 +1550,22 @@ impl<'source> SwiftSpelling<'source> {
                     return None;
                 };
                 Some(SwiftType::Dictionary(
-                    Box::new(self.type_of(*key)?),
-                    Box::new(self.type_of(*value)?),
+                    Box::new(reader.type_of(*key)?),
+                    Box::new(reader.type_of(*value)?),
                 ))
             }
-            "tuple_type" => self.tuple_type_of(node),
-            "function_type" => self.function_type_of(node),
+            "tuple_type" => reader.tuple_type_of(node, position),
+            "function_type" => reader.function_type_of(node),
             "opaque_type" => Some(SwiftType::Opaque(Box::new(
-                self.type_of(only_type_child_of(node)?)?,
+                reader.type_of(only_type_child_of(node)?)?,
             ))),
             "existential_type" => {
-                let wrapped = self.type_of(only_type_child_of(node)?)?;
-                // `any P.Type` と `P.Type` は同じメタタイプ。`(any P).Type` の `any` は基底型に入る。
-                if matches!(wrapped, SwiftType::Metatype(_)) {
+                let wrapped = reader.type_of(only_type_child_of(node)?)?;
+                // 単独の `any P.Type` は `P.Type` と同じ型。`(any P.Type).Type` では
+                // 基底に書いた `any` が外側のメタタイプの種類を変える。
+                if matches!(position, TypePosition::Ordinary)
+                    && matches!(wrapped, SwiftType::Metatype(_))
+                {
                     return Some(wrapped);
                 }
                 Some(wrapped.into_existential())
@@ -1480,18 +1573,18 @@ impl<'source> SwiftSpelling<'source> {
             "protocol_composition_type" => {
                 let mut members = BTreeSet::new();
                 for member in type_children_of(node)? {
-                    members.insert(self.type_of(member)?);
+                    members.insert(reader.type_of(member)?);
                 }
                 Some(SwiftType::Composition(members))
             }
             _ => None,
-        }
+        })
     }
 
     fn user_type_of(&mut self, node: Node<'_>) -> Option<SwiftType> {
         // 型引数を読むと番号が振られる。当てはめた後に振り直すので、読む前の数を覚える
         let numbered_before = self.numbered.len();
-        let mut path: Vec<(String, Vec<SwiftType>)> = Vec::new();
+        let mut path = Vec::new();
         let mut last_identifier = None;
         let mut suffixes = Vec::new();
         let mut cursor = node.walk();
@@ -1508,28 +1601,39 @@ impl<'source> SwiftSpelling<'source> {
                     match suffix {
                         Some(suffix) => suffixes.push(suffix),
                         None if suffixes.is_empty() => {
-                            path.push((name.to_owned(), Vec::new()));
+                            path.push((name.to_owned(), None));
                             last_identifier = Some(child);
                         }
                         None => return None,
                     }
                 }
                 TYPE_ARGUMENTS_KIND if suffixes.is_empty() => {
-                    let mut arguments = Vec::new();
-                    for argument in type_children_of(child)? {
-                        arguments.push(self.type_of(argument)?);
-                    }
-                    path.last_mut()?.1 = arguments;
+                    path.last_mut()?.1 = Some(child);
                 }
                 _ => return None,
             }
         }
-        let base = self.path_type_of(path, last_identifier, numbered_before);
-        Some(
-            suffixes
+        let layers = suffixes.iter().map(MetatypeSuffix::maximum_layers).sum();
+        self.with_type_layers(layers, |reader| {
+            let path = path
                 .into_iter()
-                .fold(base, |base, suffix| suffix.wrapping(base)),
-        )
+                .map(|(name, arguments)| {
+                    let mut types = Vec::new();
+                    if let Some(arguments) = arguments {
+                        for argument in type_children_of(arguments)? {
+                            types.push(reader.type_of(argument)?);
+                        }
+                    }
+                    Some((name, types))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let base = reader.path_type_of(path, last_identifier, numbered_before);
+            Some(
+                suffixes
+                    .into_iter()
+                    .fold(base, |base, suffix| suffix.wrapping(base)),
+            )
+        })
     }
 
     /// `(any P).Type` などの metatype と、`[T].Type` などの bracket_qualified_type を読む。
@@ -1539,10 +1643,19 @@ impl<'source> SwiftSpelling<'source> {
         let mut parts = node
             .children(&mut cursor)
             .filter(|part| !part.is_extra() && part.kind() != ".");
-        let base = self.type_of(parts.next()?)?;
-        parts.try_fold(base, |wrapped, part| {
-            let suffix = MetatypeSuffix::from_spelling(self.text(part)?)?;
-            Some(suffix.wrapping(wrapped))
+        let base = parts.next()?;
+        let suffixes = parts
+            .map(|part| MetatypeSuffix::from_spelling(self.text(part)?))
+            .collect::<Option<Vec<_>>>()?;
+        let layers: usize = suffixes.iter().map(MetatypeSuffix::maximum_layers).sum();
+        // type_in で最初の一層を確保済み。
+        self.with_type_layers(layers.checked_sub(1)?, |reader| {
+            let base = reader.type_in(base, TypePosition::MetatypeBase)?;
+            Some(
+                suffixes
+                    .into_iter()
+                    .fold(base, |base, suffix| suffix.wrapping(base)),
+            )
         })
     }
 
@@ -1627,7 +1740,9 @@ impl<'source> SwiftSpelling<'source> {
         if front.iter().any(|(_, arguments)| !arguments.is_empty()) {
             return Err(SwiftAliasFailure::Unopenable);
         }
-        let applied = opened.applied_to(arguments)?;
+        // 予約済みの名前の一層を展開した型へ置き換える。
+        let maximum_depth = (self.remaining_type_depth + 1).min(MAXIMUM_SWIFT_TYPE_DEPTH);
+        let applied = opened.applied_to(arguments, maximum_depth)?;
         if numbered_before >= self.numbered.len() {
             return Ok(applied);
         }
@@ -1688,13 +1803,14 @@ impl<'source> SwiftSpelling<'source> {
         self.numbered.len() - 1
     }
 
-    fn tuple_type_of(&mut self, node: Node<'_>) -> Option<SwiftType> {
+    fn tuple_type_of(&mut self, node: Node<'_>, position: TypePosition) -> Option<SwiftType> {
         let mut elements = Vec::new();
         let mut cursor = node.walk();
         let items: Vec<Node<'_>> = node
             .named_children(&mut cursor)
             .filter(|child| child.kind() == TUPLE_TYPE_ITEM_KIND)
             .collect();
+        let single_item = items.len() == 1;
         for item in items {
             let children = all_children_of(item);
             if children
@@ -1712,11 +1828,11 @@ impl<'source> SwiftSpelling<'source> {
                 .iter()
                 .rev()
                 .find(|child| child.is_named() && is_type_kind(child.kind()))?;
+            // ラベルのない `(T)` は透過的な括弧。
+            if single_item && label.is_none() {
+                return self.type_in(*written, position);
+            }
             elements.push((label, self.type_of(*written)?));
-        }
-        // 括弧 1 つだけの `(T)` は `T` と同じ型
-        if let [(None, single)] = elements.as_slice() {
-            return Some(single.clone());
         }
         Some(SwiftType::Tuple(elements))
     }
@@ -2003,6 +2119,92 @@ mod tests {
         assert_eq!(conforming_metatype, callable_of("func f(x: P.Type)"));
         assert_eq!(container_metatype, callable_of("func f(x: P.Protocol)"));
         assert_ne!(conforming_metatype, container_metatype);
+    }
+
+    #[test]
+    fn test_from_spelling_keeps_any_on_the_base_of_a_nested_metatype() {
+        let legacy = callable_of("func f(x: P.Type.Type)");
+        let explicit = callable_of("func f(x: (any P.Type).Type)");
+
+        assert_ne!(legacy, explicit);
+        assert_eq!(legacy, callable_of("func f(x: (P.Type).Type)"));
+        assert_eq!(explicit, callable_of("func f(x: ((any P.Type)).Type)"));
+        assert_eq!(explicit, callable_of("func f(x: P.Type.Protocol)"));
+        assert_eq!(
+            callable_of("func f(x: (any P.Type, Int).Type)"),
+            callable_of("func f(x: (P.Type, Int).Type)")
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_bounds_metatype_depth_for_every_base_spelling() {
+        for (base, base_depth) in [("Int", 1), ("(Int)", 2), ("[Int]", 2), ("[Int: String]", 2)] {
+            let suffixes = ".Type".repeat(MAXIMUM_SWIFT_TYPE_DEPTH - base_depth);
+            let allowed = format!("func f(x: {base}{suffixes}, y: {base}{suffixes})");
+            let too_deep = format!("func f(x: {base}{suffixes}.Type)");
+
+            assert!(
+                SwiftCallable::from_spelling(&allowed, &standard, None).is_some(),
+                "{base}"
+            );
+            assert!(
+                SwiftCallable::from_spelling(&too_deep, &standard, None).is_none(),
+                "{base}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_spelling_counts_postfix_layers_towards_the_type_depth_limit() {
+        let protocol_suffixes = ".Type".repeat(MAXIMUM_SWIFT_TYPE_DEPTH - 3);
+        let optional_suffixes = "?".repeat(MAXIMUM_SWIFT_TYPE_DEPTH - 1);
+        let metatype_suffixes = ".Type".repeat(MAXIMUM_SWIFT_TYPE_DEPTH - 2);
+
+        for (allowed, too_deep) in [
+            (
+                format!("func f(x: P.Protocol{protocol_suffixes})"),
+                format!("func f(x: P.Protocol{protocol_suffixes}.Type)"),
+            ),
+            (
+                format!("func f(x: Int{optional_suffixes})"),
+                format!("func f(x: Int{optional_suffixes}?)"),
+            ),
+            (
+                format!("func f(x: Int{metatype_suffixes}!)"),
+                format!("func f(x: Int{metatype_suffixes}.Type!)"),
+            ),
+            (
+                format!("func f() -> Int{metatype_suffixes}!"),
+                format!("func f() -> Int{metatype_suffixes}.Type!"),
+            ),
+        ] {
+            assert!(
+                SwiftCallable::from_spelling(&allowed, &standard, None).is_some(),
+                "{allowed}"
+            );
+            assert!(
+                SwiftCallable::from_spelling(&too_deep, &standard, None).is_none(),
+                "{too_deep}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_spelling_counts_failable_init_in_the_type_depth_limit() {
+        let suffixes = ".Type".repeat(MAXIMUM_SWIFT_TYPE_DEPTH - 3);
+        let receiver = SwiftEnclosingType::new(format!("Box<Int{suffixes}>"));
+        let receiver_at_limit = SwiftEnclosingType::new(format!("Box<Int{suffixes}.Type>"));
+
+        assert!(
+            SwiftCallable::from_spelling("init()", &standard, Some(&receiver_at_limit)).is_some()
+        );
+        for spelling in ["init?()", "init!()"] {
+            assert!(SwiftCallable::from_spelling(spelling, &standard, Some(&receiver)).is_some());
+            assert!(
+                SwiftCallable::from_spelling(spelling, &standard, Some(&receiver_at_limit))
+                    .is_none()
+            );
+        }
     }
 
     #[test]
@@ -2727,6 +2929,84 @@ mod tests {
     }
 
     #[test]
+    fn test_from_spelling_treats_an_alias_to_any_metatype_as_a_type_name() {
+        let protocol = declared_at("P@declared");
+        let alias = opened("any P.Type", &[("P", protocol.clone())]);
+        let table = [("Witness", alias), ("P", protocol)];
+
+        assert_eq!(
+            resolved_callable_of("func f(x: Witness.Type)", &table),
+            resolved_callable_of("func f(x: P.Type.Type)", &table)
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_defers_ambiguous_metatype_bases_after_alias_substitution() {
+        let alias = opened_declaration("typealias MetatypeOf<T> = T.Type", &[]);
+        let twice = opened_declaration("typealias Twice<T> = T.Type.Type", &[]);
+        let table = [
+            ("MetatypeOf", alias),
+            ("Twice", twice),
+            ("P", declared_at("P@declared")),
+            ("Q", declared_at("Q@declared")),
+        ];
+
+        for base in ["P", "any P.Type", "(P & Q)"] {
+            let indirect = resolved_callable_of(&format!("func f(x: MetatypeOf<{base}>)"), &table);
+            assert_eq!(
+                indirect.alias_failure(),
+                Some(SwiftAliasFailure::Unopenable),
+                "{base}"
+            );
+        }
+
+        let concrete = resolved_callable_of("func f(x: Twice<[Int]>)", &table);
+        assert_eq!(concrete.alias_failure(), None);
+        assert_eq!(
+            concrete,
+            resolved_callable_of("func f(x: [Int].Type.Type)", &table)
+        );
+        assert_eq!(
+            resolved_callable_of("func f(x: MetatypeOf<any P>)", &table),
+            resolved_callable_of("func f(x: (any P).Type)", &table)
+        );
+    }
+
+    #[test]
+    fn test_from_spelling_bounds_the_depth_of_expanded_typealiases() {
+        let type_at_limit = format!("Int{}", ".Type".repeat(MAXIMUM_SWIFT_TYPE_DEPTH - 1));
+        let closed = opened(&type_at_limit, &[("Int", standard_at("Int"))]);
+        let generic = opened_declaration("typealias Wrapped<T> = [[T]]", &[]);
+        let table = [
+            ("Closed", closed),
+            ("Wrapped", generic),
+            ("Int", standard_at("Int")),
+        ];
+        let suffixes = ".Type".repeat(MAXIMUM_SWIFT_TYPE_DEPTH - 3);
+
+        for (allowed, direct, too_deep) in [
+            (
+                "func f(x: Closed)".to_owned(),
+                format!("func f(x: {type_at_limit})"),
+                "func f(x: Closed.Type)".to_owned(),
+            ),
+            (
+                format!("func f(x: Wrapped<Int{suffixes}>)"),
+                format!("func f(x: [[Int{suffixes}]])"),
+                format!("func f(x: Wrapped<Int{suffixes}.Type>)"),
+            ),
+        ] {
+            let expanded = resolved_callable_of(&allowed, &table);
+            assert_eq!(expanded.alias_failure(), None);
+            assert_eq!(expanded, resolved_callable_of(&direct, &table));
+            assert_eq!(
+                resolved_callable_of(&too_deep, &table).alias_failure(),
+                Some(SwiftAliasFailure::ExpansionLimit)
+            );
+        }
+    }
+
+    #[test]
     fn test_from_spelling_substitutes_type_arguments_inside_metatypes() {
         let alias = opened_declaration("typealias Swapped<T, U> = (U.Type, T)", &[]);
         let table = [
@@ -2736,8 +3016,8 @@ mod tests {
         ];
 
         assert_eq!(
-            resolved_callable_of("func f(x: Swapped<Int, String>)", &table),
-            resolved_callable_of("func f(x: (String.Type, Int))", &table)
+            resolved_callable_of("func f(x: Swapped<Int, [String]>)", &table),
+            resolved_callable_of("func f(x: ([String].Type, Int))", &table)
         );
         assert_eq!(
             resolved_callable_of("func f<T, U>(x: Swapped<T, U>) -> T", &table),
@@ -3054,8 +3334,8 @@ mod tests {
             panic!("開いた右辺");
         };
 
-        assert_eq!(single.value.size(), 1);
-        assert_eq!(pair.value.size(), 3);
+        assert_eq!(single.value.shape().node_count, 1);
+        assert_eq!(pair.value.shape().node_count, 3);
     }
 
     #[test]

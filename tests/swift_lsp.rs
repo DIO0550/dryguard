@@ -440,6 +440,15 @@ fn test_sourcekit_lsp_metatype_alias_matches_its_right_side() {
 
 #[test]
 #[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
+fn test_sourcekit_lsp_nested_protocol_metatypes_distinguish_the_scope_of_any() {
+    assert_eq!(
+        type_signature_match_of("legacyNestedMetatype", "explicitNestedMetatype"),
+        TypeSignatureMatch::NotUnifiable
+    );
+}
+
+#[test]
+#[ignore = "sourcekit-lsp が要る。CI では入れて --ignored で走らせる"]
 fn test_sourcekit_lsp_any_class_is_unmeasurable_when_any_object_cannot_be_opened() {
     // AnyClass の右辺 `any AnyObject.Type` は、基底型の AnyObject まで辿る。
     assert_eq!(
