@@ -350,15 +350,17 @@ typeDefinition は型名の位置に `null` を返すので、Rust と同じく 
 （`Flip<T, U>` = `(U, T)` を通る形と `(U, T)` を直接書いた形を重ねる）。当てはめないもの（`UnopenableAlias`。偽陰性側）:
 型引数の数の不一致・前の区切りの型引数（`Outer<Int>.Alias`）・**境界を持つ宣言（`<T: Hashable>`）に使用側の型変数を
 当てる形**（Swift は境界を使用側の関数の要求として推論する。hover の綴りにその要求が出るかは未実測で、出なければ`[T]` を直接書いた
-境界の無い関数と重なる）・型パラメータの関連型（`C.Element`）に具体的な型を当てる形。`where` 節を持つ宣言は
-tree-sitter-swift が宣言の外に置くので読まない（コメントを飛ばした最初の兄弟が ERROR か `where` の語かで見る。
+境界の無い関数と重なる）・型パラメータの関連型（`C.Element`）に具体的な型を当てる形・`T.Type` の基底に名前で書かれた型、
+メタタイプ、合成型を当てる形。Swift 6.4.2 では、プロトコルの `P` と `P.Type` を `T.Type` の基底に当てると、それぞれ
+`P.Protocol` と `P.Type.Protocol` になる。宣言位置だけでは `P` がプロトコルか判断できない。
+`where` 節を持つ宣言は tree-sitter-swift が宣言の外に置くので読まない（コメントを飛ばした最初の兄弟が ERROR か `where` の語かで見る。
 改行を挟むと `where` が名前として読まれ、直後の兄弟だけでは見落とす）。
 それ以外・ツールチェーンの `.swiftinterface` の宣言・右辺を綴らない宣言（生成インタフェースの
 `public typealias AnyObject`）・右辺に `Self` や属性がある宣言は `UnopenableAlias` で「測れない」にする
 （宣言の場所のまま比べると、`Amount` と `Int` が重ならないと確かめた答えになる）。循環は宣言の場所で
 `CyclicAlias`、32 段か展開した型が 4096 ノードを超えると `AliasExpansionLimit`（ノード数の上限は使用側で型引数を
-当てはめた結果にも当てる。`Couple<Couple<…>>` は段ごとに倍になる。循環した宣言の使用位置には
-sourcekit-lsp 6.4.2 が答えないので、`CyclicAlias` はサーバが答えたときの防御）。開いた答えは
+当てはめた結果にも当てる。`Couple<Couple<…>>` は段ごとに倍になる。使用位置の残りの深さを超える場合も同じ理由で返す。
+循環した宣言の使用位置には sourcekit-lsp 6.4.2 が答えないので、`CyclicAlias` はサーバが答えたときの防御）。開いた答えは
 `SwiftDeclarationCache` が宣言の場所ごとに、展開に使った段数と一緒に持ち、別の連鎖の途中で使うときは
 今の段数との和で上限を確かめ直す（尋ねる順で答えが変わらない）。型名の使用位置への definition と hover の
 答え（宣言の場所と、エイリアスか）も、同じキャッシュが**ドキュメントのパス・位置・綴りごとに**持つ
@@ -370,6 +372,19 @@ sourcekit-lsp 6.4.2 が答えないので、`CyclicAlias` はサーバが答え�
 `extension` の `where` も綴らないので、型引数（`Array<Int>` / `[Int]`）と `where` 節も同じ綴りで運び、
 `where` の右辺と型引数の型名は使用位置から辿る。**`where` の左辺は辿らない** — レシーバの型変数で、
 sourcekit-lsp 6.4.2 の definition は宣言ではない位置（そのモジュールの生成インタフェースの先頭）を返す。
+
+**Swift のメタタイプは基底型を持つ型構造で比べる。** `SwiftSpelling` は `X.Type` の `X` を型名として集め、その位置に
+definition を向ける。ツリー上の `user_type`・`metatype`・`bracket_qualified_type` がこの形を持つ。
+単独の `any P.Type` は `P.Type` と重ね、`(any P).Type` は `P.Protocol` と重ねる。
+外側のメタタイプの基底に直接書いた `any` は透過的な括弧を越えて保持する。`(any P.Type).Type` は `P.Type.Protocol` と重なり、
+`P.Type.Type` とは別の型になる（Swift 6.4.2 の `ObjectIdentifier` で確認）。
+バッククォート付きの ``Outer.`Type` `` は型名として辿る。
+エイリアスの右辺も同じ規則で読む。固定長配列の長さや値の型引数など、比較に残せない情報を含む型は測れないとする。
+型を読むときは深さを 64 層までに制限し、括弧とメタタイプ・Optional の接尾辞の層を組み立てる前に確保する。
+`.Protocol` は existential 型を包む可能性があるので 2 層を確保する。型エイリアスも、展開結果を組み立てる前に使用位置に残る深さに
+収まるかを確認する。
+Swift の definition が空の場合は `NoSwiftDefinitionSite` とし、テキストでは sourcekit-lsp の応答を説明する。
+Swift の JSON では空の definition を `no-definition-site` で表す。
 
 **Java の型名は definition で辿り、宣言の場所でそのまま比べる。** jdtls 1.63.0 の typeDefinition は
 結果を持たない応答を返すので definition を尋ねる（`semantics::resolved_type` の

@@ -162,11 +162,12 @@ pub enum UnopenedReason {
     NoDeclarationSite,
     /// サーバが definition に宣言の場所を答えなかった。
     ///
-    /// **[`UnopenedReason::NoDeclarationSite`] と分ける。** definition を尋ねるのは Rust で、
-    /// **rust-analyzer は rust-src が無いと std / core の名前にも空を返す**
-    /// （1.94.1 で実測）。利用者が次に試すこと（rust-src を入れる）が増えるので、
-    /// TypeScript の利用者にその案内を出さないよう問い合わせで分ける。
+    /// Rust では rust-analyzer が rust-src の無い環境で std / core の名前にも空を返す
+    /// （1.94.1 で実測）。この理由を使って Rust の利用者に rust-src を案内する。
+    /// Swift と Java はそれぞれのサーバに対応する理由へ置き換える。
     NoDefinitionSite,
+    /// sourcekit-lsp が definition に宣言の場所を答えなかった。
+    NoSwiftDefinitionSite,
     /// jdtls が definition に宣言の場所を答えなかった。
     ///
     /// **[`UnopenedReason::NoDefinitionSite`] と分ける。** jdtls 1.63.0 は JDK の型
@@ -637,6 +638,9 @@ impl SwiftAliasOpener<'_> {
             reference.position(),
         )? {
             Ok(site) => site,
+            Err(UnopenedReason::NoDefinitionSite) => {
+                return Ok(Err(UnopenedReason::NoSwiftDefinitionSite));
+            }
             Err(reason) => return Ok(Err(reason)),
         };
 
@@ -2266,7 +2270,7 @@ done
         assert_eq!(declared_names(&second), vec!["Ledger"]);
         assert_eq!(
             asked_again.unopened_reason_of("Ledger"),
-            Some(UnopenedReason::NoDefinitionSite)
+            Some(UnopenedReason::NoSwiftDefinitionSite)
         );
     }
 
