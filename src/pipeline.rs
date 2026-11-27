@@ -355,8 +355,7 @@ pub fn measured_pair_of(
 }
 
 /// [`measured_pair_of`] と同じく測るが、サーバはペアの grammar で `servers` から引く。
-/// `distance_paths` は `pair` の順に並んだ、モジュール距離用の絶対パス。
-/// チャンクや LSP には元のパスを使う。
+/// モジュール距離はチャンクが持つパスから測る。
 ///
 /// **対応するサーバが並びに無くても失敗にしない。** 尋ねずに
 /// [`SemanticsUnavailable::NotAsked`] として出す（走査がサーバの無い言語を扱うのと同じ）。
@@ -365,6 +364,23 @@ pub fn measured_pair_of(
 ///
 /// [`measured_pair_of`] と同じ。
 pub fn measured_pair_with_language_servers(
+    pair: &ChunkPair,
+    thresholds: ConfiguredThresholds,
+    declarations: &DomainDeclarations,
+    servers: LanguageServers<'_>,
+) -> Result<MeasuredPair, AmbiguousDomain> {
+    let distance_paths = [pair.chunk_a.path(), pair.chunk_b.path()];
+    measured_pair_with_distance_paths(pair, distance_paths, thresholds, declarations, servers)
+}
+
+/// [`measured_pair_with_language_servers`] と同じく測るが、モジュール距離は
+/// `pair` と同じ順で並べた、起点の揃った `distance_paths` から測る。
+/// チャンクや LSP には元のパスを使う。
+///
+/// # Errors
+///
+/// [`measured_pair_of`] と同じ。
+pub fn measured_pair_with_distance_paths(
     pair: &ChunkPair,
     distance_paths: [&Path; 2],
     thresholds: ConfiguredThresholds,

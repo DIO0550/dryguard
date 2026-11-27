@@ -11,7 +11,8 @@
 //! 判定に当てる閾値は `--threshold` > `dryguard.toml` > 既定値の順に決まる
 //! （[`configured_thresholds_of`]）。ドメインの宣言は `dryguard.toml` の `[domains]` だけが持つ。
 
-use std::path::{self, Path, PathBuf};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -27,7 +28,7 @@ use dryguard::location::Location;
 use dryguard::lsp::ServerCommand;
 use dryguard::pipeline::{
     LanguageServers, Scan, check_with_language_servers, chunk_pair_of,
-    measured_pair_with_language_servers, scan_with_language_servers,
+    measured_pair_with_distance_paths, scan_with_language_servers,
 };
 use dryguard::report::{Explanation, json_of, scan_json_of, scan_text_of, text_of};
 use dryguard::syntax::chunk::TestFunctions;
@@ -166,7 +167,7 @@ fn report_compare(
 
     // **宣言の食い違いは判定を出さずに止める。** 直す先は dryguard.toml で、
     // どちらかの宣言へ寄せた判定を出すと、並べ替えただけで答えが変わる
-    let measured = match measured_pair_with_language_servers(
+    let measured = match measured_pair_with_distance_paths(
         &pair,
         [&path_a, &path_b],
         settings.thresholds,
@@ -202,11 +203,27 @@ fn report_compare(
     )
 }
 
-/// モジュール距離のためだけに、相対パスを作業ディレクトリに揃える。
+/// モジュール距離のためだけに、親ディレクトリを OS に解決させる。
+/// `..` がある側だけ解決すると、同じディレクトリでもリンク経由の綴りによって距離が変わる。
+/// ファイル名自体のリンクは辿らない。見るのは、そのファイル名が置かれたディレクトリ。
 /// ファイルを読む位置や表示に使う位置は、指定された綴りのままにする。
-fn distance_path_of(location: &Location) -> std::io::Result<PathBuf> {
-    path::absolute(location.path()).inspect_err(|error| {
-        eprintln!("{location} の比較用パスを絶対パスにできません: {error}");
+fn distance_path_of(location: &Location) -> io::Result<PathBuf> {
+    let path = location.path();
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let resolved = match path.file_name() {
+        Some(file_name) => directory
+            .canonicalize()
+            .map(|directory| directory.join(file_name)),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ファイル名を取得できません",
+        )),
+    };
+    resolved.inspect_err(|error| {
+        eprintln!("{location} の比較用パスを解決できません: {error}");
     })
 }
 

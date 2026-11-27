@@ -14,15 +14,16 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use dryguard::classification::signal::{
-    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, SemanticsUnavailable, Signals,
-    StructuralSimilarity, TypeSignatureMatch,
+    CalleeDomainOverlap, CallerDomainOverlap, ImportOverlap, ModuleSeparation,
+    SemanticsUnavailable, Signals, StructuralSimilarity, TypeSignatureMatch,
 };
 use dryguard::classification::verdict::Verdict;
 use dryguard::classification::{ConfiguredThresholds, classification_of};
 use dryguard::domain_declaration::DomainDeclarations;
 use dryguard::location::Location;
 use dryguard::pipeline::{
-    ChunkPairError, MeasuredPair, chunk_pair_of, measured_pair_of, signals_of,
+    ChunkPairError, LanguageServers, MeasuredPair, chunk_pair_of, measured_pair_of,
+    measured_pair_with_language_servers, signals_of,
 };
 use dryguard::report::{Explanation, text_of};
 use dryguard::similarity::Similarity;
@@ -720,13 +721,29 @@ fn test_compare_of_a_local_file_and_a_same_named_package_is_review_for_both_path
 }
 
 #[test]
+fn test_compare_library_measures_distance_from_the_chunk_paths_with_no_explicit_paths() {
+    let pair = chunk_pair_of(
+        &fixture("billing/discount.ts", 6),
+        &fixture("inventory/reorder.ts", 6),
+    )
+    .expect("フィクスチャからチャンクを切り出せる");
+    let measured = measured_pair_with_language_servers(
+        &pair,
+        ConfiguredThresholds::default(),
+        &DomainDeclarations::default(),
+        LanguageServers::new(&[]),
+    )
+    .expect("宣言が無ければ食い違わない");
+
+    let ModuleSeparation::Directories(distance) = measured.signals().module_separation() else {
+        panic!("宣言が無ければディレクトリの距離を測る");
+    };
+    assert_eq!(distance.steps(), 2);
+}
+
+#[test]
 fn test_compare_measures_the_same_module_distance_for_equivalent_path_spellings() {
     let directory = scratch_directory("module-distance");
-    // 子プロセスが取得する作業ディレクトリに合わせ、TMPDIR 自体のリンクはテスト側で解決する。
-    #[cfg(unix)]
-    let directory = directory
-        .canonicalize()
-        .expect("作業ディレクトリを解決できる");
     let src = directory.join("src");
     let other = directory.join("other");
     fs::create_dir_all(&src).expect("比較対象のディレクトリを作れる");
@@ -741,11 +758,23 @@ fn test_compare_measures_the_same_module_distance_for_equivalent_path_spellings(
     let a = typescript_file(&src, "a.ts", source);
     let b = typescript_file(&src, "b.ts", &other_source);
     let distant_b = typescript_file(&other, "b.ts", &other_source);
+    typescript_file(&directory, "a.ts", source);
+    typescript_file(&directory, "b.ts", &other_source);
     let b_via_parent = Path::new("..")
         .join(directory.file_name().expect("一時ディレクトリの名前がある"))
         .join("src/b.ts");
+    #[cfg(unix)]
+    {
+        let deep = other.join("deep");
+        fs::create_dir_all(deep.join("child")).expect("リンク先のディレクトリを作れる");
+        typescript_file(&deep, "a.ts", source);
+        typescript_file(&deep, "b.ts", &other_source);
+        std::os::unix::fs::symlink("../other/deep", src.join("jump"))
+            .expect("比較用のディレクトリリンクを作れる");
+    }
 
     for (left, right, expected_steps, expected_verdict) in [
+        (Path::new("a.ts"), Path::new("./b.ts"), 0, "REVIEW"),
         (Path::new("src/a.ts"), Path::new("src/b.ts"), 0, "REVIEW"),
         (Path::new("src/a.ts"), &b, 0, "REVIEW"),
         (&a, Path::new("src/b.ts"), 0, "REVIEW"),
@@ -758,6 +787,27 @@ fn test_compare_measures_the_same_module_distance_for_equivalent_path_spellings(
         ),
         (Path::new("src/a.ts"), &b_via_parent, 0, "REVIEW"),
         (Path::new("src/a.ts"), &distant_b, 2, "DO-NOT-EXTRACT"),
+        #[cfg(unix)]
+        (
+            Path::new("src/a.ts"),
+            Path::new("src/jump/child/../../b.ts"),
+            2,
+            "DO-NOT-EXTRACT",
+        ),
+        #[cfg(unix)]
+        (
+            Path::new("src/jump/a.ts"),
+            Path::new("src/jump/child/../b.ts"),
+            0,
+            "REVIEW",
+        ),
+        #[cfg(unix)]
+        (
+            Path::new("src/jump/a.ts"),
+            Path::new("other/deep/b.ts"),
+            0,
+            "REVIEW",
+        ),
     ] {
         let left_arg = format!("{}:2", left.display());
         let right_arg = format!("{}:2", right.display());
