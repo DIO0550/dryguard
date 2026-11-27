@@ -720,6 +720,89 @@ fn test_compare_of_a_local_file_and_a_same_named_package_is_review_for_both_path
 }
 
 #[test]
+fn test_compare_measures_the_same_module_distance_for_equivalent_path_spellings() {
+    let directory = scratch_directory("module-distance");
+    // 子プロセスが取得する作業ディレクトリに合わせ、TMPDIR 自体のリンクはテスト側で解決する。
+    #[cfg(unix)]
+    let directory = directory
+        .canonicalize()
+        .expect("作業ディレクトリを解決できる");
+    let src = directory.join("src");
+    let other = directory.join("other");
+    fs::create_dir_all(&src).expect("比較対象のディレクトリを作れる");
+    fs::create_dir_all(&other).expect("対照のディレクトリを作れる");
+    let source = "import { helper } from 'first-package';\n\
+                  export function transform(value: number): number {\n\
+                  const doubled = helper(value) * 2;\n\
+                  const shifted = doubled + 3;\n\
+                  return shifted * value;\n\
+                  }\n";
+    let other_source = source.replace("first-package", "second-package");
+    let a = typescript_file(&src, "a.ts", source);
+    let b = typescript_file(&src, "b.ts", &other_source);
+    let distant_b = typescript_file(&other, "b.ts", &other_source);
+    let b_via_parent = Path::new("..")
+        .join(directory.file_name().expect("一時ディレクトリの名前がある"))
+        .join("src/b.ts");
+
+    for (left, right, expected_steps, expected_verdict) in [
+        (Path::new("src/a.ts"), Path::new("src/b.ts"), 0, "REVIEW"),
+        (Path::new("src/a.ts"), &b, 0, "REVIEW"),
+        (&a, Path::new("src/b.ts"), 0, "REVIEW"),
+        (&a, &b, 0, "REVIEW"),
+        (
+            Path::new("src/a.ts"),
+            Path::new("other/../src/b.ts"),
+            0,
+            "REVIEW",
+        ),
+        (Path::new("src/a.ts"), &b_via_parent, 0, "REVIEW"),
+        (Path::new("src/a.ts"), &distant_b, 2, "DO-NOT-EXTRACT"),
+    ] {
+        let left_arg = format!("{}:2", left.display());
+        let right_arg = format!("{}:2", right.display());
+        let output = process::Command::new(env!("CARGO_BIN_EXE_dryguard"))
+            .args([
+                "compare",
+                &left_arg,
+                &right_arg,
+                "--format",
+                "json",
+                "--explain",
+            ])
+            .current_dir(&directory)
+            .env("PATH", "")
+            .output()
+            .expect("CLI を起動できる");
+        assert!(output.status.success(), "{:?}", output);
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("JSON を出す");
+        let reasons = report["reasons"].as_array().expect("判定の根拠がある");
+        let reason = |name: &str| {
+            reasons
+                .iter()
+                .find(|reason| reason["signal"] == name)
+                .unwrap_or_else(|| panic!("根拠に {name} がある: {report}"))
+        };
+
+        assert_eq!(
+            reason("module-distance")["value"]["steps"],
+            expected_steps,
+            "{left_arg} / {right_arg}"
+        );
+        assert_eq!(report["verdict"], expected_verdict, "{report}");
+        assert_eq!(reason("import-overlap")["value"]["overlap"], 0.0);
+        assert_eq!(
+            reason("type-signature-match")["value"]["reason"],
+            "lsp-unusable"
+        );
+        assert_eq!(report["location_a"]["file"], left.display().to_string());
+        assert_eq!(report["location_b"]["file"], right.display().to_string());
+    }
+    fs::remove_dir_all(directory).expect("作業ディレクトリを消せる");
+}
+
+#[test]
 fn test_compare_without_an_lsp_server_still_reaches_the_stage1_verdict() {
     // Phase 0 の仮説と同じペア。**サーバを使えなくても判定まで届く**
     // （届かないと、LSP の入っていない環境でツールが使えなくなる）

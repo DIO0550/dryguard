@@ -11,7 +11,7 @@
 //! 判定に当てる閾値は `--threshold` > `dryguard.toml` > 既定値の順に決まる
 //! （[`configured_thresholds_of`]）。ドメインの宣言は `dryguard.toml` の `[domains]` だけが持つ。
 
-use std::path::Path;
+use std::path::{self, Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -160,10 +160,15 @@ fn report_compare(
         return ExitCode::from(NOT_CLASSIFIED);
     }
 
+    let [Ok(path_a), Ok(path_b)] = [location_a, location_b].map(distance_path_of) else {
+        return ExitCode::from(NOT_CLASSIFIED);
+    };
+
     // **宣言の食い違いは判定を出さずに止める。** 直す先は dryguard.toml で、
     // どちらかの宣言へ寄せた判定を出すと、並べ替えただけで答えが変わる
     let measured = match measured_pair_with_language_servers(
         &pair,
+        [&path_a, &path_b],
         settings.thresholds,
         settings.declarations,
         LanguageServers::new(&language_servers()),
@@ -195,6 +200,14 @@ fn report_compare(
         [classification.verdict()],
         semantics_coverage_of(measured.semantics_error().is_some()),
     )
+}
+
+/// モジュール距離のためだけに、相対パスを作業ディレクトリに揃える。
+/// ファイルを読む位置や表示に使う位置は、指定された綴りのままにする。
+fn distance_path_of(location: &Location) -> std::io::Result<PathBuf> {
+    path::absolute(location.path()).inspect_err(|error| {
+        eprintln!("{location} の比較用パスを絶対パスにできません: {error}");
+    })
 }
 
 /// `scan` の対象ディレクトリを走査して、候補ペアを理由付きで表示する。

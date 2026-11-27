@@ -82,8 +82,8 @@ impl ChunkPair {
 /// 重複を畳むのでサーバが見るのは先の版だけになり、**後のチャンクの名前の位置だけが
 /// 別の版から来る**。
 ///
-/// 綴りが違って同じファイルを指す場合（`./a.ts` と `a.ts`）は 2 回読む。パスを絶対に
-/// 直すのは `lsp::uri` の担当で、そこへ寄せると `pipeline` がパスの解決を持つことになる。
+/// パスの比較は渡された `Location` 同士で行う。モジュール距離用のパスで読み込み位置を
+/// 置き換えず、LSP へ渡す URI の組み立ても `lsp` に任せる。
 ///
 /// # Errors
 ///
@@ -207,25 +207,34 @@ fn enclosing_chunk_at(location: &Location, tree: &SyntaxTree<'_>) -> Result<Chun
 /// 測れなかったシグナルは、その理由を持つバリアントで返る（値は埋めない）。
 /// **測るのはここ、判定は `classification`** という分担にする
 /// (`rules/architecture.md`「3 ステージのパイプライン」)。
+/// 距離を測るため、チャンクのパスは両方とも絶対パスか同じ起点からの相対パスとする。
 pub fn signals_of(chunk_a: &Chunk, chunk_b: &Chunk) -> Signals {
+    signals_with_paths_of(chunk_a, chunk_b, [chunk_a.path(), chunk_b.path()])
+}
+
+fn signals_with_paths_of(
+    chunk_a: &Chunk,
+    chunk_b: &Chunk,
+    [path_a, path_b]: [&Path; 2],
+) -> Signals {
     Signals::new(
         structural_similarity_of(chunk_a, chunk_b),
         leaf_divergence_of(chunk_a, chunk_b),
         import_overlap_of(chunk_a, chunk_b),
-        ModuleDistance::between(chunk_a.path(), chunk_b.path()),
+        ModuleDistance::between(path_a, path_b),
     )
 }
 
-/// [`signals_of`] に、2 つのファイルが当たった `dryguard.toml` の宣言を重ねる。
+/// `distance_paths` で測ったシグナルに、2 つのファイルが当たった `dryguard.toml` の宣言を重ねる。
 ///
 /// `declared_a` / `declared_b` はそれぞれのファイルが当たった宣言。**どちらかが当たれば
-/// モジュール距離を段数ではなく宣言で比べる**（宣言が推定に勝つ）。どちらも当たらなければ
-/// [`signals_of`] と同じ。
+/// モジュール距離を段数ではなく宣言で比べる**（宣言が推定に勝つ）。
 fn declared_signals_of(
     (chunk_a, declared_a): (&Chunk, Option<&DomainName>),
     (chunk_b, declared_b): (&Chunk, Option<&DomainName>),
+    distance_paths: [&Path; 2],
 ) -> Signals {
-    let signals = signals_of(chunk_a, chunk_b);
+    let signals = signals_with_paths_of(chunk_a, chunk_b, distance_paths);
 
     match DeclaredDomains::new(declared_a.cloned(), declared_b.cloned()) {
         Some(declared) => signals.with_declared_domains(declared),
@@ -320,6 +329,7 @@ impl MeasuredPair {
 /// `thresholds` は判定に当てる閾値（候補ペアと見なす構造類似度の下限もここが持つ）、
 /// `declarations` は `dryguard.toml` のドメインの宣言、
 /// `server` は起こす LSP サーバの指定（TypeScript なら [`ServerCommand::typescript`]）。
+/// `pair` のパスは [`signals_of`] と同じ起点の条件を満たすものとする。
 ///
 /// **候補ペアでなければサーバを起こさない。** 構造が似ていないペアの判定は Stage 2 で
 /// 変わらないので、起動とインデックスの待ち時間だけが増える
@@ -340,10 +350,13 @@ pub fn measured_pair_of(
     declarations: &DomainDeclarations,
     server: &ServerCommand,
 ) -> Result<MeasuredPair, AmbiguousDomain> {
-    measured_pair_with(pair, thresholds, declarations, Some(server))
+    let distance_paths = [pair.chunk_a.path(), pair.chunk_b.path()];
+    measured_pair_with(pair, distance_paths, thresholds, declarations, Some(server))
 }
 
 /// [`measured_pair_of`] と同じく測るが、サーバはペアの grammar で `servers` から引く。
+/// `distance_paths` は `pair` の順に並んだ、モジュール距離用の絶対パス。
+/// チャンクや LSP には元のパスを使う。
 ///
 /// **対応するサーバが並びに無くても失敗にしない。** 尋ねずに
 /// [`SemanticsUnavailable::NotAsked`] として出す（走査がサーバの無い言語を扱うのと同じ）。
@@ -353,16 +366,18 @@ pub fn measured_pair_of(
 /// [`measured_pair_of`] と同じ。
 pub fn measured_pair_with_language_servers(
     pair: &ChunkPair,
+    distance_paths: [&Path; 2],
     thresholds: ConfiguredThresholds,
     declarations: &DomainDeclarations,
     servers: LanguageServers<'_>,
 ) -> Result<MeasuredPair, AmbiguousDomain> {
     let server = servers.server_for(pair.chunk_a.grammar());
-    measured_pair_with(pair, thresholds, declarations, server)
+    measured_pair_with(pair, distance_paths, thresholds, declarations, server)
 }
 
 fn measured_pair_with(
     pair: &ChunkPair,
+    distance_paths: [&Path; 2],
     thresholds: ConfiguredThresholds,
     declarations: &DomainDeclarations,
     server: Option<&ServerCommand>,
@@ -372,6 +387,7 @@ fn measured_pair_with(
     let signals = declared_signals_of(
         (&pair.chunk_a, declared_a.as_ref()),
         (&pair.chunk_b, declared_b.as_ref()),
+        distance_paths,
     );
 
     let supported = |server: &&ServerCommand| {
@@ -1837,6 +1853,7 @@ impl ComparedPairs {
             let signals = declared_signals_of(
                 (chunk, scanned.declared.as_ref()),
                 (other_chunk, other.declared.as_ref()),
+                [chunk.path(), other_chunk.path()],
             );
             if !is_structurally_similar(
                 signals.structural_similarity(),
