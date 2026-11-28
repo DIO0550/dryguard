@@ -163,14 +163,17 @@ fn test_check_staged_swift_uses_the_index_declaration_for_an_extension_in_anothe
                      }\n";
     let mut edited = extension.replace("2 * 3", "3 * 3");
     edited = edited.replace("total, 6", "total, 9");
+    let manifest = r#"import PackageDescription
+let package = Package(name: "Shop", targets: [
+    .testTarget(name: "CartTests", path: ".", sources: ["AExtension.swift", "ZDeclaration.swift"]),
+])"#;
+    let declaration = "import XCTest\nfinal class CartTests: XCTestCase {}\n";
     let root = committed_work_tree(
         "swift-staged-extension",
         &[
+            ("Package.swift", manifest),
             ("AExtension.swift", extension),
-            (
-                "ZDeclaration.swift",
-                "import XCTest\nfinal class CartTests: XCTestCase {}\n",
-            ),
+            ("ZDeclaration.swift", declaration),
         ],
     );
     write_file(&root, "AExtension.swift", &edited);
@@ -196,6 +199,16 @@ fn test_check_staged_swift_uses_the_index_declaration_for_an_extension_in_anothe
     assert_eq!(staged.changed_chunk_count(), Some(0));
     assert_eq!(work_tree.excluded_test_function_count(), 0);
     assert_eq!(work_tree.changed_chunk_count(), Some(1));
+
+    // 継承宣言を戻し、今度はマニフェストだけを作業ツリーで変更する。
+    write_file(&root, "ZDeclaration.swift", declaration);
+    write_file(
+        &root,
+        "Package.swift",
+        &manifest.replace(".testTarget", ".target"),
+    );
+    assert_eq!(check(DiffTarget::Index).excluded_test_function_count(), 1);
+    assert_eq!(check(DiffTarget::WorkTree).changed_chunk_count(), Some(1));
 }
 
 #[test]

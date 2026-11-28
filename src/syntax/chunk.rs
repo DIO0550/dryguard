@@ -424,7 +424,7 @@ impl FileChunks {
         Self::from_tree_with_test_classes(tree, path, test_functions, &swift_test_classes)
     }
 
-    /// 走査対象全体で見つかった Swift の型宣言を使って切り出す。
+    /// 同一ファイルか、同じテストターゲットで見つかった Swift の型宣言を使って切り出す。
     pub(crate) fn from_tree_with_test_classes(
         tree: &SyntaxTree<'_>,
         path: &Path,
@@ -713,7 +713,7 @@ const XCTEST_METHOD_PREFIX: &str = "test";
 /// XCTest のテストを持つクラスが継承する型の名前。
 const XCTEST_CASE_NAME: &str = "XCTestCase";
 
-/// 走査した Swift ファイルに現れた最上位の型宣言。名前だけでは宣言を確定できないので、
+/// 単一ファイルか、所属を確かめた一つのテストターゲット内の最上位の Swift 型宣言。
 /// 同名宣言が複数ある場合は extension のメソッドを残す。
 #[derive(Default)]
 pub(crate) struct SwiftTestClasses(BTreeMap<String, SwiftTypeDeclaration>);
@@ -752,11 +752,21 @@ impl SwiftTestClasses {
             else {
                 continue;
             };
-            self.0
-                .entry(name.to_owned())
-                .and_modify(|known| *known = SwiftTypeDeclaration::OtherOrAmbiguous)
-                .or_insert(declaration_type);
+            self.insert(name.to_owned(), declaration_type);
         }
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        for (name, declaration) in other.0 {
+            self.insert(name, declaration);
+        }
+    }
+
+    fn insert(&mut self, name: String, declaration: SwiftTypeDeclaration) {
+        self.0
+            .entry(name)
+            .and_modify(|known| *known = SwiftTypeDeclaration::OtherOrAmbiguous)
+            .or_insert(declaration);
     }
 
     fn directly_inherits_xctest_case(&self, name: &str, path: &Path) -> bool {
@@ -767,6 +777,29 @@ impl SwiftTestClasses {
             _ => false,
         }
     }
+}
+
+/// ファイル間で拡張先を照合するまで、チャンク化を待つ必要のある XCTest 形のメソッドがあるか。
+pub(crate) fn has_xctest_extension_candidates(tree: &SyntaxTree<'_>) -> bool {
+    let source = tree.source();
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .filter(|node| swift_declaration_kind_of(*node) == Some("extension"))
+        .filter(|node| {
+            node.child_by_field_name(NAME_FIELD)
+                .and_then(|name| swift_simple_type_name_of(name, source))
+                .is_some()
+        })
+        .filter_map(|node| node.child_by_field_name("body"))
+        .any(|body| {
+            let mut cursor = body.walk();
+            body.named_children(&mut cursor).any(|method| {
+                is_chunk_node(method, Grammar::Swift)
+                    && has_xctest_method_shape(method, source)
+                    && !has_swift_test_attribute(method, source)
+            })
+        })
 }
 
 /// トップレベルの `private` / `fileprivate` 型は別ファイルの拡張先にできない。
@@ -799,6 +832,11 @@ fn is_swift_test_function(
     if has_swift_test_attribute(node, source) {
         return true;
     }
+    has_xctest_method_shape(node, source)
+        && is_in_xctest_case(node, source, path, swift_test_classes)
+}
+
+fn has_xctest_method_shape(node: Node<'_>, source: &str) -> bool {
     if node.kind() != SWIFT_FUNCTION_KIND {
         return false;
     }
@@ -806,13 +844,13 @@ fn is_swift_test_function(
         .child_by_field_name(NAME_FIELD)
         .and_then(|name| source.get(name.byte_range()))
         .is_some_and(|name| name.starts_with(XCTEST_METHOD_PREFIX));
+    if !named_like_a_test {
+        return false;
+    }
     let mut cursor = node.walk();
-    let takes_no_parameters = !node
+    !node
         .named_children(&mut cursor)
-        .any(|child| child.kind() == SWIFT_PARAMETER_KIND);
-    named_like_a_test
-        && takes_no_parameters
-        && is_in_xctest_case(node, source, path, swift_test_classes)
+        .any(|child| child.kind() == SWIFT_PARAMETER_KIND)
 }
 
 /// Swift の宣言の属性に `@Test` があるか。

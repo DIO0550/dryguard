@@ -590,6 +590,11 @@ pr-155 と同じ形だと自己申告している）。
 
 ## Rust・Swift の参照元のテスト範囲
 
+**Swift のチャンク化（Stage 1）と参照元の判別（Stage 2）は別。** Stage 1 で別ファイルの XCTest クラスに
+拡張を結びつける場合は、チャンク化に使う版の SwiftPM マニフェストから同一テストターゲットだと確認する。
+宣言と配置の要約だけを先に集め、照合を待つファイルも構文木は保持しない。必要になったとき、読み込んで
+保持した同じ版のソースだけを再解析する。他のファイルは読み込んだ時点でチャンク化する。
+
 参照元のテスト範囲は、Rust は `syntax::rust_test_scope`、Swift は `syntax::swift_test_source` と
 `syntax::swift_package` が取り出す。`semantics::caller_domain` は `codebase` の読み取り結果を
 `syntax` に渡し、照合して残った参照をドメインへまとめる。`pipeline` は compare / scan ごとに

@@ -1,6 +1,7 @@
 //! `Package.swift` の初期ターゲット配列に静的に書かれたテストの配置。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 use tree_sitter::Node;
@@ -8,6 +9,11 @@ use tree_sitter::Node;
 use super::tree::{Grammar, SyntaxTree};
 
 pub(crate) const MANIFEST_FILE_NAME: &str = "Package.swift";
+
+pub(crate) fn is_versioned_manifest_name(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with("Package@swift-") && name.ends_with(".swift"))
+}
 
 const PACKAGE_INITIALIZERS: [&str; 2] = ["Package", "PackageDescription.Package"];
 const TEST_TARGET_FACTORIES: [&str; 3] = [
@@ -29,6 +35,7 @@ const RESOURCE_FACTORIES: [&str; 9] = [
 
 #[derive(Debug)]
 pub(crate) struct SwiftTestTarget {
+    name: String,
     directory: PathBuf,
     sources: Vec<PathBuf>,
     excluded: Vec<PathBuf>,
@@ -42,17 +49,21 @@ impl SwiftTestTarget {
         let Ok(tree) = SyntaxTree::from_source(source, Grammar::Swift) else {
             return Vec::new();
         };
+        Self::from_tree(&tree, package_directory)
+    }
+
+    pub(crate) fn from_tree(tree: &SyntaxTree<'_>, package_directory: &Path) -> Vec<Self> {
         if tree.has_error() {
             return Vec::new();
         }
 
-        let Some(targets) = targets_array_of(&tree) else {
+        let Some(targets) = targets_array_of(tree) else {
             return Vec::new();
         };
         let mut cursor = targets.walk();
         targets
             .children_by_field_name("element", &mut cursor)
-            .filter_map(|element| Self::of_declaration(&tree, element, package_directory))
+            .filter_map(|element| Self::of_declaration(tree, element, package_directory))
             .collect()
     }
 
@@ -62,8 +73,8 @@ impl SwiftTestTarget {
         package_directory: &Path,
     ) -> Option<Self> {
         let arguments = arguments_of(tree, declaration, &TEST_TARGET_FACTORIES)?;
-        let name = Path::new(plain_string_of(tree, *arguments.get("name")?)?);
-        if name.file_name()? != name.as_os_str() {
+        let name = plain_string_of(tree, *arguments.get("name")?)?;
+        if Path::new(name).file_name()? != name {
             return None;
         }
 
@@ -93,6 +104,7 @@ impl SwiftTestTarget {
         }
 
         Some(Self {
+            name: name.to_owned(),
             directory: package_directory.join(directory),
             sources,
             excluded,
@@ -114,6 +126,85 @@ impl SwiftTestTarget {
                 .iter()
                 .any(|excluded| relative.starts_with(excluded))
     }
+}
+
+/// 走査と同じ版のマニフェストから確かめた SwiftPM のテストターゲット。
+#[derive(Default)]
+pub(crate) struct SwiftTestPackages<'path>(BTreeMap<&'path Path, ManifestLayouts>);
+
+/// 名前が同じでも、別パッケージのテストターゲットは同一視しない。
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct SwiftTestTargetId<'layout> {
+    package: &'layout Path,
+    name: &'layout str,
+}
+
+#[derive(Default)]
+struct ManifestLayouts {
+    default: Option<Vec<SwiftTestTarget>>,
+    versioned: Vec<Vec<SwiftTestTarget>>,
+}
+
+impl<'path> SwiftTestPackages<'path> {
+    pub(crate) fn record_manifest(&mut self, path: &'path Path, targets: Vec<SwiftTestTarget>) {
+        let (Some(directory), Some(name)) = (path.parent(), path.file_name()) else {
+            return;
+        };
+        if name == MANIFEST_FILE_NAME {
+            self.0.entry(directory).or_default().default = Some(targets);
+        } else if is_versioned_manifest_name(name) {
+            self.0.entry(directory).or_default().versioned.push(targets);
+        }
+    }
+
+    /// 最寄りのパッケージで、どのマニフェストでも同じ単一のテストターゲットに当たるときだけ返す。
+    /// 読めない・配置が曖昧な内側のマニフェストを外側で補わない。
+    pub(crate) fn target_of(&self, path: &Path) -> Option<SwiftTestTargetId<'_>> {
+        let (package, layouts) = path
+            .parent()?
+            .ancestors()
+            .find_map(|parent| self.0.get_key_value(parent))?;
+        if !can_be_target_source(path.strip_prefix(package).ok()?) {
+            return None;
+        }
+        let name = unique_target_name_of(layouts.default.as_deref()?, path)?;
+        layouts
+            .versioned
+            .iter()
+            .all(|targets| unique_target_name_of(targets, path) == Some(name))
+            .then_some(SwiftTestTargetId { package, name })
+    }
+}
+
+/// SwiftPM が探索で除くパスは、別ファイルの型宣言を結びつける根拠にしない。
+fn can_be_target_source(relative: &Path) -> bool {
+    let Some(file_name) = relative.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    let at_package_root = relative.parent() == Some(Path::new(""));
+    if at_package_root
+        && (file_name == MANIFEST_FILE_NAME
+            || (file_name.starts_with("Package@") && file_name.ends_with(".swift")))
+    {
+        return false;
+    }
+    relative.iter().all(|component| {
+        component.to_str().is_some_and(|name| {
+            !name.starts_with('.')
+                && !name.ends_with(".xcodeproj")
+                && !name.ends_with(".playground")
+                && !name.ends_with(".xcworkspace")
+        })
+    })
+}
+
+fn unique_target_name_of<'targets>(
+    targets: &'targets [SwiftTestTarget],
+    path: &Path,
+) -> Option<&'targets str> {
+    let mut matching = targets.iter().filter(|target| target.contains(path));
+    let target = matching.next()?;
+    matching.next().is_none().then_some(&target.name)
 }
 
 fn targets_array_of<'tree>(tree: &'tree SyntaxTree<'_>) -> Option<Node<'tree>> {
@@ -244,6 +335,66 @@ fn paths_of_array<'tree>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_swift_test_package_requires_unambiguous_and_consistent_target_membership() {
+        let root = Path::new("Shop");
+        let normal = r#"let package = Package(name: "Shop", targets: [
+    .testTarget(name: "Unit", path: "Checks"),
+    .testTarget(name: "Manual", path: "Checks/Manual")
+])"#;
+        let versioned = r#"let package = Package(name: "Shop", targets: [
+    .testTarget(name: "Unit", path: "Checks", exclude: ["Omitted.swift", "Switched"]),
+    .testTarget(name: "Switched", path: "Checks/Switched"),
+    .testTarget(name: "Alternate", path: "Versioned")
+])"#;
+        let manifest = root.join("Package.swift");
+        let alternate = root.join("Package@swift-5.9.swift");
+        let mut packages = SwiftTestPackages::default();
+        packages.record_manifest(&manifest, SwiftTestTarget::from_manifest(normal, root));
+        packages.record_manifest(&alternate, SwiftTestTarget::from_manifest(versioned, root));
+
+        let owner = |name| packages.target_of(&root.join(name));
+        let included = owner("Checks/Included.swift").expect("両マニフェストで Unit に属する");
+        assert!(owner("Checks/Subfolder/Helper.swift") == Some(included));
+        assert!(owner("Checks/Manual/Overlapping.swift").is_none());
+        assert!(owner("Checks/Omitted.swift").is_none());
+        assert!(owner("Checks/Switched/ChangedTarget.swift").is_none());
+        assert!(owner("Checks/.Hidden.swift").is_none());
+        assert!(owner("Checks/.fixtures/Hidden.swift").is_none());
+        assert!(owner("Checks/Demo.playground/Example.swift").is_none());
+        assert!(owner("Versioned/OnlyAlternate.swift").is_none());
+    }
+
+    #[test]
+    fn test_swift_test_package_keeps_target_identity_separate_across_packages() {
+        let manifest_a = Path::new("Workspace/Package.swift");
+        let manifest_b = Path::new("Workspace/Tests/Unit/Nested/Package.swift");
+        let normal = r#"let package = Package(name: "Shop", targets: [
+    .testTarget(name: "Unit")
+])"#;
+        let mut packages = SwiftTestPackages::default();
+        for manifest in [manifest_a, manifest_b] {
+            let directory = manifest.parent().expect("マニフェストに親がある");
+            packages.record_manifest(manifest, SwiftTestTarget::from_manifest(normal, directory));
+        }
+        let outer = packages
+            .target_of(Path::new("Workspace/Tests/Unit/Outer.swift"))
+            .expect("外側の Unit に属する");
+        let inner = packages
+            .target_of(Path::new(
+                "Workspace/Tests/Unit/Nested/Tests/Unit/Inner.swift",
+            ))
+            .expect("内側の Unit に属する");
+
+        assert!(outer != inner, "別パッケージの同名ターゲット");
+        assert!(
+            packages
+                .target_of(Path::new("Workspace/Tests/Unit/Nested/Unassigned.swift"))
+                .is_none(),
+            "内側に所属がないファイルを外側の Unit に結びつけない"
+        );
+    }
 
     #[test]
     fn test_swift_test_targets_read_literal_paths_and_source_lists() {

@@ -15,7 +15,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::syntax::swift_package::MANIFEST_FILE_NAME;
+use crate::syntax::swift_package::{MANIFEST_FILE_NAME, is_versioned_manifest_name};
 use crate::syntax::tree::Grammar;
 
 pub mod diff;
@@ -180,12 +180,7 @@ pub(crate) fn swift_package_manifests_at(directory: &Path) -> io::Result<Option<
     let mut sources = vec![source_of(&manifest)?];
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.starts_with("Package@swift-") && name.ends_with(".swift"))
-            && entry.path().metadata()?.is_file()
-        {
+        if is_versioned_manifest_name(&entry.file_name()) && entry.path().metadata()?.is_file() {
             sources.push(source_of(&entry.path())?);
         }
     }

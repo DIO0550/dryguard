@@ -203,7 +203,7 @@ sourcekit-lsp の時間（中継スクリプトがフレームの受け渡し時
 
 Issue #554 では、同じ Swift Argument Parser 1.6.1 を sourcekit-lsp 6.4.2 で `scan . --lang swift --explain --format json` し直した。参照元に `Tests/ArgumentParserPackageManagerTests/PackageManager` のドメインが入るペアは main（`5ae71ba`）の 28 から 0、`caller-domain-overlap` が測れたペアは 149 から 135 になった。
 
-Issue #521 では、Swift Argument Parser 1.6.1（`309a47b`）を修正前（`cb8abec`）と修正後の両方で `dryguard scan --lang swift --format json <root>` した。sourcekit-lsp は無い環境で、分類結果ではなく Stage 1 の件数を比較した。除外した `test function`（`walked.excluded_test_functions`）は 66 → 523、候補ペア（`candidate_pairs`）は 10,677 → 706、そのうち両方のパスが `Tests/` 下にあるものは 9,993 → 22 になった。
+Issue #521 では、Swift Argument Parser 1.6.1（`309a47b`）を修正前（`cb8abec`）と修正後の両方で `dryguard scan --lang swift --format json <root>` した。sourcekit-lsp は無い環境で、分類結果ではなく Stage 1 の件数を比較した。別ファイルの拡張先は、SwiftPM の同じテストターゲットに属すると確かめたものだけを照合した。除外した `test function`（`walked.excluded_test_functions`）は 66 → 523、候補ペア（`candidate_pairs`）は 10,677 → 706、そのうち両方のパスが `Tests/` 下にあるものは 9,993 → 22 になった。
 
 同じモジュールのファイルどうしは `import` を書かないので、`Sources` 同士の 564 ペアのうち 544 ペアで依存先の重なりは `no-declarations`（測れない）だった。判定は呼び出し先ドメインとモジュール距離が持つ。
 

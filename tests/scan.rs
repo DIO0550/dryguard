@@ -249,7 +249,7 @@ fn swift_package_scan_of(language: SourceLanguage, test_functions: TestFunctions
 fn test_swift_scan_lists_functions_and_initializers_without_asking_a_server() {
     let scan = swift_package_scan_of(SourceLanguage::Swift, TestFunctions::Excluded);
 
-    assert_eq!(scan.file_count(), 5, "`.ts` は数えない");
+    assert_eq!(scan.file_count(), 6, "`.ts` は数えない");
     assert_eq!(
         scan.chunk_count(),
         6,
@@ -331,8 +331,8 @@ fn test_auto_scan_does_not_compare_swift_with_typescript() {
 
     assert_eq!(
         scan.file_count(),
-        6,
-        "`.swift` の 5 つと `.ts` の 1 つを集める"
+        7,
+        "`.swift` の 6 つと `.ts` の 1 つを集める"
     );
     assert_eq!(scan.chunk_count(), 7);
     assert_eq!(
@@ -384,6 +384,51 @@ fn test_swift_scan_including_test_functions_keeps_the_pair_of_two_tests() {
     assert_eq!(scan.excluded_test_function_count(), 0);
     assert_eq!(scan.chunk_count(), 8);
     assert_eq!(scan.compared_pair_count(), 28);
+}
+
+#[test]
+fn test_swift_scan_keeps_an_imported_type_extension_in_a_different_target() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/swift-xctest-targets");
+    let scan = scan_of_language(
+        &root,
+        SourceLanguage::Swift,
+        TestFunctions::Excluded,
+        ConfiguredThresholds::default(),
+        &DomainDeclarations::default(),
+        &missing_server(),
+    )
+    .expect("SwiftPM のフィクスチャを走査できる");
+
+    assert_eq!(scan.excluded_test_function_count(), 2);
+    assert_eq!(scan.chunk_count(), 3);
+    assert!(scan.candidate_pairs().iter().any(|pair| is_pair_of(
+        pair,
+        "Calendar/Timestamp.swift:4",
+        "Calendar/Timestamp.swift:10"
+    )));
+    assert!(scan.candidate_pairs().iter().any(|pair| is_pair_of(
+        pair,
+        "Calendar/Timestamp.swift:4",
+        "DisplayTests/TimestampSupport.swift:5"
+    )));
+}
+
+#[test]
+fn test_swift_scan_keeps_cross_file_extensions_without_a_manifest_in_the_scan() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/swift-xctest-targets/Tests/CalendarTests");
+    let scan = scan_of_language(
+        &root,
+        SourceLanguage::Swift,
+        TestFunctions::Excluded,
+        ConfiguredThresholds::default(),
+        &DomainDeclarations::default(),
+        &missing_server(),
+    )
+    .expect("マニフェストのない入力も走査できる");
+
+    assert_eq!(scan.excluded_test_function_count(), 0);
+    assert_eq!(scan.chunk_count(), 1);
 }
 
 #[test]

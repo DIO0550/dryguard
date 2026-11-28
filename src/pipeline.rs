@@ -43,11 +43,18 @@ use crate::semantics::type_signature::{
     rust_type_signature_outcome_of, swift_type_signature_outcome_of, type_signature_outcome_of,
 };
 use crate::source_position::SourcePosition;
-use crate::syntax::chunk::{Chunk, ChunkingError, FileChunks, SwiftTestClasses, TestFunctions};
+use crate::syntax::chunk::{
+    Chunk, ChunkingError, FileChunks, SwiftTestClasses, TestFunctions,
+    has_xctest_extension_candidates,
+};
 use crate::syntax::import::ImportsUnavailable;
 use crate::syntax::leaf_divergence::LeafComparison;
 use crate::syntax::module_distance::ModuleDistance;
-use crate::syntax::tree::{Grammar, OwnedSyntaxTree, ParseError, SyntaxTree};
+use crate::syntax::swift_package::{
+    MANIFEST_FILE_NAME, SwiftTestPackages, SwiftTestTarget, SwiftTestTargetId,
+    is_versioned_manifest_name,
+};
+use crate::syntax::tree::{Grammar, ParseError, SyntaxTree};
 use crate::threshold::Threshold;
 
 /// 比較する 2 箇所から切り出したチャンクと、その元になったファイルの中身。
@@ -1586,11 +1593,16 @@ struct ChunkedFile {
     source: Arc<str>,
 }
 
-/// 読み込み・パースを済ませたファイル。Swift でテストを除外する場合だけ、走査全体の型宣言を
-/// 集め終えるまで同じ版の構文木を保持する。
-enum PreparedFile {
+struct PreparedFile {
+    chunks: PreparedChunks,
+    declarations: SwiftTestClasses,
+    manifest_targets: Vec<SwiftTestTarget>,
+}
+
+/// 他ファイルの型宣言を待つ場合も、保持するのは初回に読んだソースだけ。構文木はワーカー内で解放する。
+enum PreparedChunks {
     Chunked(ChunkedFile),
-    Swift(OwnedSyntaxTree),
+    SwiftExtensionSource(String),
 }
 
 /// 走査で切り出したチャンク 1 つと、それを切り出したファイルの中身。
@@ -1621,39 +1633,65 @@ fn chunk_files(
     tree: SourceTree<'_>,
     test_functions: TestFunctions,
 ) -> Vec<Result<ChunkedFile, SkippedFile>> {
-    let prepared: Vec<_> = paths
+    let mut prepared: Vec<_> = paths
         .par_iter()
         .map(|path| prepare_file(path, tree, test_functions))
         .collect();
-    let mut swift_test_classes = SwiftTestClasses::default();
-    for (path, file) in paths.iter().zip(&prepared) {
-        if let Ok(PreparedFile::Swift(tree)) = file {
-            swift_test_classes.record_declarations_in(&tree.as_tree(), path);
+
+    let mut packages = SwiftTestPackages::default();
+    for (path, file) in paths.iter().zip(&mut prepared) {
+        if test_functions == TestFunctions::Excluded && is_swift_manifest(path) {
+            let layout = file
+                .as_mut()
+                .map(|file| std::mem::take(&mut file.manifest_targets))
+                .unwrap_or_default();
+            packages.record_manifest(path, layout);
+        }
+    }
+    let targets: Vec<_> = paths.iter().map(|path| packages.target_of(path)).collect();
+    let mut target_declarations: BTreeMap<SwiftTestTargetId<'_>, SwiftTestClasses> =
+        BTreeMap::new();
+    for (target, file) in targets.iter().zip(&mut prepared) {
+        if let (Some(target), Ok(file)) = (target, file) {
+            target_declarations
+                .entry(*target)
+                .or_default()
+                .merge(std::mem::take(&mut file.declarations));
         }
     }
 
     paths
         .par_iter()
         .zip(prepared)
-        .map(|(path, file)| {
-            let file = match file? {
-                PreparedFile::Chunked(file) => file,
-                PreparedFile::Swift(tree) => {
+        .zip(targets)
+        .map(|((path, file), target)| {
+            let file = file?;
+            match file.chunks {
+                PreparedChunks::Chunked(file) => Ok(file),
+                PreparedChunks::SwiftExtensionSource(source) => {
+                    let syntax = scan_syntax_of(path, &source, Grammar::Swift)?;
+                    let declarations = target
+                        .and_then(|target| target_declarations.get(&target))
+                        .unwrap_or(&file.declarations);
                     let chunks = FileChunks::from_tree_with_test_classes(
-                        &tree.as_tree(),
+                        &syntax,
                         path,
                         test_functions,
-                        &swift_test_classes,
+                        declarations,
                     );
-                    ChunkedFile {
+                    Ok(ChunkedFile {
                         chunks,
-                        source: Arc::from(tree.into_source()),
-                    }
+                        source: Arc::from(source),
+                    })
                 }
-            };
-            Ok(file)
+            }
         })
         .collect()
+}
+
+fn is_swift_manifest(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == MANIFEST_FILE_NAME || is_versioned_manifest_name(name))
 }
 
 /// ファイルを読み、Swift の型宣言を集める必要がなければその場でチャンクまで切り出す。
@@ -1684,21 +1722,46 @@ fn prepare_file(
             cause,
         })?;
 
-    let unparsable = |cause| SkippedFile::SourceUnparsable {
-        path: path.to_path_buf(),
-        cause,
-    };
+    let syntax = scan_syntax_of(path, &source, grammar)?;
+    let mut declarations = SwiftTestClasses::default();
+    let mut manifest_targets = Vec::new();
     if grammar == Grammar::Swift && test_functions == TestFunctions::Excluded {
-        return OwnedSyntaxTree::from_source(source, grammar)
-            .map(PreparedFile::Swift)
-            .map_err(unparsable);
+        if let Some(directory) = path.parent().filter(|_| is_swift_manifest(path)) {
+            manifest_targets = SwiftTestTarget::from_tree(&syntax, directory);
+        }
+        declarations.record_declarations_in(&syntax, path);
+        if has_xctest_extension_candidates(&syntax) {
+            return Ok(PreparedFile {
+                chunks: PreparedChunks::SwiftExtensionSource(source),
+                declarations,
+                manifest_targets,
+            });
+        }
     }
 
-    let tree = SyntaxTree::from_source(&source, grammar).map_err(unparsable)?;
-    Ok(PreparedFile::Chunked(ChunkedFile {
-        chunks: FileChunks::from_tree(&tree, path, test_functions),
-        source: Arc::from(source),
-    }))
+    let chunks =
+        FileChunks::from_tree_with_test_classes(&syntax, path, test_functions, &declarations);
+    Ok(PreparedFile {
+        chunks: PreparedChunks::Chunked(ChunkedFile {
+            chunks,
+            source: Arc::from(source),
+        }),
+        declarations,
+        manifest_targets,
+    })
+}
+
+/// # Errors
+/// 指定された grammar で構文木を作れないとき。
+fn scan_syntax_of<'source>(
+    path: &Path,
+    source: &'source str,
+    grammar: Grammar,
+) -> Result<SyntaxTree<'source>, SkippedFile> {
+    SyntaxTree::from_source(source, grammar).map_err(|cause| SkippedFile::SourceUnparsable {
+        path: path.to_path_buf(),
+        cause,
+    })
 }
 
 /// 走査で集めた、チャンク以外の材料。
