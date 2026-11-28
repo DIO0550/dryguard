@@ -80,7 +80,9 @@ cargo run -- check --diff --staged   # ステージ済みの変更だけを起�
 TypeScript / TSX の `describe` / `it` / `test`（`.only` / `.skip` も対応）の第2引数に
 直接書いたアロー関数・関数式を除外する。コールバック側の括弧・型アサーション等は辿る。
 Java（`--lang java` と `auto`）では注釈の名前が `Test` で終わるメソッド（`@Test` / `@ParameterizedTest` など）を、
-Swift（`--lang swift` と `auto`）では `@Test` 付きの関数と、`XCTestCase` を継承したクラスに直接書いた引数を取らない `func test…` を除外する。
+Swift（`--lang swift` と `auto`）では `@Test` 付きの関数と、`XCTestCase` を直接継承したクラスや、その `extension` に直接書いた引数を取らない `func test…` を除外する。
+拡張先は最上位の型宣言に非修飾の名前で照合する。別ファイルの場合は、走査範囲内の最寄りの `Package.swift` とすべてのバージョン別マニフェストで、両ファイルが同じ単一の SwiftPM テストターゲットに属すると確認できるときだけ照合する。見るのは初期 `targets:` 配列の静的な配置で、ビルド構成は評価しない。
+所属が分からない別ファイル、別ファイルの `private` / `fileprivate` 型、同名の宣言が複数ある場合、間接継承・修飾付きの拡張先は除外しない。
 ファイル名では除外せず、ヘルパーやテスト本体内の通常の関数は残す。除外数は走査結果に出る。
 `--include-tests` で再び比較対象にでき、`compare` での直接指定には影響しない。
 
@@ -132,7 +134,6 @@ Swift の候補は sourcekit-lsp に型シグネチャ・呼び出し元・呼�
 sourcekit-lsp は index を作り終える前の参照元に空を返すので、セッションを始めるたびに index を作り終えるまで待つ（`compare` は実行ごと、`scan` / `check` は走査ごとに 1 回。`swift build` は要らない）。
 `swift build` が要らないのは sourcekit-lsp の background indexing が有効なとき（既定）だけで、無効にすると参照元と呼び出し先は測れなくなる（Swift 6.4.2 の既定のビルドシステムで `swift build` した後も同じ）。
 実コード（apple/swift-argument-parser 1.6.1、160 ファイル）で `scan` が通り、握手から最後の答えまで約 62 秒（初回起動は 105 秒）だった（#408）。
-`extension` に書いた XCTest のメソッドは外れないので、テストをそう書くコードベースでは候補ペアの大半がテスト同士になる（#521）。
 呼び出し元ドメインは、XCTest か Testing を import するファイル（SwiftPM が `.build` に生成するテスト一覧を含む）と、最寄りの `Package.swift` からテストターゲットと確認できたファイルの参照を除く。
 マニフェストでは `Package(..., targets: [...])` の初期配列に直接書いた `testTarget` を読み、`Tests/<name>` または文字列リテラルの `path:` と、`sources:` / `exclude:` / `resources:` のリテラル配置を使う。
 バージョン別マニフェストがあれば、全マニフェストでテストに属するファイルを除く。式で組み立てた配置や SwiftPM マニフェストを持たない Xcode プロジェクトでは import の判定に従う。初期化後のターゲットの変更は読み取る配置に反映されない。
@@ -178,7 +179,8 @@ CLI は拡張子から TypeScript・Rust・Swift・Java の LSP サーバを選�
 リビジョンと組み合わせられる。
 
 - **関数の切り出しも、比べる相手も、index の版から読む。** 部分的にステージした
-  （`git add -p`）ファイルでも、位置は index の版の行番号を指す
+  （`git add -p`）ファイルでも、位置は index の版の行番号を指す。切り出しに使う Swift の
+  XCTest クラスの宣言と、テストターゲットの所属を確かめるマニフェストも index の版を使う
 - コミットに入らないものは比べない。未追跡のファイルは起点にも相手にもならず、
   作業ツリーから消しただけ（ステージしていない）のファイルは相手に入る
 - index に未解決のマージ衝突があると終了コード 2（どの版を読むかが決まらない）

@@ -154,6 +154,64 @@ fn includes_file(pair: &CandidatePair, file: &str) -> bool {
 }
 
 #[test]
+fn test_check_staged_swift_uses_the_index_declaration_for_an_extension_in_another_file() {
+    let extension = "extension CartTests {\n\
+                     \x20 func testTotal() {\n\
+                     \x20   let total = 2 * 3\n\
+                     \x20   XCTAssertEqual(total, 6)\n\
+                     \x20 }\n\
+                     }\n";
+    let mut edited = extension.replace("2 * 3", "3 * 3");
+    edited = edited.replace("total, 6", "total, 9");
+    let manifest = r#"import PackageDescription
+let package = Package(name: "Shop", targets: [
+    .testTarget(name: "CartTests", path: ".", sources: ["AExtension.swift", "ZDeclaration.swift"]),
+])"#;
+    let declaration = "import XCTest\nfinal class CartTests: XCTestCase {}\n";
+    let root = committed_work_tree(
+        "swift-staged-extension",
+        &[
+            ("Package.swift", manifest),
+            ("AExtension.swift", extension),
+            ("ZDeclaration.swift", declaration),
+        ],
+    );
+    write_file(&root, "AExtension.swift", &edited);
+    git(&root, &["add", "AExtension.swift"]);
+    write_file(&root, "ZDeclaration.swift", "final class CartTests {}\n");
+
+    let check = |target| {
+        check_with_language_servers(
+            &root,
+            &DiffSides::new("HEAD".parse().expect("HEAD は有効なリビジョン"), target),
+            SourceLanguage::Swift,
+            TestFunctions::Excluded,
+            ConfiguredThresholds::default(),
+            &DomainDeclarations::default(),
+            LanguageServers::new(&[]),
+        )
+        .expect("Swift の差分を走査できる")
+    };
+    let staged = check(DiffTarget::Index);
+    let work_tree = check(DiffTarget::WorkTree);
+
+    assert_eq!(staged.excluded_test_function_count(), 1);
+    assert_eq!(staged.changed_chunk_count(), Some(0));
+    assert_eq!(work_tree.excluded_test_function_count(), 0);
+    assert_eq!(work_tree.changed_chunk_count(), Some(1));
+
+    // 継承宣言を戻し、今度はマニフェストだけを作業ツリーで変更する。
+    write_file(&root, "ZDeclaration.swift", declaration);
+    write_file(
+        &root,
+        "Package.swift",
+        &manifest.replace(".testTarget", ".target"),
+    );
+    assert_eq!(check(DiffTarget::Index).excluded_test_function_count(), 1);
+    assert_eq!(check(DiffTarget::WorkTree).changed_chunk_count(), Some(1));
+}
+
+#[test]
 fn test_check_lists_only_the_pairs_that_include_a_changed_chunk() {
     let root = committed_work_tree("changed", &FILES);
     write_file(&root, "src/billing/discount.ts", DISCOUNT_EDITED);

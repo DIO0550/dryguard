@@ -1,6 +1,6 @@
 import XCTest
 
-final class ReorderTests: XCTestCase {
+extension ReorderTests {
     func testReorderOfThreeIsFour() {
         let value = reorder(of: 3)
         let expected = (3 + 1) * (3 - 1) / 2
