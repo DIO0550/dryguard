@@ -8,6 +8,7 @@
 //! `EXTRACT-CANDIDATE`（共通化してよい）の意味で埋まっているため
 //! (rules/naming.md「このツールの語彙を固定する」)。
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -414,7 +415,22 @@ impl FileChunks {
     /// 外した関数は、構文エラーがあっても始まりの行には入れず、**数だけを残す**
     /// （比べるつもりの無い関数を「切り出せなかった」と出さない）。外すのはその関数だけで、
     /// 本体の中に書いた関数は印が付いていないので残る（入れ子の扱いと同じ）。
+    /// Swift の extension は、この構文木の中に継承元を確認できる型宣言がある場合に照合する。
     pub fn from_tree(tree: &SyntaxTree<'_>, path: &Path, test_functions: TestFunctions) -> Self {
+        let mut swift_test_classes = SwiftTestClasses::default();
+        if tree.grammar() == Grammar::Swift && test_functions == TestFunctions::Excluded {
+            swift_test_classes.record_declarations_in(tree, path);
+        }
+        Self::from_tree_with_test_classes(tree, path, test_functions, &swift_test_classes)
+    }
+
+    /// 走査対象全体で見つかった Swift の型宣言を使って切り出す。
+    pub(crate) fn from_tree_with_test_classes(
+        tree: &SyntaxTree<'_>,
+        path: &Path,
+        test_functions: TestFunctions,
+        swift_test_classes: &SwiftTestClasses,
+    ) -> Self {
         let imports = ImportSet::from_tree(tree, path);
         let mut chunks = Vec::new();
         let mut unparsable_starts = Vec::new();
@@ -426,7 +442,7 @@ impl FileChunks {
             }
 
             let excluded_test_function = test_functions == TestFunctions::Excluded
-                && is_test_function(node, tree.source(), tree.grammar());
+                && is_test_function(node, tree, path, swift_test_classes);
             if excluded_test_function {
                 excluded_test_function_count += 1;
                 continue;
@@ -604,12 +620,18 @@ const TEST_ATTRIBUTE_NAME: &str = "test";
 ///
 /// Rust の `#[cfg(test)]` や TypeScript のファイル名は見ない。**印の付かないヘルパーは、別の
 /// テストモジュールの同じヘルパーと比べたい**（`rules/testing.md`「テスト用ヘルパーの置き場所」）。
-fn is_test_function(node: Node<'_>, source: &str, grammar: Grammar) -> bool {
-    match grammar {
+fn is_test_function(
+    node: Node<'_>,
+    tree: &SyntaxTree<'_>,
+    path: &Path,
+    swift_test_classes: &SwiftTestClasses,
+) -> bool {
+    let source = tree.source();
+    match tree.grammar() {
         Grammar::Rust => has_test_attribute(node, source),
         Grammar::TypeScript | Grammar::Tsx => is_typescript_test_callback(node, source),
         Grammar::Java => has_java_test_annotation(node, source),
-        Grammar::Swift => is_swift_test_function(node, source),
+        Grammar::Swift => is_swift_test_function(node, source, path, swift_test_classes),
     }
 }
 
@@ -691,15 +713,89 @@ const XCTEST_METHOD_PREFIX: &str = "test";
 /// XCTest のテストを持つクラスが継承する型の名前。
 const XCTEST_CASE_NAME: &str = "XCTestCase";
 
+/// 走査した Swift ファイルに現れた最上位の型宣言。名前だけでは宣言を確定できないので、
+/// 同名宣言が複数ある場合は extension のメソッドを残す。
+#[derive(Default)]
+pub(crate) struct SwiftTestClasses(BTreeMap<String, SwiftTypeDeclaration>);
+
+enum SwiftTypeDeclaration {
+    DirectXCTestCase { visible_only_in: Option<PathBuf> },
+    OtherOrAmbiguous,
+}
+
+impl SwiftTestClasses {
+    pub(crate) fn record_declarations_in(&mut self, tree: &SyntaxTree<'_>, path: &Path) {
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        for declaration in root.named_children(&mut cursor) {
+            let declaration_type = match declaration.kind() {
+                "class_declaration" => match swift_declaration_kind_of(declaration) {
+                    Some("class") if directly_inherits_xctest_case(declaration, tree.source()) => {
+                        SwiftTypeDeclaration::DirectXCTestCase {
+                            visible_only_in: has_swift_file_visibility(declaration)
+                                .then(|| path.to_path_buf()),
+                        }
+                    }
+                    Some("class" | "struct" | "enum" | "actor") => {
+                        SwiftTypeDeclaration::OtherOrAmbiguous
+                    }
+                    _ => continue,
+                },
+                "protocol_declaration" | "typealias_declaration" => {
+                    SwiftTypeDeclaration::OtherOrAmbiguous
+                }
+                _ => continue,
+            };
+            let Some(name) = declaration
+                .child_by_field_name(NAME_FIELD)
+                .and_then(|name| swift_simple_type_name_of(name, tree.source()))
+            else {
+                continue;
+            };
+            self.0
+                .entry(name.to_owned())
+                .and_modify(|known| *known = SwiftTypeDeclaration::OtherOrAmbiguous)
+                .or_insert(declaration_type);
+        }
+    }
+
+    fn directly_inherits_xctest_case(&self, name: &str, path: &Path) -> bool {
+        match self.0.get(name) {
+            Some(SwiftTypeDeclaration::DirectXCTestCase { visible_only_in }) => visible_only_in
+                .as_deref()
+                .is_none_or(|declared| declared == path),
+            _ => false,
+        }
+    }
+}
+
+/// トップレベルの `private` / `fileprivate` 型は別ファイルの拡張先にできない。
+fn has_swift_file_visibility(declaration: Node<'_>) -> bool {
+    let Some(modifiers) = swift_modifiers_of(declaration) else {
+        return false;
+    };
+    let mut cursor = modifiers.walk();
+    modifiers.named_children(&mut cursor).any(|modifier| {
+        modifier.kind() == "visibility_modifier"
+            && modifier
+                .child(0)
+                .is_some_and(|keyword| matches!(keyword.kind(), "private" | "fileprivate"))
+    })
+}
+
 /// Swift の関数が `test function` か。`@Test` の属性（Swift Testing）か、
-/// `XCTestCase` を継承したクラスの引数を取らない `func test…`（XCTest）。
+/// `XCTestCase` を直接継承したクラスか、その extension に直接書いた引数なしの `func test…`。
 ///
 /// **XCTest は継承と引数まで確かめる。** 名前の接頭辞だけで外すと、`test` で始まる普通の関数や、
-/// XCTest が走らせない引数付きのヘルパーまで外す。直接囲むクラスの継承しか見ないので、
-/// `extension` の中のメソッドと、`XCTestCase` を間接に継承したクラスのメソッドはチャンクとして
-/// 残る（比べる側へ倒れる）。`static` / `private` は見ないので、XCTest が走らせない
+/// XCTest が走らせない引数付きのヘルパーまで外す。間接継承や、拡張先の宣言が見つからない
+/// メソッドはチャンクとして残る。`static` / `private` は見ないので、XCTest が走らせない
 /// `static func test…` なども外れる（比べない側へ倒れる。外した数は走査の出力に出る）。
-fn is_swift_test_function(node: Node<'_>, source: &str) -> bool {
+fn is_swift_test_function(
+    node: Node<'_>,
+    source: &str,
+    path: &Path,
+    swift_test_classes: &SwiftTestClasses,
+) -> bool {
     if has_swift_test_attribute(node, source) {
         return true;
     }
@@ -714,7 +810,9 @@ fn is_swift_test_function(node: Node<'_>, source: &str) -> bool {
     let takes_no_parameters = !node
         .named_children(&mut cursor)
         .any(|child| child.kind() == SWIFT_PARAMETER_KIND);
-    named_like_a_test && takes_no_parameters && is_in_xctest_case(node, source)
+    named_like_a_test
+        && takes_no_parameters
+        && is_in_xctest_case(node, source, path, swift_test_classes)
 }
 
 /// Swift の宣言の属性に `@Test` があるか。
@@ -723,11 +821,7 @@ fn is_swift_test_function(node: Node<'_>, source: &str) -> bool {
 /// `attribute` を許すが、前置きの修飾子・改行・引数付きの `@Test` を並べても `modifiers` の下に
 /// しか並ばなかった。見落とした形は印の無い関数としてチャンクに残る（比べる側へ倒れる）。
 fn has_swift_test_attribute(node: Node<'_>, source: &str) -> bool {
-    let mut cursor = node.walk();
-    let Some(modifiers) = node
-        .named_children(&mut cursor)
-        .find(|child| child.kind() == "modifiers")
-    else {
+    let Some(modifiers) = swift_modifiers_of(node) else {
         return false;
     };
     let mut modifier_cursor = modifiers.walk();
@@ -745,8 +839,19 @@ fn has_swift_test_attribute(node: Node<'_>, source: &str) -> bool {
     })
 }
 
-/// その関数を直接囲むクラスが、`XCTestCase` を継承しているか。
-fn is_in_xctest_case(node: Node<'_>, source: &str) -> bool {
+fn swift_modifiers_of(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == "modifiers")
+}
+
+/// その関数は XCTestCase のサブクラスか、既知のサブクラスの extension の直接のメンバーか。
+fn is_in_xctest_case(
+    node: Node<'_>,
+    source: &str,
+    path: &Path,
+    swift_test_classes: &SwiftTestClasses,
+) -> bool {
     let Some(declaration) = node
         .parent()
         .filter(|body| body.kind() == "class_body")
@@ -755,12 +860,58 @@ fn is_in_xctest_case(node: Node<'_>, source: &str) -> bool {
     else {
         return false;
     };
+    match swift_declaration_kind_of(declaration) {
+        Some("class") => directly_inherits_xctest_case(declaration, source),
+        Some("extension") => declaration
+            .child_by_field_name(NAME_FIELD)
+            .and_then(|name| swift_simple_type_name_of(name, source))
+            .is_some_and(|name| swift_test_classes.directly_inherits_xctest_case(name, path)),
+        _ => false,
+    }
+}
+
+fn swift_declaration_kind_of(declaration: Node<'_>) -> Option<&'static str> {
+    Some(declaration.child_by_field_name("declaration_kind")?.kind())
+}
+
+fn directly_inherits_xctest_case(declaration: Node<'_>, source: &str) -> bool {
     let mut cursor = declaration.walk();
     declaration
         .named_children(&mut cursor)
         .filter(|child| child.kind() == "inheritance_specifier")
         .filter_map(|specifier| specifier.child_by_field_name("inherits_from"))
         .any(|parent| swift_type_name_tail_of(parent, source) == Some(XCTEST_CASE_NAME))
+}
+
+/// 非修飾の型名。`Module.Tests` や `Box<Int>` の末尾だけを使うと別の宣言を拾うので残す。
+fn swift_simple_type_name_of<'source>(
+    node: Node<'_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    let name = match node.kind() {
+        "type_identifier" => node,
+        "user_type" => {
+            let mut cursor = node.walk();
+            let mut parts = node
+                .named_children(&mut cursor)
+                .filter(|part| !part.is_extra());
+            let name = parts.next()?;
+            if name.kind() != "type_identifier" || parts.next().is_some() {
+                return None;
+            }
+            name
+        }
+        _ => return None,
+    };
+    if name.is_missing() || name.has_error() {
+        return None;
+    }
+    let name = source.get(name.byte_range())?;
+    Some(
+        name.strip_prefix('`')
+            .and_then(|name| name.strip_suffix('`'))
+            .unwrap_or(name),
+    )
 }
 
 /// `user_type` の末尾の型名の綴り。`XCTest.XCTestCase` なら `XCTestCase`。
@@ -1828,6 +1979,138 @@ func testable(value: Int) -> Bool {
             vec![4, 8, 13, 17, 21, 27, 33, 38]
         );
         assert_eq!(file_chunks.excluded_test_function_count(), 0);
+    }
+
+    #[test]
+    fn test_file_chunks_exclude_only_parameterless_test_methods_directly_in_a_known_extension() {
+        let source = r#"extension CartTests {
+    func testOrder() throws {
+        func testLocal() { print("local") }
+        testLocal()
+    }
+    func testHelper(value: Int) { print(value) }
+    func makeCart() { print("helper") }
+}
+final class CartTests: XCTest.XCTestCase {}
+final class DerivedCartTests: CartTests {}
+extension DerivedCartTests {
+    func testDerived() { print("indirect") }
+}
+extension UnknownTests {
+    func testUnknown() { print("unknown") }
+}
+enum Fixtures {
+    final class UnknownTests: XCTestCase {}
+}
+"#;
+        let file_chunks = swift_chunks_of(source, TestFunctions::Excluded);
+
+        assert_eq!(file_chunks.excluded_test_function_count(), 1);
+        assert_eq!(start_lines_of(&file_chunks), vec![3, 6, 7, 12, 15]);
+    }
+
+    #[test]
+    fn test_file_chunks_do_not_match_a_qualified_or_specialized_swift_extension_by_its_leaf_name() {
+        let source = r#"final class CartTests: XCTestCase {}
+extension CartTests {
+    func testDirect() { print("direct") }
+}
+extension OtherModule.CartTests {
+    func testQualified() { print("qualified") }
+}
+extension CartTests<Int> {
+    func testSpecialized() { print("specialized") }
+}
+"#;
+        let file_chunks = swift_chunks_of(source, TestFunctions::Excluded);
+
+        assert_eq!(file_chunks.excluded_test_function_count(), 1);
+        assert_eq!(start_lines_of(&file_chunks), vec![6, 9]);
+    }
+
+    #[test]
+    fn test_file_chunks_exclude_a_swift_extension_test_when_only_the_declaration_uses_backticks() {
+        let source = r#"final class `CartTests`: XCTestCase {}
+extension CartTests {
+    func testCart() { print("test") }
+    func makeCart() { print("helper") }
+}
+"#;
+        let file_chunks = swift_chunks_of(source, TestFunctions::Excluded);
+
+        assert_eq!(file_chunks.excluded_test_function_count(), 1);
+        assert_eq!(start_lines_of(&file_chunks), vec![4]);
+    }
+
+    #[test]
+    fn test_file_chunks_keep_swift_extension_tests_when_another_type_declaration_has_the_same_name()
+    {
+        let extension = r#"extension CartTests {
+    func testCart() { print("ambiguous") }
+}
+extension OrderTests {
+    func testOrder() { print("unambiguous") }
+}
+"#;
+        let declarations =
+            "final class CartTests: XCTestCase {}\nfinal class OrderTests: XCTestCase {}";
+        for other in [
+            "struct CartTests {}",
+            "enum CartTests {}",
+            "actor CartTests {}",
+            "protocol CartTests {}",
+            "typealias CartTests = OtherType",
+            "final class CartTests: XCTestCase {}",
+        ] {
+            for sources in [[declarations, other], [other, declarations]] {
+                let mut test_classes = SwiftTestClasses::default();
+                for (source, path) in sources.into_iter().zip(["A.swift", "B.swift"]) {
+                    let tree = SyntaxTree::from_source(source, Grammar::Swift)
+                        .expect("テストが渡す型宣言は木にできる");
+                    test_classes.record_declarations_in(&tree, Path::new(path));
+                }
+                let tree = SyntaxTree::from_source(extension, Grammar::Swift)
+                    .expect("テストが渡す extension は木にできる");
+                let chunks = FileChunks::from_tree_with_test_classes(
+                    &tree,
+                    Path::new("Extensions.swift"),
+                    TestFunctions::Excluded,
+                    &test_classes,
+                );
+
+                assert_eq!(chunks.excluded_test_function_count(), 1, "{sources:?}");
+                assert_eq!(start_lines_of(&chunks), vec![2], "{sources:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_file_chunks_only_match_file_private_xctest_classes_in_the_declaring_file() {
+        let extension = "extension CartTests {\n    func testCart() { print(\"test\") }\n}\n";
+        for visibility in ["private", "fileprivate"] {
+            let declaration = format!("{visibility} final class CartTests: XCTestCase {{}}\n");
+            let tree = SyntaxTree::from_source(&declaration, Grammar::Swift)
+                .expect("テストが渡す型宣言は木にできる");
+            let mut test_classes = SwiftTestClasses::default();
+            test_classes.record_declarations_in(&tree, Path::new("Declaration.swift"));
+            let other_tree = SyntaxTree::from_source(extension, Grammar::Swift)
+                .expect("テストが渡す extension は木にできる");
+            let other_chunks = FileChunks::from_tree_with_test_classes(
+                &other_tree,
+                Path::new("Extension.swift"),
+                TestFunctions::Excluded,
+                &test_classes,
+            );
+            assert_eq!(start_lines_of(&other_chunks), vec![2], "{visibility}");
+
+            let same_file = format!("{declaration}{extension}");
+            let same_chunks = swift_chunks_of(&same_file, TestFunctions::Excluded);
+            assert_eq!(
+                same_chunks.excluded_test_function_count(),
+                1,
+                "{visibility}"
+            );
+        }
     }
 
     #[test]

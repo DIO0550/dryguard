@@ -249,7 +249,7 @@ fn swift_package_scan_of(language: SourceLanguage, test_functions: TestFunctions
 fn test_swift_scan_lists_functions_and_initializers_without_asking_a_server() {
     let scan = swift_package_scan_of(SourceLanguage::Swift, TestFunctions::Excluded);
 
-    assert_eq!(scan.file_count(), 4, "`.ts` は数えない");
+    assert_eq!(scan.file_count(), 5, "`.ts` は数えない");
     assert_eq!(
         scan.chunk_count(),
         6,
@@ -331,8 +331,8 @@ fn test_auto_scan_does_not_compare_swift_with_typescript() {
 
     assert_eq!(
         scan.file_count(),
-        5,
-        "`.swift` の 4 つと `.ts` の 1 つを集める"
+        6,
+        "`.swift` の 5 つと `.ts` の 1 つを集める"
     );
     assert_eq!(scan.chunk_count(), 7);
     assert_eq!(
@@ -348,7 +348,7 @@ fn test_auto_scan_does_not_compare_swift_with_typescript() {
 }
 
 #[test]
-fn test_swift_scan_excluding_test_functions_leaves_out_both_kinds_of_tests() {
+fn test_swift_scan_excludes_test_attributes_and_xctest_extensions_declared_in_another_file() {
     // 対照として本番の関数どうしのペアを同じフィクスチャに置く。消えるのは
     // `@Test` と XCTest のメソッドを含むペアだけ
     let scan = swift_package_scan_of(SourceLanguage::Swift, TestFunctions::Excluded);
@@ -356,7 +356,7 @@ fn test_swift_scan_excluding_test_functions_leaves_out_both_kinds_of_tests() {
     assert_eq!(
         scan.excluded_test_function_count(),
         2,
-        "`@Test` と XCTest のメソッドを 1 つずつ外す"
+        "`@Test` と、別ファイルで宣言された XCTest クラスの extension メソッドを外す"
     );
     assert!(scan.candidate_pairs().iter().all(|pair| {
         !pair.location_a().to_string().contains("Tests.swift:")
@@ -379,7 +379,7 @@ fn test_swift_scan_including_test_functions_keeps_the_pair_of_two_tests() {
             "BillingTests/DiscountTests.swift:3",
             "InventoryTests/ReorderTests.swift:4"
         )),
-        "`--include-tests` を付けると、`@Test` と XCTest のメソッドの組も比べる"
+        "`--include-tests` を付けると、`@Test` と XCTest クラスの extension メソッドの組も比べる"
     );
     assert_eq!(scan.excluded_test_function_count(), 0);
     assert_eq!(scan.chunk_count(), 8);

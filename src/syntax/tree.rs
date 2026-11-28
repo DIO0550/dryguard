@@ -7,6 +7,7 @@
 //! パースはプロセスを起動せずメモリの中だけで済むので、`syntax` に I/O を
 //! 持ち込まない (rules/coding.md「禁止事項」)。
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -106,7 +107,7 @@ impl Grammar {
 /// (rules/coding.md「不正な状態を型で表現できなくする」)。
 #[derive(Debug)]
 pub struct SyntaxTree<'source> {
-    tree: tree_sitter::Tree,
+    tree: Cow<'source, tree_sitter::Tree>,
     source: &'source str,
     grammar: Grammar,
 }
@@ -123,15 +124,8 @@ impl<'source> SyntaxTree<'source> {
     ///
     /// grammar を実行時が受け付けなかった / パーサが木を返さなかったとき。
     pub fn from_source(source: &'source str, grammar: Grammar) -> Result<Self, ParseError> {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&grammar.language())
-            .map_err(|_| ParseError::GrammarRejected)?;
-
-        let tree = parser.parse(source, None).ok_or(ParseError::NoTree)?;
-
         Ok(Self {
-            tree,
+            tree: Cow::Owned(parse_tree_of(source, grammar)?),
             source,
             grammar,
         })
@@ -190,6 +184,49 @@ impl<'source> SyntaxTree<'source> {
     pub fn source(&self) -> &'source str {
         self.source
     }
+}
+
+/// ソースと構文木を所有する。走査全体から宣言を集めてからチャンク化する場合も、同じ版を使う。
+pub(crate) struct OwnedSyntaxTree {
+    tree: tree_sitter::Tree,
+    source: String,
+    grammar: Grammar,
+}
+
+impl OwnedSyntaxTree {
+    /// ソースを保持したまま、指定した grammar で構文木にする。
+    ///
+    /// # Errors
+    /// grammar を実行時が受け付けなかった / パーサが木を返さなかったとき。
+    pub(crate) fn from_source(source: String, grammar: Grammar) -> Result<Self, ParseError> {
+        Ok(Self {
+            tree: parse_tree_of(&source, grammar)?,
+            source,
+            grammar,
+        })
+    }
+
+    pub(crate) fn as_tree(&self) -> SyntaxTree<'_> {
+        SyntaxTree {
+            tree: Cow::Borrowed(&self.tree),
+            source: &self.source,
+            grammar: self.grammar,
+        }
+    }
+
+    pub(crate) fn into_source(self) -> String {
+        self.source
+    }
+}
+
+/// # Errors
+/// grammar を実行時が受け付けなかった / パーサが木を返さなかったとき。
+fn parse_tree_of(source: &str, grammar: Grammar) -> Result<tree_sitter::Tree, ParseError> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&grammar.language())
+        .map_err(|_| ParseError::GrammarRejected)?;
+    parser.parse(source, None).ok_or(ParseError::NoTree)
 }
 
 /// そのノードの先頭が置かれている位置。バイト範囲が文字の境界に乗っていなければ `None`。
