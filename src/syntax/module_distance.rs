@@ -22,6 +22,9 @@ impl ModuleDistance {
     ///
     /// 共通の親までさかのぼる段数と、そこから下りる段数の合計。
     /// ファイル名は見ない（同じディレクトリにある別々のファイルは 0）。
+    /// パスは両方とも絶対パスか同じ起点からの相対パスとする。
+    /// 起点自体をさかのぼるパスは、起点の名前も比較できるよう絶対パスで渡す。
+    /// `.` と `..` は綴りの上で畳み、シンボリックリンクは辿らない。
     ///
     /// `new` ではなく `between` と呼ぶのは、**2 つのパスの間の関係**であって
     /// パスがこの値の材料ではないため（`Location::new(path, line)` とは形が違う）。
@@ -45,16 +48,24 @@ impl ModuleDistance {
 }
 
 /// そのファイルを含むディレクトリを、上から順に並べたもの。
-fn directories_of(path: &Path) -> Vec<&str> {
+fn directories_of(path: &Path) -> Vec<Component<'_>> {
     let directory = path.parent().unwrap_or_else(|| Path::new(""));
+    let mut directories = Vec::new();
 
-    directory
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(name) => name.to_str(),
-            _ => None,
-        })
-        .collect()
+    for component in directory.components() {
+        match component {
+            Component::Normal(_) => directories.push(component),
+            Component::ParentDir => {
+                if matches!(directories.last(), Some(Component::Normal(_))) {
+                    directories.pop();
+                } else if !directory.has_root() {
+                    directories.push(component);
+                }
+            }
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    directories
 }
 
 #[cfg(test)]
@@ -72,6 +83,16 @@ mod tests {
             steps("src/billing/discount.ts", "src/billing/invoice.ts"),
             0
         );
+    }
+
+    #[test]
+    fn test_module_distance_folds_parent_components_without_crossing_the_root() {
+        assert_eq!(steps("/src/a.ts", "/../other/../src/./b.ts"), 0);
+    }
+
+    #[test]
+    fn test_module_distance_keeps_unmatched_parents_on_relative_paths() {
+        assert_eq!(steps("a.ts", "../../b.ts"), 2);
     }
 
     #[test]
