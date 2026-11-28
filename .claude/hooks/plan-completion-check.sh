@@ -26,7 +26,8 @@ body="$(jq -r '.tool_input.body // empty' 2>/dev/null)"
 
 # 計画の見出しの読み方は plan-impact-check.sh と揃える。片方だけが止まる本文を作らないため。
 plan_heading_pattern='^#{1,6}[[:space:]].*計画'
-criterion_pattern='^[[:space:]]*([-*+][[:space:]]+)?(\*\*)?完了条件の確かめ方(\*\*)?[：:][[:space:]]*[^[:space:]]'
+# 値が空の行も拾う。値の有無で拾うと、正しい行が 1 つあるだけで書きかけの行が検査から漏れる。
+criterion_pattern='^[[:space:]]*([-*+][[:space:]]+)?(\*\*)?完了条件の確かめ方(\*\*)?[：:]'
 
 if ! printf '%s\n' "$body" | grep -Eq "$plan_heading_pattern"; then
   exit 0
@@ -44,19 +45,28 @@ if [ -z "$criterion_lines" ]; then
   exit 2
 fi
 
-# 「なし（理由）」は確かめるコマンドが無いと宣言した行なので、形は求めない。
-if printf '%s\n' "$criterion_lines" | grep -Eq '[：:][[:space:]]*なし'; then
-  exit 0
-fi
+# 行の値（ラベルの後ろ）を取り出す。
+value_of() {
+  local value="${1#*完了条件の確かめ方}"
+  value="${value#\*\*}"
+  value="${value#[：:]}"
+  printf '%s' "$value" | sed -E 's/^[[:space:]]+//'
+}
 
 # コマンドと期待する出力の両方が無い行は、何を走らせて何が出れば完了かを言えない
 # （pr-497 指摘 4・pr-519 指摘 7: grep のパターン・テストの名前が無かった、pr-537 指摘 1: 「数回」）。
+# 「なし（理由）」は確かめるコマンドが無いと宣言した行なので、その行だけ形を求めない。
+# Why not（なしの行が 1 つあれば全体を通す）: 他の行の崩れまで黙って通る。
 # Why not（コマンドの中身まで見る）: 足りているかは機械で言えず、語を並べるだけの儀式になる。
 unformed=""
+checked_lines=""
 while IFS= read -r line; do
-  value="${line#*完了条件の確かめ方}"
-  value="${value#\*\*}"
-  value="${value#[：:]}"
+  value="$(value_of "$line")"
+  case "$value" in
+    なし*) continue ;;
+  esac
+  checked_lines="$checked_lines$line
+"
   command_part="${value%%→*}"
   expected_part="${value#*→}"
   has_command="$(printf '%s' "$command_part" | tr -d '[:space:]')"
@@ -79,18 +89,24 @@ if [ -n "$unformed" ]; then
   exit 2
 fi
 
+if [ -z "$checked_lines" ]; then
+  exit 0
+fi
+
 # どの行も「0 件」だけを待つなら、旧い綴りを行ごと消しても通る（pr-505 指摘 6・pr-512 指摘 4）。
-# 新しい綴り・テストが在ることを数える行が 1 つは要る。
+# 新しい綴り・テストが在ることを数える行が 1 つは要る。期待する出力の太字・コードの印は落として読む。
 # Why not（0 件の行ごとに対になる行を求める）: どの行が対かを機械で言えず、書き方を決める儀式になる。
 nonzero_found=""
 while IFS= read -r line; do
-  expected_part="${line#*→}"
-  trimmed="$(printf '%s' "$expected_part" | sed -E 's/^[[:space:]]+//')"
+  [ -z "$line" ] && continue
+  value="$(value_of "$line")"
+  expected_part="${value#*→}"
+  trimmed="$(printf '%s' "$expected_part" | tr -d '`*' | sed -E 's/__//g; s/^[[:space:]]+//')"
   if ! printf '%s' "$trimmed" | grep -Eq '^(0|０)[[:space:]]*(件|箇所|行|個)?([[:space:]]|[（(]|$)|^(出力なし|空)'; then
     nonzero_found="yes"
     break
   fi
-done <<< "$criterion_lines"
+done <<< "$checked_lines"
 
 if [ -z "$nonzero_found" ]; then
   {
