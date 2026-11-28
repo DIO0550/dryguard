@@ -15,6 +15,7 @@
 | `hook-canary.sh` | `PreToolUse`（`Bash`） | コマンドが `echo hook-canary` そのものなら exit 2 で止める。このセッションでフックが発火しているかを確かめるためだけのもの |
 | `pr-body-check.sh` | `PreToolUse`（`mcp__github__create_pull_request`） | 本文に `差分規模:` の宣言の行が無ければ exit 2 で止める。数の突き合わせは層 1（`harness/ci/pr-body-diff.sh`）に任せる |
 | `plan-impact-check.sh` | `PreToolUse`（`issue-comment-count-check.sh` と同じ MCP ツール） | 計画の見出しを持つ本文に `影響範囲の出どころ:` の行が無ければ exit 2 で止める。挙げた範囲が足りているかは見ない |
+| `plan-completion-check.sh` | `PreToolUse`（`plan-impact-check.sh` と同じ MCP ツール） | 計画の見出しを持つ本文に `完了条件の確かめ方: <コマンド> → <期待する出力>` の行が無い・形が崩れている・どの行も 0 件しか待たないなら exit 2 で止める。条件で足りているかは見ない |
 | `issue-comment-count-check.sh` | `PreToolUse`（`mcp__github__add_issue_comment` / `update_issue_comment` / `issue_write`） | 本文に「N 件」「N 箇所」などの数があるのに `数の出どころ:` の行が無ければ exit 2 で止める。数が正しいかは見ない |
 | `post-merge-review.sh` | `PostToolUse`（`mcp__github__merge_pull_request` / `Bash`） | PR のマージ（MCP のマージか `gh pr merge`）を検知したら、Issue への追記と `harness/records/pr-<N>.md` の記録を `additionalContext` で促す。止めない |
 | `post-edit-rust.sh` | `PostToolUse`（`Edit` / `Write` / `MultiEdit`） | `.rs` を編集したら、そのクレートに `cargo fmt` をかけ、`cargo clippy` が落ちたら診断を exit 2 で返す |
@@ -129,6 +130,25 @@ push の前に `echo hook-canary` を 1 度実行する。**止められれば**
 - 同じ PreToolUse の matcher（Issue コメント・Issue の本文を書く MCP ツール）に、
   `issue-comment-count-check.sh` と並べて配線してある
 
+## `plan-completion-check.sh` — 計画のコメントに、完了条件のコマンドと期待する出力を求める
+
+`plan-completion-criterion` は、計画の完了条件が**機械的に確かめられる形になっていない**形で、
+`implementation-flow` の「3. 計画」と `plan-review.md` の「入力の網羅」（層 4）に観点が在っても、
+計画の検証で毎回直している（pr-497 指摘 4・pr-505 指摘 6・pr-512 指摘 4・pr-519 指摘 7・
+pr-537 指摘 1・pr-502 指摘 24）。
+
+- **止めるのは、計画の見出しを持つ本文に `完了条件の確かめ方:` の行が無いとき。**
+  見出しの読み方は `plan-impact-check.sh` と同じ。機械的に確かめる条件が無ければ `なし（理由）`
+- **行の中身が `<コマンド> → <期待する出力>` の形でなければ止める**（矢印が無い・どちらかが空）。
+  「数回」「通る」のように、何が出れば完了かを言えない条件を投稿の前に書き直させる
+- **どの行も 0 件（`0 件` / `出力なし` / `空`）しか待たなければ止める。** 旧い綴りを行ごと消しても
+  通るので、新しい綴り・テストが在ることを数える行を 1 つ求める。どの行が対かは見ない
+- **条件で足りているかは見ない。** 突き合わせの向き・入れ子・閉じた語彙への追加を拾えるか
+  （pr-552 指摘 1 / 6 / 8）、grep のパターンが新しく書く綴りに当たらないか（pr-558 指摘 5）は、
+  `plan-review.md` の観点が持つ
+
+**黙って通す条件**: `jq` が無い・入力の JSON が読めない・本文が空。
+
 ## `issue-comment-count-check.sh` — Issue コメントの数に、立ち止まる一度を挟む
 
 層 1 が突き合わせるのは PR 本文の差分規模だけで、Issue コメントに書いた「N 件」「N 箇所」は
@@ -188,6 +208,7 @@ bash .claude/hooks/post-merge-review-test.sh
 bash .claude/hooks/pr-body-check-test.sh
 bash .claude/hooks/issue-comment-count-check-test.sh
 bash .claude/hooks/plan-impact-check-test.sh
+bash .claude/hooks/plan-completion-check-test.sh
 ```
 
 CI（`.github/workflows/rust.yml` の `claude-hooks`）でも走る。
